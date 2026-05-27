@@ -3,6 +3,7 @@
 
 # Node / Vite
 node_modules
+.turbo
 dist
 dist-ssr
 *.local

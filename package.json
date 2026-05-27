@@ -1,0 +1,22 @@
+{
+  "name": "hitch",
+  "private": true,
+  "packageManager": "bun@1.3.9",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "turbo dev --continue",
+    "build": "turbo build",
+    "check": "turbo check",
+    "preview": "turbo --filter=hitch-desktop preview",
+    "desktop": "bun --cwd apps/desktop tauri",
+    "desktop:dev": "bun --cwd apps/desktop tauri dev",
+    "desktop:build": "bun --cwd apps/desktop tauri build",
+    "rust:check": "cargo check --workspace",
+    "rust:test": "cargo test --workspace"
+  },
+  "devDependencies": {
+    "turbo": "2.9.15"
+  }
+}
