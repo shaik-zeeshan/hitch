@@ -1,6 +1,6 @@
 // Overlay open-state — the small bit of cross-cutting UI state that several
 // surfaces drive (the ⌘K palette opens the same create-worktree dialog the
-// tree's "New worktree…" row does, etc.). Kept out of daemon.ts (that owns the
+// tree's per-project "+" does, etc.). Kept out of daemon.ts (that owns the
 // daemon contract, not view chrome) and shared as stores rather than
 // prop-drilled, mirroring how components read daemon state directly.
 

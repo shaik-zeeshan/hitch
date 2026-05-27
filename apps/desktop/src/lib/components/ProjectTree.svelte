@@ -114,13 +114,17 @@
       {#if project.kind === "git-backed"}
         <button
           class="twirl"
-          style={expanded ? "transform: rotate(90deg)" : ""}
+          class:open={expanded}
           aria-label={expanded ? "Collapse" : "Expand"}
           onclick={(e) => {
             e.stopPropagation();
             toggleExpand(project);
-          }}>▶</button
+          }}
         >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+            ><path d="M6 4l4 4-4 4" /></svg
+          >
+        </button>
       {:else}
         <span class="twirl"></span>
       {/if}
@@ -139,14 +143,24 @@
 
       <span class="lbl">{project.name}</span>
 
-      {#if project.kind === "plain"}
-        <span class="tag">plain</span>
-      {:else if expanded}
-        <span class="tag">git</span>
-      {:else if status}
+      {#if !expanded && status}
         <span class="status {AGENT_LABEL[status].cls}">{AGENT_LABEL[status].label}</span>
-      {:else}
-        <span class="tag">git</span>
+      {/if}
+
+      {#if project.kind === "git-backed"}
+        <button
+          class="quick-add"
+          aria-label={`New worktree in ${project.name}`}
+          title={`New worktree in ${project.name}`}
+          onclick={(e) => {
+            e.stopPropagation();
+            createWorktreeFor.set(project);
+          }}
+        >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+            ><path d="M8 3.5v9M3.5 8h9" /></svg
+          >
+        </button>
       {/if}
     </div>
 
@@ -181,7 +195,7 @@
                       <span class="status {AGENT_LABEL[wtStatus].cls}">{AGENT_LABEL[wtStatus].label}</span>
                     </span>
                   {/if}
-                  {#if worktree.is_main}<span class="tag">main</span>{/if}
+                  {#if worktree.is_main}<span class="wt-main">main</span>{/if}
                 </button>
               {/snippet}
             </ContextMenu.Trigger>
@@ -231,11 +245,6 @@
             </ContextMenu.Portal>
           </ContextMenu.Root>
         {/each}
-
-        <button class="row wt-row wt-add" onclick={() => createWorktreeFor.set(project)}>
-          <span class="plus-ico">+</span>
-          <span class="lbl">New worktree…</span>
-        </button>
       </div>
     {/if}
   {/each}
@@ -291,22 +300,29 @@
   .row.sel {
     background: var(--ac-wash);
     color: var(--tx-hi);
-    box-shadow: inset 0 0 0 1px oklch(62% 0.1 265 / 0.28);
   }
   .row.sel .lbl {
     font-weight: 560;
   }
   .row .twirl {
     width: 12px;
+    height: 12px;
     color: var(--tx-lo);
-    font-size: 9px;
     display: grid;
     place-items: center;
     padding: 0;
     border: 0;
     background: transparent;
     cursor: pointer;
+    flex: none;
+  }
+  .row .twirl svg {
+    width: 9px;
+    height: 9px;
     transition: transform var(--t-fast);
+  }
+  .row .twirl.open svg {
+    transform: rotate(90deg);
   }
   button.twirl:hover {
     color: var(--tx-hi);
@@ -356,13 +372,10 @@
   .diffstat .del {
     color: var(--err);
   }
-  .row .tag {
-    font-size: 9.5px;
+  .wt-main {
+    font-size: 10px;
     color: var(--tx-lo);
     font-family: var(--mono);
-    padding: 1px 5px;
-    border: 1px solid var(--line);
-    border-radius: 4px;
     flex: none;
   }
 
@@ -376,38 +389,25 @@
 
   .worktrees {
     display: grid;
-    gap: 1px;
+    gap: 2px;
   }
-  /* tree hierarchy: indent guide + connector ticks */
+  /* tree hierarchy: one quiet vertical hairline under the caret, no ticks */
   .tree .worktrees {
-    padding-left: 16px;
-    margin: 2px 0 9px;
+    padding-left: 24px;
+    margin: 2px 0 8px;
     position: relative;
   }
   .tree .worktrees::before {
     content: "";
     position: absolute;
-    left: 6px;
-    top: -2px;
-    bottom: 13px;
+    left: 14px;
+    top: -1px;
+    bottom: 12px;
     width: 1px;
     background: var(--line-soft);
   }
   .tree .wt-row {
-    padding-left: 12px;
-    position: relative;
-  }
-  .tree .wt-row::before {
-    content: "";
-    position: absolute;
-    left: -10px;
-    top: 15px;
-    width: 9px;
-    height: 1px;
-    background: var(--line-soft);
-  }
-  .tree .wt-row.wt-add::before {
-    display: none;
+    padding-left: 6px;
   }
 
   /* status as a WORD, in a reserved hue */
@@ -437,15 +437,30 @@
     flex: none;
   }
 
-  .wt-add {
+  /* per-project quick-add: a "+" on the project row that creates a worktree
+     under it directly. Always visible, brightening on its own hover. */
+  .row .quick-add {
+    width: 18px;
+    height: 18px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
     color: var(--tx-lo);
-  }
-  .wt-add:hover {
-    color: var(--ac-bright);
-  }
-  .wt-add .plus-ico {
-    width: 12px;
-    text-align: center;
+    cursor: pointer;
     flex: none;
+    transition:
+      background var(--t-fast),
+      color var(--t-fast);
+  }
+  .row .quick-add svg {
+    width: 12px;
+    height: 12px;
+  }
+  .row .quick-add:hover {
+    background: var(--bg-4);
+    color: var(--ac-bright);
   }
 </style>
