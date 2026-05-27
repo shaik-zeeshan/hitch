@@ -33,8 +33,10 @@ const OUTPUT_STAGING_CAPACITY: usize = 1024 * 1024;
 
 /// Routes raw PTY bytes to the webview per session (ADR 0007).
 ///
-/// Lives in the Tauri process, NOT cleared on daemon disconnect, so a daemon
-/// restart/reconnect reuses the already-registered channels.
+/// Lives in the Tauri process. Channels are kept across an ordinary daemon
+/// disconnect, but a `SessionOpened` replay invalidates that session's channel
+/// until the webview has reset its byte ring and registered a fresh channel;
+/// replay bytes are staged during that registration gap.
 ///
 /// Channel type choice (verified against tauri 2.11.2): we store
 /// `Channel<InvokeResponseBody>` and send `InvokeResponseBody::Raw(bytes)`. That
@@ -61,6 +63,43 @@ impl OutputRouter {
             let drop = buf.len() - OUTPUT_STAGING_CAPACITY;
             buf.drain(..drop);
         }
+    }
+
+    /// A session-opened event is followed by the daemon's authoritative
+    /// scrollback replay. Drop any old channel before the webview sees the event
+    /// so replay cannot race through a stale channel and be wiped by the JS ring
+    /// reset that happens during fresh registration.
+    fn prepare_fresh_registration(&mut self, session_id: SessionId) {
+        self.channels.remove(&session_id);
+        self.staging.remove(&session_id);
+    }
+
+    /// Route output to the active channel, or stage it until registration
+    /// completes. Sending is best-effort: a dead webview channel should not tear
+    /// down the daemon reader loop.
+    fn send_or_stage(&mut self, session_id: SessionId, payload: Vec<u8>) {
+        if let Some(channel) = self.channels.get(&session_id) {
+            let _ = channel.send(InvokeResponseBody::Raw(payload));
+        } else {
+            self.stage(session_id, &payload);
+        }
+    }
+
+    /// Register (or re-register) a webview channel and flush bytes staged during
+    /// the registration gap.
+    fn register_channel(&mut self, session_id: SessionId, channel: Channel<InvokeResponseBody>) {
+        if let Some(staged) = self.staging.remove(&session_id) {
+            if !staged.is_empty() {
+                let _ = channel.send(InvokeResponseBody::Raw(staged));
+            }
+        }
+        self.channels.insert(session_id, channel);
+    }
+
+    /// Drop a session's output channel and any bytes staged for it.
+    fn unregister_channel(&mut self, session_id: SessionId) {
+        self.channels.remove(&session_id);
+        self.staging.remove(&session_id);
     }
 }
 
@@ -440,18 +479,17 @@ fn reader_loop(app: &AppHandle, client: &HitchClient, stream: UnixStream) -> io:
                         // binary Channel — never stringify here (ADR 0007). If
                         // the channel isn't registered yet (registration is a
                         // round-trip the daemon may beat), stage the bytes so
-                        // the first prompt isn't lost.
+                        // the first prompt/reconnect replay isn't lost.
                         if let Ok(mut router) = client.0.output_router.lock() {
-                            if let Some(channel) = router.channels.get(session_id) {
-                                // Sending is best-effort: a dead webview channel
-                                // shouldn't tear down the daemon reader loop.
-                                let _ = channel.send(InvokeResponseBody::Raw(payload));
-                            } else {
-                                router.stage(*session_id, &payload);
-                            }
+                            router.send_or_stage(*session_id, payload);
                         }
                     }
-                    Event::SessionOpened { session } => client.track_session(app, session.id, true),
+                    Event::SessionOpened { session } => {
+                        if let Ok(mut router) = client.0.output_router.lock() {
+                            router.prepare_fresh_registration(session.id);
+                        }
+                        client.track_session(app, session.id, true)
+                    }
                     Event::SessionClosed { session_id, .. } => {
                         client.track_session(app, *session_id, false)
                     }
@@ -592,13 +630,7 @@ fn register_session_output(
         .output_router
         .lock()
         .map_err(|_| "output-router lock poisoned".to_string())?;
-    if let Some(staged) = router.staging.remove(&session_id) {
-        if !staged.is_empty() {
-            // Best-effort: a dead channel here just means the session is gone.
-            let _ = channel.send(InvokeResponseBody::Raw(staged));
-        }
-    }
-    router.channels.insert(session_id, channel);
+    router.register_channel(session_id, channel);
     Ok(())
 }
 
@@ -614,8 +646,7 @@ fn unregister_session_output(
         .output_router
         .lock()
         .map_err(|_| "output-router lock poisoned".to_string())?;
-    router.channels.remove(&session_id);
-    router.staging.remove(&session_id);
+    router.unregister_channel(session_id);
     Ok(())
 }
 
@@ -685,7 +716,64 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::tray_status_text;
+    use super::{tray_status_text, OutputRouter};
+    use hitch_core::SessionId;
+    use std::sync::{Arc, Mutex};
+    use tauri::ipc::{Channel, InvokeResponseBody};
+
+    fn recording_channel(received: Arc<Mutex<Vec<Vec<u8>>>>) -> Channel<InvokeResponseBody> {
+        Channel::new(move |body| {
+            match body {
+                InvokeResponseBody::Raw(bytes) => received.lock().unwrap().push(bytes),
+                InvokeResponseBody::Json(json) => panic!("unexpected JSON channel payload: {json}"),
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn session_opened_stages_replay_until_fresh_channel_registered() {
+        let session_id = SessionId::new();
+        let old_received = Arc::new(Mutex::new(Vec::new()));
+        let new_received = Arc::new(Mutex::new(Vec::new()));
+        let mut router = OutputRouter::default();
+
+        router.register_channel(session_id, recording_channel(old_received.clone()));
+        router.send_or_stage(session_id, b"before-reconnect".to_vec());
+        assert_eq!(
+            old_received.lock().unwrap().clone(),
+            vec![b"before-reconnect".to_vec()]
+        );
+
+        router.prepare_fresh_registration(session_id);
+        router.send_or_stage(session_id, b"replayed-scrollback".to_vec());
+
+        assert_eq!(
+            old_received.lock().unwrap().clone(),
+            vec![b"before-reconnect".to_vec()],
+            "replay must not be delivered over the stale pre-reconnect channel"
+        );
+        assert_eq!(
+            router.staging.get(&session_id).cloned(),
+            Some(b"replayed-scrollback".to_vec())
+        );
+
+        router.register_channel(session_id, recording_channel(new_received.clone()));
+        assert_eq!(
+            new_received.lock().unwrap().clone(),
+            vec![b"replayed-scrollback".to_vec()]
+        );
+        assert!(!router.staging.contains_key(&session_id));
+
+        router.send_or_stage(session_id, b"live-after-registration".to_vec());
+        assert_eq!(
+            new_received.lock().unwrap().clone(),
+            vec![
+                b"replayed-scrollback".to_vec(),
+                b"live-after-registration".to_vec(),
+            ]
+        );
+    }
 
     #[test]
     fn tray_status_text_reflects_connection_and_count() {

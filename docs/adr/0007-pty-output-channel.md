@@ -13,8 +13,9 @@ tearing them down on every tab/diff switch.
 - **Per-session binary `Channel<&[u8]>`** (chosen) — Tauri v2's purpose-built
   streaming primitive; carries raw bytes point-to-point without JSON framing.
   One channel per Session, opened on `session-opened`, closed on
-  `session-closed`; long-lived in the Tauri process so it survives daemon
-  reconnects.
+  `session-closed`; the Tauri router stages bytes until registration completes,
+  and invalidates an old channel on reconnect before forwarding the daemon's
+  authoritative scrollback replay.
 - **base64 over the existing event** — smallest diff, but taxes the hot path
   twice (encode/decode) and inflates every frame ~33%; rejected because this
   branch is dedicated to terminal quality, not minimal change.
