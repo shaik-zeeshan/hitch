@@ -79,6 +79,10 @@ impl HitchClient {
                 self.wait_for_daemon()?
             }
         };
+        self.attach_stream(app, stream)
+    }
+
+    fn attach_stream(&self, app: &AppHandle, stream: UnixStream) -> Result<(), String> {
         stream
             .set_nonblocking(false)
             .map_err(|err| format!("failed to configure daemon socket: {err}"))?;
@@ -95,6 +99,23 @@ impl HitchClient {
 
         self.start_reader(app.clone(), stream);
         Ok(())
+    }
+
+    fn restart_daemon(&self, app: &AppHandle, reason: String) -> Result<(), String> {
+        self.request_daemon_shutdown();
+        self.mark_disconnected(app, reason);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if UnixStream::connect(&self.0.socket_path).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        self.spawn_daemon()?;
+        let stream = self.wait_for_daemon()?;
+        self.attach_stream(app, stream)
     }
 
     fn send_request(&self, app: &AppHandle, request: Request) -> Result<Response, String> {
@@ -461,6 +482,25 @@ fn connect_daemon(app: AppHandle, state: State<'_, HitchClient>) -> Result<(), S
         },
     )? {
         Response::Hello { .. } => Ok(()),
+        Response::Error { error } if error.code == ErrorCode::UnsupportedProtocol => {
+            state.restart_daemon(
+                &app,
+                format!("restarting incompatible daemon: {}", error.message),
+            )?;
+            match state.send_request(
+                &app,
+                Request::Hello {
+                    client_name: "hitch-desktop".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            )? {
+                Response::Hello { .. } => Ok(()),
+                Response::Error { error } => Err(error.message),
+                other => Err(format!(
+                    "unexpected hello response after daemon restart: {other:?}"
+                )),
+            }
+        }
         Response::Error { error } => Err(error.message),
         other => Err(format!("unexpected hello response: {other:?}")),
     }

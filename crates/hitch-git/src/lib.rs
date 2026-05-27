@@ -139,6 +139,69 @@ impl GitClient {
         self.run_git(repo_path.as_ref(), args)
     }
 
+    /// Discard whole-file changes, including staged edits and untracked files.
+    ///
+    /// Hitch's Changes list is file-oriented, so discard intentionally resets
+    /// both the index and working tree for each selected path. Untracked entries
+    /// are removed with `git clean`; newly staged files are removed with
+    /// `git rm`, which also works before the first commit.
+    pub fn discard_files(
+        &self,
+        repo_path: impl AsRef<Path>,
+        paths: &[PathBuf],
+    ) -> Result<CommandOutput> {
+        if paths.is_empty() {
+            return Ok(CommandOutput::default());
+        }
+
+        let repo_path = repo_path.as_ref();
+        let summary = status(repo_path)?;
+        let mut output = CommandOutput::default();
+
+        for path in paths {
+            let Some(entry) = summary.entry_for(path) else {
+                continue;
+            };
+
+            if entry.index == FileState::New {
+                output = self.run_git(
+                    repo_path,
+                    vec![os("rm"), os("-f"), os("-r"), os("--"), path_os(path)],
+                )?;
+                continue;
+            }
+
+            if entry.index != FileState::Unmodified {
+                let mut args = vec![os("restore"), os("--staged"), os("--worktree"), os("--")];
+                if let Some(old_path) = &entry.old_path {
+                    args.push(path_os(old_path));
+                }
+                args.push(path_os(path));
+                output = self.run_git(repo_path, args)?;
+            } else if !matches!(entry.working_tree, FileState::Unmodified | FileState::New) {
+                let restore_path = entry.old_path.as_ref().unwrap_or(path);
+                output = self.run_git(
+                    repo_path,
+                    vec![
+                        os("restore"),
+                        os("--worktree"),
+                        os("--"),
+                        path_os(restore_path),
+                    ],
+                )?;
+            }
+
+            if matches!(entry.working_tree, FileState::New | FileState::Renamed) {
+                output = self.run_git(
+                    repo_path,
+                    vec![os("clean"), os("-fd"), os("--"), path_os(path)],
+                )?;
+            }
+        }
+
+        Ok(output)
+    }
+
     /// Commit staged changes using the system git executable.
     pub fn commit(&self, repo_path: impl AsRef<Path>, message: &str) -> Result<CommandOutput> {
         self.run_git(
@@ -227,6 +290,7 @@ pub enum FileState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusEntry {
     pub path: PathBuf,
+    pub old_path: Option<PathBuf>,
     pub index: FileState,
     pub working_tree: FileState,
 }
@@ -432,11 +496,12 @@ pub fn status(repo_path: impl AsRef<Path>) -> Result<StatusSummary> {
     let mut entries = Vec::with_capacity(statuses.len());
     for entry in statuses.iter() {
         let status = entry.status();
-        let Some(path) = status_path(entry) else {
+        let Some((path, old_path)) = status_paths(entry) else {
             continue;
         };
         entries.push(StatusEntry {
             path,
+            old_path,
             index: index_state(status),
             working_tree: worktree_state(status),
         });
@@ -793,17 +858,21 @@ fn run_command(program: &Path, cwd: &Path, args: Vec<OsString>) -> Result<Comman
     }
 }
 
-fn status_path(entry: git2::StatusEntry<'_>) -> Option<PathBuf> {
+fn status_paths(entry: git2::StatusEntry<'_>) -> Option<(PathBuf, Option<PathBuf>)> {
     entry
         .head_to_index()
-        .and_then(|delta| delta.new_file().path().or_else(|| delta.old_file().path()))
-        .or_else(|| {
-            entry
-                .index_to_workdir()
-                .and_then(|delta| delta.new_file().path().or_else(|| delta.old_file().path()))
+        .or_else(|| entry.index_to_workdir())
+        .and_then(|delta| {
+            let new = delta.new_file().path();
+            let old = delta.old_file().path();
+            let path = new.or(old)?;
+            let old_path = match (old, new) {
+                (Some(old), Some(new)) if old != new => Some(old.to_path_buf()),
+                _ => None,
+            };
+            Some((path.to_path_buf(), old_path))
         })
-        .map(Path::to_path_buf)
-        .or_else(|| entry.path().map(PathBuf::from))
+        .or_else(|| entry.path().map(|path| (PathBuf::from(path), None)))
 }
 
 fn index_state(status: Status) -> FileState {
@@ -969,6 +1038,92 @@ mod tests {
             .unwrap();
         client.commit(fixture.path(), "update tracked").unwrap();
         assert!(!status(fixture.path()).unwrap().dirty);
+    }
+
+    #[test]
+    fn discard_files_resets_tracked_staged_and_untracked_paths() {
+        let fixture = RepoFixture::new();
+        let client = GitClient::default();
+
+        fixture.write("tracked.txt", "discard me\n");
+        fixture.write("staged.txt", "staged\n");
+        fixture.git(["add", "staged.txt"]);
+        fixture.write("new.txt", "new\n");
+
+        client
+            .discard_files(
+                fixture.path(),
+                &[
+                    PathBuf::from("tracked.txt"),
+                    PathBuf::from("staged.txt"),
+                    PathBuf::from("new.txt"),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(fixture.path().join("tracked.txt")).unwrap(),
+            "initial\n"
+        );
+        assert!(!fixture.path().join("staged.txt").exists());
+        assert!(!fixture.path().join("new.txt").exists());
+        assert!(!status(fixture.path()).unwrap().dirty);
+    }
+
+    #[test]
+    fn discard_files_reverts_renamed_paths() {
+        let fixture = RepoFixture::new();
+        let client = GitClient::default();
+
+        fixture.git(["mv", "tracked.txt", "moved.txt"]);
+        client
+            .discard_files(fixture.path(), &[PathBuf::from("moved.txt")])
+            .unwrap();
+
+        assert!(fixture.path().join("tracked.txt").exists());
+        assert!(!fixture.path().join("moved.txt").exists());
+        assert!(!status(fixture.path()).unwrap().dirty);
+    }
+
+    #[test]
+    fn discard_files_reverts_worktree_renamed_paths() {
+        let fixture = RepoFixture::new();
+        let client = GitClient::default();
+
+        fs::rename(
+            fixture.path().join("tracked.txt"),
+            fixture.path().join("moved.txt"),
+        )
+        .unwrap();
+        client
+            .discard_files(fixture.path(), &[PathBuf::from("moved.txt")])
+            .unwrap();
+
+        assert!(fixture.path().join("tracked.txt").exists());
+        assert!(!fixture.path().join("moved.txt").exists());
+        assert!(!status(fixture.path()).unwrap().dirty);
+    }
+
+    #[test]
+    fn discard_staged_new_file_works_before_the_first_commit() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("repo");
+        fs::create_dir(&path).unwrap();
+        run_real_git(&path, ["init", "--initial-branch=main"]);
+        run_real_git(&path, ["config", "user.name", "Hitch Test"]);
+        run_real_git(&path, ["config", "user.email", "hitch@example.test"]);
+        fs::write(path.join("first.txt"), "hello\n").unwrap();
+
+        let client = GitClient::default();
+        client
+            .stage_files(&path, &[PathBuf::from("first.txt")])
+            .unwrap();
+        client
+            .discard_files(&path, &[PathBuf::from("first.txt")])
+            .unwrap();
+
+        assert!(!path.join("first.txt").exists());
+        assert!(!status(&path).unwrap().dirty);
     }
 
     #[test]

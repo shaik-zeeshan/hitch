@@ -271,9 +271,8 @@ fn build_command(command: &Option<Vec<String>>, cwd: &Path) -> CommandBuilder {
 #[cfg(target_os = "macos")]
 fn command_name_for_pid(pid: libc::pid_t) -> Option<String> {
     let mut buf = [0_u8; 4096];
-    let ret = unsafe {
-        libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32)
-    };
+    let ret =
+        unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32) };
     if ret <= 0 {
         return None;
     }

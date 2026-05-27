@@ -3,7 +3,7 @@
   // headers; their worktrees nest under an indent guide with connector ticks.
   // Agent state shows as a WORD in a reserved hue (rolled up to the project row
   // when collapsed). Dirty worktrees show their aggregate +/− line stat next
-  // to the branch name, plus the iris dot as the compact dirty signal.
+  // to the branch name.
   import { ContextMenu } from "bits-ui";
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
   import { get } from "svelte/store";
@@ -176,14 +176,9 @@
                       </span>
                     {/if}
                   </span>
-                  {#if $dirtyWorktrees[worktree.id] || wtStatus}
+                  {#if wtStatus}
                     <span class="meta-r">
-                      {#if $dirtyWorktrees[worktree.id]}
-                        <span class="dirtydot" title="uncommitted changes"></span>
-                      {/if}
-                      {#if wtStatus}
-                        <span class="status {AGENT_LABEL[wtStatus].cls}">{AGENT_LABEL[wtStatus].label}</span>
-                      {/if}
+                      <span class="status {AGENT_LABEL[wtStatus].cls}">{AGENT_LABEL[wtStatus].label}</span>
                     </span>
                   {/if}
                   {#if worktree.is_main}<span class="tag">main</span>{/if}
@@ -434,13 +429,6 @@
   }
   .status.error {
     color: var(--err);
-  }
-  .dirtydot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--ac);
-    flex: none;
   }
   .meta-r {
     display: flex;

@@ -7,8 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hitch_core::{Project, Session, SessionId, SessionParent, Worktree};
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, ControlMessage, Event, GitStatus, Request, Response,
-    PROTOCOL_VERSION,
+    encode_control_message, encode_pty_frame, ControlMessage, ErrorCode, Event, GitStatus, Request,
+    Response, PROTOCOL_VERSION,
 };
 
 #[test]
@@ -205,6 +205,73 @@ fn git_status_stage_and_unstage_round_trip_over_socket() {
     client.shutdown(9);
     daemon.wait_for_exit();
     let _ = std::fs::remove_dir_all(repo);
+}
+
+#[test]
+fn discard_files_round_trip_over_socket_keeps_connection_open() {
+    let socket = test_socket_path("git-discard");
+    let repo = test_dir_path("git-discard-repo");
+    init_git_repo(&repo);
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &repo);
+    let worktree = client.list_worktrees(3, project.id).remove(0);
+
+    std::fs::write(repo.join("tracked.txt"), "changed\n").unwrap();
+    std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+    assert!(client.git_status(4, worktree.id).dirty);
+
+    client.ack(
+        5,
+        Request::DiscardFiles {
+            worktree_id: worktree.id,
+            paths: vec!["tracked.txt".into(), "new.txt".into()],
+        },
+    );
+
+    assert!(!client.git_status(6, worktree.id).dirty);
+    // A second request after discard proves the daemon did not close the client socket.
+    let sessions = client.list_sessions(7, None);
+    assert!(sessions.is_empty());
+
+    client.shutdown(8);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(repo);
+}
+
+#[test]
+fn invalid_request_returns_error_without_closing_connection() {
+    let socket = test_socket_path("invalid-request");
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    client.send_raw_control(
+        br#"{"kind":"request","id":2,"request":{"type":"future-request"}}
+"#,
+    );
+
+    loop {
+        match client.read_packet() {
+            Packet::Control(ControlMessage::Response {
+                id: 2,
+                response: Response::Error { error },
+            }) => {
+                assert_eq!(error.code, ErrorCode::InvalidRequest);
+                break;
+            }
+            Packet::Control(_) | Packet::Output { .. } => continue,
+        }
+    }
+
+    // A follow-up request proves malformed/unknown requests do not drop the client.
+    let sessions = client.list_sessions(3, None);
+    assert!(sessions.is_empty());
+
+    client.shutdown(4);
+    daemon.wait_for_exit();
 }
 
 #[test]
@@ -591,6 +658,11 @@ impl TestClient {
     fn send_request(&mut self, id: u64, request: Request) {
         let bytes = encode_control_message(&ControlMessage::request(id, request)).unwrap();
         self.writer.write_all(&bytes).unwrap();
+        self.writer.flush().unwrap();
+    }
+
+    fn send_raw_control(&mut self, bytes: &[u8]) {
+        self.writer.write_all(bytes).unwrap();
         self.writer.flush().unwrap();
     }
 

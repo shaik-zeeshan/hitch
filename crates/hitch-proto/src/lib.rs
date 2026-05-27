@@ -62,6 +62,7 @@ Request:
   git-diff(worktree_id, path)
   stage-files(worktree_id, paths)
   unstage-files(worktree_id, paths)
+  discard-files(worktree_id, paths)
   commit(worktree_id, message)
   push(worktree_id)
   create-pull-request(worktree_id, title, body?, base?, draft)

@@ -9,6 +9,8 @@
     commitMessage,
     defaultBase,
     diffPath,
+    discardAllFiles,
+    discardFile,
     gitBusy,
     gitStatus,
     gitWorktreeId,
@@ -41,6 +43,20 @@
     if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
       event.preventDefault();
       if (canCommit) void commit();
+    }
+  }
+
+  function confirmDiscardAll() {
+    if (files.length === 0 || $gitBusy) return;
+    if (window.confirm(`Discard all ${files.length} changed file${files.length === 1 ? "" : "s"}?`)) {
+      void discardAllFiles();
+    }
+  }
+
+  function confirmDiscardFile(path: string) {
+    if ($gitBusy) return;
+    if (window.confirm(`Discard changes to ${path}?`)) {
+      void discardFile(path);
     }
   }
 </script>
@@ -101,9 +117,11 @@
       {#if staged.length > 0}
         <div class="grp-head">
           Staged <span class="n">{staged.length}</span>
-          <button class="act" onclick={() => void setFilesStaged(staged.map((f) => f.path), false)}
-            >Unstage all</button
-          >
+          <span class="acts">
+            <button class="act" onclick={() => void setFilesStaged(staged.map((f) => f.path), false)}
+              >Unstage all</button
+            >
+          </span>
         </div>
         {#each staged as file (file.path)}
           <button class="frow" class:sel={$diffPath === file.path} onclick={() => void viewDiff(file.path)}>
@@ -121,6 +139,18 @@
               }}
               onkeydown={() => {}}>−</span
             >
+            <span
+              class="stage discard"
+              role="button"
+              tabindex="-1"
+              title="Discard file"
+              aria-label="Discard changes to {file.path}"
+              onclick={(e) => {
+                e.stopPropagation();
+                confirmDiscardFile(file.path);
+              }}
+              onkeydown={() => {}}>×</span
+            >
           </button>
         {/each}
       {/if}
@@ -128,9 +158,13 @@
       {#if unstaged.length > 0}
         <div class="grp-head">
           Changes <span class="n">{unstaged.length}</span>
-          <button class="act" onclick={() => void setFilesStaged(unstaged.map((f) => f.path), true)}
-            >Stage all</button
-          >
+          <span class="acts">
+            <button class="act" onclick={() => void setFilesStaged(unstaged.map((f) => f.path), true)}
+              >Stage all</button
+            >
+            <span class="sep" aria-hidden="true">·</span>
+            <button class="act danger" disabled={$gitBusy} onclick={confirmDiscardAll}>Discard</button>
+          </span>
         </div>
         {#each unstaged as file (file.path)}
           <button class="frow" class:sel={$diffPath === file.path} onclick={() => void viewDiff(file.path)}>
@@ -147,6 +181,18 @@
                 void setFileStaged(file.path, true);
               }}
               onkeydown={() => {}}>+</span
+            >
+            <span
+              class="stage discard"
+              role="button"
+              tabindex="-1"
+              title="Discard file"
+              aria-label="Discard changes to {file.path}"
+              onclick={(e) => {
+                e.stopPropagation();
+                confirmDiscardFile(file.path);
+              }}
+              onkeydown={() => {}}>×</span
             >
           </button>
         {/each}
@@ -271,8 +317,17 @@
   .grp-head .n {
     color: var(--tx-md);
   }
-  .grp-head .act {
+  .grp-head .acts {
     margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .grp-head .sep {
+    color: var(--tx-lo);
+    opacity: 0.5;
+  }
+  .grp-head .act {
     font: inherit;
     font-size: 10.5px;
     text-transform: none;
@@ -282,9 +337,23 @@
     background: transparent;
     border: 0;
     padding: 0;
+    transition: color var(--t-fast);
   }
   .grp-head .act:hover {
     color: var(--ac-bright);
+  }
+  .grp-head .act.danger {
+    color: var(--tx-lo);
+  }
+  .grp-head .act.danger:hover {
+    color: var(--err);
+  }
+  .grp-head .act:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .grp-head .act.danger:disabled:hover {
+    color: var(--tx-lo);
   }
 
   .frow {
@@ -358,6 +427,9 @@
   .frow .stage:hover {
     background: var(--bg-4);
     color: var(--tx-hi);
+  }
+  .frow .discard:hover {
+    color: var(--err);
   }
 
   .commit {

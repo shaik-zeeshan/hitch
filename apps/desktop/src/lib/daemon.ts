@@ -66,6 +66,11 @@ export const prUrl = writable<string | null>(null);
 
 const diffCache = new Map<string, string>();
 let diffRequestSeq = 0;
+let statusRequestSeq = 0;
+let statusPollTimer: ReturnType<typeof setInterval> | null = null;
+let statusPollInFlight = false;
+
+const STATUS_POLL_MS = 1_000;
 
 // ---- derived stores -------------------------------------------------------
 
@@ -333,6 +338,7 @@ export async function initDaemon(): Promise<void> {
 export function disposeDaemon(): void {
   unlisteners.forEach((unlisten) => unlisten());
   unlisteners = [];
+  stopGitStatusPolling();
   booted = false;
 }
 
@@ -353,13 +359,14 @@ export async function reconnect(): Promise<void> {
 // ---- git status load ------------------------------------------------------
 
 export async function loadGitStatus(worktreeId: Id): Promise<GitStatus> {
+  const requestSeq = ++statusRequestSeq;
   const response = await daemonRequest<Response & { status: GitStatus }>({
     type: "git-status",
     worktree_id: worktreeId,
   });
-  // A slow status response from a previously selected worktree must not replace
-  // the currently visible Changes panel.
-  if (get(gitWorktreeId) === worktreeId) {
+  // A slow status response from a previous worktree/poll must not replace newer
+  // UI state. This matters when agents edit files while the user stages changes.
+  if (requestSeq === statusRequestSeq && get(gitWorktreeId) === worktreeId) {
     gitStatus.set(response.status);
   }
   dirtyWorktrees.update((current) =>
@@ -382,6 +389,28 @@ export async function loadGitStatus(worktreeId: Id): Promise<GitStatus> {
     return { ...current, [worktreeId]: next };
   });
   return response.status;
+}
+
+function stopGitStatusPolling(): void {
+  if (statusPollTimer) clearInterval(statusPollTimer);
+  statusPollTimer = null;
+  statusPollInFlight = false;
+}
+
+function pollSelectedGitStatus(worktreeId: Id): void {
+  if (statusPollInFlight || get(connection) !== "ready" || get(gitBusy)) return;
+  if (get(gitWorktreeId) !== worktreeId) return;
+  statusPollInFlight = true;
+  void loadGitStatus(worktreeId)
+    .catch(() => {})
+    .finally(() => {
+      statusPollInFlight = false;
+    });
+}
+
+function startGitStatusPolling(worktreeId: Id): void {
+  stopGitStatusPolling();
+  statusPollTimer = setInterval(() => pollSelectedGitStatus(worktreeId), STATUS_POLL_MS);
 }
 
 function statusAfterStage(status: FileStatus): FileStatus {
@@ -612,6 +641,9 @@ export async function setFilesStaged(
   const worktreeId = get(gitWorktreeId);
   if (!worktreeId || paths.length === 0) return;
   const before = get(gitStatus);
+  // Invalidate any in-flight status poll so it cannot briefly undo the
+  // immediate stage/unstage feedback.
+  statusRequestSeq += 1;
   optimisticallySetFilesStaged(worktreeId, paths, staged);
   gitBusy.set(true);
   try {
@@ -643,6 +675,39 @@ export async function setFilesStaged(
 
 export function setFileStaged(path: string, staged: boolean): Promise<void> {
   return setFilesStaged([path], staged);
+}
+
+export async function discardFiles(paths: string[]): Promise<void> {
+  const worktreeId = get(gitWorktreeId);
+  if (!worktreeId || paths.length === 0) return;
+  statusRequestSeq += 1;
+  gitBusy.set(true);
+  try {
+    error.set(null);
+    await daemonRequest({
+      type: "discard-files",
+      worktree_id: worktreeId,
+      paths,
+    });
+    const open = get(diffPath);
+    for (const path of paths) diffCache.delete(`${worktreeId}\0${path}`);
+    if (open && paths.includes(open)) closeDiff();
+    await loadGitStatus(worktreeId);
+  } catch (err) {
+    error.set(toMessage(err));
+    void loadGitStatus(worktreeId).catch((refreshErr) => error.set(toMessage(refreshErr)));
+  } finally {
+    gitBusy.set(false);
+  }
+}
+
+export function discardFile(path: string): Promise<void> {
+  return discardFiles([path]);
+}
+
+export function discardAllFiles(): Promise<void> {
+  const paths = get(gitStatus)?.files.map((file) => file.path) ?? [];
+  return discardFiles(paths);
 }
 
 export async function commit(): Promise<void> {
@@ -756,7 +821,9 @@ gitWorktreeId.subscribe(($id) => {
   closeDiff();
   prUrl.set(null);
   commitMessage.set("");
+  stopGitStatusPolling();
   if ($id) {
     void loadGitStatus($id).catch((err) => error.set(toMessage(err)));
+    startGitStatusPolling($id);
   }
 });

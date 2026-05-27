@@ -12,7 +12,7 @@ use hitch_core::{
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version for daemon/socket compatibility checks.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -126,6 +126,11 @@ pub enum Request {
     },
     /// Unstage whole files.
     UnstageFiles {
+        worktree_id: WorktreeId,
+        paths: Vec<PathBuf>,
+    },
+    /// Discard whole-file changes from the index and working tree.
+    DiscardFiles {
         worktree_id: WorktreeId,
         paths: Vec<PathBuf>,
     },
@@ -551,6 +556,10 @@ mod tests {
                 paths: vec!["src/lib.rs".into()],
             },
             Request::UnstageFiles {
+                worktree_id,
+                paths: vec!["src/lib.rs".into()],
+            },
+            Request::DiscardFiles {
                 worktree_id,
                 paths: vec!["src/lib.rs".into()],
             },

@@ -201,6 +201,7 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     restore_layout(&state, &pty_tx).map_err(|err| io::Error::other(err.message))?;
     spawn_pty_dispatcher(Arc::clone(&state), pty_rx, Arc::clone(&shutdown));
     spawn_command_poller(Arc::clone(&state), Arc::clone(&shutdown));
+    spawn_dirty_poller(Arc::clone(&state), Arc::clone(&shutdown));
 
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -345,8 +346,8 @@ fn handle_client(
     let mut reader = BufReader::new(stream);
 
     loop {
-        let message = match read_control_message(&mut reader) {
-            Ok(Some(message)) => message,
+        let line = match read_control_line(&mut reader) {
+            Ok(Some(line)) => line,
             Ok(None) => break,
             Err(err) => {
                 let _ = send_response(
@@ -358,6 +359,21 @@ fn handle_client(
                     },
                 );
                 break;
+            }
+        };
+
+        let message: ControlMessage = match serde_json::from_slice(&line) {
+            Ok(message) => message,
+            Err(err) => {
+                let _ = send_response(
+                    &state,
+                    client_id,
+                    request_id_from_control_line(&line).unwrap_or(0),
+                    Response::Error {
+                        error: ProtocolError::new(ErrorCode::InvalidRequest, err.to_string()),
+                    },
+                );
+                continue;
             }
         };
 
@@ -598,6 +614,13 @@ fn handle_request<R: Read>(
         Request::UnstageFiles { worktree_id, paths } => {
             let (git, worktree_path) = git_context(state, worktree_id)?;
             git.unstage_files(&worktree_path, &paths)
+                .map_err(git_error)?;
+            send_response(state, client_id, request_id, Response::Ack)?;
+            broadcast_dirty(state, worktree_id)?;
+        }
+        Request::DiscardFiles { worktree_id, paths } => {
+            let (git, worktree_path) = git_context(state, worktree_id)?;
+            git.discard_files(&worktree_path, &paths)
                 .map_err(git_error)?;
             send_response(state, client_id, request_id, Response::Ack)?;
             broadcast_dirty(state, worktree_id)?;
@@ -1178,6 +1201,46 @@ fn status_entry_to_proto(entry: &StatusEntry) -> ChangedFile {
     }
 }
 
+/// Poll git worktrees once a second and broadcast dirty changes caused outside
+/// Hitch's own git buttons (editors, shells, agents). This keeps project-tree
+/// badges live without asking the GUI to full-status every worktree.
+fn spawn_dirty_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>) {
+    thread::Builder::new()
+        .name("hitch-dirty-poll".into())
+        .spawn(move || {
+            let mut last: HashMap<WorktreeId, bool> = HashMap::new();
+            while !shutdown.load(Ordering::SeqCst) {
+                let worktrees: Vec<(WorktreeId, PathBuf)> = match state.lock() {
+                    Ok(state) => state
+                        .worktrees
+                        .iter()
+                        .map(|(id, worktree)| (*id, worktree.path.clone()))
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                last.retain(|id, _| {
+                    worktrees
+                        .iter()
+                        .any(|(worktree_id, _)| worktree_id == id)
+                });
+                for (worktree_id, path) in worktrees {
+                    let Ok(dirty) = GitRepository::discover(&path).and_then(|repo| repo.is_dirty())
+                    else {
+                        continue;
+                    };
+                    if matches!(last.insert(worktree_id, dirty), Some(previous) if previous != dirty) {
+                        let _ = broadcast_event(
+                            &state,
+                            Event::WorktreeDirty { worktree_id, dirty },
+                        );
+                    }
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        })
+        .expect("failed to spawn dirty poller thread");
+}
+
 /// Poll each live session's foreground command once a second and broadcast
 /// a SessionCommand event whenever it changes. Broadcasting only on change
 /// keeps idle terminals quiet.
@@ -1203,7 +1266,10 @@ fn spawn_command_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool
                         last.insert(id, command.clone());
                         let _ = broadcast_event(
                             &state,
-                            Event::SessionCommand { session_id: id, command },
+                            Event::SessionCommand {
+                                session_id: id,
+                                command,
+                            },
                         );
                     }
                 }
@@ -1267,7 +1333,7 @@ fn persist_scrollback(state: &Arc<Mutex<DaemonState>>, session_id: SessionId) {
     }
 }
 
-fn read_control_message<R: BufRead>(reader: &mut R) -> io::Result<Option<ControlMessage>> {
+fn read_control_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     let len = reader.read_until(b'\n', &mut line)?;
     if len == 0 {
@@ -1279,9 +1345,15 @@ fn read_control_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Control
     if line.is_empty() {
         return Ok(None);
     }
-    serde_json::from_slice(&line)
-        .map(Some)
-        .map_err(io::Error::other)
+    Ok(Some(line))
+}
+
+fn request_id_from_control_line(line: &[u8]) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_slice(line).ok()?;
+    if value.get("kind")?.as_str()? != "request" {
+        return None;
+    }
+    value.get("id")?.as_u64()
 }
 
 fn read_pty_payload<R: Read>(reader: &mut R) -> Result<Vec<u8>, ProtocolError> {
