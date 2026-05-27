@@ -536,8 +536,20 @@ fn handle_request<R: Read>(
             broadcast_event(state, Event::ProjectUpdated { project })?;
         }
         Request::RemoveProject { project_id, force } => {
-            remove_project(state, project_id, force)?;
+            let closed_session_ids = remove_project(state, project_id, force)?;
             send_response(state, client_id, request_id, Response::Ack)?;
+            // close_session does not itself broadcast; mirror the CloseSession
+            // handler so peer clients drop each killed session too.
+            for session_id in closed_session_ids {
+                broadcast_event(
+                    state,
+                    Event::SessionClosed {
+                        session_id,
+                        exit_code: None,
+                    },
+                )?;
+            }
+            broadcast_event(state, Event::ProjectRemoved { project_id })?;
         }
         Request::ListWorktrees { project_id } => {
             let worktrees = list_worktrees(state, project_id)?;
@@ -991,7 +1003,7 @@ fn remove_project(
     state: &Arc<Mutex<DaemonState>>,
     project_id: ProjectId,
     force: bool,
-) -> Result<(), ProtocolError> {
+) -> Result<Vec<SessionId>, ProtocolError> {
     let (worktree_ids, live_session_ids) = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
         if !state.projects.contains_key(&project_id) {
@@ -1022,8 +1034,16 @@ fn remove_project(
         ));
     }
 
+    let mut closed_session_ids = Vec::new();
     for session_id in live_session_ids {
-        close_session(state, session_id, true)?;
+        match close_session(state, session_id, true) {
+            Ok(()) => closed_session_ids.push(session_id),
+            // The session may have exited on its own (PTY-exit dispatcher) or
+            // been closed by another client between our snapshot and this kill.
+            // A force-removal must not be derailed by an already-gone session.
+            Err(err) if err.code == ErrorCode::NotFound => {}
+            Err(err) => return Err(err),
+        }
     }
 
     let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
@@ -1035,7 +1055,7 @@ fn remove_project(
     for worktree_id in worktree_ids {
         state.worktrees.remove(&worktree_id);
     }
-    Ok(())
+    Ok(closed_session_ids)
 }
 
 fn remove_worktree(
@@ -1090,7 +1110,13 @@ fn remove_worktree(
     }
 
     for session_id in live_session_ids {
-        close_session(state, session_id, true)?;
+        match close_session(state, session_id, true) {
+            Ok(()) => {}
+            // Tolerate a session that vanished on its own (PTY-exit dispatcher)
+            // or was closed by another client; a force-removal must continue.
+            Err(err) if err.code == ErrorCode::NotFound => {}
+            Err(err) => return Err(err),
+        }
     }
 
     git.remove_worktree(
@@ -1297,7 +1323,7 @@ fn generate_commit_draft(
     let staged_paths = summary
         .entries
         .iter()
-        .filter(|entry| entry.index != FileState::Unmodified)
+        .filter(|entry| index_is_staged(entry.index))
         .map(|entry| entry.path.clone())
         .collect::<Vec<_>>();
     if staged_paths.is_empty() {
@@ -1344,13 +1370,14 @@ fn generate_pull_request_draft(
         ));
     }
 
-    let commits = repo.commits_since(&base, 25).map_err(git_error)?;
-    let commit_summaries = commits
+    // One pass over the repo for commits, changed paths, and patch text rather
+    // than three re-discoveries that each rebuild the branch diff.
+    let comparison = repo.branch_comparison(&base, 25).map_err(git_error)?;
+    let commit_summaries = comparison
+        .commits
         .iter()
         .filter_map(|commit| commit.summary.clone())
         .collect::<Vec<_>>();
-    let changed_paths = repo.changed_paths_since(&base).map_err(git_error)?;
-    let diff = repo.diff_since(&base).map_err(git_error)?;
 
     drafts::generate_pull_request_draft(
         &provider,
@@ -1359,8 +1386,8 @@ fn generate_pull_request_draft(
             branch: worktree.branch,
             base,
             commits: commit_summaries,
-            changed_paths,
-            diff,
+            changed_paths: comparison.changed_paths,
+            diff: comparison.diff,
         },
     )
 }
@@ -1428,8 +1455,15 @@ fn broadcast_dirty(
     broadcast_event(state, Event::WorktreeDirty { worktree_id, dirty })
 }
 
+/// True when the index side reflects a genuine staged change. A conflicted file
+/// has an index state of [`FileState::Conflicted`], but an unresolved conflict
+/// is not a clean staged change, so it is excluded here.
+fn index_is_staged(state: FileState) -> bool {
+    !matches!(state, FileState::Unmodified | FileState::Conflicted)
+}
+
 fn status_entry_to_proto(entry: &StatusEntry) -> ChangedFile {
-    let staged = entry.index != FileState::Unmodified;
+    let staged = index_is_staged(entry.index);
     let state = if staged {
         entry.index
     } else {

@@ -108,7 +108,9 @@
         <div class="grp-head">
           Staged <span class="n">{staged.length}</span>
           <span class="acts">
-            <button class="act" onclick={() => void setFilesStaged(staged.map((f) => f.path), false)}
+            <button
+              class="act"
+              onclick={() => void setFilesStaged(staged.map((f) => f.path), false).catch(() => {})}
               >Unstage all</button
             >
           </span>
@@ -125,7 +127,7 @@
               aria-label="Unstage {file.path}"
               onclick={(e) => {
                 e.stopPropagation();
-                void setFileStaged(file.path, false);
+                void setFileStaged(file.path, false).catch(() => {});
               }}
               onkeydown={() => {}}>−</span
             >
@@ -149,7 +151,9 @@
         <div class="grp-head">
           Changes <span class="n">{unstaged.length}</span>
           <span class="acts">
-            <button class="act" onclick={() => void setFilesStaged(unstaged.map((f) => f.path), true)}
+            <button
+              class="act"
+              onclick={() => void setFilesStaged(unstaged.map((f) => f.path), true).catch(() => {})}
               >Stage all</button
             >
             <span class="sep" aria-hidden="true">·</span>
@@ -168,7 +172,7 @@
               aria-label="Stage {file.path}"
               onclick={(e) => {
                 e.stopPropagation();
-                void setFileStaged(file.path, true);
+                void setFileStaged(file.path, true).catch(() => {});
               }}
               onkeydown={() => {}}>+</span
             >

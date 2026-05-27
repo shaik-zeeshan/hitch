@@ -170,6 +170,12 @@ impl HitchClient {
             return Err(err);
         }
 
+        // Fixed client-side response deadline. The daemon clamps its
+        // configurable draft timeout safely below this (see
+        // `hitch-daemon`'s `drafts::MAX_TIMEOUT_SECS`, currently 120 - 10s
+        // margin) so a slow draft still produces a daemon response — success
+        // or timeout error — before the client abandons the request and the
+        // reader_loop drops the late reply. Keep these two values in sync.
         match rx.recv_timeout(Duration::from_secs(120)) {
             Ok(response) => Ok(response),
             Err(mpsc::RecvTimeoutError::Timeout) => {

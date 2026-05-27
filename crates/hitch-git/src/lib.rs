@@ -84,6 +84,15 @@ impl GitRepository {
         diff_since(&self.root, base)
     }
 
+    /// Compare `HEAD` to `base` in a single pass: the commit list, the changed
+    /// paths, and the patch text are all derived from one repo open and one
+    /// `git2::Diff`. Use this when a caller needs more than one of those (e.g.
+    /// PR-draft generation) to avoid re-discovering the repo and rebuilding the
+    /// branch diff several times.
+    pub fn branch_comparison(&self, base: &str, limit: usize) -> Result<BranchComparison> {
+        branch_comparison(&self.root, base, limit)
+    }
+
     /// Best-effort default branch detection: `origin/HEAD`, then current branch.
     pub fn default_branch(&self) -> Result<String> {
         default_branch(&self.root)
@@ -366,6 +375,18 @@ pub struct CommitInfo {
     pub author_name: Option<String>,
     pub author_email: Option<String>,
     pub time_seconds: i64,
+}
+
+/// `HEAD`-vs-`base` comparison computed in a single pass: commits, changed
+/// paths, and patch text all derived from one repo open and one diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchComparison {
+    /// Commits reachable from `HEAD` but not from `base`, newest first.
+    pub commits: Vec<CommitInfo>,
+    /// Changed file paths for `HEAD` relative to `base`, sorted and deduped.
+    pub changed_paths: Vec<PathBuf>,
+    /// Unified branch diff text for `HEAD` relative to `base`.
+    pub diff: String,
 }
 
 /// Whether worktree creation should create a branch or check out an existing one.
@@ -663,7 +684,12 @@ pub fn commits_since(
     limit: usize,
 ) -> Result<Vec<CommitInfo>> {
     let repo = Repository::discover(repo_path.as_ref())?;
-    let head = repo.head()?.target().ok_or(GitError::NoHead)?;
+    // An unborn HEAD (no commits yet) has nothing reachable, so there are no
+    // commits since the base. Degrade gracefully instead of erroring, matching
+    // how staged_diff tolerates a missing HEAD.
+    let Some(head) = head_commit_oid(&repo) else {
+        return Ok(Vec::new());
+    };
     let base = resolve_base_oid(&repo, base)?;
     let merge_base = repo.merge_base(head, base).unwrap_or(base);
     let mut revwalk = repo.revwalk()?;
@@ -676,20 +702,7 @@ pub fn commits_since(
 pub fn changed_paths_since(repo_path: impl AsRef<Path>, base: &str) -> Result<Vec<PathBuf>> {
     let repo = Repository::discover(repo_path.as_ref())?;
     let diff = diff_since_base(&repo, base)?;
-    let mut paths = Vec::new();
-    for delta in diff.deltas() {
-        let path = delta
-            .new_file()
-            .path()
-            .or_else(|| delta.old_file().path())
-            .map(Path::to_path_buf);
-        if let Some(path) = path {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+    Ok(diff_changed_paths(&diff))
 }
 
 /// Return branch diff text for `HEAD` relative to `base`.
@@ -697,6 +710,51 @@ pub fn diff_since(repo_path: impl AsRef<Path>, base: &str) -> Result<String> {
     let repo = Repository::discover(repo_path.as_ref())?;
     let diff = diff_since_base(&repo, base)?;
     diff_to_string(&diff)
+}
+
+/// Compare `HEAD` to `base` in a single pass, returning the commit list,
+/// changed paths, and patch text. Opens the repo once and builds the branch
+/// `git2::Diff` once, where the per-function variants would re-discover the
+/// repo and rebuild the diff for each piece.
+pub fn branch_comparison(
+    repo_path: impl AsRef<Path>,
+    base: &str,
+    limit: usize,
+) -> Result<BranchComparison> {
+    let repo = Repository::discover(repo_path.as_ref())?;
+    let base_oid = resolve_base_oid(&repo, base)?;
+    let head = head_commit_oid(&repo);
+    let merge_base = head
+        .map(|head| repo.merge_base(head, base_oid).unwrap_or(base_oid))
+        .unwrap_or(base_oid);
+
+    // Commits reachable from HEAD but not from the merge base. An unborn HEAD
+    // contributes no commits.
+    let commits = if let Some(head) = head {
+        let mut revwalk = repo.revwalk()?;
+        revwalk.push(head)?;
+        revwalk.hide(merge_base)?;
+        commits_from_revwalk(&repo, revwalk, limit)?
+    } else {
+        Vec::new()
+    };
+
+    // One diff drives both the changed-path list and the patch text.
+    let base_tree = repo.find_commit(merge_base)?.tree()?;
+    let head_tree = match head {
+        Some(head) => repo.find_commit(head)?.tree()?,
+        None => base_tree.clone(),
+    };
+    let diff = repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)?;
+
+    let changed_paths = diff_changed_paths(&diff);
+    let diff_text = diff_to_string(&diff)?;
+
+    Ok(BranchComparison {
+        commits,
+        changed_paths,
+        diff: diff_text,
+    })
 }
 
 /// Best-effort default branch detection: `origin/HEAD`, then current branch.
@@ -853,12 +911,41 @@ fn commits_from_revwalk(
 }
 
 fn diff_since_base<'repo>(repo: &'repo Repository, base: &str) -> Result<git2::Diff<'repo>> {
-    let head = repo.head()?.target().ok_or(GitError::NoHead)?;
-    let base = resolve_base_oid(repo, base)?;
-    let merge_base = repo.merge_base(head, base).unwrap_or(base);
+    let base_oid = resolve_base_oid(repo, base)?;
+    // On an unborn HEAD the branch carries no commits, so there is nothing to
+    // diff against the base. Return an empty diff (base tree against itself)
+    // rather than erroring, consistent with staged_diff's missing-HEAD path.
+    let Some(head) = head_commit_oid(repo) else {
+        let base_tree = repo.find_commit(base_oid)?.tree()?;
+        return Ok(repo.diff_tree_to_tree(Some(&base_tree), Some(&base_tree), None)?);
+    };
+    let merge_base = repo.merge_base(head, base_oid).unwrap_or(base_oid);
     let base_tree = repo.find_commit(merge_base)?.tree()?;
     let head_tree = repo.find_commit(head)?.tree()?;
     Ok(repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)?)
+}
+
+/// Resolve the OID of the current `HEAD` commit, or `None` on an unborn HEAD.
+fn head_commit_oid(repo: &Repository) -> Option<Oid> {
+    repo.head().ok().and_then(|head| head.target())
+}
+
+/// Collect the changed file paths from a diff, sorted and deduped.
+fn diff_changed_paths(diff: &git2::Diff<'_>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for delta in diff.deltas() {
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(Path::to_path_buf);
+        if let Some(path) = path {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn resolve_base_oid(repo: &Repository, base: &str) -> Result<Oid> {
@@ -890,11 +977,16 @@ fn diff_to_string(diff: &git2::Diff<'_>) -> Result<String> {
         out.extend_from_slice(line.content());
         true
     })?;
-    Ok(String::from_utf8(out)?)
+    // A non-UTF-8 hunk (e.g. a binary-ish change) should degrade to replacement
+    // characters rather than fail the whole best-effort textual diff.
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 fn write_temp_commit_message(subject: &str, body: Option<&str>) -> Result<PathBuf> {
-    let mut message = subject.trim().to_string();
+    // A commit subject must be a single line. LLM-drafted subjects sometimes
+    // contain embedded newlines; collapse any internal whitespace runs (which
+    // include newlines) into single spaces so they don't leak into the body.
+    let mut message = subject.split_whitespace().collect::<Vec<_>>().join(" ");
     if let Some(body) = body.map(str::trim).filter(|body| !body.is_empty()) {
         message.push_str("\n\n");
         message.push_str(body);
@@ -1379,6 +1471,87 @@ mod tests {
         assert_eq!(changed, vec![PathBuf::from("feature.txt")]);
         let branch_diff = diff_since(fixture.path(), "main").unwrap();
         assert!(branch_diff.contains("feature.txt"));
+    }
+
+    #[test]
+    fn branch_comparison_matches_individual_queries_in_one_pass() {
+        let fixture = RepoFixture::new();
+        fixture.git(["checkout", "-b", "feature/combined"]);
+        fixture.write("feature.txt", "feature\n");
+        fixture.git(["add", "feature.txt"]);
+        fixture.git(["commit", "-m", "feature commit"]);
+
+        let comparison = branch_comparison(fixture.path(), "main", 10).unwrap();
+        assert_eq!(
+            comparison.commits[0].summary.as_deref(),
+            Some("feature commit")
+        );
+        assert_eq!(comparison.changed_paths, vec![PathBuf::from("feature.txt")]);
+        assert!(comparison.diff.contains("feature.txt"));
+
+        // The combined helper agrees with the per-piece functions.
+        assert_eq!(
+            comparison.commits,
+            commits_since(fixture.path(), "main", 10).unwrap()
+        );
+        assert_eq!(
+            comparison.changed_paths,
+            changed_paths_since(fixture.path(), "main").unwrap()
+        );
+        assert_eq!(comparison.diff, diff_since(fixture.path(), "main").unwrap());
+    }
+
+    #[test]
+    fn branch_queries_degrade_gracefully_on_unborn_head() {
+        // A repo with a committed `main` but a fresh unborn branch checked out:
+        // commits/diff "since main" must not error on the missing HEAD.
+        let fixture = RepoFixture::new();
+        fixture.git(["checkout", "--orphan", "feature/unborn"]);
+        fixture.git(["rm", "-rf", "--cached", "."]);
+
+        assert!(commits_since(fixture.path(), "main", 10).unwrap().is_empty());
+        assert!(changed_paths_since(fixture.path(), "main")
+            .unwrap()
+            .is_empty());
+        assert!(diff_since(fixture.path(), "main").unwrap().is_empty());
+
+        let comparison = branch_comparison(fixture.path(), "main", 10).unwrap();
+        assert!(comparison.commits.is_empty());
+        assert!(comparison.changed_paths.is_empty());
+        assert!(comparison.diff.is_empty());
+    }
+
+    #[test]
+    fn commit_subject_with_embedded_newline_stays_single_line() {
+        let fixture = RepoFixture::new();
+        fixture.write("tracked.txt", "newline subject\n");
+        let client = GitClient::default();
+        client
+            .stage_files(fixture.path(), &[PathBuf::from("tracked.txt")])
+            .unwrap();
+        // An LLM draft can leak a newline into the subject; it must not bleed
+        // into the body.
+        client
+            .commit(
+                fixture.path(),
+                "feat: do a thing\nthat leaked into a second line",
+                Some("- Real body bullet"),
+            )
+            .unwrap();
+
+        let output = Command::new("git")
+            .current_dir(fixture.path())
+            .args(["log", "-1", "--pretty=%B"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let message = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            message.starts_with(
+                "feat: do a thing that leaked into a second line\n\n- Real body bullet"
+            ),
+            "message was {message:?}"
+        );
     }
 
     #[test]

@@ -308,6 +308,29 @@ export async function initDaemon(): Promise<void> {
             return next;
           });
         }
+        if (event.type === "project-removed") {
+          // A project was forgotten (possibly by another window). Drop it and
+          // its worktrees locally; the daemon also broadcasts session-closed for
+          // any sessions it killed, so those are pruned above.
+          const projectId = event.project_id as Id;
+          const removedWorktreeIds = new Set(
+            get(worktrees)
+              .filter((w) => w.project_id === projectId)
+              .map((w) => w.id),
+          );
+          projects.update((items) => items.filter((p) => p.id !== projectId));
+          worktrees.update((items) =>
+            items.filter((w) => w.project_id !== projectId),
+          );
+          if (get(selectedProjectId) === projectId) {
+            selectedProjectId.set(null);
+            selectedWorktreeId.set(null);
+          } else if (
+            removedWorktreeIds.has(get(selectedWorktreeId) as Id)
+          ) {
+            selectedWorktreeId.set(null);
+          }
+        }
       }),
     );
 
@@ -683,6 +706,11 @@ export async function setFilesStaged(
       gitStatus.set(before);
     }
     void loadGitStatus(worktreeId).catch((refreshErr) => error.set(toMessage(refreshErr)));
+    // Rethrow so awaiting callers (e.g. CommitDialog's stage-all-and-generate)
+    // can stop their flow instead of proceeding on a failed stage. The error
+    // store + optimistic rollback above still surface the failure on their own,
+    // so fire-and-forget callers must `.catch()` (see RightRail).
+    throw err;
   } finally {
     gitBusy.set(false);
   }

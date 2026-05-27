@@ -13,6 +13,25 @@ const DEFAULT_TIMEOUT_SECS: u64 = 90;
 const MAX_DIFF_CHARS: usize = 48_000;
 const MAX_STDERR_CHARS: usize = 4_000;
 
+/// The desktop client abandons a request after this many seconds (see
+/// `apps/desktop/src-tauri/src/lib.rs`). The daemon's draft timeout is clamped
+/// below it so the daemon always sends its response — success or timeout error
+/// — before the client gives up and drops the late reply.
+const CLIENT_RESPONSE_TIMEOUT_SECS: u64 = 120;
+/// Margin reserved for the daemon to format and write its response (and for the
+/// kill/wait/join path on a timeout) before the client's deadline elapses.
+const CLIENT_RESPONSE_MARGIN_SECS: u64 = 10;
+/// Hard upper bound on a draft provider timeout. Stays safely below the client
+/// response timeout so a successful draft is never dropped.
+const MAX_TIMEOUT_SECS: u64 = CLIENT_RESPONSE_TIMEOUT_SECS - CLIENT_RESPONSE_MARGIN_SECS;
+
+/// Clamp a configured draft timeout into the supported range: at least one
+/// second, and never above [`MAX_TIMEOUT_SECS`] so the daemon responds before
+/// the client's fixed response timeout.
+fn clamp_timeout_secs(secs: u64) -> Duration {
+    Duration::from_secs(secs.clamp(1, MAX_TIMEOUT_SECS))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DraftProviderKind {
     Stub,
@@ -71,9 +90,9 @@ impl DraftProviderConfig {
                 let secs = value
                     .parse::<u64>()
                     .map_err(|_| "HITCH_DRAFT_TIMEOUT_SECS must be an integer".to_string())?;
-                Duration::from_secs(secs.max(1))
+                clamp_timeout_secs(secs)
             }
-            _ => Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            _ => clamp_timeout_secs(DEFAULT_TIMEOUT_SECS),
         };
         Ok(Self {
             kind,
@@ -93,7 +112,7 @@ impl DraftProviderConfig {
         let secs = value
             .parse::<u64>()
             .map_err(|_| "--draft-timeout-secs requires an integer".to_string())?;
-        self.timeout = Duration::from_secs(secs.max(1));
+        self.timeout = clamp_timeout_secs(secs);
         Ok(())
     }
 
@@ -104,10 +123,16 @@ impl DraftProviderConfig {
                 DraftProvider::Claude => DraftProviderKind::Claude,
                 DraftProvider::Codex => DraftProviderKind::Codex,
             };
-            self.model = settings
+            // Only override the configured model when the request actually
+            // carries one. A None/empty request model must not clobber an
+            // operator-configured --draft-model / HITCH_DRAFT_MODEL.
+            if let Some(model) = settings
                 .model
                 .map(|model| model.trim().to_string())
-                .filter(|model| !model.is_empty());
+                .filter(|model| !model.is_empty())
+            {
+                self.model = Some(model);
+            }
         }
         self
     }
@@ -306,6 +331,11 @@ fn run_headless_provider(
             if let Some(model) = config.model.as_deref() {
                 command.arg("--model").arg(model);
             }
+            // Request the structured print-mode envelope
+            // (`{"type":"result","result":"<text>",...}`); the default `-p`
+            // emits free-form text the parser can't reliably unwrap. The
+            // nested-unwrap on the "result" key handles this shape.
+            command.arg("--output-format").arg("json");
             command.arg("-p").arg(prompt);
             command
         }
@@ -442,15 +472,42 @@ fn parse_json_output(output: &str) -> Option<Value> {
     if trimmed.is_empty() {
         return None;
     }
+    // Fast path: the provider returned clean JSON with no surrounding prose.
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
         return Some(value);
     }
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    if end <= start {
-        return None;
+    // Fallback: the provider wrapped JSON in prose, log lines, or printed
+    // several objects (possibly alongside stray/unbalanced braces in the
+    // surrounding text). Attempt to parse one complete JSON object starting at
+    // every `{`; a stray `{not json` simply fails and we advance to the next
+    // candidate. CLIs print the final result last, so prefer the last object
+    // that parses into a usable value.
+    last_embedded_json_object(trimmed)
+}
+
+/// Try to parse a complete JSON object beginning at each top-level `{` in
+/// `input`, using a streaming deserializer that ignores trailing data. Returns
+/// the last object that parses successfully (the final printed result for most
+/// CLIs). `{` characters that fall inside an already-parsed object's span are
+/// skipped so braces embedded in string values don't shadow the real object.
+fn last_embedded_json_object(input: &str) -> Option<Value> {
+    let mut found = None;
+    let mut consumed_until = 0;
+    for (idx, _) in input.match_indices('{') {
+        if idx < consumed_until {
+            continue;
+        }
+        let mut stream = serde_json::Deserializer::from_str(&input[idx..]).into_iter::<Value>();
+        match stream.next() {
+            Some(Ok(value @ Value::Object(_))) => {
+                // byte_offset() is relative to the slice we started at.
+                consumed_until = idx + stream.byte_offset();
+                found = Some(value);
+            }
+            _ => continue,
+        }
     }
-    serde_json::from_str::<Value>(&trimmed[start..=end]).ok()
+    found
 }
 
 fn commit_draft_from_value(value: &Value, depth: usize) -> Option<CommitDraft> {
@@ -670,11 +727,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_prose_wrapped_and_log_prefixed_provider_json() {
+        // JSON surrounded by conversational prose with stray braces in the text.
+        let prose = "Sure! Here is the {commit} you asked for:\n{\"subject\":\"feat: ship it\",\"body\":\"- Done\"}\nLet me know if you need changes.";
+        let draft = parse_commit_draft_output(prose).unwrap();
+        assert_eq!(draft.subject, "feat: ship it");
+        assert_eq!(draft.body, "- Done");
+
+        // Log lines printed before the final JSON result; the last complete
+        // top-level object wins.
+        let logs = "[info] starting draft\n[warn] partial {not json\n{\"subject\":\"fix: real\",\"body\":\"- Body\"}\n";
+        let draft = parse_commit_draft_output(logs).unwrap();
+        assert_eq!(draft.subject, "fix: real");
+        assert_eq!(draft.body, "- Body");
+
+        // A brace inside a JSON string value must not break depth tracking.
+        let braces_in_string =
+            "noise {\"subject\":\"chore: braces { } in text\",\"body\":\"- b\"} trailing";
+        let draft = parse_commit_draft_output(braces_in_string).unwrap();
+        assert_eq!(draft.subject, "chore: braces { } in text");
+    }
+
+    #[test]
     fn provider_commit_draft_falls_back_to_context_body_when_body_is_empty() {
         let script = temp_file("empty-commit-body-provider", "sh");
         fs::write(
             &script,
-            "#!/bin/sh\n[ \"$1\" = \"-p\" ] || exit 12\nprintf '%s\n' '{\"subject\":\"fix: preserve generated body\",\"body\":\"\"}'\n",
+            "#!/bin/sh\n[ \"$1\" = \"--output-format\" ] || exit 12\n[ \"$2\" = \"json\" ] || exit 13\n[ \"$3\" = \"-p\" ] || exit 14\nprintf '%s\n' '{\"subject\":\"fix: preserve generated body\",\"body\":\"\"}'\n",
         )
         .unwrap();
         make_executable(&script);
@@ -703,6 +782,56 @@ mod tests {
         let _ = fs::remove_dir_all(cwd);
     }
 
+    fn config_with_model(model: Option<&str>) -> DraftProviderConfig {
+        DraftProviderConfig {
+            kind: DraftProviderKind::Claude,
+            claude: PathBuf::from("claude"),
+            codex: PathBuf::from("codex"),
+            timeout: Duration::from_secs(2),
+            model: model.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn with_settings_keeps_configured_model_when_request_model_is_absent_or_empty() {
+        // Request without a model must not clobber the operator-configured model.
+        let kept = config_with_model(Some("opus")).with_settings(Some(DraftGenerationSettings {
+            provider: DraftProvider::Claude,
+            model: None,
+        }));
+        assert_eq!(kept.model.as_deref(), Some("opus"));
+
+        // An empty/whitespace request model is also ignored.
+        let kept = config_with_model(Some("opus")).with_settings(Some(DraftGenerationSettings {
+            provider: DraftProvider::Claude,
+            model: Some("   ".into()),
+        }));
+        assert_eq!(kept.model.as_deref(), Some("opus"));
+
+        // A real request model still overrides.
+        let overridden =
+            config_with_model(Some("opus")).with_settings(Some(DraftGenerationSettings {
+                provider: DraftProvider::Codex,
+                model: Some("gpt-5-codex".into()),
+            }));
+        assert_eq!(overridden.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(overridden.kind, DraftProviderKind::Codex);
+    }
+
+    #[test]
+    fn timeout_is_clamped_below_client_response_deadline() {
+        let mut config = config_with_model(None);
+        // A huge configured timeout is capped so the daemon responds before the
+        // client's fixed response timeout.
+        config.set_timeout_secs("100000").unwrap();
+        assert_eq!(config.timeout.as_secs(), MAX_TIMEOUT_SECS);
+        assert!(MAX_TIMEOUT_SECS < CLIENT_RESPONSE_TIMEOUT_SECS);
+
+        // A zero/sub-second timeout floors at one second.
+        config.set_timeout_secs("0").unwrap();
+        assert_eq!(config.timeout.as_secs(), 1);
+    }
+
     #[test]
     fn parses_codex_debug_models() {
         let models = parse_codex_models(
@@ -716,7 +845,7 @@ mod tests {
         let script = temp_file("claude-provider", "sh");
         fs::write(
             &script,
-            "#!/bin/sh\n[ \"$1\" = \"--model\" ] || exit 12\n[ \"$2\" = \"sonnet\" ] || exit 13\n[ \"$3\" = \"-p\" ] || exit 14\nprintf '%s\n' '{\"subject\":\"feat: generated\",\"body\":\"Generated body\"}'\n",
+            "#!/bin/sh\n[ \"$1\" = \"--model\" ] || exit 12\n[ \"$2\" = \"sonnet\" ] || exit 13\n[ \"$3\" = \"--output-format\" ] || exit 14\n[ \"$4\" = \"json\" ] || exit 15\n[ \"$5\" = \"-p\" ] || exit 16\nprintf '%s\n' '{\"type\":\"result\",\"result\":\"{\\\"subject\\\":\\\"feat: generated\\\",\\\"body\\\":\\\"Generated body\\\"}\"}'\n",
         )
         .unwrap();
         make_executable(&script);

@@ -78,9 +78,11 @@
     const seq = ++modelLoadSeq;
     modelsError = null;
 
-    // Stub and Claude use bundled/documented choices. Only Codex has a safe
-    // non-interactive CLI model listing (`codex debug models`).
-    if (provider !== "codex") {
+    // The stub provider is a local deterministic choice with no CLI; skip the
+    // IPC roundtrip. Every other provider's authoritative model list comes from
+    // the daemon (`list-draft-models`); DRAFT_MODEL_OPTIONS is the offline
+    // fallback used only on error/timeout.
+    if (provider === "stub") {
       modelOptions = DRAFT_MODEL_OPTIONS[provider];
       modelsLoading = false;
       return;
@@ -96,7 +98,7 @@
       const message = err instanceof Error ? err.message : String(err);
       modelOptions = DRAFT_MODEL_OPTIONS[provider];
       modelsError = message.includes("unknown variant `list-draft-models`")
-        ? "Restart Hitch to enable live Codex model discovery."
+        ? "Restart Hitch to enable live model discovery."
         : message;
     } finally {
       if (seq === modelLoadSeq) modelsLoading = false;
@@ -239,8 +241,10 @@
               Using bundled fallback models: <span class="mono">{modelsError}</span>
             {:else if draftProviderValue === "codex"}
               Models are loaded with <span class="mono">codex debug models</span>. Choose default to omit <span class="mono">--model</span>.
+            {:else if draftProviderValue === "claude"}
+              Models are loaded from the Claude CLI. Choose default to omit <span class="mono">--model</span>.
             {:else}
-              Claude uses documented aliases/latest known IDs. Choose default to omit <span class="mono">--model</span>.
+              Choose default to omit <span class="mono">--model</span>.
             {/if}
           </p>
           <div class="row">

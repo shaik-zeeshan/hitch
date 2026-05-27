@@ -16,21 +16,13 @@ export type DraftProvider = "stub" | "claude" | "codex";
 export const DEFAULT_DRAFT_PROVIDER: DraftProvider = "stub";
 export const DEFAULT_DRAFT_MODEL = "";
 
+// Offline FALLBACK only. The daemon's `list-draft-models` IPC is the
+// authoritative model list per provider (it mirrors the CLI's own aliases);
+// the settings page fetches it live and falls back to these minimal lists only
+// on error/timeout, so they don't need to stay exhaustive or in sync.
 export const DRAFT_MODEL_OPTIONS: Record<DraftProvider, string[]> = {
   stub: ["stub"],
-  claude: [
-    "default",
-    "best",
-    "sonnet",
-    "opus",
-    "haiku",
-    "sonnet[1m]",
-    "opus[1m]",
-    "opusplan",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
-  ],
+  claude: ["default", "sonnet", "opus", "haiku"],
   codex: ["gpt-5-codex", "gpt-5", "gpt-5-mini"],
 };
 

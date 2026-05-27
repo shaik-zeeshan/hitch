@@ -17,12 +17,18 @@
   let generating = $state(false);
   let errMsg = $state<string | null>(null);
 
+  // Bumped on each open-reset so an in-flight draft request that resolves after
+  // the dialog was closed and reopened can detect it's stale and skip clobbering
+  // the freshly-reset blank form (or flipping `generating` for the new session).
+  let generationSeq = 0;
+
   // Open state is shared (the ⌘K palette can open this too); reset the form on
   // each open, whether triggered here or externally.
   let wasOpen = $state(false);
   $effect(() => {
     if ($createPrOpen && !wasOpen) {
       wasOpen = true;
+      generationSeq += 1;
       title = "";
       body = "";
       base = $defaultBase ?? "";
@@ -48,17 +54,20 @@
       return;
     }
     if (generating || !confirmReplace()) return;
+    const seq = generationSeq;
     generating = true;
     errMsg = null;
     try {
-      const draft = await generatePullRequestDraft(targetBase);
-      title = draft.title;
-      body = draft.body;
+      const result = await generatePullRequestDraft(targetBase);
+      if (seq !== generationSeq) return;
+      title = result.title;
+      body = result.body;
       base = targetBase;
     } catch (err) {
+      if (seq !== generationSeq) return;
       errMsg = err instanceof Error ? err.message : String(err);
     } finally {
-      generating = false;
+      if (seq === generationSeq) generating = false;
     }
   }
 

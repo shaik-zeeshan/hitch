@@ -12,7 +12,7 @@ use hitch_core::{
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version for daemon/socket compatibility checks.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -277,6 +277,11 @@ pub enum Event {
     },
     ProjectUpdated {
         project: Project,
+    },
+    /// A project (and its Hitch-owned worktrees/sessions) was removed; peers
+    /// should drop it from their view.
+    ProjectRemoved {
+        project_id: ProjectId,
     },
     /// The session's foreground process changed — the live command the user is
     /// interacting with in the PTY (e.g. a tool launched inside the shell),
@@ -744,6 +749,7 @@ mod tests {
             },
             Event::WorktreeUpdated { worktree },
             Event::ProjectUpdated { project },
+            Event::ProjectRemoved { project_id },
             Event::SessionCommand {
                 session_id,
                 command: Some("claude".into()),

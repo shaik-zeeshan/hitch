@@ -47,7 +47,10 @@
   });
 
   function onOpenChange(next: boolean) {
-    if (!next) removeProjectTarget.set(null);
+    // Stay open (non-dismissable) while a removal is in flight: Escape / overlay
+    // click must not unmount the dialog mid-await, or a failure would set errMsg
+    // on a gone component and a failed removal would look like it succeeded.
+    if (!next && !submitting) removeProjectTarget.set(null);
   }
 
   async function confirm() {

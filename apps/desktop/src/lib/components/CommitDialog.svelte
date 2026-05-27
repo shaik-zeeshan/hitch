@@ -27,10 +27,16 @@
   const canGenerate = $derived(staged.length > 0 && !$gitBusy && !generating);
   const canStageAllAndGenerate = $derived(staged.length === 0 && unstaged.length > 0 && !$gitBusy && !generating);
 
+  // Bumped on each open-reset so an in-flight draft request that resolves after
+  // the dialog was closed and reopened can detect it's stale and skip clobbering
+  // the freshly-reset blank form (or flipping `generating` for the new session).
+  let generationSeq = 0;
+
   let wasOpen = $state(false);
   $effect(() => {
     if ($commitOpen && !wasOpen) {
       wasOpen = true;
+      generationSeq += 1;
       subject = "";
       body = "";
       submitting = false;
@@ -48,34 +54,40 @@
 
   async function generate() {
     if (!canGenerate || !confirmReplace()) return;
+    const seq = generationSeq;
     generating = true;
     errMsg = null;
     try {
       const draft = await generateCommitDraft();
+      if (seq !== generationSeq) return;
       subject = draft.subject;
       body = draft.body;
     } catch (err) {
+      if (seq !== generationSeq) return;
       errMsg = err instanceof Error ? err.message : String(err);
     } finally {
-      generating = false;
+      if (seq === generationSeq) generating = false;
     }
   }
 
   async function stageAllAndGenerate() {
     if (!canStageAllAndGenerate || !confirmReplace()) return;
+    const seq = generationSeq;
     generating = true;
     errMsg = null;
     try {
       const paths = unstaged.map((file) => file.path);
       await setFilesStaged(paths, true);
       const draft = await generateCommitDraft();
+      if (seq !== generationSeq) return;
       subject = draft.subject;
       body = draft.body;
       if ($gitStatus?.worktree_id) void loadGitStatus($gitStatus.worktree_id).catch(() => {});
     } catch (err) {
+      if (seq !== generationSeq) return;
       errMsg = err instanceof Error ? err.message : String(err);
     } finally {
-      generating = false;
+      if (seq === generationSeq) generating = false;
     }
   }
 

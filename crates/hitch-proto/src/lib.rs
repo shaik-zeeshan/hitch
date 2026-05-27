@@ -95,4 +95,5 @@ Event:
   worktree-dirty(worktree_id, dirty)
   worktree-updated(worktree)
   project-updated(project)
+  project-removed(project_id)
 "#;
