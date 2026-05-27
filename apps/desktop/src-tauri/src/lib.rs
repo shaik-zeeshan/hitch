@@ -51,6 +51,11 @@ struct OutputRouter {
     channels: HashMap<SessionId, Channel<InvokeResponseBody>>,
     /// Bytes that arrived before the channel was registered, per session.
     staging: HashMap<SessionId, Vec<u8>>,
+    /// Sessions that have already produced a SessionOpened event in this GUI
+    /// process. A later SessionOpened for the same id is a reconnect/replay and
+    /// should discard pre-replay staging; the first SessionOpened must preserve
+    /// bytes that raced ahead of the event.
+    opened_sessions: HashSet<SessionId>,
 }
 
 impl OutputRouter {
@@ -66,20 +71,32 @@ impl OutputRouter {
     }
 
     /// A session-opened event is followed by the daemon's authoritative
-    /// scrollback replay. Drop any old channel before the webview sees the event
-    /// so replay cannot race through a stale channel and be wiped by the JS ring
-    /// reset that happens during fresh registration.
+    /// scrollback replay on reconnect. Drop any old channel before the webview
+    /// sees the event so replay cannot race through a stale channel and be wiped
+    /// by the JS ring reset that happens during fresh registration. Preserve
+    /// bytes staged before the first SessionOpened for a brand-new session: a PTY
+    /// can emit its first prompt before the daemon broadcasts SessionOpened.
     fn prepare_fresh_registration(&mut self, session_id: SessionId) {
+        let already_opened = !self.opened_sessions.insert(session_id);
         self.channels.remove(&session_id);
-        self.staging.remove(&session_id);
+        if already_opened {
+            self.staging.remove(&session_id);
+        }
     }
 
     /// Route output to the active channel, or stage it until registration
     /// completes. Sending is best-effort: a dead webview channel should not tear
-    /// down the daemon reader loop.
+    /// down the daemon reader loop. If the channel has gone stale, remove it and
+    /// stage the payload so the next registration can catch up.
     fn send_or_stage(&mut self, session_id: SessionId, payload: Vec<u8>) {
         if let Some(channel) = self.channels.get(&session_id) {
-            let _ = channel.send(InvokeResponseBody::Raw(payload));
+            if channel
+                .send(InvokeResponseBody::Raw(payload.clone()))
+                .is_err()
+            {
+                self.channels.remove(&session_id);
+                self.stage(session_id, &payload);
+            }
         } else {
             self.stage(session_id, &payload);
         }
@@ -100,6 +117,12 @@ impl OutputRouter {
     fn unregister_channel(&mut self, session_id: SessionId) {
         self.channels.remove(&session_id);
         self.staging.remove(&session_id);
+    }
+
+    /// Forget all routing state for a session that the daemon has closed.
+    fn close_session(&mut self, session_id: SessionId) {
+        self.unregister_channel(session_id);
+        self.opened_sessions.remove(&session_id);
     }
 }
 
@@ -483,6 +506,7 @@ fn reader_loop(app: &AppHandle, client: &HitchClient, stream: UnixStream) -> io:
                         if let Ok(mut router) = client.0.output_router.lock() {
                             router.send_or_stage(*session_id, payload);
                         }
+                        continue;
                     }
                     Event::SessionOpened { session } => {
                         if let Ok(mut router) = client.0.output_router.lock() {
@@ -491,6 +515,9 @@ fn reader_loop(app: &AppHandle, client: &HitchClient, stream: UnixStream) -> io:
                         client.track_session(app, session.id, true)
                     }
                     Event::SessionClosed { session_id, .. } => {
+                        if let Ok(mut router) = client.0.output_router.lock() {
+                            router.close_session(*session_id);
+                        }
                         client.track_session(app, *session_id, false)
                     }
                     _ => {}
@@ -732,12 +759,35 @@ mod tests {
     }
 
     #[test]
+    fn session_opened_preserves_output_that_raced_ahead_of_initial_event() {
+        let session_id = SessionId::new();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let mut router = OutputRouter::default();
+
+        router.send_or_stage(session_id, b"early-prompt".to_vec());
+        router.prepare_fresh_registration(session_id);
+
+        assert_eq!(
+            router.staging.get(&session_id).cloned(),
+            Some(b"early-prompt".to_vec())
+        );
+
+        router.register_channel(session_id, recording_channel(received.clone()));
+        assert_eq!(
+            received.lock().unwrap().clone(),
+            vec![b"early-prompt".to_vec()]
+        );
+        assert!(!router.staging.contains_key(&session_id));
+    }
+
+    #[test]
     fn session_opened_stages_replay_until_fresh_channel_registered() {
         let session_id = SessionId::new();
         let old_received = Arc::new(Mutex::new(Vec::new()));
         let new_received = Arc::new(Mutex::new(Vec::new()));
         let mut router = OutputRouter::default();
 
+        router.prepare_fresh_registration(session_id);
         router.register_channel(session_id, recording_channel(old_received.clone()));
         router.send_or_stage(session_id, b"before-reconnect".to_vec());
         assert_eq!(
@@ -772,6 +822,60 @@ mod tests {
                 b"replayed-scrollback".to_vec(),
                 b"live-after-registration".to_vec(),
             ]
+        );
+    }
+
+    #[test]
+    fn reconnect_session_opened_discards_stale_staging_even_without_channel() {
+        let session_id = SessionId::new();
+        let mut router = OutputRouter::default();
+
+        router.prepare_fresh_registration(session_id);
+        router.send_or_stage(session_id, b"missed-before-reconnect".to_vec());
+        assert!(router.staging.contains_key(&session_id));
+
+        router.prepare_fresh_registration(session_id);
+        assert!(!router.staging.contains_key(&session_id));
+    }
+
+    #[test]
+    fn send_failure_removes_dead_channel_and_stages_payload() {
+        let session_id = SessionId::new();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let mut router = OutputRouter::default();
+
+        router.prepare_fresh_registration(session_id);
+        router.register_channel(
+            session_id,
+            Channel::new(|_| Err(std::io::Error::other("closed channel").into())),
+        );
+
+        router.send_or_stage(session_id, b"not-lost".to_vec());
+
+        assert!(!router.channels.contains_key(&session_id));
+        assert_eq!(
+            router.staging.get(&session_id).cloned(),
+            Some(b"not-lost".to_vec())
+        );
+
+        router.register_channel(session_id, recording_channel(received.clone()));
+        assert_eq!(received.lock().unwrap().clone(), vec![b"not-lost".to_vec()]);
+        assert!(!router.staging.contains_key(&session_id));
+    }
+
+    #[test]
+    fn session_closed_forgets_opened_session_state() {
+        let session_id = SessionId::new();
+        let mut router = OutputRouter::default();
+
+        router.prepare_fresh_registration(session_id);
+        router.close_session(session_id);
+        router.send_or_stage(session_id, b"new-early-prompt".to_vec());
+        router.prepare_fresh_registration(session_id);
+
+        assert_eq!(
+            router.staging.get(&session_id).cloned(),
+            Some(b"new-early-prompt".to_vec())
         );
     }
 
