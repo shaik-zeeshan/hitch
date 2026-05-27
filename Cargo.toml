@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hitch-core",
+    "crates/hitch-proto",
+    "crates/hitch-git",
+    "crates/hitch-pty",
+    "crates/hitch-store",
+    "crates/hitch-agent",
+    "crates/hitch-daemon",
+    "crates/hitch-hook",
+    "apps/desktop/src-tauri",
+]
+
+# Shared package metadata, inherited by every crate via `field.workspace = true`.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Hitch"]
+
+# Centralized versions so the three socket-speaking binaries (daemon, src-tauri,
+# hook) and the feature crates never drift. Internal crates are referenced by
+# path; the DAG is enforced by which crates list which (ADR 0005).
+[workspace.dependencies]
+hitch-core = { path = "crates/hitch-core" }
+hitch-proto = { path = "crates/hitch-proto" }
+hitch-git = { path = "crates/hitch-git" }
+hitch-pty = { path = "crates/hitch-pty" }
+hitch-store = { path = "crates/hitch-store" }
+hitch-agent = { path = "crates/hitch-agent" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }

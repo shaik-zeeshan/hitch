@@ -1,0 +1,571 @@
+@import "tailwindcss";
+
+/* ============================================================
+   Hitch design tokens — ported verbatim from hitch-shell-mockup.html
+   Palette: OKLCH, dark, tinted-cool neutrals (hue 265 iris).
+   Accent (iris 265) = selection/focus/primary + the "dirty" dot.
+   State is shown as a WORD (label) in a reserved hue, never a bare
+   symbol, so it survives grayscale + color blindness:
+     running (teal) · needs approval (amber) · completed (green) · error (red)
+
+   Colors and fonts live under Tailwind v4 namespaces (--color-*, --font-*)
+   so they also generate `bg-*`/`text-*`/`border-*`/`font-*` utilities.
+   Radii and transitions stay as raw custom properties (referenced as
+   var(--radius), var(--t), …) exactly as the mockup uses them.
+   ============================================================ */
+@theme {
+  /* ---- surfaces ---- */
+  --color-bg-0: oklch(15.5% 0.006 265); /* terminal canvas (deepest) */
+  --color-bg-1: oklch(18% 0.007 265); /* center chrome */
+  --color-bg-2: oklch(20.5% 0.008 265); /* rails / panels */
+  --color-bg-3: oklch(24% 0.009 265); /* hover, wells */
+  --color-bg-4: oklch(28.5% 0.011 265); /* inputs, active */
+  --color-line: oklch(30% 0.011 265);
+  --color-line-soft: oklch(26% 0.009 265);
+
+  /* ---- text ---- */
+  --color-tx-hi: oklch(93% 0.006 265);
+  --color-tx-md: oklch(74% 0.008 265);
+  --color-tx-lo: oklch(61% 0.01 265);
+
+  /* ---- accent (iris 265) ---- */
+  --color-ac: oklch(70% 0.13 265);
+  --color-ac-bright: oklch(78% 0.13 265);
+  --color-ac-wash: oklch(34% 0.06 265);
+
+  /* ---- reserved state hues ---- */
+  --color-run: oklch(78% 0.1 195); /* teal */
+  --color-warn: oklch(81% 0.13 75); /* amber */
+  --color-ok: oklch(77% 0.12 150); /* green */
+  --color-err: oklch(68% 0.17 25); /* red */
+
+  /* ---- fonts ---- */
+  --font-ui:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui,
+    sans-serif;
+  --font-mono:
+    "Berkeley Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+}
+
+/* Radii + transitions: raw custom properties (used as var(--radius) etc.) */
+:root {
+  --radius: 6px;
+  --radius-lg: 10px;
+  --t-fast: 120ms cubic-bezier(0.22, 1, 0.36, 1);
+  --t: 180ms cubic-bezier(0.22, 1, 0.36, 1);
+
+  /* Short aliases for the @theme tokens above, so component style blocks can
+     port the locked mockup CSS verbatim. The mockup references the short names
+     (--bg-0, --ac, --mono); Tailwind v4 @theme requires the color- and font-
+     prefixed names, so we bridge them here. */
+  --bg-0: var(--color-bg-0);
+  --bg-1: var(--color-bg-1);
+  --bg-2: var(--color-bg-2);
+  --bg-3: var(--color-bg-3);
+  --bg-4: var(--color-bg-4);
+  --line: var(--color-line);
+  --line-soft: var(--color-line-soft);
+  --tx-hi: var(--color-tx-hi);
+  --tx-md: var(--color-tx-md);
+  --tx-lo: var(--color-tx-lo);
+  --ac: var(--color-ac);
+  --ac-bright: var(--color-ac-bright);
+  --ac-wash: var(--color-ac-wash);
+  --run: var(--color-run);
+  --warn: var(--color-warn);
+  --ok: var(--color-ok);
+  --err: var(--color-err);
+  --ui: var(--font-ui);
+  --mono: var(--font-mono);
+}
+
+/* ============================================================
+   Shared primitives (mockup .btn + dialog chrome). Global, not
+   component-scoped, because the buttons recur across surfaces and the
+   bits-ui dialogs render their own elements that a scoped `class` can't
+   reach. Ported verbatim from hitch-shell-mockup.html.
+   ============================================================ */
+@layer components {
+  .btn {
+    padding: 7px 10px;
+    border-radius: var(--radius);
+    font: inherit;
+    font-size: 11.5px;
+    font-weight: 540;
+    cursor: pointer;
+    background: var(--bg-3);
+    border: 1px solid var(--line);
+    color: var(--tx-hi);
+    transition:
+      background var(--t-fast),
+      border-color var(--t-fast);
+  }
+  .btn:hover {
+    background: var(--bg-4);
+  }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .btn.full {
+    width: 100%;
+  }
+  .btn.grow {
+    flex: 1;
+  }
+  .btn.primary {
+    background: var(--ac);
+    border-color: var(--ac);
+    color: oklch(18% 0.03 265);
+    font-weight: 600;
+  }
+  .btn.primary:hover {
+    background: var(--ac-bright);
+  }
+  .btn.primary:disabled:hover {
+    background: var(--ac);
+  }
+  .btn .kbd {
+    font-family: var(--mono);
+    font-size: 10px;
+    opacity: 0.6;
+    margin-left: 5px;
+  }
+  .btn .ar {
+    font-family: var(--mono);
+    opacity: 0.75;
+    margin-left: 4px;
+  }
+
+  /* bits-ui Dialog: Overlay is the dim backdrop, Content positions itself. */
+  .modal-back {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    background: oklch(8% 0.012 265 / 0.5);
+    backdrop-filter: blur(3px);
+  }
+  .modal {
+    position: fixed;
+    z-index: 61;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: 470px;
+    max-width: calc(100vw - 48px);
+    background: var(--bg-2);
+    border: 1px solid oklch(34% 0.012 265);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 30px 70px -20px oklch(4% 0.02 265 / 0.8);
+    overflow: hidden;
+  }
+  .m-head {
+    padding: 15px 18px 12px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  /* bits-ui Dialog.Title renders a `div[role=heading]`, not an <h3>; cover both
+     so ported dialog titles match the mockup's .m-head h3 styling. */
+  .m-head h3,
+  .m-head [role="heading"] {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--tx-hi);
+    margin: 0;
+  }
+  .m-head .sub {
+    font-size: 11.5px;
+    color: var(--tx-lo);
+    margin-top: 3px;
+  }
+  .m-head .sub b {
+    font-family: var(--mono);
+    color: var(--tx-md);
+    font-weight: 400;
+  }
+  .m-body {
+    padding: 14px 18px 16px;
+    display: grid;
+    gap: 13px;
+  }
+  .field {
+    display: grid;
+    gap: 5px;
+  }
+  .field > span {
+    font-size: 11px;
+    color: var(--tx-md);
+  }
+  .field input,
+  .field textarea {
+    background: var(--bg-0);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    color: var(--tx-hi);
+    font: inherit;
+    font-size: 12.5px;
+    padding: 8px 10px;
+    transition: border-color var(--t-fast);
+  }
+  .field input:focus,
+  .field textarea:focus {
+    outline: none;
+    border-color: var(--ac);
+  }
+  .field textarea {
+    resize: none;
+    min-height: 74px;
+  }
+  .field .base {
+    font-family: var(--mono);
+  }
+  /* path field + native picker button (mockup .input-row / .browse) */
+  .input-row {
+    display: flex;
+    gap: 7px;
+  }
+  .input-row input {
+    flex: 1;
+  }
+  .browse {
+    padding: 8px 12px;
+    border-radius: var(--radius);
+    border: 1px solid var(--line);
+    background: var(--bg-3);
+    color: var(--tx-hi);
+    font: inherit;
+    font-size: 11.5px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .browse:hover {
+    background: var(--bg-4);
+  }
+  .field-row {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    cursor: pointer;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    text-align: left;
+  }
+  .field-row .lab {
+    font-size: 12px;
+    color: var(--tx-md);
+  }
+  .check {
+    width: 15px;
+    height: 15px;
+    border-radius: 4px;
+    border: 1px solid var(--line);
+    background: var(--bg-0);
+    flex: none;
+    display: grid;
+    place-items: center;
+    color: transparent;
+    font-size: 10px;
+  }
+  .check.on {
+    background: var(--ac);
+    border-color: var(--ac);
+    color: oklch(18% 0.03 265);
+  }
+  .m-foot {
+    padding: 13px 18px;
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    border-top: 1px solid var(--line-soft);
+  }
+  .m-foot .btn {
+    padding: 7px 14px;
+  }
+  .m-error {
+    font-size: 11.5px;
+    color: oklch(80% 0.1 25);
+    line-height: 1.5;
+  }
+  .m-success {
+    font-size: 12px;
+    color: var(--tx-md);
+    line-height: 1.6;
+  }
+  .m-success a {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--ac-bright);
+    word-break: break-all;
+  }
+
+  /* ---- segmented control + dialog helpers (mockup) ---- */
+  .seg {
+    display: flex;
+    gap: 2px;
+    padding: 3px;
+    background: var(--bg-0);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+  }
+  .seg button {
+    flex: 1;
+    padding: 6px 10px;
+    border: 0;
+    background: transparent;
+    color: var(--tx-md);
+    font: inherit;
+    font-size: 11.5px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background var(--t-fast), color var(--t-fast);
+  }
+  .seg button.on {
+    background: var(--bg-3);
+    color: var(--tx-hi);
+  }
+  .help {
+    font-size: 11px;
+    color: var(--tx-lo);
+    line-height: 1.5;
+  }
+  .help .mono {
+    font-family: var(--mono);
+    color: var(--tx-md);
+  }
+  .field-row.disabled {
+    opacity: 0.45;
+  }
+  .btn.danger-btn {
+    background: oklch(58% 0.14 25 / 0.16);
+    border-color: oklch(58% 0.14 25 / 0.4);
+    color: oklch(85% 0.07 25);
+  }
+  .btn.danger-btn:hover {
+    background: oklch(58% 0.14 25 / 0.26);
+  }
+  .warn-box {
+    display: flex;
+    gap: 10px;
+    padding: 11px 12px;
+    border-radius: var(--radius);
+    background: oklch(58% 0.14 25 / 0.1);
+    border: 1px solid oklch(58% 0.14 25 / 0.28);
+    color: oklch(86% 0.06 25);
+    font-size: 11.5px;
+    line-height: 1.5;
+  }
+  .warn-box svg {
+    width: 16px;
+    height: 16px;
+    flex: none;
+    margin-top: 1px;
+  }
+
+  /* ---- ⌘K command palette (mockup #cmdk-modal) ---- */
+  .palette {
+    position: fixed;
+    z-index: 61;
+    left: 50%;
+    top: 80px;
+    transform: translateX(-50%);
+    width: 568px;
+    max-width: calc(100vw - 48px);
+    background: var(--bg-2);
+    border: 1px solid oklch(34% 0.012 265);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 30px 70px -20px oklch(4% 0.02 265 / 0.85);
+    overflow: hidden;
+  }
+  .p-input {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 13px 16px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .p-input svg {
+    width: 16px;
+    height: 16px;
+    color: var(--tx-lo);
+    flex: none;
+  }
+  .p-input input {
+    flex: 1;
+    background: transparent;
+    border: 0;
+    outline: 0;
+    color: var(--tx-hi);
+    font: inherit;
+    font-size: 14px;
+  }
+  .p-input input::placeholder {
+    color: var(--tx-lo);
+  }
+  .p-list {
+    max-height: 348px;
+    overflow-y: auto;
+    padding: 6px;
+  }
+  .p-group {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--tx-lo);
+    padding: 9px 8px 4px;
+  }
+  .p-empty {
+    padding: 20px 10px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--tx-lo);
+  }
+  .p-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: var(--radius);
+    color: var(--tx-md);
+    cursor: pointer;
+  }
+  .p-item:hover {
+    background: var(--bg-3);
+    color: var(--tx-hi);
+  }
+  .p-item[data-selected] {
+    background: var(--ac-wash);
+    color: var(--tx-hi);
+    box-shadow: inset 0 0 0 1px oklch(62% 0.1 265 / 0.28);
+  }
+  .p-item .pi-ico {
+    width: 15px;
+    height: 15px;
+    color: var(--tx-lo);
+    flex: none;
+  }
+  .p-item[data-selected] .pi-ico {
+    color: var(--ac-bright);
+  }
+  .p-item .pi-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .p-item .pi-label .mono {
+    font-family: var(--mono);
+    font-size: 11.5px;
+  }
+  .p-item .pi-label .ctx {
+    color: var(--tx-lo);
+  }
+  .p-foot {
+    display: flex;
+    gap: 16px;
+    padding: 8px 16px;
+    border-top: 1px solid var(--line-soft);
+    font-size: 10.5px;
+    color: var(--tx-lo);
+  }
+  .p-foot .kbd {
+    font-family: var(--mono);
+    color: var(--tx-md);
+  }
+  /* Agent-state word, reused by palette jump rows (portaled, so global). */
+  .palette .status {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+    flex: none;
+    white-space: nowrap;
+  }
+  .palette .status.run {
+    color: var(--run);
+  }
+  .palette .status.approval {
+    color: var(--warn);
+  }
+  .palette .status.done {
+    color: var(--ok);
+  }
+  .palette .status.error {
+    color: var(--err);
+  }
+
+  /* ---- context menu (mockup .menu); bits-ui positions, we style ---- */
+  .menu {
+    z-index: 70;
+    min-width: 200px;
+    background: var(--bg-2);
+    border: 1px solid oklch(34% 0.012 265);
+    border-radius: 8px;
+    box-shadow: 0 18px 44px -16px oklch(4% 0.02 265 / 0.85);
+    padding: 5px;
+  }
+  .mi {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 9px;
+    border-radius: 5px;
+    color: var(--tx-md);
+    font-size: 12px;
+    cursor: pointer;
+    outline: none;
+  }
+  .mi:hover,
+  .mi[data-highlighted] {
+    background: var(--bg-3);
+    color: var(--tx-hi);
+  }
+  .mi.danger {
+    color: oklch(78% 0.1 25);
+  }
+  .mi.danger:hover,
+  .mi.danger[data-highlighted] {
+    background: oklch(58% 0.14 25 / 0.16);
+    color: oklch(87% 0.06 25);
+  }
+  .mi .mi-ico {
+    width: 14px;
+    height: 14px;
+    color: var(--tx-lo);
+    flex: none;
+  }
+  .mi.danger .mi-ico {
+    color: oklch(70% 0.13 25);
+  }
+  .mi .mi-k {
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--tx-lo);
+  }
+  .m-sep {
+    height: 1px;
+    background: var(--line-soft);
+    margin: 5px 4px;
+  }
+}
+
+@layer base {
+  html,
+  body,
+  #app {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-bg-0);
+    color: var(--color-tx-hi);
+    font-family: var(--font-ui);
+    font-size: 12px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+}

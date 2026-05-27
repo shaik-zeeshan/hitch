@@ -1,0 +1,12 @@
+[package]
+name = "hitch-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Hitch IPC wire contract: message enum, PTY framing, and socket transport scaffolding."
+
+[dependencies]
+hitch-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true

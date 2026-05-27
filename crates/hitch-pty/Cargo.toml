@@ -1,0 +1,12 @@
+[package]
+name = "hitch-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "PTY spawn + scrollback buffering (placeholder, slice 3)."
+
+[dependencies]
+hitch-core.workspace = true
+anyhow = "1"
+portable-pty = "0.8"

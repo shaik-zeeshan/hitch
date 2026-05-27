@@ -1,0 +1,31 @@
+[package]
+name = "hitch-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Hitch desktop app — thin Tauri client (ADR 0005)."
+
+[lib]
+# The `_lib` suffix keeps the lib name distinct from the bin so it does not
+# conflict on Windows (see rust-lang/cargo#8519).
+name = "hitch_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+# Thin client (ADR 0005): depends only on `hitch-proto` (+ `hitch-core`) and
+# routes every operation through the daemon socket. No feature-crate logic here.
+# The daemon wiring lands in slice 8; the deps are declared now to fix the graph.
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+# OS-integration plugins (slice 7–8 follow-up): opener powers "Reveal in
+# Finder" and "Open in editor" (openPath with an app name); dialog powers the
+# add-project folder picker. Pure frontend↔plugin calls — no daemon requests.
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde.workspace = true
+serde_json.workspace = true
+hitch-core.workspace = true
+hitch-proto.workspace = true

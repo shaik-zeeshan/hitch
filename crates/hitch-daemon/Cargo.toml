@@ -1,0 +1,23 @@
+[package]
+name = "hitch-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The long-lived daemon: owns every PTY and serves the socket (placeholder, slice 3+)."
+
+[[bin]]
+name = "hitch-daemon"
+path = "src/main.rs"
+
+# The daemon is the sole composer (ADR 0005): the only crate allowed to link the
+# feature crates together. These are declared now to fix the dependency graph;
+# the wiring lands in slice 7.
+[dependencies]
+hitch-core.workspace = true
+hitch-proto.workspace = true
+hitch-git.workspace = true
+hitch-pty.workspace = true
+hitch-store.workspace = true
+hitch-agent.workspace = true
+serde_json.workspace = true
