@@ -186,6 +186,20 @@
     term?.reset();
   }
 
+  // Subscribe to PTY output, but ONLY once the terminal is open and fitted to
+  // its real grid. subscribeSessionOutput replays the ring immediately (catch-
+  // up), and xterm parses that replay against its CURRENT size — so subscribing
+  // before open + fit parses it at xterm's default 80x24, and the later
+  // fit-on-activate only reflows the already-mangled buffer instead of
+  // re-parsing it at the right size (cursor-addressed TUI output and wrapped
+  // lines land wrong). A hidden tab therefore defers this until activate(); the
+  // session ring keeps accumulating live bytes meanwhile, so the deferred
+  // catch-up loses nothing. Idempotent: the first caller wins.
+  function ensureSubscribed() {
+    if (unsubOutput) return;
+    unsubOutput = subscribeSessionOutput(sessionId, { onReset, onData });
+  }
+
   // True when the host has no measurable area — a hidden (`display:none`)
   // terminal or one momentarily detached during a parent/tab swap. xterm can't
   // be measured then, and fitting it corrupts the grid, so all sizing is a
@@ -231,6 +245,10 @@
       fitFrame = null;
       if (!active || !openIfMeasurable() || !term) return;
       fitLocal();
+      // Now open + sized: safe to start (or catch up) the output replay. Covers
+      // the rare active-but-zero-size-at-mount case, where neither the visible
+      // mount path nor activate() ran but the box later gains a real size.
+      ensureSubscribed();
       // Tell the daemon the (possibly) new size, but trailing-debounced so the
       // child gets ONE SIGWINCH after the drag settles.
       resizeSessionDebounced(sessionId, term.cols, term.rows);
@@ -279,6 +297,8 @@
     requestAnimationFrame(() => {
       if (!active || !openIfMeasurable() || !term) return;
       fitLocal();
+      // Open + fitted to the live grid: now replay the ring at the correct size.
+      ensureSubscribed();
       resizeSessionDebounced(sessionId, term.cols, term.rows);
       // Now that the box has a real size, GPU-accelerate the active terminal.
       attachWebgl();
@@ -367,10 +387,10 @@
 
     term.onData((data) => sendInput(sessionId, data));
 
-    // Subscribe to this session's PTY output. The subscribe call catches up by
-    // delivering the ring's current contents via onData immediately, then feeds
-    // new tails as they arrive; onReset fires on a reconnect replay.
-    unsubOutput = subscribeSessionOutput(sessionId, { onReset, onData });
+    // Output subscription is deferred to the first open + fit (see
+    // ensureSubscribed): the visible-mount path below for a tab that mounts
+    // active, or activate()/scheduleFit() for one that mounts hidden — so the
+    // ring's catch-up replay is always parsed against the real grid.
 
     // Every observed size change schedules a coalesced local fit (rAF) and a
     // trailing-debounced daemon notify. A hidden terminal still ticks here
@@ -385,6 +405,9 @@
     // happens against a real box.
     if (active && openIfMeasurable() && term) {
       fitLocal();
+      // Open + fitted before the first replay, so the ring catch-up parses at
+      // the real grid rather than xterm's default 80x24.
+      ensureSubscribed();
       // Mounted visible — GPU-accelerate immediately (the rising-edge $effect
       // won't fire for an already-active mount).
       attachWebgl();
