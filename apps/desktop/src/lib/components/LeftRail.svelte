@@ -2,8 +2,9 @@
   // Left rail (mockup .rail-left): scrollable Projects→Worktrees tree above a
   // pinned footer (Add project · Settings). The brand block lives in the top
   // nav, not here, so the rail opens straight onto the tree.
+  import { goto } from "$app/navigation";
   import ProjectTree from "./ProjectTree.svelte";
-  import { addProjectOpen, settingsOpen } from "../overlays";
+  import { addProjectOpen } from "../overlays";
 
   let { collapsed = false }: { collapsed?: boolean } = $props();
 </script>
@@ -20,7 +21,7 @@
       >
       Add project
     </button>
-    <button class="foot-row" onclick={() => settingsOpen.set(true)}>
+    <button class="foot-row" onclick={() => goto("/settings")}>
       <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"
         ><circle cx="8" cy="8" r="2.2" /><path
           d="M8 1.5v1.8M8 12.7v1.8M14.5 8h-1.8M3.3 8H1.5M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3M12.6 12.6l-1.3-1.3M4.7 4.7 3.4 3.4"

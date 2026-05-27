@@ -21,6 +21,3 @@ export const removeWorktreeTarget = writable<Worktree | null>(null);
 
 // Create-PR dialog (also openable from its button in the Changes panel).
 export const createPrOpen = writable(false);
-
-// Settings dialog (opened from the left-rail footer "Settings" button).
-export const settingsOpen = writable(false);
