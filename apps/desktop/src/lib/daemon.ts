@@ -30,6 +30,7 @@ import {
   type SessionParent,
   type Worktree,
 } from "./types";
+import { draftModel, draftProvider, type DraftProvider } from "./settings";
 
 export type Connection = "connecting" | "ready" | "offline";
 
@@ -748,12 +749,21 @@ export async function commit(subject: string, body: string | null = null): Promi
   }
 }
 
+export async function listDraftModels(provider: DraftProvider): Promise<string[]> {
+  const response = await daemonRequest<Response & { models: string[] }>({
+    type: "list-draft-models",
+    provider,
+  });
+  return response.models;
+}
+
 export async function generateCommitDraft(): Promise<CommitDraft> {
   const worktreeId = get(gitWorktreeId);
   if (!worktreeId) throw new Error("Select a git worktree first.");
   const response = await daemonRequest<Response & { draft: CommitDraft }>({
     type: "generate-commit-draft",
     worktree_id: worktreeId,
+    settings: draftGenerationSettings(),
   });
   return response.draft;
 }
@@ -765,8 +775,16 @@ export async function generatePullRequestDraft(base: string | null): Promise<Pul
     type: "generate-pull-request-draft",
     worktree_id: worktreeId,
     base: base?.trim() || null,
+    settings: draftGenerationSettings(),
   });
   return response.draft;
+}
+
+function draftGenerationSettings(): { provider: string; model: string | null } {
+  return {
+    provider: get(draftProvider),
+    model: get(draftModel).trim() || null,
+  };
 }
 
 export async function push(): Promise<void> {

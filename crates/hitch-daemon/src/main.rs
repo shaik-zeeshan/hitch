@@ -17,6 +17,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+mod drafts;
+
+use drafts::{CommitDraftInput, DraftProviderConfig, PullRequestDraftInput};
 use hitch_agent::HookInstallOptions;
 use hitch_core::{
     Project, ProjectId, ProjectKind, Session, SessionId, SessionParent, Worktree, WorktreeId,
@@ -26,9 +29,10 @@ use hitch_git::{
     GitRepository, RemoveWorktreeRequest, StatusEntry, WorktreeCheckout,
 };
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage, ErrorCode,
-    Event, FileDiff, FileStatus, GitStatus, ProtocolError, PullRequestDraft, Request, Response,
-    WorktreeCreateMode, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
+    encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage,
+    DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
+    ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode, MAX_PTY_FRAME_LEN,
+    PROTOCOL_VERSION,
 };
 use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize};
 use hitch_store::Store;
@@ -59,6 +63,7 @@ struct Args {
     hook_helper: PathBuf,
     git: PathBuf,
     gh: PathBuf,
+    draft_provider: DraftProviderConfig,
     detach: bool,
 }
 
@@ -70,6 +75,7 @@ impl Args {
         let mut hook_helper = default_hook_helper_path();
         let mut git = PathBuf::from("git");
         let mut gh = PathBuf::from("gh");
+        let mut draft_provider = DraftProviderConfig::from_env()?;
         let mut detach = false;
         let mut args = std::env::args().skip(1);
 
@@ -111,10 +117,42 @@ impl Args {
                             .ok_or_else(|| "--gh requires a path".to_string())?,
                     );
                 }
+                "--draft-provider" => {
+                    let value = args.next().ok_or_else(|| {
+                        "--draft-provider requires stub, claude, or codex".to_string()
+                    })?;
+                    draft_provider.set_kind(&value)?;
+                }
+                "--claude" => {
+                    draft_provider.claude = PathBuf::from(
+                        args.next()
+                            .ok_or_else(|| "--claude requires a path".to_string())?,
+                    );
+                }
+                "--codex" => {
+                    draft_provider.codex = PathBuf::from(
+                        args.next()
+                            .ok_or_else(|| "--codex requires a path".to_string())?,
+                    );
+                }
+                "--draft-timeout-secs" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--draft-timeout-secs requires a value".to_string())?;
+                    draft_provider.set_timeout_secs(&value)?;
+                }
+                "--draft-model" => {
+                    let model = args
+                        .next()
+                        .ok_or_else(|| "--draft-model requires a value".to_string())?
+                        .trim()
+                        .to_string();
+                    draft_provider.model = (!model.is_empty()).then_some(model);
+                }
                 "--detach" => detach = true,
                 "--help" | "-h" => {
                     println!(
-                        "usage: hitch-daemon [--socket PATH] [--store PATH] [--managed-root PATH] [--hook-helper PATH] [--git PATH] [--gh PATH] [--detach]"
+                        "usage: hitch-daemon [--socket PATH] [--store PATH] [--managed-root PATH] [--hook-helper PATH] [--git PATH] [--gh PATH] [--draft-provider stub|claude|codex] [--draft-model MODEL] [--claude PATH] [--codex PATH] [--draft-timeout-secs N] [--detach]"
                     );
                     std::process::exit(0);
                 }
@@ -129,6 +167,7 @@ impl Args {
             hook_helper,
             git,
             gh,
+            draft_provider,
             detach,
         })
     }
@@ -142,6 +181,7 @@ struct DaemonConfig {
     hook_helper: PathBuf,
     git: PathBuf,
     gh: PathBuf,
+    draft_provider: DraftProviderConfig,
 }
 
 impl From<Args> for DaemonConfig {
@@ -153,13 +193,15 @@ impl From<Args> for DaemonConfig {
             hook_helper: args.hook_helper,
             git: args.git,
             gh: args.gh,
+            draft_provider: args.draft_provider,
         }
     }
 }
 
 fn detach_spawn(args: &Args) -> io::Result<()> {
     let exe = std::env::current_exe()?;
-    let child = Command::new(exe)
+    let mut child = Command::new(exe);
+    child
         .arg("--socket")
         .arg(&args.socket_path)
         .arg("--store")
@@ -172,6 +214,18 @@ fn detach_spawn(args: &Args) -> io::Result<()> {
         .arg(&args.git)
         .arg("--gh")
         .arg(&args.gh)
+        .arg("--draft-provider")
+        .arg(args.draft_provider.kind.label())
+        .arg("--claude")
+        .arg(&args.draft_provider.claude)
+        .arg("--codex")
+        .arg(&args.draft_provider.codex)
+        .arg("--draft-timeout-secs")
+        .arg(args.draft_provider.timeout.as_secs().to_string());
+    if let Some(model) = args.draft_provider.model.as_deref() {
+        child.arg("--draft-model").arg(model);
+    }
+    let child = child
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -640,22 +694,47 @@ fn handle_request<R: Read>(
             send_response(state, client_id, request_id, Response::Ack)?;
             broadcast_dirty(state, worktree_id)?;
         }
-        Request::GenerateCommitDraft { worktree_id } => {
-            let draft = generate_commit_draft(state, worktree_id)?;
-            send_response(
-                state,
+        Request::ListDraftModels { provider } => {
+            spawn_response_task(
+                "hitch-draft-models",
+                Arc::clone(state),
                 client_id,
                 request_id,
-                Response::CommitDraft { draft },
+                move |state| {
+                    let models = list_draft_models(state, provider)?;
+                    Ok(Response::DraftModels { provider, models })
+                },
             )?;
         }
-        Request::GeneratePullRequestDraft { worktree_id, base } => {
-            let draft = generate_pull_request_draft(state, worktree_id, base)?;
-            send_response(
-                state,
+        Request::GenerateCommitDraft {
+            worktree_id,
+            settings,
+        } => {
+            spawn_response_task(
+                "hitch-commit-draft",
+                Arc::clone(state),
                 client_id,
                 request_id,
-                Response::PullRequestDraft { draft },
+                move |state| {
+                    let draft = generate_commit_draft(state, worktree_id, settings)?;
+                    Ok(Response::CommitDraft { draft })
+                },
+            )?;
+        }
+        Request::GeneratePullRequestDraft {
+            worktree_id,
+            base,
+            settings,
+        } => {
+            spawn_response_task(
+                "hitch-pr-draft",
+                Arc::clone(state),
+                client_id,
+                request_id,
+                move |state| {
+                    let draft = generate_pull_request_draft(state, worktree_id, base, settings)?;
+                    Ok(Response::PullRequestDraft { draft })
+                },
             )?;
         }
         Request::Push { worktree_id } => {
@@ -1198,11 +1277,21 @@ fn git_diff(
     })
 }
 
+fn list_draft_models(
+    state: &Arc<Mutex<DaemonState>>,
+    provider: DraftProvider,
+) -> Result<Vec<String>, ProtocolError> {
+    let config = draft_provider_config(state)?;
+    drafts::list_models(&config, provider)
+}
+
 fn generate_commit_draft(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
+    settings: Option<DraftGenerationSettings>,
 ) -> Result<CommitDraft, ProtocolError> {
     let worktree = refreshed_worktree_context(state, worktree_id)?.1;
+    let provider = draft_provider_config(state)?.with_settings(settings);
     let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
     let summary = repo.status().map_err(git_error)?;
     let staged_paths = summary
@@ -1220,35 +1309,24 @@ fn generate_commit_draft(
 
     // Compose from the staged side only; unstaged worktree edits are ignored.
     let staged_patch = staged_diff(&worktree.path).map_err(git_error)?;
-    let primary = primary_area(&staged_paths);
-    let subject = format!("chore: update {primary}");
-    let mut body_lines = staged_paths
-        .iter()
-        .map(|path| format!("- Update {}", path.display()))
-        .collect::<Vec<_>>();
-    let changed_lines = staged_patch
-        .lines()
-        .filter(|line| {
-            (line.starts_with('+') || line.starts_with('-'))
-                && !line.starts_with("+++")
-                && !line.starts_with("---")
-        })
-        .count();
-    if changed_lines > 0 {
-        body_lines.push(format!("- Review {changed_lines} staged changed lines"));
-    }
-    Ok(CommitDraft {
-        subject,
-        body: body_lines.join("\n"),
-    })
+    drafts::generate_commit_draft(
+        &provider,
+        CommitDraftInput {
+            worktree_path: worktree.path,
+            staged_paths,
+            staged_patch,
+        },
+    )
 }
 
 fn generate_pull_request_draft(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
     base: Option<String>,
+    settings: Option<DraftGenerationSettings>,
 ) -> Result<PullRequestDraft, ProtocolError> {
     let worktree = refreshed_worktree_context(state, worktree_id)?.1;
+    let provider = draft_provider_config(state)?.with_settings(settings);
     let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
     let base = base
         .map(|base| base.trim().to_string())
@@ -1267,73 +1345,31 @@ fn generate_pull_request_draft(
     }
 
     let commits = repo.commits_since(&base, 25).map_err(git_error)?;
+    let commit_summaries = commits
+        .iter()
+        .filter_map(|commit| commit.summary.clone())
+        .collect::<Vec<_>>();
     let changed_paths = repo.changed_paths_since(&base).map_err(git_error)?;
     let diff = repo.diff_since(&base).map_err(git_error)?;
-    let title = title_from_branch(
-        &worktree.branch,
-        commits.first().and_then(|commit| commit.summary.as_deref()),
-    );
 
-    let mut body = String::from("## Summary\n\n");
-    if changed_paths.is_empty() {
-        body.push_str("- No committed file changes detected.\n");
-    } else {
-        for path in &changed_paths {
-            body.push_str(&format!("- Update {}\n", path.display()));
-        }
-    }
-    if !commits.is_empty() {
-        body.push_str("\n## Commits\n\n");
-        for commit in commits
-            .iter()
-            .filter_map(|commit| commit.summary.as_deref())
-        {
-            body.push_str(&format!("- {commit}\n"));
-        }
-    }
-    let changed_lines = diff
-        .lines()
-        .filter(|line| {
-            (line.starts_with('+') || line.starts_with('-'))
-                && !line.starts_with("+++")
-                && !line.starts_with("---")
-        })
-        .count();
-    if changed_lines > 0 {
-        body.push_str(&format!("\nChanged lines: {changed_lines}\n"));
-    }
-    body.push_str("\n## Testing\n\n- [ ] Not run");
-
-    Ok(PullRequestDraft { title, body })
+    drafts::generate_pull_request_draft(
+        &provider,
+        PullRequestDraftInput {
+            worktree_path: worktree.path,
+            branch: worktree.branch,
+            base,
+            commits: commit_summaries,
+            changed_paths,
+            diff,
+        },
+    )
 }
 
-fn primary_area(paths: &[PathBuf]) -> String {
-    paths
-        .first()
-        .and_then(|path| path.components().next())
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .unwrap_or_else(|| "files".into())
-}
-
-fn title_from_branch(branch: &str, first_commit: Option<&str>) -> String {
-    if let Some(summary) = first_commit.filter(|summary| !summary.trim().is_empty()) {
-        return summary.to_string();
-    }
-    branch
-        .rsplit('/')
-        .next()
-        .unwrap_or(branch)
-        .split(['-', '_'])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+fn draft_provider_config(
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<DraftProviderConfig, ProtocolError> {
+    let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    Ok(state.config.draft_provider.clone())
 }
 
 fn git_context(
@@ -1668,6 +1704,29 @@ fn replay_sessions_to_client(
         }
     }
     Ok(())
+}
+
+fn spawn_response_task<F>(
+    name: &'static str,
+    state: Arc<Mutex<DaemonState>>,
+    client_id: u64,
+    request_id: u64,
+    job: F,
+) -> Result<(), ProtocolError>
+where
+    F: FnOnce(&Arc<Mutex<DaemonState>>) -> Result<Response, ProtocolError> + Send + 'static,
+{
+    thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let response = match job(&state) {
+                Ok(response) => response,
+                Err(error) => Response::Error { error },
+            };
+            let _ = send_response(&state, client_id, request_id, response);
+        })
+        .map(|_| ())
+        .map_err(|err| internal(format!("failed to spawn {name}: {err}")))
 }
 
 fn send_response(

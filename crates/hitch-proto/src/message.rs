@@ -12,7 +12,7 @@ use hitch_core::{
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version for daemon/socket compatibility checks.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -142,12 +142,18 @@ pub enum Request {
         subject: String,
         body: Option<String>,
     },
+    /// List available Draft Generator models for a provider.
+    ListDraftModels { provider: DraftProvider },
     /// Generate a commit draft from staged changes.
-    GenerateCommitDraft { worktree_id: WorktreeId },
+    GenerateCommitDraft {
+        worktree_id: WorktreeId,
+        settings: Option<DraftGenerationSettings>,
+    },
     /// Generate a pull-request draft from branch context relative to `base`.
     GeneratePullRequestDraft {
         worktree_id: WorktreeId,
         base: Option<String>,
+        settings: Option<DraftGenerationSettings>,
     },
     /// Push the current branch using the system `git` CLI.
     Push { worktree_id: WorktreeId },
@@ -228,6 +234,10 @@ pub enum Response {
     },
     PullRequestDraft {
         draft: PullRequestDraft,
+    },
+    DraftModels {
+        provider: DraftProvider,
+        models: Vec<String>,
     },
     /// Command failed. Kept in-band so clients can correlate by request id.
     Error {
@@ -319,6 +329,22 @@ pub struct FileDiff {
     pub worktree_id: WorktreeId,
     pub path: PathBuf,
     pub diff: String,
+}
+
+/// Client-selected Draft Generator provider settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftGenerationSettings {
+    pub provider: DraftProvider,
+    pub model: Option<String>,
+}
+
+/// Headless provider used for Draft Generator runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DraftProvider {
+    Stub,
+    Claude,
+    Codex,
 }
 
 /// Generated commit text.
@@ -602,10 +628,23 @@ mod tests {
                 subject: "feat: add proto".into(),
                 body: Some("Body".into()),
             },
-            Request::GenerateCommitDraft { worktree_id },
+            Request::ListDraftModels {
+                provider: DraftProvider::Codex,
+            },
+            Request::GenerateCommitDraft {
+                worktree_id,
+                settings: Some(DraftGenerationSettings {
+                    provider: DraftProvider::Claude,
+                    model: Some("sonnet".into()),
+                }),
+            },
             Request::GeneratePullRequestDraft {
                 worktree_id,
                 base: Some("main".into()),
+                settings: Some(DraftGenerationSettings {
+                    provider: DraftProvider::Codex,
+                    model: Some("gpt-5-codex".into()),
+                }),
             },
             Request::Push { worktree_id },
             Request::CreatePullRequest {
@@ -666,6 +705,10 @@ mod tests {
                     title: "Add proto".into(),
                     body: "## Summary\n\n- Update src/lib.rs\n\n## Testing\n\n- [ ] Not run".into(),
                 },
+            },
+            Response::DraftModels {
+                provider: DraftProvider::Codex,
+                models: vec!["gpt-5-codex".into(), "gpt-5".into()],
             },
             Response::Error {
                 error: ProtocolError::new(ErrorCode::Unavailable, "daemon busy").retryable(true),

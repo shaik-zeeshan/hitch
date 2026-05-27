@@ -12,4 +12,5 @@ Hitch will support non-interactive draft generation for commit messages, commit 
 
 - Draft generation gets its own provider abstraction and IPC requests, separate from the Agent Registry and hook installation.
 - The daemon composes git context and draft providers; `src-tauri` remains a thin IPC client.
-- Initial implementation can ship with a deterministic stub provider before wiring a real headless CLI provider.
+- The desktop Settings UI selects provider/model and sends that selection on draft-generation IPC requests; Codex models come from `codex debug models`, while Claude uses documented aliases/latest-known IDs.
+- A deterministic stub provider remains available for tests and fallback, while Claude/Codex run as headless CLIs outside Agent Sessions.

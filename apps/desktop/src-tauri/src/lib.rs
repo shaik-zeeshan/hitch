@@ -472,65 +472,78 @@ struct DisconnectedPayload {
 }
 
 #[tauri::command]
-fn connect_daemon(app: AppHandle, state: State<'_, HitchClient>) -> Result<(), String> {
-    state.connect(&app)?;
-    match state.send_request(
-        &app,
-        Request::Hello {
-            client_name: "hitch-desktop".into(),
-            protocol_version: PROTOCOL_VERSION,
-        },
-    )? {
-        Response::Hello { .. } => Ok(()),
-        Response::Error { error } if error.code == ErrorCode::UnsupportedProtocol => {
-            state.restart_daemon(
-                &app,
-                format!("restarting incompatible daemon: {}", error.message),
-            )?;
-            match state.send_request(
-                &app,
-                Request::Hello {
-                    client_name: "hitch-desktop".into(),
-                    protocol_version: PROTOCOL_VERSION,
-                },
-            )? {
-                Response::Hello { .. } => Ok(()),
-                Response::Error { error } => Err(error.message),
-                other => Err(format!(
-                    "unexpected hello response after daemon restart: {other:?}"
-                )),
+async fn connect_daemon(app: AppHandle, state: State<'_, HitchClient>) -> Result<(), String> {
+    let client = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        client.connect(&app)?;
+        match client.send_request(
+            &app,
+            Request::Hello {
+                client_name: "hitch-desktop".into(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+        )? {
+            Response::Hello { .. } => Ok(()),
+            Response::Error { error } if error.code == ErrorCode::UnsupportedProtocol => {
+                client.restart_daemon(
+                    &app,
+                    format!("restarting incompatible daemon: {}", error.message),
+                )?;
+                match client.send_request(
+                    &app,
+                    Request::Hello {
+                        client_name: "hitch-desktop".into(),
+                        protocol_version: PROTOCOL_VERSION,
+                    },
+                )? {
+                    Response::Hello { .. } => Ok(()),
+                    Response::Error { error } => Err(error.message),
+                    other => Err(format!(
+                        "unexpected hello response after daemon restart: {other:?}"
+                    )),
+                }
             }
+            Response::Error { error } => Err(error.message),
+            other => Err(format!("unexpected hello response: {other:?}")),
         }
-        Response::Error { error } => Err(error.message),
-        other => Err(format!("unexpected hello response: {other:?}")),
-    }
+    })
+    .await
+    .map_err(|err| format!("daemon connection task failed: {err}"))?
 }
 
 #[tauri::command]
-fn hitch_request(
+async fn hitch_request(
     app: AppHandle,
     state: State<'_, HitchClient>,
     request: Request,
 ) -> Result<Response, String> {
-    state.send_request(&app, request)
+    let client = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || client.send_request(&app, request))
+        .await
+        .map_err(|err| format!("daemon request task failed: {err}"))?
 }
 
 #[tauri::command]
-fn send_session_input(
+async fn send_session_input(
     app: AppHandle,
     state: State<'_, HitchClient>,
     session_id: SessionId,
     data: String,
 ) -> Result<Response, String> {
-    let bytes = data.into_bytes();
-    state.send_request_with_payload(
-        &app,
-        Request::SendSessionInput {
-            session_id,
-            byte_count: bytes.len() as u32,
-        },
-        Some(bytes),
-    )
+    let client = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = data.into_bytes();
+        client.send_request_with_payload(
+            &app,
+            Request::SendSessionInput {
+                session_id,
+                byte_count: bytes.len() as u32,
+            },
+            Some(bytes),
+        )
+    })
+    .await
+    .map_err(|err| format!("session input task failed: {err}"))?
 }
 
 /// Menu-bar status line, e.g. "Hitch — running 2 sessions". The daemon keeps

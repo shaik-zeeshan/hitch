@@ -3,21 +3,65 @@
   // an overlay). Replaces the old SettingsDialog modal. A back control returns to
   // the shell via client-side navigation, so the daemon connection (owned by the
   // root layout) is never torn down. The left sub-nav is built to grow; today the
-  // only section with real settings is Editor, plus a static About — no dead UI.
+  // sections include Editor, Drafts, and static About — no dead UI.
   import { goto } from "$app/navigation";
+  import { listDraftModels } from "$lib/daemon";
   import { onMount } from "svelte";
-  import { DEFAULT_EDITOR, editorApp } from "$lib/settings";
+  import { Select } from "bits-ui";
+  import {
+    DEFAULT_DRAFT_MODEL,
+    DEFAULT_DRAFT_PROVIDER,
+    DEFAULT_EDITOR,
+    DRAFT_MODEL_OPTIONS,
+    draftModel,
+    draftProvider,
+    editorApp,
+    type DraftProvider,
+  } from "$lib/settings";
 
-  type Section = "editor" | "about";
+  type Section = "editor" | "drafts" | "about";
+  const DEFAULT_MODEL_VALUE = "__hitch_cli_default__";
+  const providerOptions: Array<{ value: DraftProvider; label: string }> = [
+    { value: "stub", label: "Stub (deterministic)" },
+    { value: "claude", label: "Claude" },
+    { value: "codex", label: "Codex" },
+  ];
+
   let section = $state<Section>("editor");
 
   // Staged editor value, committed (trimmed, with fallback) on Save / Enter /
   // blur — mirroring the old dialog so an empty field can't wipe the setting.
   let editor = $state("");
+  let draftProviderValue = $state<DraftProvider>(DEFAULT_DRAFT_PROVIDER);
+  let selectedDraftModel = $state(DEFAULT_MODEL_VALUE);
+  let modelOptions = $state<string[]>(DRAFT_MODEL_OPTIONS[DEFAULT_DRAFT_PROVIDER]);
+  let modelsLoading = $state(false);
+  let modelsError = $state<string | null>(null);
+  let modelLoadSeq = 0;
+  let lastDraftProvider: DraftProvider = DEFAULT_DRAFT_PROVIDER;
+  let draftsHydrated = false;
   let saved = $state(false);
+  let draftSaved = $state(false);
+  let selectableModels = $derived(
+    selectedDraftModel !== DEFAULT_MODEL_VALUE && !modelOptions.includes(selectedDraftModel)
+      ? [selectedDraftModel, ...modelOptions]
+      : modelOptions,
+  );
 
   onMount(() => {
     editor = $editorApp;
+    draftProviderValue = $draftProvider;
+    selectedDraftModel = $draftModel || DEFAULT_MODEL_VALUE;
+    lastDraftProvider = $draftProvider;
+    draftsHydrated = true;
+  });
+
+  $effect(() => {
+    if (draftsHydrated && draftProviderValue !== lastDraftProvider) {
+      selectedDraftModel = DEFAULT_MODEL_VALUE;
+      lastDraftProvider = draftProviderValue;
+    }
+    void loadModels(draftProviderValue);
   });
 
   function commitEditor() {
@@ -28,6 +72,51 @@
       saved = true;
       setTimeout(() => (saved = false), 1600);
     }
+  }
+
+  async function loadModels(provider: DraftProvider) {
+    const seq = ++modelLoadSeq;
+    modelsError = null;
+
+    // Stub and Claude use bundled/documented choices. Only Codex has a safe
+    // non-interactive CLI model listing (`codex debug models`).
+    if (provider !== "codex") {
+      modelOptions = DRAFT_MODEL_OPTIONS[provider];
+      modelsLoading = false;
+      return;
+    }
+
+    modelsLoading = true;
+    try {
+      const models = await withTimeout(listDraftModels(provider), 3500);
+      if (seq !== modelLoadSeq) return;
+      modelOptions = models.length > 0 ? models : DRAFT_MODEL_OPTIONS[provider];
+    } catch (err) {
+      if (seq !== modelLoadSeq) return;
+      const message = err instanceof Error ? err.message : String(err);
+      modelOptions = DRAFT_MODEL_OPTIONS[provider];
+      modelsError = message.includes("unknown variant `list-draft-models`")
+        ? "Restart Hitch to enable live Codex model discovery."
+        : message;
+    } finally {
+      if (seq === modelLoadSeq) modelsLoading = false;
+    }
+  }
+
+  function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) =>
+        setTimeout(() => reject(new Error("model discovery timed out; using fallback list")), ms),
+      ),
+    ]);
+  }
+
+  function commitDraftSettings() {
+    draftProvider.set(draftProviderValue);
+    draftModel.set(selectedDraftModel === DEFAULT_MODEL_VALUE ? DEFAULT_DRAFT_MODEL : selectedDraftModel);
+    draftSaved = true;
+    setTimeout(() => (draftSaved = false), 1600);
   }
 
   function back() {
@@ -56,6 +145,9 @@
     <nav class="s-nav" aria-label="Settings sections">
       <button class="nav-row" class:active={section === "editor"} onclick={() => (section = "editor")}>
         Editor
+      </button>
+      <button class="nav-row" class:active={section === "drafts"} onclick={() => (section = "drafts")}>
+        Drafts
       </button>
       <button class="nav-row" class:active={section === "about"} onclick={() => (section = "about")}>
         About
@@ -86,6 +178,74 @@
           <div class="row">
             <button class="btn primary" onclick={commitEditor}>Save</button>
             {#if saved}<span class="saved" role="status">Saved</span>{/if}
+          </div>
+        </section>
+      {:else if section === "drafts"}
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Drafts</h2>
+            <p class="help">
+              Provider and model used by <b>Generate</b> in commit and pull-request dialogs.
+              Claude and Codex run headlessly through their installed CLIs.
+            </p>
+          </div>
+          <div class="field">
+            <span>Provider</span>
+            <Select.Root type="single" bind:value={draftProviderValue}>
+              <Select.Trigger class="select-trigger base" aria-label="Draft provider">
+                <Select.Value placeholder="Choose provider" />
+                <span class="chev" aria-hidden="true">⌄</span>
+              </Select.Trigger>
+              <Select.Portal>
+                <Select.Content class="select-content" sideOffset={6}>
+                  <Select.Viewport>
+                    {#each providerOptions as option}
+                      <Select.Item class="select-item" value={option.value} label={option.label}>
+                        {option.label}
+                      </Select.Item>
+                    {/each}
+                  </Select.Viewport>
+                </Select.Content>
+              </Select.Portal>
+            </Select.Root>
+          </div>
+          <div class="field">
+            <span>Model</span>
+            <Select.Root type="single" bind:value={selectedDraftModel}>
+              <Select.Trigger class="select-trigger base" aria-label="Draft model">
+                <Select.Value placeholder={modelsLoading ? "Loading models…" : "Provider CLI default"} />
+                <span class="chev" aria-hidden="true">⌄</span>
+              </Select.Trigger>
+              <Select.Portal>
+                <Select.Content class="select-content" sideOffset={6}>
+                  <Select.Viewport>
+                    <Select.Item class="select-item" value={DEFAULT_MODEL_VALUE} label="Provider CLI default">
+                      Provider CLI default
+                    </Select.Item>
+                    {#each selectableModels as model}
+                      <Select.Item class="select-item" value={model} label={model}>
+                        {model}
+                      </Select.Item>
+                    {/each}
+                  </Select.Viewport>
+                </Select.Content>
+              </Select.Portal>
+            </Select.Root>
+          </div>
+          <p class="help">
+            {#if modelsLoading}
+              Loading models…
+            {:else if modelsError}
+              Using bundled fallback models: <span class="mono">{modelsError}</span>
+            {:else if draftProviderValue === "codex"}
+              Models are loaded with <span class="mono">codex debug models</span>. Choose default to omit <span class="mono">--model</span>.
+            {:else}
+              Claude uses documented aliases/latest known IDs. Choose default to omit <span class="mono">--model</span>.
+            {/if}
+          </p>
+          <div class="row">
+            <button class="btn primary" onclick={commitDraftSettings}>Save</button>
+            {#if draftSaved}<span class="saved" role="status">Saved</span>{/if}
           </div>
         </section>
       {:else if section === "about"}
@@ -220,6 +380,66 @@
   .panel-head .help b {
     color: var(--tx-md);
     font-weight: 540;
+  }
+  :global(.select-trigger) {
+    width: 100%;
+    min-height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    background: var(--bg-0);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    color: var(--tx-hi);
+    font: inherit;
+    font-size: 12.5px;
+    padding: 8px 10px;
+    text-align: left;
+    cursor: pointer;
+  }
+  :global(.select-trigger:focus-visible) {
+    outline: none;
+    border-color: var(--ac);
+  }
+  :global(.select-trigger:disabled) {
+    cursor: wait;
+    color: var(--tx-lo);
+  }
+  .chev {
+    color: var(--tx-lo);
+    font-size: 12px;
+  }
+  :global(.select-content) {
+    z-index: 1000;
+    min-width: var(--bits-select-anchor-width);
+    max-height: 260px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+    background: var(--bg-2);
+    box-shadow: var(--shadow-pop);
+    padding: 5px;
+  }
+  :global(.select-item) {
+    min-height: 30px;
+    display: flex;
+    align-items: center;
+    padding: 6px 8px;
+    border-radius: var(--radius);
+    color: var(--tx-md);
+    font-size: 12px;
+    font-family: var(--mono);
+    cursor: pointer;
+    outline: none;
+  }
+  :global(.select-item[data-highlighted]) {
+    background: var(--bg-4);
+    color: var(--tx-hi);
+  }
+  :global(.select-item[data-selected]) {
+    background: var(--ac-wash);
+    color: var(--tx-hi);
   }
 
   .row {
