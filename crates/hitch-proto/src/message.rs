@@ -12,7 +12,7 @@ use hitch_core::{
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version for daemon/socket compatibility checks.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -88,10 +88,15 @@ pub enum Request {
     /// Return sessions, optionally scoped to a worktree or plain project root.
     ListSessions { parent: Option<SessionParent> },
     /// Spawn a new PTY session. `command == None` means default shell.
+    /// `cols`/`rows` carry the client's initial terminal grid so the PTY spawns
+    /// at the right size (no first-fit reflow flash); `0` means "use the daemon
+    /// default" (mirrors [`ResizeSession`]'s fields).
     OpenSession {
         parent: SessionParent,
         name: String,
         command: Option<Vec<String>>,
+        cols: u16,
+        rows: u16,
     },
     /// Close a session. `kill_process` controls whether the PTY process is killed.
     CloseSession {
@@ -427,6 +432,25 @@ mod tests {
     }
 
     #[test]
+    fn open_session_carries_initial_size_as_contract() {
+        let (_, worktree_id, _) = ids();
+        let request = Request::OpenSession {
+            parent: SessionParent::Worktree(worktree_id),
+            name: "shell".into(),
+            command: Some(vec!["zsh".into()]),
+            cols: 132,
+            rows: 50,
+        };
+        let value: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["type"], "open-session");
+        assert_eq!(value["cols"], 132);
+        assert_eq!(value["rows"], 50);
+
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(request, back);
+    }
+
+    #[test]
     fn catalog_mentions_core_message_families() {
         assert!(crate::MESSAGE_CATALOG.contains("Request:"));
         assert!(crate::MESSAGE_CATALOG.contains("Response:"));
@@ -528,6 +552,8 @@ mod tests {
                 parent: SessionParent::Worktree(worktree_id),
                 name: "shell".into(),
                 command: Some(vec!["zsh".into(), "-l".into()]),
+                cols: 120,
+                rows: 40,
             },
             Request::CloseSession {
                 session_id,

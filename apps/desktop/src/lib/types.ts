@@ -76,11 +76,6 @@ export type Request = { type: string; [key: string]: unknown };
 export type Response = { type: string; [key: string]: unknown };
 export type HitchEvent = { type: string; [key: string]: unknown };
 
-export type SessionOutputPayload = {
-  session_id: Id;
-  data: string;
-};
-
 // ---- display maps ---------------------------------------------------------
 
 // Single-letter badge for a changed file's status (right-rail Changes list).

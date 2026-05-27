@@ -20,9 +20,49 @@ use hitch_proto::{
     Request, RequestId, Response, PROTOCOL_VERSION,
 };
 use serde::Serialize;
+use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
+
+/// Per-session bound on the bytes we stage before the webview registers that
+/// session's output channel. Mirrors the daemon's `DEFAULT_SCROLLBACK_CAPACITY`
+/// (1 MiB) so a brand-new session's first prompt survives the registration
+/// round-trip without letting staging grow without bound (ADR 0007).
+const OUTPUT_STAGING_CAPACITY: usize = 1024 * 1024;
+
+/// Routes raw PTY bytes to the webview per session (ADR 0007).
+///
+/// Lives in the Tauri process, NOT cleared on daemon disconnect, so a daemon
+/// restart/reconnect reuses the already-registered channels.
+///
+/// Channel type choice (verified against tauri 2.11.2): we store
+/// `Channel<InvokeResponseBody>` and send `InvokeResponseBody::Raw(bytes)`. That
+/// is the ONLY way to guarantee binary transmission on this version — the blanket
+/// `impl<T: Serialize> IpcResponse for T` would route `&[u8]`/`Vec<u8]` through
+/// serde as a JSON array of integers (`InvokeResponseBody::Json`, ~6x blowup).
+/// `Raw` is delivered to JS as an ArrayBuffer (small payloads via
+/// `new Uint8Array([...]).buffer`, large via the fetch-channel path), matching
+/// the JS side `new Channel<ArrayBuffer>()`.
+#[derive(Default)]
+struct OutputRouter {
+    channels: HashMap<SessionId, Channel<InvokeResponseBody>>,
+    /// Bytes that arrived before the channel was registered, per session.
+    staging: HashMap<SessionId, Vec<u8>>,
+}
+
+impl OutputRouter {
+    /// Append `payload` to a session's bounded staging buffer, trimming the head
+    /// on overflow so staging never exceeds `OUTPUT_STAGING_CAPACITY`.
+    fn stage(&mut self, session_id: SessionId, payload: &[u8]) {
+        let buf = self.staging.entry(session_id).or_default();
+        buf.extend_from_slice(payload);
+        if buf.len() > OUTPUT_STAGING_CAPACITY {
+            let drop = buf.len() - OUTPUT_STAGING_CAPACITY;
+            buf.drain(..drop);
+        }
+    }
+}
 
 #[derive(Clone)]
 struct HitchClient(Arc<HitchClientInner>);
@@ -39,6 +79,9 @@ struct HitchClientInner {
     sessions: Mutex<HashSet<SessionId>>,
     /// The tray's status line; populated once the tray is built in `setup`.
     tray_status: Mutex<Option<MenuItem<Wry>>>,
+    /// Per-session PTY-output channels + pre-registration staging (ADR 0007).
+    /// One mutex guards both maps; the struct it protects is small.
+    output_router: Mutex<OutputRouter>,
 }
 
 /// The tray's stable id, used to look it up for tooltip updates.
@@ -55,6 +98,7 @@ impl HitchClient {
             pending: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashSet::new()),
             tray_status: Mutex::new(None),
+            output_router: Mutex::new(OutputRouter::default()),
         }))
     }
 
@@ -392,14 +436,20 @@ fn reader_loop(app: &AppHandle, client: &HitchClient, stream: UnixStream) -> io:
                                 ),
                             ));
                         }
-                        app.emit(
-                            "hitch-session-output",
-                            SessionOutputPayload {
-                                session_id: *session_id,
-                                data: String::from_utf8_lossy(&payload).into_owned(),
-                            },
-                        )
-                        .map_err(io::Error::other)?;
+                        // Stream RAW bytes to the webview over the per-session
+                        // binary Channel — never stringify here (ADR 0007). If
+                        // the channel isn't registered yet (registration is a
+                        // round-trip the daemon may beat), stage the bytes so
+                        // the first prompt isn't lost.
+                        if let Ok(mut router) = client.0.output_router.lock() {
+                            if let Some(channel) = router.channels.get(session_id) {
+                                // Sending is best-effort: a dead webview channel
+                                // shouldn't tear down the daemon reader loop.
+                                let _ = channel.send(InvokeResponseBody::Raw(payload));
+                            } else {
+                                router.stage(*session_id, &payload);
+                            }
+                        }
                     }
                     Event::SessionOpened { session } => client.track_session(app, session.id, true),
                     Event::SessionClosed { session_id, .. } => {
@@ -458,12 +508,6 @@ fn daemon_binary_path() -> Option<PathBuf> {
     }
 
     None
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SessionOutputPayload {
-    session_id: SessionId,
-    data: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -531,6 +575,48 @@ fn send_session_input(
         },
         Some(bytes),
     )
+}
+
+/// Register the webview's per-session output channel (ADR 0007). Any bytes that
+/// arrived before registration are flushed immediately so a new session's first
+/// prompt isn't dropped. Re-registration (e.g. the same session re-subscribing)
+/// replaces the stored channel cleanly and drains whatever was staged since.
+#[tauri::command]
+fn register_session_output(
+    state: State<'_, HitchClient>,
+    session_id: SessionId,
+    channel: Channel<InvokeResponseBody>,
+) -> Result<(), String> {
+    let mut router = state
+        .0
+        .output_router
+        .lock()
+        .map_err(|_| "output-router lock poisoned".to_string())?;
+    if let Some(staged) = router.staging.remove(&session_id) {
+        if !staged.is_empty() {
+            // Best-effort: a dead channel here just means the session is gone.
+            let _ = channel.send(InvokeResponseBody::Raw(staged));
+        }
+    }
+    router.channels.insert(session_id, channel);
+    Ok(())
+}
+
+/// Drop a session's output channel + any staged bytes (ADR 0007). Called when
+/// the session closes or the webview tears its terminal down.
+#[tauri::command]
+fn unregister_session_output(
+    state: State<'_, HitchClient>,
+    session_id: SessionId,
+) -> Result<(), String> {
+    let mut router = state
+        .0
+        .output_router
+        .lock()
+        .map_err(|_| "output-router lock poisoned".to_string())?;
+    router.channels.remove(&session_id);
+    router.staging.remove(&session_id);
+    Ok(())
 }
 
 /// Menu-bar status line, e.g. "Hitch — running 2 sessions". The daemon keeps
@@ -611,6 +697,31 @@ mod tests {
     }
 }
 
+/// Make held keys repeat in the terminal on macOS.
+///
+/// WKWebView honours the `ApplePressAndHoldEnabled` user default. When it is on
+/// (the OS default), holding a key shows the accent-character popup and
+/// SUPPRESSES key repeat — so holding `j` in vim does nothing. We register the
+/// default to `NO`, process-scoped (registration domain is never persisted to
+/// disk), before the webview reads it. This is surprising but intentional and
+/// app-wide: the trade-off is that holding a key in any input field no longer
+/// opens the accent popup, which we accept for a terminal-native app.
+#[cfg(target_os = "macos")]
+fn disable_press_and_hold() {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
+
+    let key = NSString::from_str("ApplePressAndHoldEnabled");
+    let value: Retained<AnyObject> = NSNumber::numberWithBool(false).into();
+    let defaults = NSDictionary::from_retained_objects(&[&*key], &[value]);
+    // SAFETY: `defaults` is an `NSDictionary<NSString, AnyObject>`, matching the
+    // type `registerDefaults:` expects.
+    unsafe {
+        NSUserDefaults::standardUserDefaults().registerDefaults(&defaults);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -618,6 +729,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            disable_press_and_hold();
             build_tray(app)?;
             Ok(())
         })
@@ -632,7 +745,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             connect_daemon,
             hitch_request,
-            send_session_input
+            send_session_input,
+            register_session_output,
+            unregister_session_output
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -53,7 +53,7 @@ Request:
   create-worktree(project_id, branch, base?, mode)
   remove-worktree(worktree_id, delete_branch, force)
   list-sessions(parent?)
-  open-session(parent, name, command?)
+  open-session(parent, name, command?, cols, rows)
   close-session(session_id, kill_process)
   rename-session(session_id, name)
   send-session-input(session_id, byte_count)

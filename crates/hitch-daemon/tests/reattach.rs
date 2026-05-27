@@ -589,6 +589,8 @@ impl TestClient {
                 parent,
                 name: "test-shell".into(),
                 command: Some(command),
+                cols: 80,
+                rows: 24,
             },
         );
 

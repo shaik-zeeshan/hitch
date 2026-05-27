@@ -538,8 +538,10 @@ fn handle_request<R: Read>(
             parent,
             name,
             command,
+            cols,
+            rows,
         } => {
-            let session = open_session(state, parent, name, command, pty_tx)?;
+            let session = open_session(state, parent, name, command, cols, rows, pty_tx)?;
             send_response(
                 state,
                 client_id,
@@ -963,12 +965,25 @@ fn open_session(
     parent: SessionParent,
     name: String,
     command: Option<Vec<String>>,
+    cols: u16,
+    rows: u16,
     pty_tx: &mpsc::Sender<PtyEvent>,
 ) -> Result<Session, ProtocolError> {
     let cwd = session_parent_cwd(state, parent)?;
     let session = Session::new(name, parent, cwd.clone());
+    // Spawn at the client's initial grid so the terminal doesn't visibly reflow
+    // on its first fit. A `0` in either dimension means the client couldn't
+    // measure a size yet, so fall back to the daemon default rather than ever
+    // spawning a degenerate 0-sized PTY.
+    let size = if cols == 0 || rows == 0 {
+        TerminalSize::default()
+    } else {
+        TerminalSize::new(cols, rows)
+    };
     let pty = ManagedPty::spawn(
-        PtySpawnConfig::new(session.id, cwd).command(command),
+        PtySpawnConfig::new(session.id, cwd)
+            .command(command)
+            .size(size),
         pty_tx.clone(),
     )
     .map_err(|err| ProtocolError::new(ErrorCode::PtyFailed, err.to_string()))?;

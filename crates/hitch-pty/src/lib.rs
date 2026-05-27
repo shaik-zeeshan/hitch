@@ -18,6 +18,10 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 40;
 const DEFAULT_SCROLLBACK_CAPACITY: usize = 1024 * 1024;
+/// Reader thread read buffer size. A larger buffer means fewer output frames
+/// and less chance of splitting multi-byte sequences across reads under heavy
+/// output. This 64 KB array lives on the reader thread's stack.
+const READER_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Size of a terminal in character cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,7 +224,7 @@ fn spawn_reader_thread(
     thread::Builder::new()
         .name(format!("hitch-pty-reader-{}", pty.session_id()))
         .spawn(move || {
-            let mut buf = [0_u8; 8192];
+            let mut buf = [0_u8; READER_BUFFER_BYTES];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
