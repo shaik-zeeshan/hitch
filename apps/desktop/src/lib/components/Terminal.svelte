@@ -59,6 +59,7 @@
 
   let host: HTMLDivElement;
   let term: Xterm | null = null;
+  let opened = false;
   let fit: FitAddon | null = null;
   let webLinks: WebLinksAddon | null = null;
   let searchAddon: SearchAddon | null = null;
@@ -193,11 +194,24 @@
     return !host || host.clientWidth === 0 || host.clientHeight === 0;
   }
 
+  // xterm's `open()` measures DOM at attach time and requires a visible,
+  // measurable parent. Hidden session slots are `display:none`, so a Terminal
+  // may mount before it can be safely opened. Create the xterm instance and
+  // addons eagerly, but attach its DOM only when this slot is active and sized.
+  function openIfMeasurable(): boolean {
+    if (!term || isZeroSize()) return false;
+    if (!opened) {
+      term.open(host);
+      opened = true;
+    }
+    return true;
+  }
+
   // Reflow the local grid to the host size. Cheap and synchronous; the daemon
   // is NOT told here — that goes through the trailing debounce so the PTY child
   // sees one resize after the size settles, not one per frame.
   function fitLocal() {
-    if (!term || !fit || isZeroSize()) return;
+    if (!term || !fit || !opened || isZeroSize()) return;
     try {
       fit.fit();
       // Remember the grid we settled on so the NEXT session's PTY can open at
@@ -215,12 +229,11 @@
     if (fitFrame !== null) cancelAnimationFrame(fitFrame);
     fitFrame = requestAnimationFrame(() => {
       fitFrame = null;
+      if (!active || !openIfMeasurable() || !term) return;
       fitLocal();
       // Tell the daemon the (possibly) new size, but trailing-debounced so the
       // child gets ONE SIGWINCH after the drag settles.
-      if (term && !isZeroSize()) {
-        resizeSessionDebounced(sessionId, term.cols, term.rows);
-      }
+      resizeSessionDebounced(sessionId, term.cols, term.rows);
     });
   }
 
@@ -264,7 +277,7 @@
   // observer tick into one resize), and focus.
   function activate() {
     requestAnimationFrame(() => {
-      if (!term || isZeroSize()) return;
+      if (!active || !openIfMeasurable() || !term) return;
       fitLocal();
       resizeSessionDebounced(sessionId, term.cols, term.rows);
       // Now that the box has a real size, GPU-accelerate the active terminal.
@@ -273,8 +286,8 @@
     });
   }
 
-  // Drive fit-on-activate off the rising edge of `active` (hidden→visible). The
-  // initial mount already fits + focuses in onMount, so only react to changes.
+  // Drive open + fit-on-activate off the rising edge of `active` (hidden→visible).
+  // A visible initial mount opens/fits/focuses in onMount, so only react to changes.
   // `wasActive` seeds from the initial `active` purely to anchor the edge
   // detector; the $effect below keeps it in sync on every subsequent change.
   // svelte-ignore state_referenced_locally -- seeding the edge detector is intended
@@ -311,18 +324,6 @@
     // In-terminal search (Cmd+F overlay below).
     searchAddon = new SearchAddon();
     term.loadAddon(searchAddon);
-
-    term.open(host);
-    // Fit + focus only if we mounted visible. A non-active tab in the same
-    // parent mounts hidden (zero-size) alongside the active one; fitting it now
-    // would corrupt its grid, so we defer to fit-on-activate when it's shown.
-    if (active && !isZeroSize()) {
-      fitLocal();
-      // Mounted visible — GPU-accelerate immediately (the rising-edge $effect
-      // won't fire for an already-active mount).
-      attachWebgl();
-      term.focus();
-    }
 
     // "New output ↓" nudge wiring. On scroll, recompute whether the viewport is
     // pinned to the bottom; the moment the user returns to the bottom (by
@@ -373,14 +374,21 @@
 
     // Every observed size change schedules a coalesced local fit (rAF) and a
     // trailing-debounced daemon notify. A hidden terminal still ticks here
-    // (e.g. when the window resizes), but the zero-size guard inside makes
-    // those ticks no-ops — fit-on-activate catches the size up when it's shown.
+    // (e.g. when the window resizes), but the active + zero-size guards inside
+    // make those ticks no-ops — fit-on-activate catches the size up when shown.
     resizeObserver = new ResizeObserver(() => scheduleFit());
     resizeObserver.observe(host);
 
-    // Seed the daemon with the freshly-fitted size (debounced) when we mounted
-    // visible; a hidden mount skips this and is caught up by fit-on-activate.
-    if (active && term && !isZeroSize()) {
+    // Open + fit + focus only if we mounted visible. A non-active tab in the
+    // same parent mounts hidden (`display:none`) alongside the active one; even
+    // xterm.open() must be deferred until activation so xterm's DOM measurement
+    // happens against a real box.
+    if (active && openIfMeasurable() && term) {
+      fitLocal();
+      // Mounted visible — GPU-accelerate immediately (the rising-edge $effect
+      // won't fire for an already-active mount).
+      attachWebgl();
+      term.focus();
       resizeSessionDebounced(sessionId, term.cols, term.rows);
     }
   });
@@ -416,6 +424,7 @@
     }
     term?.dispose();
     term = null;
+    opened = false;
     fit = null;
     webLinks = null;
     searchAddon = null;
