@@ -106,8 +106,14 @@ impl OutputRouter {
     /// the registration gap.
     fn register_channel(&mut self, session_id: SessionId, channel: Channel<InvokeResponseBody>) {
         if let Some(staged) = self.staging.remove(&session_id) {
-            if !staged.is_empty() {
-                let _ = channel.send(InvokeResponseBody::Raw(staged));
+            if !staged.is_empty()
+                && channel
+                    .send(InvokeResponseBody::Raw(staged.clone()))
+                    .is_err()
+            {
+                self.channels.remove(&session_id);
+                self.staging.insert(session_id, staged);
+                return;
             }
         }
         self.channels.insert(session_id, channel);
@@ -835,6 +841,33 @@ mod tests {
         assert!(router.staging.contains_key(&session_id));
 
         router.prepare_fresh_registration(session_id);
+        assert!(!router.staging.contains_key(&session_id));
+    }
+
+    #[test]
+    fn registration_flush_failure_restages_staged_bytes() {
+        let session_id = SessionId::new();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let mut router = OutputRouter::default();
+
+        router.send_or_stage(session_id, b"early-prompt".to_vec());
+
+        router.register_channel(
+            session_id,
+            Channel::new(|_| Err(std::io::Error::other("closed channel").into())),
+        );
+
+        assert!(!router.channels.contains_key(&session_id));
+        assert_eq!(
+            router.staging.get(&session_id).cloned(),
+            Some(b"early-prompt".to_vec())
+        );
+
+        router.register_channel(session_id, recording_channel(received.clone()));
+        assert_eq!(
+            received.lock().unwrap().clone(),
+            vec![b"early-prompt".to_vec()]
+        );
         assert!(!router.staging.contains_key(&session_id));
     }
 
