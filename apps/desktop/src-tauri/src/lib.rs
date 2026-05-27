@@ -258,9 +258,10 @@ impl HitchClient {
             return;
         }
         let request_id = self.0.next_request_id.fetch_add(1, Ordering::SeqCst);
-        let Ok(bytes) =
-            encode_control_message(&ControlMessage::request(request_id, Request::ShutdownDaemon))
-        else {
+        let Ok(bytes) = encode_control_message(&ControlMessage::request(
+            request_id,
+            Request::ShutdownDaemon,
+        )) else {
             return;
         };
         if let Ok(mut guard) = self.0.writer.lock() {

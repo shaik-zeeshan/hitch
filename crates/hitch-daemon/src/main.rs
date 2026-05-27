@@ -465,13 +465,7 @@ fn handle_request<R: Read>(
             broadcast_event(state, Event::ProjectUpdated { project })?;
         }
         Request::ListWorktrees { project_id } => {
-            let worktrees = {
-                let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
-                state
-                    .store
-                    .list_worktrees(project_id)
-                    .map_err(store_error)?
-            };
+            let worktrees = list_worktrees(state, project_id)?;
             send_response(
                 state,
                 client_id,
@@ -617,14 +611,7 @@ fn handle_request<R: Read>(
             broadcast_dirty(state, worktree_id)?;
         }
         Request::Push { worktree_id } => {
-            let (git, worktree) = {
-                let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
-                let worktree =
-                    state.worktrees.get(&worktree_id).cloned().ok_or_else(|| {
-                        ProtocolError::new(ErrorCode::NotFound, "worktree not found")
-                    })?;
-                (state.git.clone(), worktree)
-            };
+            let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
             git.push(&worktree.path, "origin", &worktree.branch, true)
                 .map_err(git_error)?;
             send_response(state, client_id, request_id, Response::Ack)?;
@@ -636,14 +623,7 @@ fn handle_request<R: Read>(
             base,
             draft,
         } => {
-            let (git, worktree) = {
-                let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
-                let worktree =
-                    state.worktrees.get(&worktree_id).cloned().ok_or_else(|| {
-                        ProtocolError::new(ErrorCode::NotFound, "worktree not found")
-                    })?;
-                (state.git.clone(), worktree)
-            };
+            let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
             let url = git
                 .create_pr(
                     &worktree.path,
@@ -724,7 +704,7 @@ fn add_project_from_root(
 
     let (project_root, kind, branch) = match GitRepository::discover(&canonical) {
         Ok(repo) => {
-            let branch = repo.default_branch().unwrap_or_else(|_| "HEAD".into());
+            let branch = repo.current_branch().unwrap_or_else(|_| "HEAD".into());
             (
                 repo.root().to_path_buf(),
                 ProjectKind::GitBacked,
@@ -755,6 +735,49 @@ fn add_project_from_root(
         state.worktrees.insert(worktree.id, worktree);
     }
     Ok(project)
+}
+
+fn list_worktrees(
+    state: &Arc<Mutex<DaemonState>>,
+    project_id: ProjectId,
+) -> Result<Vec<Worktree>, ProtocolError> {
+    let worktrees = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        state
+            .store
+            .list_worktrees(project_id)
+            .map_err(store_error)?
+    };
+
+    worktrees
+        .into_iter()
+        .map(|worktree| {
+            refresh_worktree_branch_from_disk(state, worktree).map(|(worktree, _)| worktree)
+        })
+        .collect()
+}
+
+fn refresh_worktree_branch_from_disk(
+    state: &Arc<Mutex<DaemonState>>,
+    mut worktree: Worktree,
+) -> Result<(Worktree, bool), ProtocolError> {
+    let branch =
+        match GitRepository::discover(&worktree.path).and_then(|repo| repo.current_branch()) {
+            Ok(branch) => branch,
+            Err(_) => return Ok((worktree, false)),
+        };
+    if branch == worktree.branch {
+        return Ok((worktree, false));
+    }
+
+    worktree.branch = branch;
+    let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    state
+        .store
+        .update_worktree(&worktree)
+        .map_err(store_error)?;
+    state.worktrees.insert(worktree.id, worktree.clone());
+    Ok((worktree, true))
 }
 
 fn clone_project(
@@ -1022,10 +1045,19 @@ fn git_status(
             .cloned()
             .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?
     };
+    let (worktree, branch_changed) = refresh_worktree_branch_from_disk(state, worktree)?;
     let summary = GitRepository::discover(&worktree.path)
         .map_err(git_error)?
         .status()
         .map_err(git_error)?;
+    if branch_changed {
+        broadcast_event(
+            state,
+            Event::WorktreeUpdated {
+                worktree: worktree.clone(),
+            },
+        )?;
+    }
     Ok(GitStatus {
         worktree_id,
         branch: worktree.branch,
@@ -1075,6 +1107,31 @@ fn git_context(
         .get(&worktree_id)
         .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?;
     Ok((state.git.clone(), worktree.path.clone()))
+}
+
+fn refreshed_worktree_context(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+) -> Result<(GitClient, Worktree), ProtocolError> {
+    let (git, worktree) = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        let worktree = state
+            .worktrees
+            .get(&worktree_id)
+            .cloned()
+            .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?;
+        (state.git.clone(), worktree)
+    };
+    let (worktree, branch_changed) = refresh_worktree_branch_from_disk(state, worktree)?;
+    if branch_changed {
+        broadcast_event(
+            state,
+            Event::WorktreeUpdated {
+                worktree: worktree.clone(),
+            },
+        )?;
+    }
+    Ok((git, worktree))
 }
 
 fn broadcast_dirty(

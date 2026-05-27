@@ -72,6 +72,11 @@ impl GitRepository {
     pub fn default_branch(&self) -> Result<String> {
         default_branch(&self.root)
     }
+
+    /// Return the branch currently checked out in this worktree, including unborn branches.
+    pub fn current_branch(&self) -> Result<String> {
+        current_branch(&self.root)
+    }
 }
 
 /// Paths and executables used for write-side commands.
@@ -543,8 +548,13 @@ pub fn default_branch(repo_path: impl AsRef<Path>) -> Result<String> {
         }
     }
 
-    let head = repo.head().map_err(|_| GitError::NoHead)?;
-    head.shorthand().map(str::to_owned).ok_or(GitError::NoHead)
+    current_branch_from_repo(&repo)
+}
+
+/// Return the branch currently checked out in a worktree, including unborn branches.
+pub fn current_branch(repo_path: impl AsRef<Path>) -> Result<String> {
+    let repo = Repository::discover(repo_path.as_ref())?;
+    current_branch_from_repo(&repo)
 }
 
 /// Build the managed worktree path Hitch owns for a project branch.
@@ -659,10 +669,31 @@ fn create_pr_with_client(
     Ok(output.stdout.trim().to_string())
 }
 
-fn current_branch(repo_path: &Path) -> Result<String> {
-    let repo = Repository::discover(repo_path)?;
-    let head = repo.head().map_err(|_| GitError::NoHead)?;
-    head.shorthand().map(str::to_owned).ok_or(GitError::NoHead)
+fn current_branch_from_repo(repo: &Repository) -> Result<String> {
+    if let Ok(head) = repo.head() {
+        if let Some(branch) = branch_name_from_head(&head) {
+            return Ok(branch);
+        }
+    }
+
+    if let Ok(head) = repo.find_reference("HEAD") {
+        if let Some(branch) = branch_name_from_head(&head) {
+            return Ok(branch);
+        }
+    }
+
+    Err(GitError::NoHead)
+}
+
+fn branch_name_from_head(reference: &git2::Reference<'_>) -> Option<String> {
+    if let Some(target) = reference.symbolic_target() {
+        return target.strip_prefix("refs/heads/").map(str::to_owned);
+    }
+
+    match reference.shorthand()? {
+        "HEAD" => None,
+        branch => Some(branch.to_owned()),
+    }
 }
 
 fn branch_needs_push(repo_path: &Path, branch: &str) -> Result<bool> {
@@ -895,6 +926,17 @@ mod tests {
         let entry = entry.entry_for("first.txt").unwrap();
         assert_eq!(entry.index, FileState::Unmodified);
         assert_eq!(entry.working_tree, FileState::New);
+    }
+
+    #[test]
+    fn current_branch_reads_unborn_symbolic_head() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("repo");
+        fs::create_dir(&path).unwrap();
+        run_real_git(&path, ["init", "--initial-branch=main"]);
+
+        assert_eq!(current_branch(&path).unwrap(), "main");
+        assert_eq!(default_branch(&path).unwrap(), "main");
     }
 
     #[test]

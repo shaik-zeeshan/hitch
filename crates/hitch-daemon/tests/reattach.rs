@@ -139,6 +139,31 @@ fn graceful_quit_preserves_layout_for_next_launch() {
 }
 
 #[test]
+fn worktree_branch_tracks_unborn_head_renames() {
+    let socket = test_socket_path("unborn-branch");
+    let repo = test_dir_path("unborn-branch-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    run_git(&repo, ["init", "--initial-branch=placeholder"]);
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &repo);
+    let worktree = client.list_worktrees(3, project.id).remove(0);
+    assert_eq!(worktree.branch, "placeholder");
+
+    run_git(&repo, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let status = client.git_status(4, worktree.id);
+    assert_eq!(status.branch, "main");
+    let refreshed = client.list_worktrees(5, project.id).remove(0);
+    assert_eq!(refreshed.branch, "main");
+
+    client.shutdown(6);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(repo);
+}
+
+#[test]
 fn git_status_stage_and_unstage_round_trip_over_socket() {
     let socket = test_socket_path("git-flow");
     let repo = test_dir_path("git-repo");
@@ -213,7 +238,12 @@ fn stage_commit_push_and_create_pr_round_trip_over_socket() {
             message: "feat: change tracked".into(),
         },
     );
-    client.ack(7, Request::Push { worktree_id: worktree.id });
+    client.ack(
+        7,
+        Request::Push {
+            worktree_id: worktree.id,
+        },
+    );
 
     // The committed worktree is clean again, and the bare remote has the commit.
     assert!(!client.git_status(8, worktree.id).dirty);
