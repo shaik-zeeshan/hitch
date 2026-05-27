@@ -22,13 +22,13 @@ use hitch_core::{
     Project, ProjectId, ProjectKind, Session, SessionId, SessionParent, Worktree, WorktreeId,
 };
 use hitch_git::{
-    CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState, GitClient, GitRepository,
-    RemoveWorktreeRequest, StatusEntry, WorktreeCheckout,
+    staged_diff, CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState, GitClient,
+    GitRepository, RemoveWorktreeRequest, StatusEntry, WorktreeCheckout,
 };
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, ChangedFile, ControlMessage, ErrorCode, Event,
-    FileDiff, FileStatus, GitStatus, ProtocolError, Request, Response, WorktreeCreateMode,
-    MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
+    encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage, ErrorCode,
+    Event, FileDiff, FileStatus, GitStatus, ProtocolError, PullRequestDraft, Request, Response,
+    WorktreeCreateMode, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
 use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize};
 use hitch_store::Store;
@@ -481,6 +481,10 @@ fn handle_request<R: Read>(
             )?;
             broadcast_event(state, Event::ProjectUpdated { project })?;
         }
+        Request::RemoveProject { project_id, force } => {
+            remove_project(state, project_id, force)?;
+            send_response(state, client_id, request_id, Response::Ack)?;
+        }
         Request::ListWorktrees { project_id } => {
             let worktrees = list_worktrees(state, project_id)?;
             send_response(
@@ -627,12 +631,32 @@ fn handle_request<R: Read>(
         }
         Request::Commit {
             worktree_id,
-            message,
+            subject,
+            body,
         } => {
             let (git, worktree_path) = git_context(state, worktree_id)?;
-            git.commit(&worktree_path, &message).map_err(git_error)?;
+            git.commit(&worktree_path, &subject, body.as_deref())
+                .map_err(git_error)?;
             send_response(state, client_id, request_id, Response::Ack)?;
             broadcast_dirty(state, worktree_id)?;
+        }
+        Request::GenerateCommitDraft { worktree_id } => {
+            let draft = generate_commit_draft(state, worktree_id)?;
+            send_response(
+                state,
+                client_id,
+                request_id,
+                Response::CommitDraft { draft },
+            )?;
+        }
+        Request::GeneratePullRequestDraft { worktree_id, base } => {
+            let draft = generate_pull_request_draft(state, worktree_id, base)?;
+            send_response(
+                state,
+                client_id,
+                request_id,
+                Response::PullRequestDraft { draft },
+            )?;
         }
         Request::Push { worktree_id } => {
             let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
@@ -884,6 +908,57 @@ fn create_worktree(
     Ok(worktree)
 }
 
+fn remove_project(
+    state: &Arc<Mutex<DaemonState>>,
+    project_id: ProjectId,
+    force: bool,
+) -> Result<(), ProtocolError> {
+    let (worktree_ids, live_session_ids) = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        if !state.projects.contains_key(&project_id) {
+            return Err(ProtocolError::new(ErrorCode::NotFound, "project not found"));
+        }
+        let worktree_ids = state
+            .worktrees
+            .values()
+            .filter(|worktree| worktree.project_id == project_id)
+            .map(|worktree| worktree.id)
+            .collect::<Vec<_>>();
+        let live_session_ids = state
+            .sessions
+            .values()
+            .filter(|session| match session.session.parent {
+                SessionParent::Project(id) => id == project_id,
+                SessionParent::Worktree(id) => worktree_ids.contains(&id),
+            })
+            .map(|session| session.session.id)
+            .collect::<Vec<_>>();
+        (worktree_ids, live_session_ids)
+    };
+
+    if !force && !live_session_ids.is_empty() {
+        return Err(ProtocolError::new(
+            ErrorCode::LiveSessions,
+            "project has live sessions; retry with force to kill them",
+        ));
+    }
+
+    for session_id in live_session_ids {
+        close_session(state, session_id, true)?;
+    }
+
+    let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    state
+        .store
+        .delete_project(project_id)
+        .map_err(store_error)?;
+    state.projects.remove(&project_id);
+    for worktree_id in worktree_ids {
+        state.worktrees.remove(&worktree_id);
+    }
+    Ok(())
+}
+
 fn remove_worktree(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
@@ -1121,6 +1196,144 @@ fn git_diff(
         path,
         diff,
     })
+}
+
+fn generate_commit_draft(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+) -> Result<CommitDraft, ProtocolError> {
+    let worktree = refreshed_worktree_context(state, worktree_id)?.1;
+    let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
+    let summary = repo.status().map_err(git_error)?;
+    let staged_paths = summary
+        .entries
+        .iter()
+        .filter(|entry| entry.index != FileState::Unmodified)
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    if staged_paths.is_empty() {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "stage files before generating a commit draft",
+        ));
+    }
+
+    // Compose from the staged side only; unstaged worktree edits are ignored.
+    let staged_patch = staged_diff(&worktree.path).map_err(git_error)?;
+    let primary = primary_area(&staged_paths);
+    let subject = format!("chore: update {primary}");
+    let mut body_lines = staged_paths
+        .iter()
+        .map(|path| format!("- Update {}", path.display()))
+        .collect::<Vec<_>>();
+    let changed_lines = staged_patch
+        .lines()
+        .filter(|line| {
+            (line.starts_with('+') || line.starts_with('-'))
+                && !line.starts_with("+++")
+                && !line.starts_with("---")
+        })
+        .count();
+    if changed_lines > 0 {
+        body_lines.push(format!("- Review {changed_lines} staged changed lines"));
+    }
+    Ok(CommitDraft {
+        subject,
+        body: body_lines.join("\n"),
+    })
+}
+
+fn generate_pull_request_draft(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+    base: Option<String>,
+) -> Result<PullRequestDraft, ProtocolError> {
+    let worktree = refreshed_worktree_context(state, worktree_id)?.1;
+    let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
+    let base = base
+        .map(|base| base.trim().to_string())
+        .filter(|base| !base.is_empty())
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "enter a base branch before generating a PR draft",
+            )
+        })?;
+    if base == worktree.branch {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "choose a base branch different from the current branch",
+        ));
+    }
+
+    let commits = repo.commits_since(&base, 25).map_err(git_error)?;
+    let changed_paths = repo.changed_paths_since(&base).map_err(git_error)?;
+    let diff = repo.diff_since(&base).map_err(git_error)?;
+    let title = title_from_branch(
+        &worktree.branch,
+        commits.first().and_then(|commit| commit.summary.as_deref()),
+    );
+
+    let mut body = String::from("## Summary\n\n");
+    if changed_paths.is_empty() {
+        body.push_str("- No committed file changes detected.\n");
+    } else {
+        for path in &changed_paths {
+            body.push_str(&format!("- Update {}\n", path.display()));
+        }
+    }
+    if !commits.is_empty() {
+        body.push_str("\n## Commits\n\n");
+        for commit in commits
+            .iter()
+            .filter_map(|commit| commit.summary.as_deref())
+        {
+            body.push_str(&format!("- {commit}\n"));
+        }
+    }
+    let changed_lines = diff
+        .lines()
+        .filter(|line| {
+            (line.starts_with('+') || line.starts_with('-'))
+                && !line.starts_with("+++")
+                && !line.starts_with("---")
+        })
+        .count();
+    if changed_lines > 0 {
+        body.push_str(&format!("\nChanged lines: {changed_lines}\n"));
+    }
+    body.push_str("\n## Testing\n\n- [ ] Not run");
+
+    Ok(PullRequestDraft { title, body })
+}
+
+fn primary_area(paths: &[PathBuf]) -> String {
+    paths
+        .first()
+        .and_then(|path| path.components().next())
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .unwrap_or_else(|| "files".into())
+}
+
+fn title_from_branch(branch: &str, first_commit: Option<&str>) -> String {
+    if let Some(summary) = first_commit.filter(|summary| !summary.trim().is_empty()) {
+        return summary.to_string();
+    }
+    branch
+        .rsplit('/')
+        .next()
+        .unwrap_or(branch)
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn git_context(

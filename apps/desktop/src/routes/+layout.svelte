@@ -15,6 +15,7 @@
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import AddProjectDialog from "$lib/components/AddProjectDialog.svelte";
   import CreateWorktreeDialog from "$lib/components/CreateWorktreeDialog.svelte";
+  import RemoveProjectDialog from "$lib/components/RemoveProjectDialog.svelte";
   import RemoveWorktreeDialog from "$lib/components/RemoveWorktreeDialog.svelte";
 
   let { children } = $props();
@@ -58,6 +59,7 @@
 <CommandPalette />
 <AddProjectDialog />
 <CreateWorktreeDialog />
+<RemoveProjectDialog />
 <RemoveWorktreeDialog />
 
 <style>

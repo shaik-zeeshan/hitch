@@ -14,6 +14,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
 use hitch_core::{ProjectId, Worktree};
@@ -66,6 +67,21 @@ impl GitRepository {
     /// Return recent commits from `HEAD`, newest first.
     pub fn log(&self, limit: usize) -> Result<Vec<CommitInfo>> {
         log(&self.root, limit)
+    }
+
+    /// Return commits reachable from `HEAD` but not from `base`, newest first.
+    pub fn commits_since(&self, base: &str, limit: usize) -> Result<Vec<CommitInfo>> {
+        commits_since(&self.root, base, limit)
+    }
+
+    /// Return changed file paths for `HEAD` relative to `base`.
+    pub fn changed_paths_since(&self, base: &str) -> Result<Vec<PathBuf>> {
+        changed_paths_since(&self.root, base)
+    }
+
+    /// Return branch diff text for `HEAD` relative to `base`.
+    pub fn diff_since(&self, base: &str) -> Result<String> {
+        diff_since(&self.root, base)
     }
 
     /// Best-effort default branch detection: `origin/HEAD`, then current branch.
@@ -202,12 +218,21 @@ impl GitClient {
         Ok(output)
     }
 
-    /// Commit staged changes using the system git executable.
-    pub fn commit(&self, repo_path: impl AsRef<Path>, message: &str) -> Result<CommandOutput> {
-        self.run_git(
-            repo_path.as_ref(),
-            vec![os("commit"), os("-m"), os(message)],
-        )
+    /// Commit staged changes using the system git executable and a message file.
+    pub fn commit(
+        &self,
+        repo_path: impl AsRef<Path>,
+        subject: &str,
+        body: Option<&str>,
+    ) -> Result<CommandOutput> {
+        let repo_path = repo_path.as_ref();
+        let message_path = write_temp_commit_message(subject, body)?;
+        let result = self.run_git(
+            repo_path,
+            vec![os("commit"), os("-F"), path_os(&message_path)],
+        );
+        let _ = fs::remove_file(&message_path);
+        result
     }
 
     /// Push a branch using the system git executable.
@@ -578,19 +603,16 @@ pub fn diff_file(
         }
     };
 
-    let mut out = Vec::new();
-    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
-        // libgit2 reports the line origin (+/-/space) separately from the line
-        // content; re-prepend it for context/added/removed lines so the result
-        // is a valid unified diff. File and hunk headers ('F'/'H') already
-        // carry their own prefix in `content`, so they're left untouched.
-        if matches!(line.origin(), '+' | '-' | ' ') {
-            out.push(line.origin() as u8);
-        }
-        out.extend_from_slice(line.content());
-        true
-    })?;
-    Ok(String::from_utf8(out)?)
+    diff_to_string(&diff)
+}
+
+/// Read the complete staged diff using libgit2.
+pub fn staged_diff(repo_path: impl AsRef<Path>) -> Result<String> {
+    let repo = Repository::discover(repo_path.as_ref())?;
+    let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
+    let mut index = repo.index()?;
+    let diff = repo.diff_tree_to_index(head_tree.as_ref(), Some(&mut index), None)?;
+    diff_to_string(&diff)
 }
 
 /// List local and remote branches using libgit2.
@@ -631,19 +653,50 @@ pub fn log(repo_path: impl AsRef<Path>, limit: usize) -> Result<Vec<CommitInfo>>
     let mut revwalk = repo.revwalk()?;
     revwalk.push_head()?;
 
-    let mut commits = Vec::new();
-    for oid in revwalk.take(limit) {
-        let commit = repo.find_commit(oid?)?;
-        let author = commit.author();
-        commits.push(CommitInfo {
-            id: commit.id().to_string(),
-            summary: commit.summary().map(str::to_owned),
-            author_name: author.name().map(str::to_owned),
-            author_email: author.email().map(str::to_owned),
-            time_seconds: commit.time().seconds(),
-        });
+    commits_from_revwalk(&repo, revwalk, limit)
+}
+
+/// Return commits reachable from `HEAD` but not from `base`, newest first.
+pub fn commits_since(
+    repo_path: impl AsRef<Path>,
+    base: &str,
+    limit: usize,
+) -> Result<Vec<CommitInfo>> {
+    let repo = Repository::discover(repo_path.as_ref())?;
+    let head = repo.head()?.target().ok_or(GitError::NoHead)?;
+    let base = resolve_base_oid(&repo, base)?;
+    let merge_base = repo.merge_base(head, base).unwrap_or(base);
+    let mut revwalk = repo.revwalk()?;
+    revwalk.push(head)?;
+    revwalk.hide(merge_base)?;
+    commits_from_revwalk(&repo, revwalk, limit)
+}
+
+/// Return changed file paths for `HEAD` relative to `base`.
+pub fn changed_paths_since(repo_path: impl AsRef<Path>, base: &str) -> Result<Vec<PathBuf>> {
+    let repo = Repository::discover(repo_path.as_ref())?;
+    let diff = diff_since_base(&repo, base)?;
+    let mut paths = Vec::new();
+    for delta in diff.deltas() {
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(Path::to_path_buf);
+        if let Some(path) = path {
+            paths.push(path);
+        }
     }
-    Ok(commits)
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Return branch diff text for `HEAD` relative to `base`.
+pub fn diff_since(repo_path: impl AsRef<Path>, base: &str) -> Result<String> {
+    let repo = Repository::discover(repo_path.as_ref())?;
+    let diff = diff_since_base(&repo, base)?;
+    diff_to_string(&diff)
 }
 
 /// Best-effort default branch detection: `origin/HEAD`, then current branch.
@@ -777,6 +830,89 @@ fn create_pr_with_client(
 
     let output = client.run_gh(repo_path, args)?;
     Ok(output.stdout.trim().to_string())
+}
+
+fn commits_from_revwalk(
+    repo: &Repository,
+    revwalk: git2::Revwalk<'_>,
+    limit: usize,
+) -> Result<Vec<CommitInfo>> {
+    let mut commits = Vec::new();
+    for oid in revwalk.take(limit) {
+        let commit = repo.find_commit(oid?)?;
+        let author = commit.author();
+        commits.push(CommitInfo {
+            id: commit.id().to_string(),
+            summary: commit.summary().map(str::to_owned),
+            author_name: author.name().map(str::to_owned),
+            author_email: author.email().map(str::to_owned),
+            time_seconds: commit.time().seconds(),
+        });
+    }
+    Ok(commits)
+}
+
+fn diff_since_base<'repo>(repo: &'repo Repository, base: &str) -> Result<git2::Diff<'repo>> {
+    let head = repo.head()?.target().ok_or(GitError::NoHead)?;
+    let base = resolve_base_oid(repo, base)?;
+    let merge_base = repo.merge_base(head, base).unwrap_or(base);
+    let base_tree = repo.find_commit(merge_base)?.tree()?;
+    let head_tree = repo.find_commit(head)?.tree()?;
+    Ok(repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)?)
+}
+
+fn resolve_base_oid(repo: &Repository, base: &str) -> Result<Oid> {
+    let candidates = [
+        base.to_string(),
+        format!("origin/{base}"),
+        format!("refs/heads/{base}"),
+    ];
+    for candidate in candidates {
+        if let Ok(object) = repo.revparse_single(&candidate) {
+            return Ok(object.peel_to_commit()?.id());
+        }
+    }
+    Err(GitError::Git(git2::Error::from_str(&format!(
+        "base branch not found: {base}"
+    ))))
+}
+
+fn diff_to_string(diff: &git2::Diff<'_>) -> Result<String> {
+    let mut out = Vec::new();
+    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+        // libgit2 reports the line origin (+/-/space) separately from the line
+        // content; re-prepend it for context/added/removed lines so the result
+        // is a valid unified diff. File and hunk headers ('F'/'H') already
+        // carry their own prefix in `content`, so they're left untouched.
+        if matches!(line.origin(), '+' | '-' | ' ') {
+            out.push(line.origin() as u8);
+        }
+        out.extend_from_slice(line.content());
+        true
+    })?;
+    Ok(String::from_utf8(out)?)
+}
+
+fn write_temp_commit_message(subject: &str, body: Option<&str>) -> Result<PathBuf> {
+    let mut message = subject.trim().to_string();
+    if let Some(body) = body.map(str::trim).filter(|body| !body.is_empty()) {
+        message.push_str("\n\n");
+        message.push_str(body);
+        message.push('\n');
+    } else {
+        message.push('\n');
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let path = std::env::temp_dir().join(format!(
+        "hitch-commit-message-{}-{nanos}.txt",
+        std::process::id()
+    ));
+    fs::write(&path, message)?;
+    Ok(path)
 }
 
 fn current_branch_from_repo(repo: &Repository) -> Result<String> {
@@ -1036,7 +1172,9 @@ mod tests {
         client
             .stage_files(fixture.path(), &[PathBuf::from("tracked.txt")])
             .unwrap();
-        client.commit(fixture.path(), "update tracked").unwrap();
+        client
+            .commit(fixture.path(), "update tracked", None)
+            .unwrap();
         assert!(!status(fixture.path()).unwrap().dirty);
     }
 
@@ -1187,9 +1325,37 @@ mod tests {
         client
             .stage_files(fixture.path(), &[PathBuf::from("tracked.txt")])
             .unwrap();
-        client.commit(fixture.path(), "hooked commit").unwrap();
+        client
+            .commit(fixture.path(), "hooked commit", None)
+            .unwrap();
 
         assert_eq!(fs::read_to_string(marker).unwrap(), "hook\n");
+    }
+
+    #[test]
+    fn commit_preserves_multiline_subject_and_body() {
+        let fixture = RepoFixture::new();
+        fixture.write("tracked.txt", "body commit\n");
+        let client = GitClient::default();
+        client
+            .stage_files(fixture.path(), &[PathBuf::from("tracked.txt")])
+            .unwrap();
+        client
+            .commit(
+                fixture.path(),
+                "feat: update tracked",
+                Some("First body line\n\nSecond body line"),
+            )
+            .unwrap();
+
+        let output = Command::new("git")
+            .current_dir(fixture.path())
+            .args(["log", "-1", "--pretty=%B"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let message = String::from_utf8(output.stdout).unwrap();
+        assert!(message.starts_with("feat: update tracked\n\nFirst body line\n\nSecond body line"));
     }
 
     #[test]
@@ -1206,6 +1372,13 @@ mod tests {
             .any(|branch| branch.name == "feature/list" && branch.is_head));
         let log = log(fixture.path(), 2).unwrap();
         assert_eq!(log[0].summary.as_deref(), Some("feature commit"));
+
+        let branch_commits = commits_since(fixture.path(), "main", 10).unwrap();
+        assert_eq!(branch_commits[0].summary.as_deref(), Some("feature commit"));
+        let changed = changed_paths_since(fixture.path(), "main").unwrap();
+        assert_eq!(changed, vec![PathBuf::from("feature.txt")]);
+        let branch_diff = diff_since(fixture.path(), "main").unwrap();
+        assert!(branch_diff.contains("feature.txt"));
     }
 
     #[test]

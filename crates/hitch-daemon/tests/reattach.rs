@@ -7,8 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hitch_core::{Project, Session, SessionId, SessionParent, Worktree};
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, ControlMessage, ErrorCode, Event, GitStatus, Request,
-    Response, PROTOCOL_VERSION,
+    encode_control_message, encode_pty_frame, CommitDraft, ControlMessage, ErrorCode, Event,
+    GitStatus, PullRequestDraft, Request, Response, PROTOCOL_VERSION,
 };
 
 #[test]
@@ -208,6 +208,53 @@ fn git_status_stage_and_unstage_round_trip_over_socket() {
 }
 
 #[test]
+fn draft_generation_round_trips_over_socket() {
+    let socket = test_socket_path("drafts");
+    let repo = test_dir_path("drafts-repo");
+    init_git_repo(&repo);
+    run_git(&repo, ["checkout", "-b", "feature/draft-text"]);
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &repo);
+    let worktree = client.list_worktrees(3, project.id).remove(0);
+
+    std::fs::write(repo.join("tracked.txt"), "staged\n").unwrap();
+    std::fs::write(repo.join("unstaged.txt"), "unstaged\n").unwrap();
+    client.ack(
+        4,
+        Request::StageFiles {
+            worktree_id: worktree.id,
+            paths: vec!["tracked.txt".into()],
+        },
+    );
+    let commit = client.generate_commit_draft(5, worktree.id);
+    assert_eq!(commit.subject, "chore: update tracked.txt");
+    assert!(commit.body.contains("tracked.txt"));
+    assert!(!commit.body.contains("unstaged.txt"));
+
+    client.ack(
+        6,
+        Request::Commit {
+            worktree_id: worktree.id,
+            subject: commit.subject,
+            body: Some(commit.body),
+        },
+    );
+    let pr = client.generate_pr_draft(7, worktree.id, Some("main".into()));
+    assert!(pr.title.contains("update") || pr.title.contains("tracked"));
+    assert!(pr.body.contains("## Summary"));
+    assert!(pr.body.contains("tracked.txt"));
+    assert!(pr.body.contains("## Testing"));
+    assert!(pr.body.contains("- [ ] Not run"));
+
+    client.shutdown(8);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(repo);
+}
+
+#[test]
 fn discard_files_round_trip_over_socket_keeps_connection_open() {
     let socket = test_socket_path("git-discard");
     let repo = test_dir_path("git-discard-repo");
@@ -304,7 +351,8 @@ fn stage_commit_push_and_create_pr_round_trip_over_socket() {
         6,
         Request::Commit {
             worktree_id: worktree.id,
-            message: "feat: change tracked".into(),
+            subject: "feat: change tracked".into(),
+            body: None,
         },
     );
     client.ack(
@@ -527,6 +575,49 @@ impl TestClient {
                     response: Response::Error { error },
                     ..
                 }) => panic!("git status failed: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
+
+    fn generate_commit_draft(
+        &mut self,
+        id: u64,
+        worktree_id: hitch_core::WorktreeId,
+    ) -> CommitDraft {
+        self.send_request(id, Request::GenerateCommitDraft { worktree_id });
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::CommitDraft { draft },
+                }) if response_id == id => return draft,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("generate commit draft failed: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
+
+    fn generate_pr_draft(
+        &mut self,
+        id: u64,
+        worktree_id: hitch_core::WorktreeId,
+        base: Option<String>,
+    ) -> PullRequestDraft {
+        self.send_request(id, Request::GeneratePullRequestDraft { worktree_id, base });
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::PullRequestDraft { draft },
+                }) if response_id == id => return draft,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("generate PR draft failed: {error:?}"),
                 Packet::Control(_) | Packet::Output { .. } => continue,
             }
         }

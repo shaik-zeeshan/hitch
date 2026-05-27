@@ -19,7 +19,7 @@
     worktreeLineStats,
     worktrees,
   } from "../daemon";
-  import { createWorktreeFor, removeWorktreeTarget } from "../overlays";
+  import { createWorktreeFor, removeProjectTarget, removeWorktreeTarget } from "../overlays";
   import { AGENT_LABEL, type Id, type Project, type Worktree } from "../types";
 
   // Open a session under a worktree, selecting it first so the new session
@@ -103,66 +103,115 @@
   {#each $projects as project (project.id)}
     {@const status = $agentStateByProject[project.id]}
     {@const expanded = isExpanded(project)}
-    <div
-      class="row"
-      class:sel={project.id === $selectedProjectId && $selectedWorktreeId === null}
-      role="button"
-      tabindex="0"
-      onclick={() => selectProject(project)}
-      onkeydown={(e) => onProjectKey(e, project)}
-    >
-      {#if project.kind === "git-backed"}
-        <button
-          class="twirl"
-          class:open={expanded}
-          aria-label={expanded ? "Collapse" : "Expand"}
-          onclick={(e) => {
-            e.stopPropagation();
-            toggleExpand(project);
-          }}
-        >
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
-            ><path d="M6 4l4 4-4 4" /></svg
+    <ContextMenu.Root>
+      <ContextMenu.Trigger>
+        {#snippet child({ props })}
+          <div
+            {...props}
+            class="row"
+            class:sel={project.id === $selectedProjectId && $selectedWorktreeId === null}
+            role="button"
+            tabindex="0"
+            onclick={() => selectProject(project)}
+            onkeydown={(e) => onProjectKey(e, project)}
           >
-        </button>
-      {:else}
-        <span class="twirl"></span>
-      {/if}
+            {#if project.kind === "git-backed"}
+              <button
+                class="twirl"
+                class:open={expanded}
+                aria-label={expanded ? "Collapse" : "Expand"}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  toggleExpand(project);
+                }}
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                  ><path d="M6 4l4 4-4 4" /></svg
+                >
+              </button>
+            {:else}
+              <span class="twirl"></span>
+            {/if}
 
-      {#if project.kind === "git-backed"}
-        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-          ><circle cx="4" cy="4" r="1.8" /><circle cx="4" cy="12" r="1.8" /><circle cx="12" cy="6" r="1.8" /><path
-            d="M4 5.8v4.4M5.7 4.5c3 0 4.6 0 5.3 0M11 7.7c0 1.5-1.4 2.4-3.2 2.4H5.8"
-          /></svg
-        >
-      {:else}
-        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-          ><path d="M1.5 4.5a2 2 0 0 1 2-2h3l1.5 1.6h4.5a2 2 0 0 1 2 2v5.4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z" /></svg
-        >
-      {/if}
+            {#if project.kind === "git-backed"}
+              <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                ><circle cx="4" cy="4" r="1.8" /><circle cx="4" cy="12" r="1.8" /><circle cx="12" cy="6" r="1.8" /><path
+                  d="M4 5.8v4.4M5.7 4.5c3 0 4.6 0 5.3 0M11 7.7c0 1.5-1.4 2.4-3.2 2.4H5.8"
+                /></svg
+              >
+            {:else}
+              <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                ><path d="M1.5 4.5a2 2 0 0 1 2-2h3l1.5 1.6h4.5a2 2 0 0 1 2 2v5.4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z" /></svg
+              >
+            {/if}
 
-      <span class="lbl">{project.name}</span>
+            <span class="lbl">{project.name}</span>
 
-      {#if !expanded && status}
-        <span class="status {AGENT_LABEL[status].cls}">{AGENT_LABEL[status].label}</span>
-      {/if}
+            {#if !expanded && status}
+              <span class="status {AGENT_LABEL[status].cls}">{AGENT_LABEL[status].label}</span>
+            {/if}
 
-      {#if project.kind === "git-backed"}
-        <button
-          class="quick-add"
-          aria-label={`New worktree in ${project.name}`}
-          title={`New worktree in ${project.name}`}
-          onclick={(e) => {
-            e.stopPropagation();
-            createWorktreeFor.set(project);
-          }}
-        >
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
-            ><path d="M8 3.5v9M3.5 8h9" /></svg
-          >
-        </button>
-      {/if}
-    </div>
+            {#if project.kind === "git-backed"}
+              <button
+                class="quick-add"
+                aria-label={`New worktree in ${project.name}`}
+                title={`New worktree in ${project.name}`}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  createWorktreeFor.set(project);
+                }}
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                  ><path d="M8 3.5v9M3.5 8h9" /></svg
+                >
+              </button>
+            {/if}
+          </div>
+        {/snippet}
+      </ContextMenu.Trigger>
+      <ContextMenu.Portal>
+        <ContextMenu.Content class="menu">
+          {#if project.kind === "git-backed"}
+            <ContextMenu.Item class="mi" onSelect={() => createWorktreeFor.set(project)}>
+              <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                ><path d="M8 3.5v9M3.5 8h9" /></svg
+              >
+              New worktree…
+            </ContextMenu.Item>
+            <ContextMenu.Separator class="m-sep" />
+          {/if}
+          <ContextMenu.Item class="mi" onSelect={() => void revealInFinder(project.root)}>
+            <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+              ><path d="M1.5 4.5a2 2 0 0 1 2-2h3l1.5 1.6h4.5a2 2 0 0 1 2 2v5.4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z" /></svg
+            >
+            Reveal in Finder
+          </ContextMenu.Item>
+          <ContextMenu.Item class="mi" onSelect={() => void openInEditor(project.root)}>
+            <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+              ><rect x="2" y="3" width="12" height="10" rx="2" /><path d="M6 6l-2 2 2 2M10 6l2 2-2 2" /></svg
+            >
+            Open in editor
+          </ContextMenu.Item>
+          <ContextMenu.Item class="mi" onSelect={() => void copyPath(project.root)}>
+            <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+              ><rect x="3" y="3" width="8" height="8" rx="1.5" /><path
+                d="M5.5 3V2.2a1 1 0 0 1 1-1H13a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1h-.8"
+              /></svg
+            >
+            Copy path
+          </ContextMenu.Item>
+          <ContextMenu.Separator class="m-sep" />
+          <ContextMenu.Item class="mi danger" onSelect={() => removeProjectTarget.set(project)}>
+            <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+              ><path
+                d="M3 4.5h10M6 4.5V3.2a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V4.5M4.5 4.5l.6 8a1 1 0 0 0 1 1h3.8a1 1 0 0 0 1-1l.6-8"
+              /></svg
+            >
+            Remove project…
+          </ContextMenu.Item>
+        </ContextMenu.Content>
+      </ContextMenu.Portal>
+    </ContextMenu.Root>
 
     {#if expanded}
       <div class="worktrees">

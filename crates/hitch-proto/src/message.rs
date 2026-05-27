@@ -12,7 +12,7 @@ use hitch_core::{
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version for daemon/socket compatibility checks.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -68,6 +68,8 @@ pub enum Request {
         destination: PathBuf,
         name: Option<String>,
     },
+    /// Forget a project and its Hitch-owned layout. Does not delete the project root.
+    RemoveProject { project_id: ProjectId, force: bool },
 
     /// Return worktrees belonging to a git-backed project.
     ListWorktrees { project_id: ProjectId },
@@ -137,7 +139,15 @@ pub enum Request {
     /// Commit staged files using the system `git` CLI.
     Commit {
         worktree_id: WorktreeId,
-        message: String,
+        subject: String,
+        body: Option<String>,
+    },
+    /// Generate a commit draft from staged changes.
+    GenerateCommitDraft { worktree_id: WorktreeId },
+    /// Generate a pull-request draft from branch context relative to `base`.
+    GeneratePullRequestDraft {
+        worktree_id: WorktreeId,
+        base: Option<String>,
     },
     /// Push the current branch using the system `git` CLI.
     Push { worktree_id: WorktreeId },
@@ -212,6 +222,12 @@ pub enum Response {
     },
     PullRequestCreated {
         url: String,
+    },
+    CommitDraft {
+        draft: CommitDraft,
+    },
+    PullRequestDraft {
+        draft: PullRequestDraft,
     },
     /// Command failed. Kept in-band so clients can correlate by request id.
     Error {
@@ -303,6 +319,20 @@ pub struct FileDiff {
     pub worktree_id: WorktreeId,
     pub path: PathBuf,
     pub diff: String,
+}
+
+/// Generated commit text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitDraft {
+    pub subject: String,
+    pub body: String,
+}
+
+/// Generated pull-request text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestDraft {
+    pub title: String,
+    pub body: String,
 }
 
 /// Structured in-band protocol/application error.
@@ -509,6 +539,10 @@ mod tests {
                 destination: "/tmp/hitch".into(),
                 name: Some("hitch".into()),
             },
+            Request::RemoveProject {
+                project_id,
+                force: true,
+            },
             Request::ListWorktrees { project_id },
             Request::CreateWorktree {
                 project_id,
@@ -565,7 +599,13 @@ mod tests {
             },
             Request::Commit {
                 worktree_id,
-                message: "feat: add proto".into(),
+                subject: "feat: add proto".into(),
+                body: Some("Body".into()),
+            },
+            Request::GenerateCommitDraft { worktree_id },
+            Request::GeneratePullRequestDraft {
+                worktree_id,
+                base: Some("main".into()),
             },
             Request::Push { worktree_id },
             Request::CreatePullRequest {
@@ -614,6 +654,18 @@ mod tests {
             },
             Response::PullRequestCreated {
                 url: "https://github.com/example/hitch/pull/1".into(),
+            },
+            Response::CommitDraft {
+                draft: CommitDraft {
+                    subject: "chore: update src".into(),
+                    body: "- Update src/lib.rs".into(),
+                },
+            },
+            Response::PullRequestDraft {
+                draft: PullRequestDraft {
+                    title: "Add proto".into(),
+                    body: "## Summary\n\n- Update src/lib.rs\n\n## Testing\n\n- [ ] Not run".into(),
+                },
             },
             Response::Error {
                 error: ProtocolError::new(ErrorCode::Unavailable, "daemon busy").retryable(true),

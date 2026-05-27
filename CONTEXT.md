@@ -36,6 +36,10 @@ _Avoid_: Plugins, Providers.
 A small `hitch` CLI invoked by an Agent's installed hook; it reports the Agent's state to the **Daemon**'s local socket. Hitch installs the hook by merging it into a per-Worktree, gitignored agent-local config (e.g. `.claude/settings.local.json`) without overwriting the user's own keys.
 _Avoid_: Notifier, Bridge.
 
+**Draft Generator**:
+A non-interactive generation run that drafts commit messages, commit bodies, or PR descriptions from git context.
+_Avoid_: Agent harness, Agent.
+
 ## Relationships
 
 - A **Project** is either git-backed or a plain folder (its *kind*).
@@ -45,7 +49,9 @@ _Avoid_: Notifier, Bridge.
 - A **Session** runs in exactly one Worktree (git-backed) or one plain-folder Project root.
 - A **Session** running a known **Agent** has an **Agent State**; other Sessions do not.
 - Hitch enables Agent State by writing the agent's hook config into the Worktree it manages.
+- A **Draft Generator** runs outside Sessions and does not produce **Agent State**.
 
 ## Flagged ambiguities
 
 - "Tracked task" — there is no Task entity. A Session running an Agent is the closest thing; its "tracking" is just its Agent State, surfaced in the tree/tab. Typing `claude` in any Session reports state because the hook lives in the worktree config, not in how the Session was launched.
+- "Agent harness" — resolved as **Draft Generator** for this feature; **Agent** remains reserved for known CLIs running in Sessions.

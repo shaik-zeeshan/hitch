@@ -8,7 +8,9 @@
   import {
     activeSessionId,
     agentStateByWorktree,
+    defaultBase,
     diffActive,
+    gitStatus,
     gitWorktreeId,
     openSession,
     projects,
@@ -31,6 +33,7 @@
       ? $selectedProject
       : ($projects.find((p) => p.kind === "git-backed") ?? null),
   );
+  const canCreatePr = $derived(Boolean($gitWorktreeId && (!$defaultBase || $gitStatus?.branch !== $defaultBase)));
 
   function run(action: () => void) {
     commandOpen.set(false);
@@ -150,7 +153,7 @@
                     <span class="pi-label">Launch Claude in this worktree</span>
                   </Command.Item>
                 {/if}
-                {#if $gitWorktreeId}
+                {#if canCreatePr}
                   <Command.Item
                     class="p-item"
                     value="create pull request pr"

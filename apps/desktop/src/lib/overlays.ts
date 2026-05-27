@@ -16,8 +16,14 @@ export const addProjectOpen = writable(false);
 // Create-worktree dialog, scoped to the project it creates under (null = closed).
 export const createWorktreeFor = writable<Project | null>(null);
 
+// Remove-project confirmation, scoped to its target project (null = closed).
+export const removeProjectTarget = writable<Project | null>(null);
+
 // Remove-worktree confirmation, scoped to its target worktree (null = closed).
 export const removeWorktreeTarget = writable<Worktree | null>(null);
+
+// Commit dialog.
+export const commitOpen = writable(false);
 
 // Create-PR dialog (also openable from its button in the Changes panel).
 export const createPrOpen = writable(false);

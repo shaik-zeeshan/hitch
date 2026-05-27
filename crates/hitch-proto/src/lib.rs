@@ -49,6 +49,7 @@ Request:
   list-projects
   add-project(root)
   clone-project(remote_url, destination, name?)
+  remove-project(project_id, force)
   list-worktrees(project_id)
   create-worktree(project_id, branch, base?, mode)
   remove-worktree(worktree_id, delete_branch, force)
@@ -63,7 +64,9 @@ Request:
   stage-files(worktree_id, paths)
   unstage-files(worktree_id, paths)
   discard-files(worktree_id, paths)
-  commit(worktree_id, message)
+  commit(worktree_id, subject, body?)
+  generate-commit-draft(worktree_id)
+  generate-pull-request-draft(worktree_id, base?)
   push(worktree_id)
   create-pull-request(worktree_id, title, body?, base?, draft)
   install-agent-hooks(worktree_id)
@@ -79,6 +82,8 @@ Response:
   git-status(status)
   file-diff(diff)
   pull-request-created(url)
+  commit-draft(draft)
+  pull-request-draft(draft)
   error(error)
 
 Event:

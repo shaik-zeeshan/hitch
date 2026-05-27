@@ -15,11 +15,13 @@ import {
   sessionBelongsTo,
   type AgentState,
   type ChangedFile,
+  type CommitDraft,
   type FileStatus,
   type GitStatus,
   type HitchEvent,
   type Id,
   type PrFields,
+  type PullRequestDraft,
   type Project,
   type Request,
   type Response,
@@ -60,7 +62,6 @@ export const diffText = writable<string | null>(null);
 // peer of the session tabs (so `diffPath` can be set while a terminal shows);
 // this flag is what the tab bar and center pane switch on.
 export const diffActive = writable<boolean>(false);
-export const commitMessage = writable<string>("");
 export const gitBusy = writable<boolean>(false);
 export const prUrl = writable<string | null>(null);
 
@@ -474,6 +475,19 @@ export async function cloneProject(
   await refreshAll();
 }
 
+export async function removeProject(projectId: Id, force: boolean): Promise<void> {
+  await daemonRequest({
+    type: "remove-project",
+    project_id: projectId,
+    force,
+  });
+  if (get(selectedProjectId) === projectId) {
+    selectedProjectId.set(null);
+    selectedWorktreeId.set(null);
+  }
+  await refreshAll();
+}
+
 export async function createWorktree(
   projectId: Id,
   branch: string,
@@ -710,22 +724,49 @@ export function discardAllFiles(): Promise<void> {
   return discardFiles(paths);
 }
 
-export async function commit(): Promise<void> {
+export async function commit(subject: string, body: string | null = null): Promise<void> {
   const worktreeId = get(gitWorktreeId);
-  const message = get(commitMessage).trim();
-  if (!worktreeId || !message) return;
+  const trimmedSubject = subject.trim();
+  const trimmedBody = body?.trim() || null;
+  if (!worktreeId || !trimmedSubject) return;
   gitBusy.set(true);
   try {
     error.set(null);
-    await daemonRequest({ type: "commit", worktree_id: worktreeId, message });
-    commitMessage.set("");
+    await daemonRequest({
+      type: "commit",
+      worktree_id: worktreeId,
+      subject: trimmedSubject,
+      body: trimmedBody,
+    });
     closeDiff();
     await loadGitStatus(worktreeId);
   } catch (err) {
     error.set(toMessage(err));
+    throw err;
   } finally {
     gitBusy.set(false);
   }
+}
+
+export async function generateCommitDraft(): Promise<CommitDraft> {
+  const worktreeId = get(gitWorktreeId);
+  if (!worktreeId) throw new Error("Select a git worktree first.");
+  const response = await daemonRequest<Response & { draft: CommitDraft }>({
+    type: "generate-commit-draft",
+    worktree_id: worktreeId,
+  });
+  return response.draft;
+}
+
+export async function generatePullRequestDraft(base: string | null): Promise<PullRequestDraft> {
+  const worktreeId = get(gitWorktreeId);
+  if (!worktreeId) throw new Error("Select a git worktree first.");
+  const response = await daemonRequest<Response & { draft: PullRequestDraft }>({
+    type: "generate-pull-request-draft",
+    worktree_id: worktreeId,
+    base: base?.trim() || null,
+  });
+  return response.draft;
 }
 
 export async function push(): Promise<void> {
@@ -820,7 +861,6 @@ gitWorktreeId.subscribe(($id) => {
   gitStatus.set(null);
   closeDiff();
   prUrl.set(null);
-  commitMessage.set("");
   stopGitStatusPolling();
   if ($id) {
     void loadGitStatus($id).catch((err) => error.set(toMessage(err)));
