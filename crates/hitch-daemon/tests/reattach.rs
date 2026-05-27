@@ -178,6 +178,8 @@ fn git_status_stage_and_unstage_round_trip_over_socket() {
     std::fs::write(repo.join("tracked.txt"), "changed\n").unwrap();
     let status = client.git_status(4, worktree.id);
     assert!(status.dirty);
+    assert_eq!(status.additions, 1);
+    assert_eq!(status.deletions, 1);
     assert!(status.files.iter().any(|file| !file.staged));
 
     client.ack(

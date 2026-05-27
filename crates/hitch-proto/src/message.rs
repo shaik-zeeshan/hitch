@@ -264,6 +264,10 @@ pub struct GitStatus {
     pub dirty: bool,
     pub ahead: u32,
     pub behind: u32,
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
     pub files: Vec<ChangedFile>,
 }
 
@@ -380,6 +384,21 @@ mod tests {
     }
 
     #[test]
+    fn git_status_deserializes_without_line_stats_for_rolling_upgrades() {
+        let (_, worktree_id, _) = ids();
+        let json = format!(
+            r#"{{"type":"git-status","status":{{"worktree_id":"{worktree_id}","branch":"main","dirty":true,"ahead":0,"behind":0,"files":[]}}}}"#
+        );
+        let back: Response = serde_json::from_str(&json).unwrap();
+
+        let Response::GitStatus { status } = back else {
+            panic!("expected git-status response");
+        };
+        assert_eq!(status.additions, 0);
+        assert_eq!(status.deletions, 0);
+    }
+
+    #[test]
     fn session_command_event_serializes_as_contract() {
         let (_, _, session_id) = ids();
         let event = Event::SessionCommand {
@@ -450,6 +469,8 @@ mod tests {
             dirty: true,
             ahead: 1,
             behind: 0,
+            additions: 12,
+            deletions: 3,
             files: vec![ChangedFile {
                 path: "src/lib.rs".into(),
                 status: FileStatus::Modified,

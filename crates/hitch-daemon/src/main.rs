@@ -1065,6 +1065,8 @@ fn git_status(
         dirty: summary.dirty,
         ahead: 0,
         behind: 0,
+        additions: summary.additions.min(u32::MAX as usize) as u32,
+        deletions: summary.deletions.min(u32::MAX as usize) as u32,
         files: summary.entries.iter().map(status_entry_to_proto).collect(),
     })
 }
@@ -1139,7 +1141,18 @@ fn broadcast_dirty(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
 ) -> Result<(), ProtocolError> {
-    let dirty = git_status(state, worktree_id)?.dirty;
+    let path = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        state
+            .worktrees
+            .get(&worktree_id)
+            .map(|worktree| worktree.path.clone())
+            .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?
+    };
+    let dirty = GitRepository::discover(&path)
+        .map_err(git_error)?
+        .is_dirty()
+        .map_err(git_error)?;
     broadcast_event(state, Event::WorktreeDirty { worktree_id, dirty })
 }
 

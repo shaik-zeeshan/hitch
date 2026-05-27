@@ -2,9 +2,8 @@
   // Projects → Worktrees tree (mockup .tree). Project rows read as group
   // headers; their worktrees nest under an indent guide with connector ticks.
   // Agent state shows as a WORD in a reserved hue (rolled up to the project row
-  // when collapsed). Dirty worktrees get the iris dot — the daemon's GitStatus
-  // carries no per-file line counts, so the mockup's "+N −M" stat isn't
-  // available from the frozen contract; the dot is the honest signal.
+  // when collapsed). Dirty worktrees show their aggregate +/− line stat next
+  // to the branch name, plus the iris dot as the compact dirty signal.
   import { ContextMenu } from "bits-ui";
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
   import { get } from "svelte/store";
@@ -17,6 +16,7 @@
     projects,
     selectedProjectId,
     selectedWorktreeId,
+    worktreeLineStats,
     worktrees,
   } from "../daemon";
   import { createWorktreeFor, removeWorktreeTarget } from "../overlays";
@@ -154,6 +154,7 @@
       <div class="worktrees">
         {#each worktreesFor(project.id) as worktree (worktree.id)}
           {@const wtStatus = $agentStateByWorktree[worktree.id]}
+          {@const lineStat = $worktreeLineStats[worktree.id]}
           <ContextMenu.Root>
             <ContextMenu.Trigger>
               {#snippet child({ props })}
@@ -163,7 +164,18 @@
                   class:sel={worktree.id === $selectedWorktreeId}
                   onclick={() => selectWorktree(worktree)}
                 >
-                  <span class="lbl br-name">{worktree.branch}</span>
+                  <span class="branch-main">
+                    <span class="lbl br-name">{worktree.branch}</span>
+                    {#if lineStat && (lineStat.additions > 0 || lineStat.deletions > 0)}
+                      <span
+                        class="diffstat"
+                        title={`${lineStat.additions} additions, ${lineStat.deletions} deletions`}
+                      >
+                        {#if lineStat.additions > 0}<span class="add">{lineStat.additions}+</span>{/if}
+                        {#if lineStat.deletions > 0}<span class="del">{lineStat.deletions}-</span>{/if}
+                      </span>
+                    {/if}
+                  </span>
                   {#if $dirtyWorktrees[worktree.id] || wtStatus}
                     <span class="meta-r">
                       {#if $dirtyWorktrees[worktree.id]}
@@ -320,9 +332,34 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .branch-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+  }
+  .branch-main .lbl {
+    flex: 0 1 auto;
+  }
   .row .br-name {
     font-family: var(--mono);
     font-size: 11.5px;
+  }
+  .diffstat {
+    display: inline-flex;
+    gap: 4px;
+    flex: none;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .diffstat .add {
+    color: var(--ok);
+  }
+  .diffstat .del {
+    color: var(--err);
   }
   .row .tag {
     font-size: 9.5px;

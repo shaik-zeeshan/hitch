@@ -543,13 +543,12 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         &[&status, &PredefinedMenuItem::separator(app)?, &show, &quit],
     )?;
 
-    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
+    let builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
         .tooltip(tray_status_text(false, 0))
+        .icon(tauri::include_image!("icons/tray.png"))
+        .icon_as_template(true)
         .on_menu_event(handle_tray_menu_event);
-    if let Some(icon) = app.default_window_icon().cloned() {
-        builder = builder.icon(icon);
-    }
     builder.build(app)?;
 
     if let Ok(mut slot) = app.state::<HitchClient>().0.tray_status.lock() {

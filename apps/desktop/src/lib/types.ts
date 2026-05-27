@@ -54,6 +54,8 @@ export type GitStatus = {
   dirty: boolean;
   ahead: number;
   behind: number;
+  additions: number;
+  deletions: number;
   files: ChangedFile[];
 };
 

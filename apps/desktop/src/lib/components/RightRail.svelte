@@ -2,9 +2,8 @@
   // Right rail — Changes (mockup .rail-right). Staged / unstaged file groups
   // with inline stage toggles, a commit box, and Push / Create-PR. Clicking a
   // file row opens its diff (the diff tab itself lands in slice 7; here it sets
-  // the selection + loads the diff text). Daemon GitStatus carries no per-file
-  // line counts, so the mockup's `+N −M` branch stat isn't shown — ahead/behind
-  // is the honest summary.
+  // the selection + loads the diff text). Branch-level +/− stats live in the
+  // tree; this panel focuses on file status and commit actions.
   import {
     commit,
     commitMessage,

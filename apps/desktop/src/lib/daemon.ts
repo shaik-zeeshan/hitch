@@ -14,6 +14,8 @@ import {
   aggregateAgentState,
   sessionBelongsTo,
   type AgentState,
+  type ChangedFile,
+  type FileStatus,
   type GitStatus,
   type HitchEvent,
   type Id,
@@ -44,6 +46,7 @@ export const agentStates = writable<Record<Id, AgentState>>({});
 // with in the PTY), pushed by the daemon. Absent until the first report.
 export const sessionCommands = writable<Record<Id, string | null>>({});
 export const dirtyWorktrees = writable<Record<Id, boolean>>({});
+export const worktreeLineStats = writable<Record<Id, { additions: number; deletions: number }>>({});
 
 export const selectedProjectId = writable<Id | null>(null);
 export const selectedWorktreeId = writable<Id | null>(null);
@@ -60,6 +63,9 @@ export const diffActive = writable<boolean>(false);
 export const commitMessage = writable<string>("");
 export const gitBusy = writable<boolean>(false);
 export const prUrl = writable<string | null>(null);
+
+const diffCache = new Map<string, string>();
+let diffRequestSeq = 0;
 
 // ---- derived stores -------------------------------------------------------
 
@@ -204,21 +210,31 @@ export async function refreshAll(): Promise<void> {
   });
   sessions.set(sessionResponse.sessions);
 
-  // Seed dirty indicators so the tree shows them before the Changes panel opens.
-  const dirtyEntries = await Promise.all(
+  // Seed dirty indicators and line stats so the tree is useful before the Changes panel opens.
+  const statusEntries = await Promise.all(
     allWorktrees.map(async (worktree) => {
       try {
         const response = await daemonRequest<Response & { status: GitStatus }>({
           type: "git-status",
           worktree_id: worktree.id,
         });
-        return [worktree.id, response.status.dirty] as const;
+        return [worktree.id, response.status] as const;
       } catch {
-        return [worktree.id, false] as const;
+        return [worktree.id, null] as const;
       }
     }),
   );
-  dirtyWorktrees.set(Object.fromEntries(dirtyEntries));
+  dirtyWorktrees.set(
+    Object.fromEntries(statusEntries.map(([id, status]) => [id, status?.dirty ?? false])),
+  );
+  worktreeLineStats.set(
+    Object.fromEntries(
+      statusEntries.map(([id, status]) => [
+        id,
+        { additions: status?.additions ?? 0, deletions: status?.deletions ?? 0 },
+      ]),
+    ),
+  );
 }
 
 // ---- connection lifecycle -------------------------------------------------
@@ -252,11 +268,9 @@ export async function initDaemon(): Promise<void> {
               ? current
               : { ...current, [worktreeId]: dirty },
           );
-          // If the dirtied worktree is the one whose Changes panel is open,
-          // refresh its full status so the file list tracks the change live.
-          if (get(selectedWorktreeId) === worktreeId) {
-            void loadGitStatus(worktreeId).catch(() => {});
-          }
+          // Refresh the full status so the tree's line stats and, when selected,
+          // the Changes panel track filesystem changes live.
+          void loadGitStatus(worktreeId).catch(() => {});
         }
         if (event.type === "agent-state") {
           const sessionId = event.session_id as Id | null;
@@ -343,13 +357,65 @@ export async function loadGitStatus(worktreeId: Id): Promise<GitStatus> {
     type: "git-status",
     worktree_id: worktreeId,
   });
-  gitStatus.set(response.status);
+  // A slow status response from a previously selected worktree must not replace
+  // the currently visible Changes panel.
+  if (get(gitWorktreeId) === worktreeId) {
+    gitStatus.set(response.status);
+  }
   dirtyWorktrees.update((current) =>
     current[worktreeId] === response.status.dirty
       ? current
       : { ...current, [worktreeId]: response.status.dirty },
   );
+  worktreeLineStats.update((current) => {
+    const next = {
+      additions: response.status.additions,
+      deletions: response.status.deletions,
+    };
+    const previous = current[worktreeId];
+    if (
+      previous?.additions === next.additions &&
+      previous?.deletions === next.deletions
+    ) {
+      return current;
+    }
+    return { ...current, [worktreeId]: next };
+  });
   return response.status;
+}
+
+function statusAfterStage(status: FileStatus): FileStatus {
+  return status === "untracked" ? "added" : status;
+}
+
+function statusAfterUnstage(status: FileStatus): FileStatus {
+  return status === "added" ? "untracked" : status;
+}
+
+function optimisticallySetFilesStaged(
+  worktreeId: Id,
+  paths: string[],
+  staged: boolean,
+): void {
+  const selected = new Set(paths);
+  gitStatus.update((current) => {
+    if (!current || current.worktree_id !== worktreeId) return current;
+    let changed = false;
+    const files: ChangedFile[] = current.files.map((file) => {
+      if (!selected.has(file.path)) return file;
+      const next = {
+        ...file,
+        staged,
+        status: staged ? statusAfterStage(file.status) : statusAfterUnstage(file.status),
+      };
+      changed ||= next.staged !== file.staged || next.status !== file.status;
+      return next;
+    });
+    return changed ? { ...current, dirty: files.length > 0, files } : current;
+  });
+  dirtyWorktrees.update((current) =>
+    current[worktreeId] === true ? current : { ...current, [worktreeId]: true },
+  );
 }
 
 // ---- request actions ------------------------------------------------------
@@ -501,8 +567,10 @@ export function sendInput(sessionId: Id, data: string): void {
 export async function viewDiff(path: string, activate = true): Promise<void> {
   const worktreeId = get(gitWorktreeId);
   if (!worktreeId) return;
+  const requestSeq = ++diffRequestSeq;
+  const cacheKey = `${worktreeId}\0${path}`;
   diffPath.set(path);
-  diffText.set(null);
+  diffText.set(diffCache.get(cacheKey) ?? null);
   if (activate) diffActive.set(true);
   try {
     const response = await daemonRequest<Response & { diff: { diff: string } }>({
@@ -510,10 +578,23 @@ export async function viewDiff(path: string, activate = true): Promise<void> {
       worktree_id: worktreeId,
       path,
     });
-    diffText.set(response.diff.diff);
+    diffCache.set(cacheKey, response.diff.diff);
+    if (
+      requestSeq === diffRequestSeq &&
+      get(gitWorktreeId) === worktreeId &&
+      get(diffPath) === path
+    ) {
+      diffText.set(response.diff.diff);
+    }
   } catch (err) {
     error.set(toMessage(err));
-    diffText.set(null);
+    if (
+      requestSeq === diffRequestSeq &&
+      get(gitWorktreeId) === worktreeId &&
+      get(diffPath) === path
+    ) {
+      diffText.set(null);
+    }
   }
 }
 
@@ -530,6 +611,8 @@ export async function setFilesStaged(
 ): Promise<void> {
   const worktreeId = get(gitWorktreeId);
   if (!worktreeId || paths.length === 0) return;
+  const before = get(gitStatus);
+  optimisticallySetFilesStaged(worktreeId, paths, staged);
   gitBusy.set(true);
   try {
     error.set(null);
@@ -538,13 +621,21 @@ export async function setFilesStaged(
       worktree_id: worktreeId,
       paths,
     });
-    await loadGitStatus(worktreeId);
+    gitBusy.set(false);
+    void loadGitStatus(worktreeId).catch((err) => error.set(toMessage(err)));
     // Keep an open diff in sync if its file was just (un)staged, without
     // stealing focus from a terminal the user may be looking at.
     const open = get(diffPath);
-    if (open && paths.includes(open)) await viewDiff(open, false);
+    if (open && paths.includes(open)) {
+      diffCache.delete(`${worktreeId}\0${open}`);
+      void viewDiff(open, false);
+    }
   } catch (err) {
     error.set(toMessage(err));
+    if (before?.worktree_id === worktreeId && get(gitWorktreeId) === worktreeId) {
+      gitStatus.set(before);
+    }
+    void loadGitStatus(worktreeId).catch((refreshErr) => error.set(toMessage(refreshErr)));
   } finally {
     gitBusy.set(false);
   }

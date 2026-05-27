@@ -50,7 +50,7 @@ impl GitRepository {
 
     /// True when the repo has staged, unstaged, conflicted, or untracked changes.
     pub fn is_dirty(&self) -> Result<bool> {
-        Ok(self.status()?.dirty)
+        is_dirty(&self.root)
     }
 
     /// Read a file-level patch for either the staged or unstaged/worktree side.
@@ -236,6 +236,8 @@ pub struct StatusEntry {
 pub struct StatusSummary {
     pub entries: Vec<StatusEntry>,
     pub dirty: bool,
+    pub additions: usize,
+    pub deletions: usize,
 }
 
 impl StatusSummary {
@@ -418,7 +420,11 @@ pub fn status(repo_path: impl AsRef<Path>) -> Result<StatusSummary> {
     let mut options = StatusOptions::new();
     options
         .include_untracked(true)
-        .recurse_untracked_dirs(true)
+        // Keep the app's Changes panel fast in worktrees with generated output
+        // or dependency folders that are not ignored yet. The UI can stage a
+        // collapsed untracked directory with `git add dir/`; the next status
+        // refresh expands only the tracked index entries that Git now knows.
+        .recurse_untracked_dirs(false)
         .renames_head_to_index(true)
         .renames_index_to_workdir(true);
 
@@ -436,10 +442,49 @@ pub fn status(repo_path: impl AsRef<Path>) -> Result<StatusSummary> {
         });
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let (additions, deletions) = diff_line_stats(&repo)?;
     Ok(StatusSummary {
         dirty: !entries.is_empty(),
         entries,
+        additions,
+        deletions,
     })
+}
+
+fn diff_line_stats(repo: &Repository) -> Result<(usize, usize)> {
+    let mut additions = 0;
+    let mut deletions = 0;
+
+    let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
+    let mut index = repo.index()?;
+    let staged = repo.diff_tree_to_index(head_tree.as_ref(), Some(&mut index), None)?;
+    let staged_stats = staged.stats()?;
+    additions += staged_stats.insertions();
+    deletions += staged_stats.deletions();
+
+    let mut options = DiffOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .show_untracked_content(true);
+    let mut index = repo.index()?;
+    let worktree = repo.diff_index_to_workdir(Some(&mut index), Some(&mut options))?;
+    let worktree_stats = worktree.stats()?;
+    additions += worktree_stats.insertions();
+    deletions += worktree_stats.deletions();
+
+    Ok((additions, deletions))
+}
+
+/// Fast dirty check for badge/event refreshes that only need a boolean.
+pub fn is_dirty(repo_path: impl AsRef<Path>) -> Result<bool> {
+    let repo = Repository::discover(repo_path.as_ref())?;
+    let mut options = StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(false);
+    let statuses = repo.statuses(Some(&mut options))?;
+    Ok(!statuses.is_empty())
 }
 
 /// Read a file-level diff using libgit2.
@@ -846,6 +891,8 @@ mod tests {
             summary.entry_for("new.txt").unwrap().working_tree,
             FileState::New
         );
+        assert_eq!(summary.additions, 2);
+        assert_eq!(summary.deletions, 1);
 
         let diff = diff_file(fixture.path(), "tracked.txt", DiffTarget::Worktree).unwrap();
         assert!(diff.contains("changed"), "diff was {diff:?}");
@@ -864,6 +911,33 @@ mod tests {
         );
         let staged = diff_file(fixture.path(), "tracked.txt", DiffTarget::Staged).unwrap();
         assert!(staged.contains("changed"), "staged diff was {staged:?}");
+    }
+
+    #[test]
+    fn dirty_check_detects_changes_without_full_status_work() {
+        let fixture = RepoFixture::new();
+        assert!(!is_dirty(fixture.path()).unwrap());
+
+        fixture.write("tracked.txt", "changed\n");
+        assert!(is_dirty(fixture.path()).unwrap());
+    }
+
+    #[test]
+    fn status_collapses_untracked_directories_for_fast_app_reads() {
+        let fixture = RepoFixture::new();
+        fs::create_dir(fixture.path().join("generated")).unwrap();
+        fs::write(fixture.path().join("generated/one.txt"), "one\n").unwrap();
+        fs::write(fixture.path().join("generated/two.txt"), "two\n").unwrap();
+
+        let summary = status(fixture.path()).unwrap();
+
+        assert_eq!(summary.entries.len(), 1, "entries were {summary:?}");
+        let path = summary.entries[0].path.to_string_lossy();
+        assert!(
+            path == "generated" || path == "generated/",
+            "path was {path:?}"
+        );
+        assert_eq!(summary.entries[0].working_tree, FileState::New);
     }
 
     #[test]
