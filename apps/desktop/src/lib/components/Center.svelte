@@ -1,8 +1,8 @@
 <script lang="ts">
   // Center column (mockup .center): connection banner, then either an empty
-  // prompt or the agent bar + session tabs + live terminal for the active
-  // parent. The terminal is re-keyed on the session id so switching tabs
-  // rebuilds a clean xterm instead of replaying one buffer into another.
+  // prompt or the session tabs + live terminal for the active parent. The
+  // terminal is re-keyed on the session id so switching tabs rebuilds a clean
+  // xterm instead of replaying one buffer into another.
   import {
     activeSession,
     connection,
@@ -14,7 +14,6 @@
     selectedProject,
     worktrees,
   } from "../daemon";
-  import AgentBar from "./AgentBar.svelte";
   import SessionTabs from "./SessionTabs.svelte";
   import Terminal from "./Terminal.svelte";
   import DiffTab from "./DiffTab.svelte";
@@ -51,7 +50,6 @@
       </p>
     </div>
   {:else}
-    <AgentBar parent={$selectedParent} />
     <SessionTabs parent={$selectedParent} />
     <div class="view">
       {#if $diffActive && $diffPath}

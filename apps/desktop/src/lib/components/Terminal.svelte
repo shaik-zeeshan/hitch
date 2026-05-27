@@ -129,21 +129,32 @@
   });
 </script>
 
-<div class="term" bind:this={host}></div>
+<!-- Outer .term provides the visual padding; the inner host is a clean
+     unpadded box so FitAddon measures the true content area and the rows it
+     computes leave the padding (incl. the bottom) intact. -->
+<div class="term">
+  <div class="term-host" bind:this={host}></div>
+</div>
 
 <style>
   .term {
     height: 100%;
     width: 100%;
     background: var(--bg-0);
-    padding: 10px 14px;
+    padding: 12px 14px;
     overflow: hidden;
   }
-  /* xterm injects its own canvas/layout; keep its viewport scrollbar on theme. */
-  .term :global(.xterm) {
+  /* Clean inner box (no padding) so fit.fit() reads an exact content size. */
+  .term-host {
     height: 100%;
+    width: 100%;
   }
-  .term :global(.xterm-viewport) {
+  /* xterm injects its own canvas/layout; keep its viewport scrollbar on theme. */
+  .term-host :global(.xterm) {
+    height: 100%;
+    width: 100%;
+  }
+  .term-host :global(.xterm-viewport) {
     background: transparent !important;
   }
 </style>

@@ -27,10 +27,6 @@
     >
   </button>
 
-  <div class="app-id" data-tauri-drag-region>
-    <span class="mark">H</span><span class="app-name">Hitch</span>
-  </div>
-
   <div class="nav-grow" data-tauri-drag-region></div>
 
   <button class="cmdk" onclick={() => commandOpen.set(true)} aria-label="Search or jump to">
@@ -71,7 +67,9 @@
 </nav>
 
 <style>
-  /* macOS traffic lights (Overlay titlebar) live in the top-left ~70px. */
+  /* macOS traffic lights are inset to x 16 / y 23 in tauri.conf.json so their
+     centers sit on the 44px top-nav row, level with the sidebar toggle icon;
+     this reserves their horizontal room. */
   .topnav {
     display: flex;
     align-items: center;
@@ -81,30 +79,6 @@
     border-bottom: 1px solid var(--line);
     padding: 0 12px 0 78px;
     user-select: none;
-  }
-
-  .app-id {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .app-id .mark {
-    width: 18px;
-    height: 18px;
-    border-radius: 5px;
-    display: grid;
-    place-items: center;
-    background: linear-gradient(160deg, var(--ac-bright), oklch(52% 0.13 280));
-    color: oklch(18% 0.03 265);
-    font-weight: 800;
-    font-size: 11px;
-    box-shadow: inset 0 1px 0 oklch(90% 0.05 265 / 0.4);
-  }
-  .app-id .app-name {
-    font-weight: 600;
-    font-size: 12.5px;
-    letter-spacing: 0.1px;
-    color: var(--tx-hi);
   }
 
   .nav-grow {

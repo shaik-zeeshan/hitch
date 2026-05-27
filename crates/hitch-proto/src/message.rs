@@ -247,6 +247,13 @@ pub enum Event {
     ProjectUpdated {
         project: Project,
     },
+    /// The session's foreground process changed — the live command the user is
+    /// interacting with in the PTY (e.g. a tool launched inside the shell),
+    /// not the spawn command. `None` when it can't be resolved.
+    SessionCommand {
+        session_id: SessionId,
+        command: Option<String>,
+    },
 }
 
 /// Git status summary used by the focused common-flow UI.
@@ -370,6 +377,29 @@ mod tests {
             let back: Event = serde_json::from_str(&json).unwrap();
             assert_eq!(event, back, "failed to round-trip {json}");
         }
+    }
+
+    #[test]
+    fn session_command_event_serializes_as_contract() {
+        let (_, _, session_id) = ids();
+        let event = Event::SessionCommand {
+            session_id,
+            command: Some("claude".into()),
+        };
+        let value: serde_json::Value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "session-command");
+        assert_eq!(value["session_id"], session_id.to_string());
+        assert_eq!(value["command"], "claude");
+
+        let back: Event = serde_json::from_value(value).unwrap();
+        assert_eq!(event, back);
+
+        let cleared = Event::SessionCommand {
+            session_id,
+            command: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&cleared).unwrap();
+        assert!(value["command"].is_null());
     }
 
     #[test]
@@ -589,6 +619,14 @@ mod tests {
             },
             Event::WorktreeUpdated { worktree },
             Event::ProjectUpdated { project },
+            Event::SessionCommand {
+                session_id,
+                command: Some("claude".into()),
+            },
+            Event::SessionCommand {
+                session_id,
+                command: None,
+            },
         ]
     }
 

@@ -200,6 +200,7 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
 
     restore_layout(&state, &pty_tx).map_err(|err| io::Error::other(err.message))?;
     spawn_pty_dispatcher(Arc::clone(&state), pty_rx, Arc::clone(&shutdown));
+    spawn_command_poller(Arc::clone(&state), Arc::clone(&shutdown));
 
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -1164,6 +1165,41 @@ fn status_entry_to_proto(entry: &StatusEntry) -> ChangedFile {
     }
 }
 
+/// Poll each live session's foreground command once a second and broadcast
+/// a SessionCommand event whenever it changes. Broadcasting only on change
+/// keeps idle terminals quiet.
+fn spawn_command_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>) {
+    thread::Builder::new()
+        .name("hitch-cmd-poll".into())
+        .spawn(move || {
+            let mut last: HashMap<SessionId, Option<String>> = HashMap::new();
+            while !shutdown.load(Ordering::SeqCst) {
+                let ptys: Vec<(SessionId, Arc<ManagedPty>)> = match state.lock() {
+                    Ok(state) => state
+                        .sessions
+                        .iter()
+                        .map(|(id, session)| (*id, Arc::clone(&session.pty)))
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                // Forget commands for sessions that have closed.
+                last.retain(|id, _| ptys.iter().any(|(pid, _)| pid == id));
+                for (id, pty) in ptys {
+                    let command = pty.foreground_command();
+                    if last.get(&id) != Some(&command) {
+                        last.insert(id, command.clone());
+                        let _ = broadcast_event(
+                            &state,
+                            Event::SessionCommand { session_id: id, command },
+                        );
+                    }
+                }
+                thread::sleep(Duration::from_millis(1000));
+            }
+        })
+        .expect("failed to spawn command poller thread");
+}
+
 fn spawn_pty_dispatcher(
     state: Arc<Mutex<DaemonState>>,
     rx: mpsc::Receiver<PtyEvent>,
@@ -1307,17 +1343,26 @@ fn replay_sessions_to_client(
             .map(|daemon_session| {
                 let mut scrollback = daemon_session.restored_scrollback.clone();
                 scrollback.extend(daemon_session.pty.scrollback());
-                (daemon_session.session.clone(), scrollback)
+                let command = daemon_session.pty.foreground_command();
+                (daemon_session.session.clone(), scrollback, command)
             })
             .collect::<Vec<_>>()
     };
 
-    for (session, scrollback) in replay_items {
+    for (session, scrollback, command) in replay_items {
         send_event_to_client(
             state,
             client_id,
             Event::SessionOpened {
                 session: session.clone(),
+            },
+        )?;
+        send_event_to_client(
+            state,
+            client_id,
+            Event::SessionCommand {
+                session_id: session.id,
+                command,
             },
         )?;
         if !scrollback.is_empty() {

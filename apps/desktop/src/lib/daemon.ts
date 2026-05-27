@@ -40,6 +40,9 @@ export const sessions = writable<Session[]>([]);
 
 export const buffers = writable<Record<Id, string>>({});
 export const agentStates = writable<Record<Id, AgentState>>({});
+// Live foreground command per session (the process the user is interacting
+// with in the PTY), pushed by the daemon. Absent until the first report.
+export const sessionCommands = writable<Record<Id, string | null>>({});
 export const dirtyWorktrees = writable<Record<Id, boolean>>({});
 
 export const selectedProjectId = writable<Id | null>(null);
@@ -262,6 +265,11 @@ export async function initDaemon(): Promise<void> {
             agentStates.update((current) => ({ ...current, [sessionId]: state }));
           }
         }
+        if (event.type === "session-command") {
+          const sessionId = event.session_id as Id;
+          const command = (event.command as string | null) ?? null;
+          sessionCommands.update((current) => ({ ...current, [sessionId]: command }));
+        }
         if (event.type === "session-opened") {
           const session = event.session as Session;
           sessions.update((items) => upsert(items, session));
@@ -273,6 +281,11 @@ export async function initDaemon(): Promise<void> {
           activeSessionId.update((current) =>
             current === sessionId ? null : current,
           );
+          sessionCommands.update((current) => {
+            const next = { ...current };
+            delete next[sessionId];
+            return next;
+          });
         }
       }),
     );
@@ -623,11 +636,17 @@ visibleSessions.subscribe(($visible) => {
   }
 });
 
-// Forget agent state for sessions that have closed (or were dropped on a
-// reconnect), so stale labels never linger on the tree.
+// Forget agent state + running command for sessions that have closed (or were
+// dropped on a reconnect), so stale labels never linger on the tree or tabs.
 sessions.subscribe(($sessions) => {
+  const liveIds = new Set($sessions.map((s) => s.id));
   agentStates.update((current) => {
-    const liveIds = new Set($sessions.map((s) => s.id));
+    const next = Object.fromEntries(
+      Object.entries(current).filter(([id]) => liveIds.has(id)),
+    );
+    return Object.keys(next).length === Object.keys(current).length ? current : next;
+  });
+  sessionCommands.update((current) => {
     const next = Object.fromEntries(
       Object.entries(current).filter(([id]) => liveIds.has(id)),
     );

@@ -183,6 +183,17 @@ impl ManagedPty {
         Ok(())
     }
 
+    /// Best-effort name of the PTY's foreground process group leader — the
+    /// command the user is currently interacting with (a tool launched inside
+    /// the shell, or the shell itself). `None` when it can't be resolved.
+    pub fn foreground_command(&self) -> Option<String> {
+        let pid = {
+            let master = self.master.lock().ok()?;
+            master.process_group_leader()?
+        };
+        command_name_for_pid(pid)
+    }
+
     /// Return a point-in-time copy of buffered scrollback bytes.
     pub fn scrollback(&self) -> Vec<u8> {
         self.scrollback.snapshot()
@@ -255,6 +266,33 @@ fn build_command(command: &Option<Vec<String>>, cwd: &Path) -> CommandBuilder {
     };
     builder.cwd(cwd);
     builder
+}
+
+#[cfg(target_os = "macos")]
+fn command_name_for_pid(pid: libc::pid_t) -> Option<String> {
+    let mut buf = [0_u8; 4096];
+    let ret = unsafe {
+        libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32)
+    };
+    if ret <= 0 {
+        return None;
+    }
+    let path = std::str::from_utf8(&buf[..ret as usize]).ok()?;
+    std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn command_name_for_pid(pid: libc::pid_t) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let name = comm.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn command_name_for_pid(_pid: libc::pid_t) -> Option<String> {
+    None
 }
 
 #[derive(Debug)]

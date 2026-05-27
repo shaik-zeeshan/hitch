@@ -9,4 +9,5 @@ description = "PTY spawn + scrollback buffering (placeholder, slice 3)."
 [dependencies]
 hitch-core.workspace = true
 anyhow = "1"
+libc = "0.2"
 portable-pty = "0.8"
