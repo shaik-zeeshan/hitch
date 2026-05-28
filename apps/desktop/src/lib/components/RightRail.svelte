@@ -89,12 +89,22 @@
       {#if $defaultBase && $defaultBase !== $gitStatus.branch}
         <span class="from">from {$defaultBase}</span>
       {/if}
-      {#if $gitStatus.ahead > 0 || $gitStatus.behind > 0}
-        <span class="track">
-          {#if $gitStatus.ahead > 0}<span class="ahead">↑{$gitStatus.ahead}</span>{/if}
-          {#if $gitStatus.behind > 0}<span class="behind">↓{$gitStatus.behind}</span>{/if}
-        </span>
+      {#if $gitStatus.behind > 0}
+        <span class="behind">↓{$gitStatus.behind}</span>
       {/if}
+      <span class="branch-acts">
+        {#if files.length > 0}
+          <CommitDialog disabled={$gitBusy} triggerClass="chip" />
+        {/if}
+        {#if ahead > 0}
+          <button class="chip" disabled={$gitBusy} onclick={() => void push()}>
+            Push <span class="ar">↑{ahead}</span>
+          </button>
+        {/if}
+        {#if !isDefaultBranch && $gitWorktreeId}
+          <CreatePrDialog disabled={$gitBusy} triggerClass="chip" />
+        {/if}
+      </span>
     </div>
   {/if}
 
@@ -194,19 +204,6 @@
     {/if}
   </div>
 
-  {#if $gitWorktreeId}
-    <div class="commit">
-      <CommitDialog disabled={$gitBusy} />
-      <div class="row2">
-        <button class="btn grow" disabled={$gitBusy} onclick={() => void push()}>
-          Push {#if ahead > 0}<span class="ar">↑{ahead}</span>{/if}
-        </button>
-        {#if !isDefaultBranch}
-          <CreatePrDialog disabled={$gitBusy} />
-        {/if}
-      </div>
-    </div>
-  {/if}
 </aside>
 
 <style>
@@ -247,7 +244,7 @@
     display: flex;
     align-items: center;
     gap: 7px;
-    padding: 9px 12px;
+    padding: 7px 10px 7px 12px;
     border-bottom: 1px solid var(--line-soft);
     font-size: 11px;
     color: var(--tx-md);
@@ -259,18 +256,43 @@
   .ch-branch .from {
     color: var(--tx-lo);
   }
-  .ch-branch .track {
-    margin-left: auto;
+  .ch-branch .behind {
     font-family: var(--mono);
     font-size: 11px;
-    display: flex;
-    gap: 6px;
-  }
-  .ch-branch .ahead {
-    color: var(--ok);
-  }
-  .ch-branch .behind {
     color: var(--warn);
+  }
+  .branch-acts {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  :global(.chip) {
+    font: inherit;
+    font-size: 10.5px;
+    padding: 2px 7px;
+    border-radius: 99px;
+    border: 1px solid var(--line);
+    background: var(--bg-3);
+    color: var(--tx-md);
+    cursor: pointer;
+    white-space: nowrap;
+    transition:
+      background var(--t-fast),
+      color var(--t-fast);
+  }
+  :global(.chip:hover) {
+    background: var(--bg-4);
+    color: var(--tx-hi);
+  }
+  :global(.chip:disabled) {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .chip .ar {
+    color: var(--ok);
+    font-family: var(--mono);
   }
 
   .ch-list {
@@ -416,19 +438,6 @@
   }
   .frow .discard:hover {
     color: var(--err);
-  }
-
-  .commit {
-    flex: none;
-    border-top: 1px solid var(--line);
-    padding: 10px;
-    display: grid;
-    gap: 8px;
-    background: var(--bg-2);
-  }
-  .row2 {
-    display: flex;
-    gap: 7px;
   }
 
   .iconbtn {

@@ -707,6 +707,15 @@ fn handle_request<R: Read>(
             }
             broadcast_event(state, Event::ProjectRemoved { project_id })?;
         }
+        Request::ListBranches { project_id } => {
+            let branches = list_branches(state, project_id)?;
+            send_response(
+                state,
+                client_id,
+                request_id,
+                Response::Branches { branches },
+            )?;
+        }
         Request::ListWorktrees { project_id } => {
             let worktrees = list_worktrees(state, project_id)?;
             send_response(
@@ -1053,6 +1062,37 @@ fn list_worktrees(
             refresh_worktree_branch_from_disk(state, worktree).map(|(worktree, _)| worktree)
         })
         .collect()
+}
+
+fn list_branches(
+    state: &Arc<Mutex<DaemonState>>,
+    project_id: ProjectId,
+) -> Result<Vec<hitch_proto::BranchSummary>, ProtocolError> {
+    let project_root = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        let project = state
+            .projects
+            .get(&project_id)
+            .cloned()
+            .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "project not found"))?;
+        if project.kind != ProjectKind::GitBacked {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "plain projects do not have branches",
+            ));
+        }
+        project.root.clone()
+    };
+    let branch_infos = GitRepository::discover(&project_root)
+        .and_then(|repo| repo.branches())
+        .map_err(git_error)?;
+    Ok(branch_infos
+        .into_iter()
+        .map(|b| hitch_proto::BranchSummary {
+            name: b.name,
+            is_remote: b.is_remote,
+        })
+        .collect())
 }
 
 fn refresh_worktree_branch_from_disk(

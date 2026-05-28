@@ -5,8 +5,9 @@
   // WorktreeCreateMode; the base field only applies to a new branch. Throws on
   // failure surface inline; success dismisses and optionally opens a shell.
   import { Dialog } from "bits-ui";
-  import { createWorktree, defaultBase, openSession } from "../daemon";
+  import { createWorktree, defaultBase, listBranches, openSession } from "../daemon";
   import { createWorktreeFor } from "../overlays";
+  import type { BranchSummary } from "../types";
 
   const project = $derived($createWorktreeFor);
 
@@ -16,9 +17,12 @@
   let openShell = $state(true);
   let submitting = $state(false);
   let errMsg = $state<string | null>(null);
+  let branches = $state<BranchSummary[]>([]);
 
-  // Reset the form when a project first opens the dialog (open is driven
-  // externally, so we can't rely on onOpenChange firing for it).
+  const localBranches = $derived(branches.filter((b) => !b.is_remote));
+  const allBranches = $derived(branches);
+
+  // Reset the form and fetch branches when a project first opens the dialog.
   let openedFor = $state<string | null>(null);
   $effect(() => {
     if (project && project.id !== openedFor) {
@@ -29,8 +33,22 @@
       openShell = true;
       submitting = false;
       errMsg = null;
+      branches = [];
+      listBranches(project.id).then((b) => {
+        branches = b;
+        if (mode === "existing-branch" && !branch && b.length > 0) {
+          branch = b.find((x) => !x.is_remote)?.name ?? b[0].name;
+        }
+      });
     } else if (!project) {
       openedFor = null;
+    }
+  });
+
+  // When switching to existing-branch mode, default-select first local branch.
+  $effect(() => {
+    if (mode === "existing-branch" && !branch && localBranches.length > 0) {
+      branch = localBranches[0].name;
     }
   });
 
@@ -74,14 +92,22 @@
       <div class="m-body">
         <label class="field">
           <span>Branch name</span>
-          <!-- svelte-ignore a11y_autofocus -->
-          <input
-            class="base"
-            bind:value={branch}
-            placeholder="feat/my-branch"
-            autofocus
-            onkeydown={(e) => e.key === "Enter" && void submit()}
-          />
+          {#if mode === "existing-branch" && localBranches.length > 0}
+            <select class="base" bind:value={branch}>
+              {#each localBranches as b}
+                <option value={b.name}>{b.name}</option>
+              {/each}
+            </select>
+          {:else}
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+              class="base"
+              bind:value={branch}
+              placeholder="feat/my-branch"
+              autofocus={mode === "new-branch"}
+              onkeydown={(e) => e.key === "Enter" && void submit()}
+            />
+          {/if}
         </label>
         <div class="field">
           <span>Create from</span>
@@ -99,7 +125,15 @@
         {#if mode === "new-branch"}
           <label class="field">
             <span>Base branch</span>
-            <input class="base" bind:value={base} placeholder={$defaultBase ?? "main"} />
+            {#if allBranches.length > 0}
+              <select class="base" bind:value={base}>
+                {#each allBranches as b}
+                  <option value={b.name}>{b.is_remote ? `↑ ${b.name}` : b.name}</option>
+                {/each}
+              </select>
+            {:else}
+              <input class="base" bind:value={base} placeholder={$defaultBase ?? "main"} />
+            {/if}
           </label>
         {/if}
         <button type="button" class="field-row" onclick={() => (openShell = !openShell)}>

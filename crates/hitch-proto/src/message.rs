@@ -71,6 +71,8 @@ pub enum Request {
     /// Forget a project and its Hitch-owned layout. Does not delete the project root.
     RemoveProject { project_id: ProjectId, force: bool },
 
+    /// Return local and remote branches for a git-backed project.
+    ListBranches { project_id: ProjectId },
     /// Return worktrees belonging to a git-backed project.
     ListWorktrees { project_id: ProjectId },
     /// Create a managed worktree on a new or existing branch.
@@ -216,6 +218,9 @@ pub enum Response {
     Projects {
         projects: Vec<Project>,
     },
+    Branches {
+        branches: Vec<BranchSummary>,
+    },
     Worktrees {
         worktrees: Vec<Worktree>,
     },
@@ -295,6 +300,13 @@ pub enum Event {
         session_id: SessionId,
         command: Option<String>,
     },
+}
+
+/// A branch name with remote flag for branch-picker UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchSummary {
+    pub name: String,
+    pub is_remote: bool,
 }
 
 /// Git status summary used by the focused common-flow UI.

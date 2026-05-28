@@ -15,6 +15,7 @@ import {
   aggregateAgentState,
   sessionBelongsTo,
   type AgentState,
+  type BranchSummary,
   type ChangedFile,
   type CommitDraft,
   type FileStatus,
@@ -607,6 +608,14 @@ export async function removeProject(projectId: Id, force: boolean): Promise<void
     selectedWorktreeId.set(null);
   }
   await refreshAll();
+}
+
+export async function listBranches(projectId: Id): Promise<BranchSummary[]> {
+  const response = await daemonRequest<Response & { branches: BranchSummary[] }>({
+    type: "list-branches",
+    project_id: projectId,
+  });
+  return response.branches;
 }
 
 export async function createWorktree(

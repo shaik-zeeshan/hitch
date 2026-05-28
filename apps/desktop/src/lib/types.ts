@@ -82,6 +82,11 @@ export type PullRequestDraft = {
   body: string;
 };
 
+export type BranchSummary = {
+  name: string;
+  is_remote: boolean;
+};
+
 export type Request = { type: string; [key: string]: unknown };
 export type Response = { type: string; [key: string]: unknown };
 export type HitchEvent = { type: string; [key: string]: unknown };

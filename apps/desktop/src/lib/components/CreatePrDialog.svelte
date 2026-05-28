@@ -7,7 +7,7 @@
   import { createPr, defaultBase, generatePullRequestDraft, gitStatus, prUrl } from "../daemon";
   import { createPrOpen } from "../overlays";
 
-  let { disabled = false }: { disabled?: boolean } = $props();
+  let { disabled = false, triggerClass = "btn grow" }: { disabled?: boolean; triggerClass?: string } = $props();
 
   let title = $state("");
   let body = $state("");
@@ -93,7 +93,7 @@
 </script>
 
 <Dialog.Root bind:open={$createPrOpen}>
-  <Dialog.Trigger class="btn grow" {disabled}>Create PR…</Dialog.Trigger>
+  <Dialog.Trigger class={triggerClass} {disabled}>Create PR…</Dialog.Trigger>
   <Dialog.Portal>
     <Dialog.Overlay class="modal-back" />
     <Dialog.Content class="modal" aria-describedby={undefined}>

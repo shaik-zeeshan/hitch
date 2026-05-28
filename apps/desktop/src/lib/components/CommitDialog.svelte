@@ -12,7 +12,7 @@
   } from "../daemon";
   import { commitOpen } from "../overlays";
 
-  let { disabled = false }: { disabled?: boolean } = $props();
+  let { disabled = false, triggerClass = "btn primary full" }: { disabled?: boolean; triggerClass?: string } = $props();
 
   let subject = $state("");
   let body = $state("");
@@ -114,7 +114,7 @@
 </script>
 
 <Dialog.Root bind:open={$commitOpen}>
-  <Dialog.Trigger class="btn primary full" {disabled}>Commit…</Dialog.Trigger>
+  <Dialog.Trigger class={triggerClass} {disabled}>Commit…</Dialog.Trigger>
   <Dialog.Portal>
     <Dialog.Overlay class="modal-back" />
     <Dialog.Content class="modal" aria-describedby={undefined}>
