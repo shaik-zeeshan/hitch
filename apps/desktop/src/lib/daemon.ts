@@ -13,6 +13,7 @@ import { derived, get, writable } from "svelte/store";
 import { ByteRing } from "./byteRing";
 import {
   aggregateAgentState,
+  parentKey,
   sessionBelongsTo,
   type AgentState,
   type BranchSummary,
@@ -1104,11 +1105,55 @@ derived([selectedProject, projectWorktrees], (v) => v).subscribe(
   },
 );
 
-// Keep the active session within the currently visible set.
+// Per-parent memory of the last active session id, so switching worktrees
+// (or projects) and coming back restores the tab the user had selected
+// instead of always snapping to the first session in the new parent.
+const lastActiveByParent = new Map<string, Id>();
+
+// Track the current parent so we can detect parent changes vs same-parent
+// session list updates (open/close/rename) and only consult the remembered
+// id on a real switch.
+let lastParentKey: string | null = null;
+
+// On every parent switch, restore the remembered session for that parent
+// (if it's still live), else fall back to the first visible one.
+selectedParent.subscribe(($parent) => {
+  const key = $parent ? parentKey($parent) : null;
+  if (key === lastParentKey) return;
+  lastParentKey = key;
+  if (!$parent) {
+    activeSessionId.set(null);
+    return;
+  }
+  const visible = get(sessions).filter((s) => sessionBelongsTo(s, $parent));
+  const remembered = lastActiveByParent.get(key!);
+  const restore =
+    (remembered && visible.some((s) => s.id === remembered) ? remembered : null) ??
+    visible[0]?.id ??
+    null;
+  activeSessionId.set(restore);
+});
+
+// Within the current parent, keep the active session valid if a session
+// closes or the list changes; don't fight the parent-switch logic above.
 visibleSessions.subscribe(($visible) => {
   const active = get(activeSessionId);
-  if (!active || !$visible.some((s) => s.id === active)) {
-    activeSessionId.set($visible[0]?.id ?? null);
+  if (active && $visible.some((s) => s.id === active)) return;
+  activeSessionId.set($visible[0]?.id ?? null);
+});
+
+// Remember the user's active choice per parent so we can restore it later.
+activeSessionId.subscribe(($id) => {
+  const parent = get(selectedParent);
+  if (!parent || !$id) return;
+  lastActiveByParent.set(parentKey(parent), $id);
+});
+
+// Drop remembered ids for sessions that have closed.
+sessions.subscribe(($sessions) => {
+  const liveIds = new Set($sessions.map((s) => s.id));
+  for (const [key, id] of lastActiveByParent) {
+    if (!liveIds.has(id)) lastActiveByParent.delete(key);
   }
 });
 

@@ -1,13 +1,17 @@
 <script lang="ts">
   // Center column (mockup .center): connection banner, then either an empty
   // prompt or the session tabs + live terminals for the active parent. Every
-  // session of the active parent keeps a live (warm) xterm: we render them all
-  // keyed by id and toggle VISIBILITY rather than mounting/unmounting per tab
-  // or diff switch, so switching tabs or opening/closing the diff is instant
-  // and preserves each terminal's scroll position and buffer. The keyed set is
-  // scoped to the active parent (`visibleSessions`), so switching parents
-  // naturally tears down the old parent's terminals and mounts the new ones —
-  // bounding how many xterm instances are live at once.
+  // open session — across ALL parents, not just the active one — keeps a live
+  // (warm) xterm: we render the keyed list off `$sessions` and toggle
+  // VISIBILITY rather than mounting/unmounting per tab, diff, or worktree
+  // switch. That lets each terminal preserve its scroll position, buffer,
+  // and (crucially) its PTY-aligned grid: remounting a Terminal would create
+  // a fresh xterm that re-parses the byte ring at whatever size the new host
+  // happened to measure, and any drift from the PTY's actual cols/rows
+  // displaces wrapped lines and cursor-addressed TUI output. Memory cost is
+  // bounded by the session count (each xterm holds ~5000 lines of scrollback)
+  // and only one terminal at a time runs the WebGL renderer (the active one),
+  // so live GPU contexts stay well under the browser cap.
   import {
     activeSessionId,
     connection,
@@ -17,9 +21,11 @@
     reconnect,
     selectedParent,
     selectedProject,
+    sessions,
     visibleSessions,
     worktrees,
   } from "../daemon";
+  import { sessionBelongsTo } from "../types";
   import SessionTabs from "./SessionTabs.svelte";
   import Terminal from "./Terminal.svelte";
   import DiffTab from "./DiffTab.svelte";
@@ -42,51 +48,53 @@
     <div class="banner connecting">Starting daemon…</div>
   {/if}
 
-  {#if !$selectedProject}
-    <div class="empty">
-      <h3>No project selected</h3>
-      <p>Add a local repo or folder, then pick a worktree to open sessions.</p>
-    </div>
-  {:else if !$selectedParent}
-    <div class="empty">
-      <h3>Choose a worktree</h3>
-      <p>
-        Select a worktree under <span class="mono">{$selectedProject.name}</span> to open a
-        shell or launch an agent.
-      </p>
-    </div>
-  {:else}
+  {#if $selectedParent}
     <SessionTabs parent={$selectedParent} />
-    <div class="view">
-      <!-- Keep every session of the active parent mounted. Each slot is keyed
-           by session id so its Terminal instance is stable for the session's
-           lifetime (mounted once, reused) and is only torn down when the
-           session closes or the parent changes. Visibility — not mount state —
-           tracks which terminal is shown: a slot is visible only when it's the
-           active session AND the diff isn't covering the view. -->
-      {#each $visibleSessions as session (session.id)}
-        {@const visible = session.id === $activeSessionId && !$diffActive}
-        <div class="slot" class:hidden={!visible}>
-          <Terminal {session} active={visible} />
-        </div>
-      {/each}
-
-      {#if $diffActive && $diffPath}
-        <!-- The diff OVERLAYS the (now hidden) terminals rather than replacing
-             them; closing it reveals the active terminal with scroll + buffer
-             intact, since it was never destroyed. -->
-        <DiffTab />
-      {:else if $visibleSessions.length === 0}
-        <div class="empty">
-          <h3>No live session</h3>
-          <p>
-            Open a shell or launch an agent in
-            <span class="mono">{parentLabel}</span>. Output survives quitting Hitch.
-          </p>
-        </div>
-      {/if}
-    </div>
   {/if}
+
+  <!-- The view stays mounted regardless of which empty/overlay state is up,
+       so the terminals inside survive worktree/project switches. Each slot
+       is keyed by session id so its Terminal instance is stable for the
+       session's lifetime — only torn down when the session itself closes.
+       A slot is visible only when its session belongs to the active parent
+       AND is the active session AND the diff isn't covering the view. -->
+  <div class="view">
+    {#each $sessions as session (session.id)}
+      {@const inActiveParent = sessionBelongsTo(session, $selectedParent)}
+      {@const visible = inActiveParent && session.id === $activeSessionId && !$diffActive}
+      <div class="slot" class:hidden={!visible}>
+        <Terminal {session} active={visible} />
+      </div>
+    {/each}
+
+    {#if !$selectedProject}
+      <div class="empty">
+        <h3>No project selected</h3>
+        <p>Add a local repo or folder, then pick a worktree to open sessions.</p>
+      </div>
+    {:else if !$selectedParent}
+      <div class="empty">
+        <h3>Choose a worktree</h3>
+        <p>
+          Select a worktree under <span class="mono">{$selectedProject.name}</span> to open a
+          shell or launch an agent.
+        </p>
+      </div>
+    {:else if $diffActive && $diffPath}
+      <!-- The diff OVERLAYS the (now hidden) terminals rather than replacing
+           them; closing it reveals the active terminal with scroll + buffer
+           intact, since it was never destroyed. -->
+      <DiffTab />
+    {:else if $visibleSessions.length === 0}
+      <div class="empty">
+        <h3>No live session</h3>
+        <p>
+          Open a shell or launch an agent in
+          <span class="mono">{parentLabel}</span>. Output survives quitting Hitch.
+        </p>
+      </div>
+    {/if}
+  </div>
 </main>
 
 <style>
