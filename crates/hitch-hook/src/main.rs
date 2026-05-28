@@ -22,6 +22,30 @@ where
     I::Item: Into<String>,
     R: Read,
 {
+    run(args, stdin, hooks_suppressed())
+}
+
+/// True when Hitch is suppressing agent-state reports for this invocation.
+/// Draft generation (`claude -p` / `codex exec`) runs inside a worktree that may
+/// have Hitch's hooks installed and exports [`SUPPRESS_AGENT_HOOKS_ENV`] so this
+/// helper stays silent instead of moving an unrelated session's state.
+fn hooks_suppressed() -> bool {
+    std::env::var_os(hitch_proto::SUPPRESS_AGENT_HOOKS_ENV).is_some()
+}
+
+fn run<I, R>(args: I, stdin: &mut R, suppressed: bool) -> Result<(), HookError>
+where
+    I: IntoIterator,
+    I::Item: Into<String>,
+    R: Read,
+{
+    // A draft-generation run loads the worktree's installed hooks; without this
+    // guard those reports would resolve by cwd to whatever live shell session
+    // shares the worktree and flip it to running/completed. Bail before touching
+    // the socket so draft generation never disturbs unrelated sessions.
+    if suppressed {
+        return Ok(());
+    }
     let args = HookArgs::parse(args)?;
     let mut payload = String::new();
     stdin.read_to_string(&mut payload)?;
@@ -390,6 +414,27 @@ mod tests {
         assert_eq!(detail.as_deref(), Some("permission requested"));
 
         let _ = fs::remove_file(socket);
+    }
+
+    #[test]
+    fn suppressed_run_does_not_touch_socket() {
+        // With suppression on, the helper must return Ok without attempting to
+        // connect — proven here by handing it a socket path that cannot exist:
+        // if the bail-out regressed, `run` would try to connect and Err.
+        let mut stdin = Cursor::new(b"{}" as &[u8]);
+        run(
+            [
+                "--agent".to_string(),
+                "claude-code".to_string(),
+                "--event".to_string(),
+                "stop".to_string(),
+                "--socket".to_string(),
+                "/nonexistent/hitch-suppressed.sock".to_string(),
+            ],
+            &mut stdin,
+            true,
+        )
+        .unwrap();
     }
 
     fn test_socket_path() -> PathBuf {

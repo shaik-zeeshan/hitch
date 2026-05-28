@@ -118,21 +118,28 @@ impl DraftProviderConfig {
 
     pub(crate) fn with_settings(mut self, settings: Option<DraftGenerationSettings>) -> Self {
         if let Some(settings) = settings {
-            self.kind = match settings.provider {
+            let requested = match settings.provider {
                 DraftProvider::Stub => DraftProviderKind::Stub,
                 DraftProvider::Claude => DraftProviderKind::Claude,
                 DraftProvider::Codex => DraftProviderKind::Codex,
             };
-            // Only override the configured model when the request actually
-            // carries one. A None/empty request model must not clobber an
-            // operator-configured --draft-model / HITCH_DRAFT_MODEL.
-            if let Some(model) = settings
+            let request_model = settings
                 .model
                 .map(|model| model.trim().to_string())
-                .filter(|model| !model.is_empty())
-            {
-                self.model = Some(model);
+                .filter(|model| !model.is_empty());
+            match request_model {
+                // An explicit request model always wins.
+                Some(model) => self.model = Some(model),
+                // No request model: keep an operator-configured --draft-model /
+                // HITCH_DRAFT_MODEL only while the request keeps the operator's
+                // provider. Switching providers makes that model stale and
+                // provider-incompatible (e.g. a Claude `sonnet` handed to
+                // `codex exec --model` fails generation), so drop it and let the
+                // new provider fall back to its own default.
+                None if requested != self.kind => self.model = None,
+                None => {}
             }
+            self.kind = requested;
         }
         self
     }
@@ -372,7 +379,14 @@ fn run_provider_command(
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Draft runs execute in the worktree's cwd, which may carry Hitch's
+        // installed agent hooks (`.claude/settings.local.json`). The provider
+        // would fire those hooks, and `hitch-hook` would resolve them by cwd to
+        // whatever live shell session shares the worktree — flipping it to
+        // running/completed. This env var tells the hook helper to stay silent
+        // for this process tree, so commit/PR drafts never disturb sessions.
+        .env(hitch_proto::SUPPRESS_AGENT_HOOKS_ENV, "1");
 
     // Run the provider as its own process-group leader so a timeout can signal
     // the whole tree. Otherwise killing only the direct child leaves any
@@ -862,6 +876,30 @@ mod tests {
             }));
         assert_eq!(overridden.model.as_deref(), Some("gpt-5-codex"));
         assert_eq!(overridden.kind, DraftProviderKind::Codex);
+    }
+
+    #[test]
+    fn with_settings_drops_stale_model_when_request_switches_provider() {
+        // Daemon configured for Claude `sonnet`; a request that switches to
+        // Codex without naming a model must not carry the Claude model into
+        // `codex exec --model sonnet` (provider-incompatible → generation
+        // fails).
+        let switched =
+            config_with_model(Some("sonnet")).with_settings(Some(DraftGenerationSettings {
+                provider: DraftProvider::Codex,
+                model: None,
+            }));
+        assert_eq!(switched.kind, DraftProviderKind::Codex);
+        assert_eq!(switched.model, None);
+
+        // Switching to stub likewise drops the stale model.
+        let stubbed =
+            config_with_model(Some("sonnet")).with_settings(Some(DraftGenerationSettings {
+                provider: DraftProvider::Stub,
+                model: None,
+            }));
+        assert_eq!(stubbed.kind, DraftProviderKind::Stub);
+        assert_eq!(stubbed.model, None);
     }
 
     #[test]

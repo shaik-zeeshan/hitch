@@ -1047,6 +1047,33 @@ fn remove_project(
     }
 
     let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+
+    // Another client can OpenSession under this project (or one of its
+    // worktrees) in the gap between the pre-snapshot above and this final lock.
+    // Recompute the live set under the lock we now hold through the delete so
+    // the force decision and the cleanup see the same world.
+    let racing_ids = state
+        .sessions
+        .values()
+        .filter(|session| match session.session.parent {
+            SessionParent::Project(id) => id == project_id,
+            SessionParent::Worktree(id) => worktree_ids.contains(&id),
+        })
+        .map(|session| session.session.id)
+        .collect::<Vec<_>>();
+
+    // Honor the force contract: a non-force removal must refuse rather than
+    // silently terminate a session that raced in after the snapshot. Reaching
+    // this point with `!force` means the snapshot was empty (else the guard
+    // above returned), so nothing has been closed and the project is still
+    // intact — failing here is a clean no-op.
+    if !force && !racing_ids.is_empty() {
+        return Err(ProtocolError::new(
+            ErrorCode::LiveSessions,
+            "project has live sessions; retry with force to kill them",
+        ));
+    }
+
     state
         .store
         .delete_project(project_id)
@@ -1056,23 +1083,12 @@ fn remove_project(
         state.worktrees.remove(worktree_id);
     }
 
-    // Another client can OpenSession under this project (or one of its
-    // worktrees) in the gap between the pre-snapshot above and this final lock.
-    // Such a session isn't in `live_session_ids`, so without this it would
-    // survive as an orphaned, unreachable PTY pointing at a now-deleted project.
-    // `delete_project` already removed its store row (it deletes sessions by
-    // parent), so we only need to evict it from the live map here and kill +
-    // broadcast it alongside the snapshotted sessions.
-    let orphan_ids = state
-        .sessions
-        .values()
-        .filter(|session| match session.session.parent {
-            SessionParent::Project(id) => id == project_id,
-            SessionParent::Worktree(id) => worktree_ids.contains(&id),
-        })
-        .map(|session| session.session.id)
-        .collect::<Vec<_>>();
-    let orphans = orphan_ids
+    // For a force removal, evict any raced-in session from the live map and
+    // kill it alongside the snapshotted sessions; `delete_project` already
+    // removed its store row (it deletes sessions by parent), so it would
+    // otherwise survive as an orphaned, unreachable PTY pointing at a now-
+    // deleted project.
+    let orphans = racing_ids
         .into_iter()
         .filter_map(|id| state.sessions.remove(&id).map(|session| (id, session)))
         .collect::<Vec<_>>();

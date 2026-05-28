@@ -36,6 +36,14 @@ pub use framing::{
 };
 pub use message::*;
 
+/// Environment variable Hitch sets on draft-generation provider runs
+/// (`claude -p` / `codex exec`). Those runs execute inside a worktree that may
+/// have Hitch's agent hooks installed (`.claude/settings.local.json`), so
+/// `hitch-hook` bails out when it sees this rather than reporting agent state
+/// for whatever live session happens to share the worktree cwd. Set by
+/// `hitch-daemon::drafts` and honored by `hitch-hook`.
+pub const SUPPRESS_AGENT_HOOKS_ENV: &str = "HITCH_SUPPRESS_AGENT_HOOKS";
+
 /// Human-readable catalog of the stable control-plane message families.
 pub const MESSAGE_CATALOG: &str = r#"
 ControlMessage:
