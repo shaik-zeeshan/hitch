@@ -1047,6 +1047,21 @@ export async function push(): Promise<void> {
   }
 }
 
+export async function pull(): Promise<void> {
+  const worktreeId = get(gitWorktreeId);
+  if (!worktreeId) return;
+  gitBusy.set(true);
+  try {
+    error.set(null);
+    await daemonRequest({ type: "pull", worktree_id: worktreeId });
+  } catch (err) {
+    error.set(toMessage(err));
+    throw err;
+  } finally {
+    gitBusy.set(false);
+  }
+}
+
 // Throws on failure so the dialog can surface the error inline (mirrors App.tsx).
 export async function createPr(fields: PrFields): Promise<void> {
   const worktreeId = get(gitWorktreeId);

@@ -948,6 +948,12 @@ fn handle_request<R: Read>(
                 .map_err(git_error)?;
             send_response(state, client_id, request_id, Response::Ack)?;
         }
+        Request::Pull { worktree_id } => {
+            let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
+            git.pull(&worktree.path, "origin", &worktree.branch)
+                .map_err(git_error)?;
+            send_response(state, client_id, request_id, Response::Ack)?;
+        }
         Request::CreatePullRequest {
             worktree_id,
             title,

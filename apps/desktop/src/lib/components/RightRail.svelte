@@ -15,6 +15,7 @@
     gitStatus,
     gitWorktreeId,
     loadGitStatus,
+    pull,
     push,
     setFileStaged,
     setFilesStaged,
@@ -38,6 +39,7 @@
   const staged = $derived(files.filter((f) => f.staged));
   const unstaged = $derived(files.filter((f) => !f.staged));
   const ahead = $derived($gitStatus?.ahead ?? 0);
+  const behind = $derived($gitStatus?.behind ?? 0);
   const isDefaultBranch = $derived(Boolean($defaultBase && $gitStatus?.branch === $defaultBase));
 
   let autoRunning = $state(false);
@@ -78,6 +80,18 @@
       await push();
       if ($gitStatus?.worktree_id) void loadGitStatus($gitStatus.worktree_id).catch(() => {});
       toast.success(`Pushed ↑${count}`, { id });
+    } catch (err) {
+      toast.error(shortError(err), { id });
+    }
+  }
+
+  async function handleManualPull() {
+    const count = behind;
+    const id = toast.loading("Pulling…");
+    try {
+      await pull();
+      if ($gitStatus?.worktree_id) void loadGitStatus($gitStatus.worktree_id).catch(() => {});
+      toast.success(`Pulled ↓${count}`, { id });
     } catch (err) {
       toast.error(shortError(err), { id });
     }
@@ -136,9 +150,6 @@
       {#if $defaultBase && $defaultBase !== $gitStatus.branch}
         <span class="from">from {$defaultBase}</span>
       {/if}
-      {#if $gitStatus.behind > 0}
-        <span class="behind">↓{$gitStatus.behind}</span>
-      {/if}
       <span class="branch-acts">
         {#if files.length > 0}
           {#if $autoCommitPush}
@@ -152,6 +163,11 @@
           {:else}
             <CommitDialog disabled={$gitBusy} triggerClass="chip" />
           {/if}
+        {/if}
+        {#if behind > 0}
+          <button class="chip" disabled={$gitBusy} onclick={() => void handleManualPull()}>
+            Pull <span class="ar down">↓{behind}</span>
+          </button>
         {/if}
         {#if ahead > 0 && !$autoCommitPush}
           <button class="chip" disabled={$gitBusy} onclick={() => void handleManualPush()}>
@@ -313,9 +329,7 @@
   .ch-branch .from {
     color: var(--tx-lo);
   }
-  .ch-branch .behind {
-    font-family: var(--mono);
-    font-size: 11px;
+  .chip .ar.down {
     color: var(--warn);
   }
   .branch-acts {

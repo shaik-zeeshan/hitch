@@ -164,6 +164,8 @@ pub enum Request {
     },
     /// Push the current branch using the system `git` CLI.
     Push { worktree_id: WorktreeId },
+    /// Pull the current branch from its upstream using the system `git` CLI.
+    Pull { worktree_id: WorktreeId },
     /// Create a GitHub PR through `gh`.
     CreatePullRequest {
         worktree_id: WorktreeId,
@@ -690,6 +692,7 @@ mod tests {
                 }),
             },
             Request::Push { worktree_id },
+            Request::Pull { worktree_id },
             Request::CreatePullRequest {
                 worktree_id,
                 title: "Add proto".into(),

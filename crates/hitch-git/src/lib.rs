@@ -272,6 +272,20 @@ impl GitClient {
         self.run_git(repo_path.as_ref(), vec![os("fetch"), os(remote)])
     }
 
+    /// Pull a branch using the system git executable (relies on user's pull
+    /// config — ff/merge/rebase).
+    pub fn pull(
+        &self,
+        repo_path: impl AsRef<Path>,
+        remote: &str,
+        branch: &str,
+    ) -> Result<CommandOutput> {
+        self.run_git(
+            repo_path.as_ref(),
+            vec![os("pull"), os(remote), os(branch)],
+        )
+    }
+
     /// Create a Hitch-managed worktree under `managed_root/<project>/<branch>`.
     pub fn create_worktree(
         &self,
