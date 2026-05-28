@@ -17,7 +17,7 @@
   import CreateWorktreeDialog from "$lib/components/CreateWorktreeDialog.svelte";
   import RemoveProjectDialog from "$lib/components/RemoveProjectDialog.svelte";
   import RemoveWorktreeDialog from "$lib/components/RemoveWorktreeDialog.svelte";
-  import { SvelteToast } from "@zerodevx/svelte-toast";
+  import { Toaster } from "svelte-french-toast";
 
   let { children } = $props();
 
@@ -62,19 +62,14 @@
 <CreateWorktreeDialog />
 <RemoveProjectDialog />
 <RemoveWorktreeDialog />
-<SvelteToast
-  options={{
-    reversed: true,
-    intro: { x: 192 },
-    theme: {
-      "--toastBackground": "oklch(22% 0.01 265)",
-      "--toastColor": "oklch(92% 0.005 265)",
-      "--toastBarBackground": "oklch(62% 0.1 265)",
-      "--toastBorderRadius": "6px",
-      "--toastMsgPadding": "0.55rem 0.9rem",
-      "--toastBoxShadow": "0 4px 16px oklch(0% 0 0 / 0.5)",
-      "--toastBarHeight": "3px",
-      "--toastWidth": "240px",
+<Toaster
+  position="bottom-right"
+  toastOptions={{
+    style:
+      "background: oklch(20% 0.015 265); color: oklch(90% 0.005 265); border: 1px solid oklch(30% 0.02 265); font-size: 12px; padding: 10px 14px;",
+    iconTheme: {
+      primary: "oklch(62% 0.1 265)",
+      secondary: "oklch(20% 0.015 265)",
     },
   }}
 />

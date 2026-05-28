@@ -24,7 +24,7 @@
   import { STATUS_GLYPH, statusGlyphClass } from "../types";
   import CommitDialog from "./CommitDialog.svelte";
   import CreatePrDialog from "./CreatePrDialog.svelte";
-  import { toast } from "@zerodevx/svelte-toast";
+  import toast from "svelte-french-toast";
 
   let {
     collapsed = false,
@@ -45,27 +45,22 @@
   async function handleAutoCommitPush() {
     if ($gitBusy || autoRunning) return;
     autoRunning = true;
-    const id = toast.push("Staging files…", { duration: 0, dismissable: false });
+    const id = toast.loading("Staging files…");
     try {
       if (unstaged.length > 0) {
         await setFilesStaged(unstaged.map((f) => f.path), true);
       }
-      toast.set(id, { msg: "Generating commit message…" });
+      toast.loading("Generating commit message…", { id });
       const draft = await generateCommitDraft();
-      toast.set(id, { msg: "Committing…" });
+      toast.loading("Committing…", { id });
       await commit(draft.subject, draft.body);
-      toast.set(id, { msg: "Pushing…" });
+      toast.loading("Pushing…", { id });
       await push();
       if ($gitStatus?.worktree_id) void loadGitStatus($gitStatus.worktree_id).catch(() => {});
-      toast.set(id, { msg: "Pushed!", duration: 3000, dismissable: true });
+      toast.success("Pushed!", { id });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      toast.set(id, {
-        msg: `Error: ${msg}`,
-        duration: 6000,
-        dismissable: true,
-        theme: { "--toastBarBackground": "oklch(55% 0.18 25)" },
-      });
+      toast.error(msg, { id });
     } finally {
       autoRunning = false;
     }
