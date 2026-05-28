@@ -304,11 +304,27 @@ function openSessionOutput(sessionId: Id): void {
   rings.set(sessionId, new ByteRing());
   subscribers.get(sessionId)?.onReset();
 
+  let replayMode = true;
   const channel = new Channel<ArrayBuffer | Uint8Array>();
   channel.onmessage = (msg) => {
     const bytes = toUint8Array(msg);
     if (bytes.length === 0) return;
     const offsetBefore = ringFor(sessionId).totalSeen;
+
+    // On reconnect, the daemon sends the full replay in one message, which can
+    // exceed the ring capacity. Stream it directly to the subscriber while
+    // retaining only the tail in the ring for future catch-up.
+    if (replayMode) {
+      // Send the full replay to the subscriber without truncation.
+      subscribers.get(sessionId)?.onData(bytes);
+      // Now add it to the ring, accepting that oversized replays will trim to
+      // capacity; future live output will be bounded normally.
+      ringFor(sessionId).append(bytes);
+      replayMode = false;
+      return;
+    }
+
+    // Normal live output path: bounded append and tail delivery.
     ringFor(sessionId).append(bytes);
     // Hand the subscriber exactly the new tail still retained by the ring.
     subscribers.get(sessionId)?.onData(ringFor(sessionId).bytesSince(offsetBefore));

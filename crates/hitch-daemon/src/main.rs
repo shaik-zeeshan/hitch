@@ -313,10 +313,9 @@ struct OutputBroadcaster {
 
 impl OutputBroadcaster {
     /// Append freshly broadcast `bytes` to a session's live log, trimming the
-    /// head so the log never exceeds `DEFAULT_SCROLLBACK_CAPACITY`. `_restored`
-    /// is accepted for symmetry with `replay_snapshot` (which composes it) but is
-    /// not stored here — the log holds live bytes only, matching the reader ring.
-    fn record_output(&mut self, session_id: SessionId, _restored: &[u8], bytes: &[u8]) {
+    /// head so the log never exceeds `DEFAULT_SCROLLBACK_CAPACITY`. The log
+    /// holds live bytes only; restored scrollback is prepended in `replay_snapshot`.
+    fn record_output(&mut self, session_id: SessionId, bytes: &[u8]) {
         let log = self.logs.entry(session_id).or_default();
         log.extend(bytes.iter().copied());
         if log.len() > DEFAULT_SCROLLBACK_CAPACITY {
@@ -1537,16 +1536,9 @@ fn record_and_broadcast_output(
     bytes: &[u8],
 ) {
     if let Ok(mut state) = state.lock() {
-        // Compose-at-replay-time: the log holds live bytes only; restored
-        // scrollback is prepended in `replay_snapshot`. Pass it for API symmetry.
-        let restored = state
-            .sessions
-            .get(&session_id)
-            .map(|session| session.restored_scrollback.clone())
-            .unwrap_or_default();
-        state
-            .broadcaster
-            .record_output(session_id, &restored, bytes);
+        // The log holds live bytes only; restored scrollback is prepended in
+        // `replay_snapshot` and does not need to be passed for every frame.
+        state.broadcaster.record_output(session_id, bytes);
     }
     let _ = broadcast_session_output(state, session_id, bytes);
 }
@@ -1677,7 +1669,11 @@ fn replay_sessions_to_client(
             .collect::<Vec<_>>()
     };
 
-    for (session, scrollback, command) in replay_items {
+    // Send control-plane messages (SessionOpened, SessionCommand) on the
+    // dispatcher thread, then spawn a thread to do the potentially blocking
+    // replay output writes. This prevents slow clients from freezing the
+    // dispatcher and blocking output delivery for other sessions.
+    for (session, _, command) in &replay_items {
         send_event_to_client(
             state,
             client_id,
@@ -1690,26 +1686,35 @@ fn replay_sessions_to_client(
             client_id,
             Event::SessionCommand {
                 session_id: session.id,
-                command,
+                command: command.clone(),
             },
         )?;
-        if !scrollback.is_empty() {
-            send_output_to_client(state, client_id, session.id, &scrollback)?;
-        }
     }
 
-    // Snapshot fully delivered: open the gate so the dispatcher's next Output
-    // broadcasts reach this client. Setting it on the dispatcher thread, after
-    // the loop, guarantees no live output preceded the snapshot. The broadcast
-    // path reads the sink's `live` atomic; we also mirror the gate in the
-    // broadcaster's set so the unit-tested core stays a self-contained model of
-    // the same state (and `forget_client` can reason about it).
-    if let Ok(mut state) = state.lock() {
-        if let Some(sink) = state.clients.get(&client_id) {
-            sink.live.store(true, Ordering::SeqCst);
+    // Spawn a thread to send replay output and open the gate. This way, slow
+    // network writes (from slow clients) don't block the dispatcher.
+    let state_clone = Arc::clone(state);
+    thread::spawn(move || {
+        for (session, scrollback, _) in replay_items {
+            if !scrollback.is_empty() {
+                let _ = send_output_to_client(&state_clone, client_id, session.id, &scrollback);
+            }
         }
-        state.broadcaster.mark_live(client_id);
-    }
+
+        // Snapshot fully delivered: open the gate so the dispatcher's next Output
+        // broadcasts reach this client. Setting it on a spawned thread, after the
+        // loop, still guarantees the gate opens only after the snapshot is sent.
+        // The broadcast path reads the sink's `live` atomic; we also mirror the
+        // gate in the broadcaster's set so the unit-tested core stays a
+        // self-contained model of the same state.
+        if let Ok(mut state) = state_clone.lock() {
+            if let Some(sink) = state.clients.get(&client_id) {
+                sink.live.store(true, Ordering::SeqCst);
+            }
+            state.broadcaster.mark_live(client_id);
+        }
+    });
+
     Ok(())
 }
 
@@ -1978,8 +1983,7 @@ mod tests {
         // The `PtyEvent::Output` path: append to the authoritative log, then
         // broadcast to every client whose readiness gate is open.
         fn record_output(&mut self, bytes: &[u8]) {
-            self.broadcaster
-                .record_output(self.session_id, &self.restored, bytes);
+            self.broadcaster.record_output(self.session_id, bytes);
             let live: Vec<u64> = self
                 .received
                 .keys()
