@@ -282,6 +282,12 @@ impl HitchClient {
             return Err(err);
         }
 
+        // Fixed client-side response deadline. The daemon clamps its
+        // configurable draft timeout safely below this (see
+        // `hitch-daemon`'s `drafts::MAX_TIMEOUT_SECS`, currently 120 - 10s
+        // margin) so a slow draft still produces a daemon response — success
+        // or timeout error — before the client abandons the request and the
+        // reader_loop drops the late reply. Keep these two values in sync.
         match rx.recv_timeout(Duration::from_secs(120)) {
             Ok(response) => Ok(response),
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -587,65 +593,78 @@ struct DisconnectedPayload {
 }
 
 #[tauri::command]
-fn connect_daemon(app: AppHandle, state: State<'_, HitchClient>) -> Result<(), String> {
-    state.connect(&app)?;
-    match state.send_request(
-        &app,
-        Request::Hello {
-            client_name: "hitch-desktop".into(),
-            protocol_version: PROTOCOL_VERSION,
-        },
-    )? {
-        Response::Hello { .. } => Ok(()),
-        Response::Error { error } if error.code == ErrorCode::UnsupportedProtocol => {
-            state.restart_daemon(
-                &app,
-                format!("restarting incompatible daemon: {}", error.message),
-            )?;
-            match state.send_request(
-                &app,
-                Request::Hello {
-                    client_name: "hitch-desktop".into(),
-                    protocol_version: PROTOCOL_VERSION,
-                },
-            )? {
-                Response::Hello { .. } => Ok(()),
-                Response::Error { error } => Err(error.message),
-                other => Err(format!(
-                    "unexpected hello response after daemon restart: {other:?}"
-                )),
+async fn connect_daemon(app: AppHandle, state: State<'_, HitchClient>) -> Result<(), String> {
+    let client = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        client.connect(&app)?;
+        match client.send_request(
+            &app,
+            Request::Hello {
+                client_name: "hitch-desktop".into(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+        )? {
+            Response::Hello { .. } => Ok(()),
+            Response::Error { error } if error.code == ErrorCode::UnsupportedProtocol => {
+                client.restart_daemon(
+                    &app,
+                    format!("restarting incompatible daemon: {}", error.message),
+                )?;
+                match client.send_request(
+                    &app,
+                    Request::Hello {
+                        client_name: "hitch-desktop".into(),
+                        protocol_version: PROTOCOL_VERSION,
+                    },
+                )? {
+                    Response::Hello { .. } => Ok(()),
+                    Response::Error { error } => Err(error.message),
+                    other => Err(format!(
+                        "unexpected hello response after daemon restart: {other:?}"
+                    )),
+                }
             }
+            Response::Error { error } => Err(error.message),
+            other => Err(format!("unexpected hello response: {other:?}")),
         }
-        Response::Error { error } => Err(error.message),
-        other => Err(format!("unexpected hello response: {other:?}")),
-    }
+    })
+    .await
+    .map_err(|err| format!("daemon connection task failed: {err}"))?
 }
 
 #[tauri::command]
-fn hitch_request(
+async fn hitch_request(
     app: AppHandle,
     state: State<'_, HitchClient>,
     request: Request,
 ) -> Result<Response, String> {
-    state.send_request(&app, request)
+    let client = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || client.send_request(&app, request))
+        .await
+        .map_err(|err| format!("daemon request task failed: {err}"))?
 }
 
 #[tauri::command]
-fn send_session_input(
+async fn send_session_input(
     app: AppHandle,
     state: State<'_, HitchClient>,
     session_id: SessionId,
     data: String,
 ) -> Result<Response, String> {
-    let bytes = data.into_bytes();
-    state.send_request_with_payload(
-        &app,
-        Request::SendSessionInput {
-            session_id,
-            byte_count: bytes.len() as u32,
-        },
-        Some(bytes),
-    )
+    let client = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = data.into_bytes();
+        client.send_request_with_payload(
+            &app,
+            Request::SendSessionInput {
+                session_id,
+                byte_count: bytes.len() as u32,
+            },
+            Some(bytes),
+        )
+    })
+    .await
+    .map_err(|err| format!("session input task failed: {err}"))?
 }
 
 /// Register the webview's per-session output channel (ADR 0007). Any bytes that

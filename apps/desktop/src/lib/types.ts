@@ -72,6 +72,16 @@ export type PrFields = {
   draft: boolean;
 };
 
+export type CommitDraft = {
+  subject: string;
+  body: string;
+};
+
+export type PullRequestDraft = {
+  title: string;
+  body: string;
+};
+
 export type Request = { type: string; [key: string]: unknown };
 export type Response = { type: string; [key: string]: unknown };
 export type HitchEvent = { type: string; [key: string]: unknown };

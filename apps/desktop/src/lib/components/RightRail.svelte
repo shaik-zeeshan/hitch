@@ -5,8 +5,6 @@
   // the selection + loads the diff text). Branch-level +/− stats live in the
   // tree; this panel focuses on file status and commit actions.
   import {
-    commit,
-    commitMessage,
     defaultBase,
     diffPath,
     discardAllFiles,
@@ -21,6 +19,7 @@
     viewDiff,
   } from "../daemon";
   import { STATUS_GLYPH, statusGlyphClass } from "../types";
+  import CommitDialog from "./CommitDialog.svelte";
   import CreatePrDialog from "./CreatePrDialog.svelte";
 
   let {
@@ -35,16 +34,7 @@
   const staged = $derived(files.filter((f) => f.staged));
   const unstaged = $derived(files.filter((f) => !f.staged));
   const ahead = $derived($gitStatus?.ahead ?? 0);
-  const canCommit = $derived(
-    staged.length > 0 && $commitMessage.trim().length > 0 && !$gitBusy,
-  );
-
-  function onCommitKey(event: KeyboardEvent) {
-    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-      event.preventDefault();
-      if (canCommit) void commit();
-    }
-  }
+  const isDefaultBranch = $derived(Boolean($defaultBase && $gitStatus?.branch === $defaultBase));
 
   function confirmDiscardAll() {
     if (files.length === 0 || $gitBusy) return;
@@ -118,7 +108,9 @@
         <div class="grp-head">
           Staged <span class="n">{staged.length}</span>
           <span class="acts">
-            <button class="act" onclick={() => void setFilesStaged(staged.map((f) => f.path), false)}
+            <button
+              class="act"
+              onclick={() => void setFilesStaged(staged.map((f) => f.path), false).catch(() => {})}
               >Unstage all</button
             >
           </span>
@@ -135,7 +127,7 @@
               aria-label="Unstage {file.path}"
               onclick={(e) => {
                 e.stopPropagation();
-                void setFileStaged(file.path, false);
+                void setFileStaged(file.path, false).catch(() => {});
               }}
               onkeydown={() => {}}>−</span
             >
@@ -159,7 +151,9 @@
         <div class="grp-head">
           Changes <span class="n">{unstaged.length}</span>
           <span class="acts">
-            <button class="act" onclick={() => void setFilesStaged(unstaged.map((f) => f.path), true)}
+            <button
+              class="act"
+              onclick={() => void setFilesStaged(unstaged.map((f) => f.path), true).catch(() => {})}
               >Stage all</button
             >
             <span class="sep" aria-hidden="true">·</span>
@@ -178,7 +172,7 @@
               aria-label="Stage {file.path}"
               onclick={(e) => {
                 e.stopPropagation();
-                void setFileStaged(file.path, true);
+                void setFileStaged(file.path, true).catch(() => {});
               }}
               onkeydown={() => {}}>+</span
             >
@@ -202,22 +196,14 @@
 
   {#if $gitWorktreeId}
     <div class="commit">
-      <textarea
-        placeholder="Commit message"
-        bind:value={$commitMessage}
-        onkeydown={onCommitKey}
-      ></textarea>
-      <button class="btn primary full" disabled={!canCommit} onclick={() => void commit()}>
-        {staged.length > 0
-          ? `Commit ${staged.length} file${staged.length === 1 ? "" : "s"}`
-          : "Nothing staged"}
-        <span class="kbd">⌘⏎</span>
-      </button>
+      <CommitDialog disabled={$gitBusy} />
       <div class="row2">
         <button class="btn grow" disabled={$gitBusy} onclick={() => void push()}>
           Push {#if ahead > 0}<span class="ar">↑{ahead}</span>{/if}
         </button>
-        <CreatePrDialog disabled={$gitBusy} />
+        {#if !isDefaultBranch}
+          <CreatePrDialog disabled={$gitBusy} />
+        {/if}
       </div>
     </div>
   {/if}
@@ -439,26 +425,6 @@
     display: grid;
     gap: 8px;
     background: var(--bg-2);
-  }
-  .commit textarea {
-    width: 100%;
-    resize: none;
-    min-height: 54px;
-    background: var(--bg-0);
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    color: var(--tx-hi);
-    font: inherit;
-    font-size: 12px;
-    padding: 8px 10px;
-    transition: border-color var(--t-fast);
-  }
-  .commit textarea::placeholder {
-    color: var(--tx-lo);
-  }
-  .commit textarea:focus {
-    outline: none;
-    border-color: var(--ac);
   }
   .row2 {
     display: flex;

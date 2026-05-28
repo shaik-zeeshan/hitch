@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Create-worktree dialog (mockup #wt-modal). Opened from the tree's "New
-  // worktree…" row and the ⌘K palette via the createWorktreeFor store (the
+  // Create-worktree dialog (mockup #wt-modal). Opened from the "+" on a
+  // project row and the ⌘K palette via the createWorktreeFor store (the
   // project it creates under). New-branch vs existing-branch picks the daemon's
   // WorktreeCreateMode; the base field only applies to a new branch. Throws on
   // failure surface inline; success dismisses and optionally opens a shell.
