@@ -4,7 +4,7 @@
   // call createPr, which throws on failure so the error surfaces inline. On
   // success the daemon's PR url lands in the prUrl store and we show it.
   import { Dialog } from "bits-ui";
-  import { createPr, defaultBase, gitStatus, prUrl } from "../daemon";
+  import { createPr, defaultBase, generatePullRequestDraft, gitStatus, prUrl } from "../daemon";
   import { createPrOpen } from "../overlays";
 
   let { disabled = false }: { disabled?: boolean } = $props();
@@ -14,7 +14,13 @@
   let base = $state("");
   let draft = $state(false);
   let submitting = $state(false);
+  let generating = $state(false);
   let errMsg = $state<string | null>(null);
+
+  // Bumped on each open-reset so an in-flight draft request that resolves after
+  // the dialog was closed and reopened can detect it's stale and skip clobbering
+  // the freshly-reset blank form (or flipping `generating` for the new session).
+  let generationSeq = 0;
 
   // Open state is shared (the ⌘K palette can open this too); reset the form on
   // each open, whether triggered here or externally.
@@ -22,17 +28,48 @@
   $effect(() => {
     if ($createPrOpen && !wasOpen) {
       wasOpen = true;
+      generationSeq += 1;
       title = "";
       body = "";
       base = $defaultBase ?? "";
       draft = false;
       submitting = false;
+      generating = false;
       errMsg = null;
       prUrl.set(null);
     } else if (!$createPrOpen) {
       wasOpen = false;
     }
   });
+
+  function confirmReplace(): boolean {
+    if (!title.trim() && !body.trim()) return true;
+    return window.confirm("Replace the current PR title and description with a generated draft?");
+  }
+
+  async function generate() {
+    const targetBase = base.trim() || $defaultBase || "";
+    if (!targetBase) {
+      errMsg = "Enter a base branch before generating a PR draft.";
+      return;
+    }
+    if (generating || !confirmReplace()) return;
+    const seq = generationSeq;
+    generating = true;
+    errMsg = null;
+    try {
+      const result = await generatePullRequestDraft(targetBase);
+      if (seq !== generationSeq) return;
+      title = result.title;
+      body = result.body;
+      base = targetBase;
+    } catch (err) {
+      if (seq !== generationSeq) return;
+      errMsg = err instanceof Error ? err.message : String(err);
+    } finally {
+      if (seq === generationSeq) generating = false;
+    }
+  }
 
   async function submit() {
     const t = title.trim();
@@ -80,6 +117,11 @@
         </div>
       {:else}
         <div class="m-body">
+          <div class="draft-actions">
+            <button class="btn" disabled={generating || submitting} onclick={() => void generate()}>
+              {generating ? "Generating…" : title || body ? "Regenerate" : "Generate"}
+            </button>
+          </div>
           <label class="field">
             <span>Title</span>
             <!-- svelte-ignore a11y_autofocus -->
@@ -113,3 +155,10 @@
     </Dialog.Content>
   </Dialog.Portal>
 </Dialog.Root>
+
+<style>
+  .draft-actions {
+    display: flex;
+    gap: 8px;
+  }
+</style>

@@ -17,18 +17,22 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+mod drafts;
+
+use drafts::{CommitDraftInput, DraftProviderConfig, PullRequestDraftInput};
 use hitch_agent::HookInstallOptions;
 use hitch_core::{
     Project, ProjectId, ProjectKind, Session, SessionId, SessionParent, Worktree, WorktreeId,
 };
 use hitch_git::{
-    CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState, GitClient, GitRepository,
-    RemoveWorktreeRequest, StatusEntry, WorktreeCheckout,
+    staged_diff, CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState, GitClient,
+    GitRepository, RemoveWorktreeRequest, StatusEntry, WorktreeCheckout,
 };
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, ChangedFile, ControlMessage, ErrorCode, Event,
-    FileDiff, FileStatus, GitStatus, ProtocolError, Request, Response, WorktreeCreateMode,
-    MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
+    encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage,
+    DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
+    ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode, MAX_PTY_FRAME_LEN,
+    PROTOCOL_VERSION,
 };
 use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize};
 use hitch_store::Store;
@@ -59,6 +63,7 @@ struct Args {
     hook_helper: PathBuf,
     git: PathBuf,
     gh: PathBuf,
+    draft_provider: DraftProviderConfig,
     detach: bool,
 }
 
@@ -70,6 +75,7 @@ impl Args {
         let mut hook_helper = default_hook_helper_path();
         let mut git = PathBuf::from("git");
         let mut gh = PathBuf::from("gh");
+        let mut draft_provider = DraftProviderConfig::from_env()?;
         let mut detach = false;
         let mut args = std::env::args().skip(1);
 
@@ -111,10 +117,42 @@ impl Args {
                             .ok_or_else(|| "--gh requires a path".to_string())?,
                     );
                 }
+                "--draft-provider" => {
+                    let value = args.next().ok_or_else(|| {
+                        "--draft-provider requires stub, claude, or codex".to_string()
+                    })?;
+                    draft_provider.set_kind(&value)?;
+                }
+                "--claude" => {
+                    draft_provider.claude = PathBuf::from(
+                        args.next()
+                            .ok_or_else(|| "--claude requires a path".to_string())?,
+                    );
+                }
+                "--codex" => {
+                    draft_provider.codex = PathBuf::from(
+                        args.next()
+                            .ok_or_else(|| "--codex requires a path".to_string())?,
+                    );
+                }
+                "--draft-timeout-secs" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--draft-timeout-secs requires a value".to_string())?;
+                    draft_provider.set_timeout_secs(&value)?;
+                }
+                "--draft-model" => {
+                    let model = args
+                        .next()
+                        .ok_or_else(|| "--draft-model requires a value".to_string())?
+                        .trim()
+                        .to_string();
+                    draft_provider.model = (!model.is_empty()).then_some(model);
+                }
                 "--detach" => detach = true,
                 "--help" | "-h" => {
                     println!(
-                        "usage: hitch-daemon [--socket PATH] [--store PATH] [--managed-root PATH] [--hook-helper PATH] [--git PATH] [--gh PATH] [--detach]"
+                        "usage: hitch-daemon [--socket PATH] [--store PATH] [--managed-root PATH] [--hook-helper PATH] [--git PATH] [--gh PATH] [--draft-provider stub|claude|codex] [--draft-model MODEL] [--claude PATH] [--codex PATH] [--draft-timeout-secs N] [--detach]"
                     );
                     std::process::exit(0);
                 }
@@ -129,6 +167,7 @@ impl Args {
             hook_helper,
             git,
             gh,
+            draft_provider,
             detach,
         })
     }
@@ -142,6 +181,7 @@ struct DaemonConfig {
     hook_helper: PathBuf,
     git: PathBuf,
     gh: PathBuf,
+    draft_provider: DraftProviderConfig,
 }
 
 impl From<Args> for DaemonConfig {
@@ -153,13 +193,15 @@ impl From<Args> for DaemonConfig {
             hook_helper: args.hook_helper,
             git: args.git,
             gh: args.gh,
+            draft_provider: args.draft_provider,
         }
     }
 }
 
 fn detach_spawn(args: &Args) -> io::Result<()> {
     let exe = std::env::current_exe()?;
-    let child = Command::new(exe)
+    let mut child = Command::new(exe);
+    child
         .arg("--socket")
         .arg(&args.socket_path)
         .arg("--store")
@@ -172,6 +214,18 @@ fn detach_spawn(args: &Args) -> io::Result<()> {
         .arg(&args.git)
         .arg("--gh")
         .arg(&args.gh)
+        .arg("--draft-provider")
+        .arg(args.draft_provider.kind.label())
+        .arg("--claude")
+        .arg(&args.draft_provider.claude)
+        .arg("--codex")
+        .arg(&args.draft_provider.codex)
+        .arg("--draft-timeout-secs")
+        .arg(args.draft_provider.timeout.as_secs().to_string());
+    if let Some(model) = args.draft_provider.model.as_deref() {
+        child.arg("--draft-model").arg(model);
+    }
+    let child = child
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -481,6 +535,22 @@ fn handle_request<R: Read>(
             )?;
             broadcast_event(state, Event::ProjectUpdated { project })?;
         }
+        Request::RemoveProject { project_id, force } => {
+            let closed_session_ids = remove_project(state, project_id, force)?;
+            send_response(state, client_id, request_id, Response::Ack)?;
+            // close_session does not itself broadcast; mirror the CloseSession
+            // handler so peer clients drop each killed session too.
+            for session_id in closed_session_ids {
+                broadcast_event(
+                    state,
+                    Event::SessionClosed {
+                        session_id,
+                        exit_code: None,
+                    },
+                )?;
+            }
+            broadcast_event(state, Event::ProjectRemoved { project_id })?;
+        }
         Request::ListWorktrees { project_id } => {
             let worktrees = list_worktrees(state, project_id)?;
             send_response(
@@ -627,12 +697,57 @@ fn handle_request<R: Read>(
         }
         Request::Commit {
             worktree_id,
-            message,
+            subject,
+            body,
         } => {
             let (git, worktree_path) = git_context(state, worktree_id)?;
-            git.commit(&worktree_path, &message).map_err(git_error)?;
+            git.commit(&worktree_path, &subject, body.as_deref())
+                .map_err(git_error)?;
             send_response(state, client_id, request_id, Response::Ack)?;
             broadcast_dirty(state, worktree_id)?;
+        }
+        Request::ListDraftModels { provider } => {
+            spawn_response_task(
+                "hitch-draft-models",
+                Arc::clone(state),
+                client_id,
+                request_id,
+                move |state| {
+                    let models = list_draft_models(state, provider)?;
+                    Ok(Response::DraftModels { provider, models })
+                },
+            )?;
+        }
+        Request::GenerateCommitDraft {
+            worktree_id,
+            settings,
+        } => {
+            spawn_response_task(
+                "hitch-commit-draft",
+                Arc::clone(state),
+                client_id,
+                request_id,
+                move |state| {
+                    let draft = generate_commit_draft(state, worktree_id, settings)?;
+                    Ok(Response::CommitDraft { draft })
+                },
+            )?;
+        }
+        Request::GeneratePullRequestDraft {
+            worktree_id,
+            base,
+            settings,
+        } => {
+            spawn_response_task(
+                "hitch-pr-draft",
+                Arc::clone(state),
+                client_id,
+                request_id,
+                move |state| {
+                    let draft = generate_pull_request_draft(state, worktree_id, base, settings)?;
+                    Ok(Response::PullRequestDraft { draft })
+                },
+            )?;
         }
         Request::Push { worktree_id } => {
             let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
@@ -884,6 +999,114 @@ fn create_worktree(
     Ok(worktree)
 }
 
+fn remove_project(
+    state: &Arc<Mutex<DaemonState>>,
+    project_id: ProjectId,
+    force: bool,
+) -> Result<Vec<SessionId>, ProtocolError> {
+    let (_worktree_ids, live_session_ids) = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        if !state.projects.contains_key(&project_id) {
+            return Err(ProtocolError::new(ErrorCode::NotFound, "project not found"));
+        }
+        let worktree_ids = state
+            .worktrees
+            .values()
+            .filter(|worktree| worktree.project_id == project_id)
+            .map(|worktree| worktree.id)
+            .collect::<Vec<_>>();
+        let live_session_ids = state
+            .sessions
+            .values()
+            .filter(|session| match session.session.parent {
+                SessionParent::Project(id) => id == project_id,
+                SessionParent::Worktree(id) => worktree_ids.contains(&id),
+            })
+            .map(|session| session.session.id)
+            .collect::<Vec<_>>();
+        (worktree_ids, live_session_ids)
+    };
+
+    if !force && !live_session_ids.is_empty() {
+        return Err(ProtocolError::new(
+            ErrorCode::LiveSessions,
+            "project has live sessions; retry with force to kill them",
+        ));
+    }
+
+    let mut closed_session_ids = Vec::new();
+    for session_id in live_session_ids {
+        match close_session(state, session_id, true) {
+            Ok(()) => closed_session_ids.push(session_id),
+            // The session may have exited on its own (PTY-exit dispatcher) or
+            // been closed by another client between our snapshot and this kill.
+            // A force-removal must not be derailed by an already-gone session.
+            Err(err) if err.code == ErrorCode::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+
+    // Another client can OpenSession under this project (or one of its
+    // worktrees) in the gap between the pre-snapshot above and this final lock.
+    // Recompute the live set under the lock we now hold through the delete so
+    // the force decision and the cleanup see the same world.
+    let worktree_ids = state
+        .worktrees
+        .values()
+        .filter(|wt| wt.project_id == project_id)
+        .map(|wt| wt.id)
+        .collect::<Vec<_>>();
+    let racing_ids = state
+        .sessions
+        .values()
+        .filter(|session| match session.session.parent {
+            SessionParent::Project(id) => id == project_id,
+            SessionParent::Worktree(id) => worktree_ids.contains(&id),
+        })
+        .map(|session| session.session.id)
+        .collect::<Vec<_>>();
+
+    // Honor the force contract: a non-force removal must refuse rather than
+    // silently terminate a session that raced in after the snapshot. Reaching
+    // this point with `!force` means the snapshot was empty (else the guard
+    // above returned), so nothing has been closed and the project is still
+    // intact — failing here is a clean no-op.
+    if !force && !racing_ids.is_empty() {
+        return Err(ProtocolError::new(
+            ErrorCode::LiveSessions,
+            "project has live sessions; retry with force to kill them",
+        ));
+    }
+
+    state
+        .store
+        .delete_project(project_id)
+        .map_err(store_error)?;
+    state.projects.remove(&project_id);
+    for worktree_id in &worktree_ids {
+        state.worktrees.remove(worktree_id);
+    }
+
+    // For a force removal, evict any raced-in session from the live map and
+    // kill it alongside the snapshotted sessions; `delete_project` already
+    // removed its store row (it deletes sessions by parent), so it would
+    // otherwise survive as an orphaned, unreachable PTY pointing at a now-
+    // deleted project.
+    let orphans = racing_ids
+        .into_iter()
+        .filter_map(|id| state.sessions.remove(&id).map(|session| (id, session)))
+        .collect::<Vec<_>>();
+    drop(state);
+
+    for (session_id, session) in orphans {
+        let _ = session.pty.kill();
+        closed_session_ids.push(session_id);
+    }
+    Ok(closed_session_ids)
+}
+
 fn remove_worktree(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
@@ -936,7 +1159,13 @@ fn remove_worktree(
     }
 
     for session_id in live_session_ids {
-        close_session(state, session_id, true)?;
+        match close_session(state, session_id, true) {
+            Ok(()) => {}
+            // Tolerate a session that vanished on its own (PTY-exit dispatcher)
+            // or was closed by another client; a force-removal must continue.
+            Err(err) if err.code == ErrorCode::NotFound => {}
+            Err(err) => return Err(err),
+        }
     }
 
     git.remove_worktree(
@@ -1123,6 +1352,102 @@ fn git_diff(
     })
 }
 
+fn list_draft_models(
+    state: &Arc<Mutex<DaemonState>>,
+    provider: DraftProvider,
+) -> Result<Vec<String>, ProtocolError> {
+    let config = draft_provider_config(state)?;
+    drafts::list_models(&config, provider)
+}
+
+fn generate_commit_draft(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+    settings: Option<DraftGenerationSettings>,
+) -> Result<CommitDraft, ProtocolError> {
+    let worktree = refreshed_worktree_context(state, worktree_id)?.1;
+    let provider = draft_provider_config(state)?.with_settings(settings);
+    let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
+    let summary = repo.status().map_err(git_error)?;
+    let staged_paths = summary
+        .entries
+        .iter()
+        .filter(|entry| index_is_staged(entry.index))
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    if staged_paths.is_empty() {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "stage files before generating a commit draft",
+        ));
+    }
+
+    // Compose from the staged side only; unstaged worktree edits are ignored.
+    let staged_patch = staged_diff(&worktree.path).map_err(git_error)?;
+    drafts::generate_commit_draft(
+        &provider,
+        CommitDraftInput {
+            worktree_path: worktree.path,
+            staged_paths,
+            staged_patch,
+        },
+    )
+}
+
+fn generate_pull_request_draft(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+    base: Option<String>,
+    settings: Option<DraftGenerationSettings>,
+) -> Result<PullRequestDraft, ProtocolError> {
+    let worktree = refreshed_worktree_context(state, worktree_id)?.1;
+    let provider = draft_provider_config(state)?.with_settings(settings);
+    let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
+    let base = base
+        .map(|base| base.trim().to_string())
+        .filter(|base| !base.is_empty())
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "enter a base branch before generating a PR draft",
+            )
+        })?;
+    if base == worktree.branch {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "choose a base branch different from the current branch",
+        ));
+    }
+
+    // One pass over the repo for commits, changed paths, and patch text rather
+    // than three re-discoveries that each rebuild the branch diff.
+    let comparison = repo.branch_comparison(&base, 25).map_err(git_error)?;
+    let commit_summaries = comparison
+        .commits
+        .iter()
+        .filter_map(|commit| commit.summary.clone())
+        .collect::<Vec<_>>();
+
+    drafts::generate_pull_request_draft(
+        &provider,
+        PullRequestDraftInput {
+            worktree_path: worktree.path,
+            branch: worktree.branch,
+            base,
+            commits: commit_summaries,
+            changed_paths: comparison.changed_paths,
+            diff: comparison.diff,
+        },
+    )
+}
+
+fn draft_provider_config(
+    state: &Arc<Mutex<DaemonState>>,
+) -> Result<DraftProviderConfig, ProtocolError> {
+    let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    Ok(state.config.draft_provider.clone())
+}
+
 fn git_context(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
@@ -1179,8 +1504,15 @@ fn broadcast_dirty(
     broadcast_event(state, Event::WorktreeDirty { worktree_id, dirty })
 }
 
+/// True when the index side reflects a genuine staged change. A conflicted file
+/// has an index state of [`FileState::Conflicted`], but an unresolved conflict
+/// is not a clean staged change, so it is excluded here.
+fn index_is_staged(state: FileState) -> bool {
+    !matches!(state, FileState::Unmodified | FileState::Conflicted)
+}
+
 fn status_entry_to_proto(entry: &StatusEntry) -> ChangedFile {
-    let staged = entry.index != FileState::Unmodified;
+    let staged = index_is_staged(entry.index);
     let state = if staged {
         entry.index
     } else {
@@ -1455,6 +1787,29 @@ fn replay_sessions_to_client(
         }
     }
     Ok(())
+}
+
+fn spawn_response_task<F>(
+    name: &'static str,
+    state: Arc<Mutex<DaemonState>>,
+    client_id: u64,
+    request_id: u64,
+    job: F,
+) -> Result<(), ProtocolError>
+where
+    F: FnOnce(&Arc<Mutex<DaemonState>>) -> Result<Response, ProtocolError> + Send + 'static,
+{
+    thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let response = match job(&state) {
+                Ok(response) => response,
+                Err(error) => Response::Error { error },
+            };
+            let _ = send_response(&state, client_id, request_id, response);
+        })
+        .map(|_| ())
+        .map_err(|err| internal(format!("failed to spawn {name}: {err}")))
 }
 
 fn send_response(

@@ -36,6 +36,14 @@ pub use framing::{
 };
 pub use message::*;
 
+/// Environment variable Hitch sets on draft-generation provider runs
+/// (`claude -p` / `codex exec`). Those runs execute inside a worktree that may
+/// have Hitch's agent hooks installed (`.claude/settings.local.json`), so
+/// `hitch-hook` bails out when it sees this rather than reporting agent state
+/// for whatever live session happens to share the worktree cwd. Set by
+/// `hitch-daemon::drafts` and honored by `hitch-hook`.
+pub const SUPPRESS_AGENT_HOOKS_ENV: &str = "HITCH_SUPPRESS_AGENT_HOOKS";
+
 /// Human-readable catalog of the stable control-plane message families.
 pub const MESSAGE_CATALOG: &str = r#"
 ControlMessage:
@@ -49,6 +57,7 @@ Request:
   list-projects
   add-project(root)
   clone-project(remote_url, destination, name?)
+  remove-project(project_id, force)
   list-worktrees(project_id)
   create-worktree(project_id, branch, base?, mode)
   remove-worktree(worktree_id, delete_branch, force)
@@ -63,7 +72,10 @@ Request:
   stage-files(worktree_id, paths)
   unstage-files(worktree_id, paths)
   discard-files(worktree_id, paths)
-  commit(worktree_id, message)
+  commit(worktree_id, subject, body?)
+  list-draft-models(provider)
+  generate-commit-draft(worktree_id, settings?)
+  generate-pull-request-draft(worktree_id, base?, settings?)
   push(worktree_id)
   create-pull-request(worktree_id, title, body?, base?, draft)
   install-agent-hooks(worktree_id)
@@ -79,6 +91,8 @@ Response:
   git-status(status)
   file-diff(diff)
   pull-request-created(url)
+  commit-draft(draft)
+  pull-request-draft(draft)
   error(error)
 
 Event:
@@ -89,4 +103,5 @@ Event:
   worktree-dirty(worktree_id, dirty)
   worktree-updated(worktree)
   project-updated(project)
+  project-removed(project_id)
 "#;

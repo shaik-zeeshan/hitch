@@ -7,8 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hitch_core::{Project, Session, SessionId, SessionParent, Worktree};
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, ControlMessage, ErrorCode, Event, GitStatus, Request,
-    Response, PROTOCOL_VERSION,
+    encode_control_message, encode_pty_frame, CommitDraft, ControlMessage, ErrorCode, Event,
+    GitStatus, PullRequestDraft, Request, Response, PROTOCOL_VERSION,
 };
 
 #[test]
@@ -208,6 +208,127 @@ fn git_status_stage_and_unstage_round_trip_over_socket() {
 }
 
 #[test]
+fn draft_generation_round_trips_over_socket() {
+    let socket = test_socket_path("drafts");
+    let repo = test_dir_path("drafts-repo");
+    init_git_repo(&repo);
+    run_git(&repo, ["checkout", "-b", "feature/draft-text"]);
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &repo);
+    let worktree = client.list_worktrees(3, project.id).remove(0);
+
+    std::fs::write(repo.join("tracked.txt"), "staged\n").unwrap();
+    std::fs::write(repo.join("unstaged.txt"), "unstaged\n").unwrap();
+    client.ack(
+        4,
+        Request::StageFiles {
+            worktree_id: worktree.id,
+            paths: vec!["tracked.txt".into()],
+        },
+    );
+    let commit = client.generate_commit_draft(5, worktree.id);
+    assert_eq!(commit.subject, "chore: update tracked.txt");
+    assert!(commit.body.contains("tracked.txt"));
+    assert!(!commit.body.contains("unstaged.txt"));
+
+    client.ack(
+        6,
+        Request::Commit {
+            worktree_id: worktree.id,
+            subject: commit.subject,
+            body: Some(commit.body),
+        },
+    );
+    let pr = client.generate_pr_draft(7, worktree.id, Some("main".into()));
+    assert!(pr.title.contains("update") || pr.title.contains("tracked"));
+    assert!(pr.body.contains("## Summary"));
+    assert!(pr.body.contains("tracked.txt"));
+    assert!(pr.body.contains("## Testing"));
+    assert!(pr.body.contains("- [ ] Not run"));
+
+    client.shutdown(8);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(repo);
+}
+
+#[test]
+fn slow_draft_generation_does_not_block_follow_up_requests() {
+    let socket = test_socket_path("async-drafts");
+    let repo = test_dir_path("async-drafts-repo");
+    let codex = write_slow_codex_stub();
+    init_git_repo(&repo);
+    let mut daemon = DaemonGuard::start_with_codex(&socket, &codex);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &repo);
+    let worktree = client.list_worktrees(3, project.id).remove(0);
+
+    std::fs::write(repo.join("tracked.txt"), "staged async draft\n").unwrap();
+    client.ack(
+        4,
+        Request::StageFiles {
+            worktree_id: worktree.id,
+            paths: vec!["tracked.txt".into()],
+        },
+    );
+
+    client.send_request(
+        5,
+        Request::GenerateCommitDraft {
+            worktree_id: worktree.id,
+            settings: None,
+        },
+    );
+    let started = Instant::now();
+    client.send_request(
+        6,
+        Request::GitStatus {
+            worktree_id: worktree.id,
+        },
+    );
+
+    let mut draft = None;
+    let status = loop {
+        match client.read_packet() {
+            Packet::Control(ControlMessage::Response {
+                id: 5,
+                response: Response::CommitDraft { draft: received },
+            }) => draft = Some(received),
+            Packet::Control(ControlMessage::Response {
+                id: 6,
+                response: Response::GitStatus { status },
+            }) => break status,
+            Packet::Control(ControlMessage::Response {
+                response: Response::Error { error },
+                ..
+            }) => panic!("request failed while waiting for git status: {error:?}"),
+            Packet::Control(_) | Packet::Output { .. } => continue,
+        }
+    };
+
+    assert!(status.dirty);
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "git status waited behind slow draft generation for {:?}",
+        started.elapsed()
+    );
+
+    if draft.is_none() {
+        draft = Some(client.generate_commit_draft_response(5));
+    }
+    assert_eq!(draft.unwrap().subject, "test: async draft");
+
+    client.shutdown(7);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(repo);
+    let _ = std::fs::remove_file(codex);
+}
+
+#[test]
 fn discard_files_round_trip_over_socket_keeps_connection_open() {
     let socket = test_socket_path("git-discard");
     let repo = test_dir_path("git-discard-repo");
@@ -304,7 +425,8 @@ fn stage_commit_push_and_create_pr_round_trip_over_socket() {
         6,
         Request::Commit {
             worktree_id: worktree.id,
-            message: "feat: change tracked".into(),
+            subject: "feat: change tracked".into(),
+            body: None,
         },
     );
     client.ack(
@@ -371,6 +493,17 @@ impl DaemonGuard {
 
     fn start_with_gh(socket: &Path, gh: &Path) -> Self {
         Self::start_inner(socket, Some(gh))
+    }
+
+    fn start_with_codex(socket: &Path, codex: &Path) -> Self {
+        let store = test_file_path("daemon-store", "sqlite");
+        let managed_root = test_dir_path("daemon-managed");
+        let child = spawn_daemon_with_codex(socket, &store, &managed_root, codex);
+        Self {
+            child,
+            store,
+            managed_root,
+        }
     }
 
     fn start_inner(socket: &Path, gh: Option<&Path>) -> Self {
@@ -527,6 +660,66 @@ impl TestClient {
                     response: Response::Error { error },
                     ..
                 }) => panic!("git status failed: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
+
+    fn generate_commit_draft(
+        &mut self,
+        id: u64,
+        worktree_id: hitch_core::WorktreeId,
+    ) -> CommitDraft {
+        self.send_request(
+            id,
+            Request::GenerateCommitDraft {
+                worktree_id,
+                settings: None,
+            },
+        );
+        self.generate_commit_draft_response(id)
+    }
+
+    fn generate_commit_draft_response(&mut self, id: u64) -> CommitDraft {
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::CommitDraft { draft },
+                }) if response_id == id => return draft,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("generate commit draft failed: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
+
+    fn generate_pr_draft(
+        &mut self,
+        id: u64,
+        worktree_id: hitch_core::WorktreeId,
+        base: Option<String>,
+    ) -> PullRequestDraft {
+        self.send_request(
+            id,
+            Request::GeneratePullRequestDraft {
+                worktree_id,
+                base,
+                settings: None,
+            },
+        );
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::PullRequestDraft { draft },
+                }) if response_id == id => return draft,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("generate PR draft failed: {error:?}"),
                 Packet::Control(_) | Packet::Output { .. } => continue,
             }
         }
@@ -725,17 +918,48 @@ fn spawn_daemon(socket: &Path, store: &Path, managed_root: &Path) -> Child {
 }
 
 fn spawn_daemon_full(socket: &Path, store: &Path, managed_root: &Path, gh: Option<&Path>) -> Child {
+    let mut command = daemon_command(socket, store, managed_root);
+    if let Some(gh) = gh {
+        command.arg("--gh").arg(gh);
+    }
+    spawn_daemon_command(command)
+}
+
+fn spawn_daemon_with_codex(
+    socket: &Path,
+    store: &Path,
+    managed_root: &Path,
+    codex: &Path,
+) -> Child {
+    let mut command = daemon_command(socket, store, managed_root);
+    command
+        .arg("--draft-provider")
+        .arg("codex")
+        .arg("--codex")
+        .arg(codex)
+        .arg("--draft-timeout-secs")
+        .arg("5");
+    spawn_daemon_command(command)
+}
+
+fn daemon_command(socket: &Path, store: &Path, managed_root: &Path) -> Command {
     let mut command = Command::new(daemon_bin());
     command
+        .env_remove("HITCH_DRAFT_PROVIDER")
+        .env_remove("HITCH_DRAFT_TIMEOUT_SECS")
+        .env_remove("HITCH_DRAFT_MODEL")
+        .env_remove("HITCH_CLAUDE_PATH")
+        .env_remove("HITCH_CODEX_PATH")
         .arg("--socket")
         .arg(socket)
         .arg("--store")
         .arg(store)
         .arg("--managed-root")
         .arg(managed_root);
-    if let Some(gh) = gh {
-        command.arg("--gh").arg(gh);
-    }
+    command
+}
+
+fn spawn_daemon_command(mut command: Command) -> Child {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -763,19 +987,31 @@ fn init_bare_remote(path: &Path) {
 /// URL so create-PR can be exercised over the socket without hitting GitHub.
 fn write_gh_stub() -> PathBuf {
     let path = test_file_path("gh-stub", "sh");
-    std::fs::write(
+    write_executable_script(
         &path,
         "#!/bin/sh\necho \"https://github.com/example/hitch/pull/1\"\n",
-    )
-    .unwrap();
+    );
+    path
+}
+
+fn write_slow_codex_stub() -> PathBuf {
+    let path = test_file_path("codex-stub", "sh");
+    write_executable_script(
+        &path,
+        "#!/bin/sh\n[ \"$1\" = \"exec\" ] || exit 12\nsleep 1\nprintf '%s\n' '{\"subject\":\"test: async draft\",\"body\":\"Generated slowly\"}'\n",
+    );
+    path
+}
+
+fn write_executable_script(path: &Path, contents: &str) {
+    std::fs::write(path, contents).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        std::fs::set_permissions(path, perms).unwrap();
     }
-    path
 }
 
 fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) {

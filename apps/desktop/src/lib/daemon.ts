@@ -15,11 +15,13 @@ import {
   sessionBelongsTo,
   type AgentState,
   type ChangedFile,
+  type CommitDraft,
   type FileStatus,
   type GitStatus,
   type HitchEvent,
   type Id,
   type PrFields,
+  type PullRequestDraft,
   type Project,
   type Request,
   type Response,
@@ -28,6 +30,7 @@ import {
   type SessionParent,
   type Worktree,
 } from "./types";
+import { draftModel, draftProvider, type DraftProvider } from "./settings";
 
 export type Connection = "connecting" | "ready" | "offline";
 
@@ -60,7 +63,6 @@ export const diffText = writable<string | null>(null);
 // peer of the session tabs (so `diffPath` can be set while a terminal shows);
 // this flag is what the tab bar and center pane switch on.
 export const diffActive = writable<boolean>(false);
-export const commitMessage = writable<string>("");
 export const gitBusy = writable<boolean>(false);
 export const prUrl = writable<string | null>(null);
 
@@ -306,6 +308,30 @@ export async function initDaemon(): Promise<void> {
             return next;
           });
         }
+        if (event.type === "project-removed") {
+          // A project was forgotten (possibly by another window). Drop it and
+          // its worktrees locally; the daemon also broadcasts session-closed for
+          // any sessions it killed, so those are pruned above.
+          const projectId = event.project_id as Id;
+          const removedWorktreeIds = new Set(
+            get(worktrees)
+              .filter((w) => w.project_id === projectId)
+              .map((w) => w.id),
+          );
+          if (get(selectedProjectId) === projectId) {
+            const remaining = get(projects).filter((p) => p.id !== projectId);
+            selectedProjectId.set(remaining.length > 0 ? remaining[0].id : null);
+            selectedWorktreeId.set(null);
+          } else if (
+            removedWorktreeIds.has(get(selectedWorktreeId) as Id)
+          ) {
+            selectedWorktreeId.set(null);
+          }
+          projects.update((items) => items.filter((p) => p.id !== projectId));
+          worktrees.update((items) =>
+            items.filter((w) => w.project_id !== projectId),
+          );
+        }
       }),
     );
 
@@ -471,6 +497,19 @@ export async function cloneProject(
     destination: destination.trim(),
     name: name?.trim() || null,
   });
+  await refreshAll();
+}
+
+export async function removeProject(projectId: Id, force: boolean): Promise<void> {
+  await daemonRequest({
+    type: "remove-project",
+    project_id: projectId,
+    force,
+  });
+  if (get(selectedProjectId) === projectId) {
+    selectedProjectId.set(null);
+    selectedWorktreeId.set(null);
+  }
   await refreshAll();
 }
 
@@ -668,6 +707,11 @@ export async function setFilesStaged(
       gitStatus.set(before);
     }
     void loadGitStatus(worktreeId).catch((refreshErr) => error.set(toMessage(refreshErr)));
+    // Rethrow so awaiting callers (e.g. CommitDialog's stage-all-and-generate)
+    // can stop their flow instead of proceeding on a failed stage. The error
+    // store + optimistic rollback above still surface the failure on their own,
+    // so fire-and-forget callers must `.catch()` (see RightRail).
+    throw err;
   } finally {
     gitBusy.set(false);
   }
@@ -710,22 +754,70 @@ export function discardAllFiles(): Promise<void> {
   return discardFiles(paths);
 }
 
-export async function commit(): Promise<void> {
+export async function commit(subject: string, body: string | null = null): Promise<void> {
   const worktreeId = get(gitWorktreeId);
-  const message = get(commitMessage).trim();
-  if (!worktreeId || !message) return;
+  const trimmedSubject = subject.trim();
+  const trimmedBody = body?.trim() || null;
+  if (!worktreeId || !trimmedSubject) return;
   gitBusy.set(true);
   try {
     error.set(null);
-    await daemonRequest({ type: "commit", worktree_id: worktreeId, message });
-    commitMessage.set("");
+    await daemonRequest({
+      type: "commit",
+      worktree_id: worktreeId,
+      subject: trimmedSubject,
+      body: trimmedBody,
+    });
     closeDiff();
     await loadGitStatus(worktreeId);
   } catch (err) {
     error.set(toMessage(err));
+    throw err;
   } finally {
     gitBusy.set(false);
   }
+}
+
+export async function listDraftModels(provider: DraftProvider): Promise<string[]> {
+  const response = await daemonRequest<Response & { models: string[] }>({
+    type: "list-draft-models",
+    provider,
+  });
+  return response.models;
+}
+
+export async function generateCommitDraft(): Promise<CommitDraft> {
+  const worktreeId = get(gitWorktreeId);
+  if (!worktreeId) throw new Error("Select a git worktree first.");
+  const response = await daemonRequest<Response & { draft: CommitDraft }>({
+    type: "generate-commit-draft",
+    worktree_id: worktreeId,
+    settings: draftGenerationSettings(),
+  });
+  return response.draft;
+}
+
+export async function generatePullRequestDraft(base: string | null): Promise<PullRequestDraft> {
+  const worktreeId = get(gitWorktreeId);
+  if (!worktreeId) throw new Error("Select a git worktree first.");
+  const response = await daemonRequest<Response & { draft: PullRequestDraft }>({
+    type: "generate-pull-request-draft",
+    worktree_id: worktreeId,
+    base: base?.trim() || null,
+    settings: draftGenerationSettings(),
+  });
+  return response.draft;
+}
+
+function draftGenerationSettings(): { provider: string; model: string | null } | null {
+  const provider = get(draftProvider);
+  // No explicit desktop choice → omit settings so the daemon keeps its own
+  // configured provider/model default instead of being forced to "stub".
+  if (!provider) return null;
+  return {
+    provider,
+    model: get(draftModel).trim() || null,
+  };
 }
 
 export async function push(): Promise<void> {
@@ -820,7 +912,6 @@ gitWorktreeId.subscribe(($id) => {
   gitStatus.set(null);
   closeDiff();
   prUrl.set(null);
-  commitMessage.set("");
   stopGitStatusPolling();
   if ($id) {
     void loadGitStatus($id).catch((err) => error.set(toMessage(err)));

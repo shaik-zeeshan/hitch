@@ -1550,6 +1550,7 @@ dependencies = [
  "hitch-proto",
  "hitch-pty",
  "hitch-store",
+ "libc",
  "serde_json",
 ]
 
