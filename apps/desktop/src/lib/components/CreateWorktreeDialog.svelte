@@ -13,11 +13,30 @@
 
   let branch = $state("");
   let mode = $state<"new-branch" | "existing-branch">("new-branch");
+
+  const ADJECTIVES = [
+    "sunny", "calm", "brave", "fuzzy", "swift", "quiet", "bold", "silly",
+    "crisp", "lucky", "wild", "amber", "dusty", "frozen", "gentle", "hollow",
+  ];
+  const NOUNS = [
+    "toast", "river", "maple", "cedar", "pebble", "flame", "ridge", "cloud",
+    "cabin", "dune", "ember", "grove", "haven", "inlet", "lemon", "orbit",
+  ];
+
+  function pick<T>(arr: T[]): T {
+    return arr[Math.floor(Math.random() * arr.length)];
+  }
+
+  function generateBranchName(): string {
+    const n = Math.floor(Math.random() * 90) + 10;
+    return `${pick(ADJECTIVES)}-${pick(NOUNS)}-${n}`;
+  }
   let base = $state("");
   let openShell = $state(true);
   let submitting = $state(false);
   let errMsg = $state<string | null>(null);
   let branches = $state<BranchSummary[]>([]);
+  let generatedPlaceholder = $state(generateBranchName());
 
   const localBranches = $derived(branches.filter((b) => !b.is_remote));
   const allBranches = $derived(branches);
@@ -28,6 +47,7 @@
     if (project && project.id !== openedFor) {
       openedFor = project.id;
       branch = "";
+      generatedPlaceholder = generateBranchName();
       mode = "new-branch";
       base = $defaultBase ?? "";
       openShell = true;
@@ -61,7 +81,7 @@
 
   async function submit() {
     const p = project;
-    const name = branch.trim();
+    const name = branch.trim() || (mode === "new-branch" ? generatedPlaceholder : "");
     if (!p || !name || submitting) return;
     submitting = true;
     errMsg = null;
@@ -118,7 +138,7 @@
             <input
               class="base"
               bind:value={branch}
-              placeholder="feat/my-branch"
+              placeholder={generatedPlaceholder}
               autofocus={mode === "new-branch"}
               onkeydown={(e) => e.key === "Enter" && void submit()}
             />
@@ -175,7 +195,7 @@
       </div>
       <div class="m-foot">
         <Dialog.Close class="btn">Cancel</Dialog.Close>
-        <button class="btn primary" disabled={!branch.trim() || submitting} onclick={() => void submit()}>
+        <button class="btn primary" disabled={(mode === "existing-branch" && !branch.trim()) || submitting} onclick={() => void submit()}>
           {submitting ? "Creating…" : "Create worktree"}
         </button>
       </div>
