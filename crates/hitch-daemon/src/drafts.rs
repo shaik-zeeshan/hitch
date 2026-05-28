@@ -400,10 +400,27 @@ fn run_provider_command(
     }
 
     let mut child = command.spawn().map_err(|err| {
-        provider_error(format!(
-            "failed to start {} draft provider: {err}",
-            config.kind.label()
-        ))
+        if err.kind() == std::io::ErrorKind::NotFound {
+            let bin = match config.kind {
+                DraftProviderKind::Claude => config.claude.display().to_string(),
+                DraftProviderKind::Codex => config.codex.display().to_string(),
+                DraftProviderKind::Stub => "stub".to_string(),
+            };
+            let env_var = match config.kind {
+                DraftProviderKind::Claude => "HITCH_CLAUDE_PATH",
+                DraftProviderKind::Codex => "HITCH_CODEX_PATH",
+                DraftProviderKind::Stub => "",
+            };
+            provider_error(format!(
+                "{} binary not found (`{bin}`); install it or set {env_var}",
+                config.kind.label(),
+            ))
+        } else {
+            provider_error(format!(
+                "failed to start {} draft provider: {err}",
+                config.kind.label()
+            ))
+        }
     })?;
     let stdout = child.stdout.take().ok_or_else(|| {
         provider_error(format!(

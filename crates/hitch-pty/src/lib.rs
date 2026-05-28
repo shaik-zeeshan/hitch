@@ -272,6 +272,7 @@ fn build_command(command: &Option<Vec<String>>, cwd: &Path) -> CommandBuilder {
         builder.arg("-l");
         builder
     };
+    builder.env("TERM", "xterm-256color");
     builder.cwd(cwd);
     builder
 }

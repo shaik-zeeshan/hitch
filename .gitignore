@@ -10,6 +10,8 @@ dist-ssr
 
 # Tauri generated sources
 apps/desktop/src-tauri/gen
+# Daemon binary staged for bundling (build artifact — copied by build.rs)
+apps/desktop/src-tauri/binaries/
 
 # OS / editor
 .DS_Store

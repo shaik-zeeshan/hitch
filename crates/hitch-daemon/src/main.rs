@@ -53,8 +53,38 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // On macOS, GUI-launched apps inherit a stripped PATH (/usr/bin:/bin only).
+    // Expand it from the user's login shell before spawning any tools (git, gh,
+    // claude, codex) so they can be found without requiring full absolute paths.
+    expand_login_shell_path();
+
     run_daemon(DaemonConfig::from(args))?;
     Ok(())
+}
+
+/// Resolve the login shell's PATH and apply it to the current process.
+/// This is called once at startup, before any threads are spawned, so
+/// mutating the environment here is safe.
+fn expand_login_shell_path() {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let Ok(output) = Command::new(&shell)
+        .args(["-l", "-c", "printenv PATH"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let Ok(path) = String::from_utf8(output.stdout) else {
+        return;
+    };
+    let path = path.trim();
+    if !path.is_empty() {
+        std::env::set_var("PATH", path);
+    }
 }
 
 #[derive(Debug)]

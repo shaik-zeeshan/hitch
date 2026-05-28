@@ -42,6 +42,12 @@
 
   let autoRunning = $state(false);
 
+  function shortError(err: unknown): string {
+    const msg = err instanceof Error ? err.message : String(err);
+    const first = msg.split("\n")[0].trim();
+    return first.length > 80 ? first.slice(0, 77) + "…" : first;
+  }
+
   async function handleAutoCommitPush() {
     if ($gitBusy || autoRunning) return;
     autoRunning = true;
@@ -57,12 +63,23 @@
       toast.loading("Pushing…", { id });
       await push();
       if ($gitStatus?.worktree_id) void loadGitStatus($gitStatus.worktree_id).catch(() => {});
-      toast.success("Pushed!", { id });
+      toast.success(draft.subject, { id });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      toast.error(msg, { id });
+      toast.error(shortError(err), { id });
     } finally {
       autoRunning = false;
+    }
+  }
+
+  async function handleManualPush() {
+    const count = ahead;
+    const id = toast.loading("Pushing…");
+    try {
+      await push();
+      if ($gitStatus?.worktree_id) void loadGitStatus($gitStatus.worktree_id).catch(() => {});
+      toast.success(`Pushed ↑${count}`, { id });
+    } catch (err) {
+      toast.error(shortError(err), { id });
     }
   }
 
@@ -137,7 +154,7 @@
           {/if}
         {/if}
         {#if ahead > 0 && !$autoCommitPush}
-          <button class="chip" disabled={$gitBusy} onclick={() => void push().catch(() => {})}>
+          <button class="chip" disabled={$gitBusy} onclick={() => void handleManualPush()}>
             Push <span class="ar">↑{ahead}</span>
           </button>
         {/if}
