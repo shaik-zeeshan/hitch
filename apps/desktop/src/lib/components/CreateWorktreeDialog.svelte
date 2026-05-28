@@ -4,7 +4,7 @@
   // project it creates under). New-branch vs existing-branch picks the daemon's
   // WorktreeCreateMode; the base field only applies to a new branch. Throws on
   // failure surface inline; success dismisses and optionally opens a shell.
-  import { Dialog } from "bits-ui";
+  import { Dialog, Select } from "bits-ui";
   import { createWorktree, defaultBase, listBranches, openSession } from "../daemon";
   import { createWorktreeFor } from "../overlays";
   import type { BranchSummary } from "../types";
@@ -36,8 +36,11 @@
       branches = [];
       listBranches(project.id).then((b) => {
         branches = b;
-        if (mode === "existing-branch" && !branch && b.length > 0) {
-          branch = b.find((x) => !x.is_remote)?.name ?? b[0].name;
+        if (!base && b.length > 0) {
+          base = $defaultBase ?? b.find((x) => !x.is_remote)?.name ?? b[0].name;
+        }
+        if (mode === "existing-branch" && !branch && localBranches.length > 0) {
+          branch = localBranches[0].name;
         }
       });
     } else if (!project) {
@@ -45,7 +48,7 @@
     }
   });
 
-  // When switching to existing-branch mode, default-select first local branch.
+  // When switching to existing-branch, default-select the first local branch.
   $effect(() => {
     if (mode === "existing-branch" && !branch && localBranches.length > 0) {
       branch = localBranches[0].name;
@@ -90,14 +93,26 @@
         <div class="sub">in <b>{project?.name ?? "project"}</b></div>
       </div>
       <div class="m-body">
-        <label class="field">
+        <div class="field">
           <span>Branch name</span>
           {#if mode === "existing-branch" && localBranches.length > 0}
-            <select class="base" bind:value={branch}>
-              {#each localBranches as b}
-                <option value={b.name}>{b.name}</option>
-              {/each}
-            </select>
+            <Select.Root type="single" bind:value={branch}>
+              <Select.Trigger class="select-trigger base" aria-label="Branch name">
+                <Select.Value placeholder="Select a branch" />
+                <span class="select-chev" aria-hidden="true">⌄</span>
+              </Select.Trigger>
+              <Select.Portal>
+                <Select.Content class="select-content" sideOffset={6}>
+                  <Select.Viewport>
+                    {#each localBranches as b}
+                      <Select.Item class="select-item" value={b.name} label={b.name}>
+                        {b.name}
+                      </Select.Item>
+                    {/each}
+                  </Select.Viewport>
+                </Select.Content>
+              </Select.Portal>
+            </Select.Root>
           {:else}
             <!-- svelte-ignore a11y_autofocus -->
             <input
@@ -108,7 +123,7 @@
               onkeydown={(e) => e.key === "Enter" && void submit()}
             />
           {/if}
-        </label>
+        </div>
         <div class="field">
           <span>Create from</span>
           <div class="seg">
@@ -123,18 +138,34 @@
           </div>
         </div>
         {#if mode === "new-branch"}
-          <label class="field">
+          <div class="field">
             <span>Base branch</span>
             {#if allBranches.length > 0}
-              <select class="base" bind:value={base}>
-                {#each allBranches as b}
-                  <option value={b.name}>{b.is_remote ? `↑ ${b.name}` : b.name}</option>
-                {/each}
-              </select>
+              <Select.Root type="single" bind:value={base}>
+                <Select.Trigger class="select-trigger base" aria-label="Base branch">
+                  <Select.Value placeholder={$defaultBase ?? "main"} />
+                  <span class="select-chev" aria-hidden="true">⌄</span>
+                </Select.Trigger>
+                <Select.Portal>
+                  <Select.Content class="select-content" sideOffset={6}>
+                    <Select.Viewport>
+                      {#each allBranches as b}
+                        <Select.Item
+                          class="select-item"
+                          value={b.name}
+                          label={b.is_remote ? `↑ ${b.name}` : b.name}
+                        >
+                          {#if b.is_remote}<span class="remote-badge">↑</span>{/if}{b.name}
+                        </Select.Item>
+                      {/each}
+                    </Select.Viewport>
+                  </Select.Content>
+                </Select.Portal>
+              </Select.Root>
             {:else}
               <input class="base" bind:value={base} placeholder={$defaultBase ?? "main"} />
             {/if}
-          </label>
+          </div>
         {/if}
         <button type="button" class="field-row" onclick={() => (openShell = !openShell)}>
           <span class="check" class:on={openShell} aria-hidden="true">✓</span>
@@ -151,3 +182,11 @@
     </Dialog.Content>
   </Dialog.Portal>
 </Dialog.Root>
+
+<style>
+  .remote-badge {
+    color: var(--tx-lo);
+    margin-right: 5px;
+    font-size: 10px;
+  }
+</style>

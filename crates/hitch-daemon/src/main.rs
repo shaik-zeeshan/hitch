@@ -1511,10 +1511,9 @@ fn git_status(
             .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?
     };
     let (worktree, branch_changed) = refresh_worktree_branch_from_disk(state, worktree)?;
-    let summary = GitRepository::discover(&worktree.path)
-        .map_err(git_error)?
-        .status()
-        .map_err(git_error)?;
+    let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
+    let summary = repo.status().map_err(git_error)?;
+    let (ahead, behind) = repo.ahead_behind().unwrap_or((0, 0));
     if branch_changed {
         broadcast_event(
             state,
@@ -1527,8 +1526,8 @@ fn git_status(
         worktree_id,
         branch: worktree.branch,
         dirty: summary.dirty,
-        ahead: 0,
-        behind: 0,
+        ahead,
+        behind,
         additions: summary.additions.min(u32::MAX as usize) as u32,
         deletions: summary.deletions.min(u32::MAX as usize) as u32,
         files: summary.entries.iter().map(status_entry_to_proto).collect(),

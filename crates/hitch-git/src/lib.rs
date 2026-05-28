@@ -75,6 +75,12 @@ impl GitRepository {
         commits_since(&self.root, base, limit)
     }
 
+    /// Return how many commits the current branch is ahead/behind its upstream.
+    /// Returns `(0, 0)` when no upstream is configured.
+    pub fn ahead_behind(&self) -> Result<(u32, u32)> {
+        ahead_behind(&self.root)
+    }
+
     /// Return changed file paths for `HEAD` relative to `base`.
     pub fn changed_paths_since(&self, base: &str) -> Result<Vec<PathBuf>> {
         changed_paths_since(&self.root, base)
@@ -1029,6 +1035,27 @@ fn branch_name_from_head(reference: &git2::Reference<'_>) -> Option<String> {
         "HEAD" => None,
         branch => Some(branch.to_owned()),
     }
+}
+
+fn ahead_behind(repo_path: &Path) -> Result<(u32, u32)> {
+    let repo = Repository::discover(repo_path)?;
+    let head = repo.head()?;
+    let local_oid = head.target().ok_or(GitError::NoHead)?;
+    let local_branch = match head.shorthand() {
+        Some(name) => name.to_owned(),
+        None => return Ok((0, 0)),
+    };
+    let local = match repo.find_branch(&local_branch, BranchType::Local) {
+        Ok(b) => b,
+        Err(_) => return Ok((0, 0)),
+    };
+    let upstream = match local.upstream() {
+        Ok(u) => u,
+        Err(_) => return Ok((0, 0)),
+    };
+    let upstream_oid = branch_target_oid(&upstream)?;
+    let (ahead, behind) = repo.graph_ahead_behind(local_oid, upstream_oid)?;
+    Ok((ahead.min(u32::MAX as usize) as u32, behind.min(u32::MAX as usize) as u32))
 }
 
 fn branch_needs_push(repo_path: &Path, branch: &str) -> Result<bool> {

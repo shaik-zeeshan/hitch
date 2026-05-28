@@ -199,7 +199,7 @@
             <Select.Root type="single" bind:value={draftProviderValue}>
               <Select.Trigger class="select-trigger base" aria-label="Draft provider">
                 <Select.Value placeholder="Choose provider" />
-                <span class="chev" aria-hidden="true">⌄</span>
+                <span class="select-chev" aria-hidden="true">⌄</span>
               </Select.Trigger>
               <Select.Portal>
                 <Select.Content class="select-content" sideOffset={6}>
@@ -219,7 +219,7 @@
             <Select.Root type="single" bind:value={selectedDraftModel}>
               <Select.Trigger class="select-trigger base" aria-label="Draft model">
                 <Select.Value placeholder={modelsLoading ? "Loading models…" : "Provider CLI default"} />
-                <span class="chev" aria-hidden="true">⌄</span>
+                <span class="select-chev" aria-hidden="true">⌄</span>
               </Select.Trigger>
               <Select.Portal>
                 <Select.Content class="select-content" sideOffset={6}>
@@ -388,67 +388,6 @@
     color: var(--tx-md);
     font-weight: 540;
   }
-  :global(.select-trigger) {
-    width: 100%;
-    min-height: 34px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    background: var(--bg-0);
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    color: var(--tx-hi);
-    font: inherit;
-    font-size: 12.5px;
-    padding: 8px 10px;
-    text-align: left;
-    cursor: pointer;
-  }
-  :global(.select-trigger:focus-visible) {
-    outline: none;
-    border-color: var(--ac);
-  }
-  :global(.select-trigger:disabled) {
-    cursor: wait;
-    color: var(--tx-lo);
-  }
-  .chev {
-    color: var(--tx-lo);
-    font-size: 12px;
-  }
-  :global(.select-content) {
-    z-index: 1000;
-    min-width: var(--bits-select-anchor-width);
-    max-height: 260px;
-    overflow: hidden;
-    border: 1px solid var(--line);
-    border-radius: var(--radius-lg);
-    background: var(--bg-2);
-    box-shadow: var(--shadow-pop);
-    padding: 5px;
-  }
-  :global(.select-item) {
-    min-height: 30px;
-    display: flex;
-    align-items: center;
-    padding: 6px 8px;
-    border-radius: var(--radius);
-    color: var(--tx-md);
-    font-size: 12px;
-    font-family: var(--mono);
-    cursor: pointer;
-    outline: none;
-  }
-  :global(.select-item[data-highlighted]) {
-    background: var(--bg-4);
-    color: var(--tx-hi);
-  }
-  :global(.select-item[data-selected]) {
-    background: var(--ac-wash);
-    color: var(--tx-hi);
-  }
-
   .row {
     display: flex;
     align-items: center;
