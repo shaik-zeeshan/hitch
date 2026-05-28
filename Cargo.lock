@@ -1560,6 +1560,8 @@ version = "0.1.0"
 dependencies = [
  "hitch-core",
  "hitch-proto",
+ "objc2",
+ "objc2-foundation",
  "serde",
  "serde_json",
  "tauri",

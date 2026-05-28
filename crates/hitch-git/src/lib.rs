@@ -455,8 +455,8 @@ pub enum GitError {
         args: Vec<String>,
         cwd: PathBuf,
         code: Option<i32>,
-        stdout: String,
-        stderr: String,
+        stdout: Box<str>,
+        stderr: Box<str>,
     },
 }
 
@@ -568,8 +568,8 @@ fn diff_line_stats(repo: &Repository) -> Result<(usize, usize)> {
     let mut deletions = 0;
 
     let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
-    let mut index = repo.index()?;
-    let staged = repo.diff_tree_to_index(head_tree.as_ref(), Some(&mut index), None)?;
+    let index = repo.index()?;
+    let staged = repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), None)?;
     let staged_stats = staged.stats()?;
     additions += staged_stats.insertions();
     deletions += staged_stats.deletions();
@@ -579,8 +579,8 @@ fn diff_line_stats(repo: &Repository) -> Result<(usize, usize)> {
         .include_untracked(true)
         .recurse_untracked_dirs(false)
         .show_untracked_content(true);
-    let mut index = repo.index()?;
-    let worktree = repo.diff_index_to_workdir(Some(&mut index), Some(&mut options))?;
+    let index = repo.index()?;
+    let worktree = repo.diff_index_to_workdir(Some(&index), Some(&mut options))?;
     let worktree_stats = worktree.stats()?;
     additions += worktree_stats.insertions();
     deletions += worktree_stats.deletions();
@@ -616,12 +616,12 @@ pub fn diff_file(
     let diff = match target {
         DiffTarget::Staged => {
             let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
-            let mut index = repo.index()?;
-            repo.diff_tree_to_index(head_tree.as_ref(), Some(&mut index), Some(&mut options))?
+            let index = repo.index()?;
+            repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), Some(&mut options))?
         }
         DiffTarget::Worktree => {
-            let mut index = repo.index()?;
-            repo.diff_index_to_workdir(Some(&mut index), Some(&mut options))?
+            let index = repo.index()?;
+            repo.diff_index_to_workdir(Some(&index), Some(&mut options))?
         }
     };
 
@@ -1077,8 +1077,8 @@ fn run_command(program: &Path, cwd: &Path, args: Vec<OsString>) -> Result<Comman
                 .collect(),
             cwd: cwd.to_path_buf(),
             code: output.status.code(),
-            stdout,
-            stderr,
+            stdout: stdout.into_boxed_str(),
+            stderr: stderr.into_boxed_str(),
         })
     }
 }

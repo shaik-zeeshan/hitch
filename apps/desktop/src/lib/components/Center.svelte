@@ -1,10 +1,15 @@
 <script lang="ts">
   // Center column (mockup .center): connection banner, then either an empty
-  // prompt or the session tabs + live terminal for the active parent. The
-  // terminal is re-keyed on the session id so switching tabs rebuilds a clean
-  // xterm instead of replaying one buffer into another.
+  // prompt or the session tabs + live terminals for the active parent. Every
+  // session of the active parent keeps a live (warm) xterm: we render them all
+  // keyed by id and toggle VISIBILITY rather than mounting/unmounting per tab
+  // or diff switch, so switching tabs or opening/closing the diff is instant
+  // and preserves each terminal's scroll position and buffer. The keyed set is
+  // scoped to the active parent (`visibleSessions`), so switching parents
+  // naturally tears down the old parent's terminals and mounts the new ones —
+  // bounding how many xterm instances are live at once.
   import {
-    activeSession,
+    activeSessionId,
     connection,
     diffActive,
     diffPath,
@@ -12,6 +17,7 @@
     reconnect,
     selectedParent,
     selectedProject,
+    visibleSessions,
     worktrees,
   } from "../daemon";
   import SessionTabs from "./SessionTabs.svelte";
@@ -52,13 +58,25 @@
   {:else}
     <SessionTabs parent={$selectedParent} />
     <div class="view">
+      <!-- Keep every session of the active parent mounted. Each slot is keyed
+           by session id so its Terminal instance is stable for the session's
+           lifetime (mounted once, reused) and is only torn down when the
+           session closes or the parent changes. Visibility — not mount state —
+           tracks which terminal is shown: a slot is visible only when it's the
+           active session AND the diff isn't covering the view. -->
+      {#each $visibleSessions as session (session.id)}
+        {@const visible = session.id === $activeSessionId && !$diffActive}
+        <div class="slot" class:hidden={!visible}>
+          <Terminal {session} active={visible} />
+        </div>
+      {/each}
+
       {#if $diffActive && $diffPath}
+        <!-- The diff OVERLAYS the (now hidden) terminals rather than replacing
+             them; closing it reveals the active terminal with scroll + buffer
+             intact, since it was never destroyed. -->
         <DiffTab />
-      {:else if $activeSession}
-        {#key $activeSession.id}
-          <Terminal session={$activeSession} />
-        {/key}
-      {:else}
+      {:else if $visibleSessions.length === 0}
         <div class="empty">
           <h3>No live session</h3>
           <p>
@@ -86,6 +104,16 @@
     min-height: 0;
     position: relative;
     overflow: hidden;
+  }
+  /* Each warm terminal fills the view; the active one shows, the rest are
+     display:none (kept mounted, never measured — the Terminal's zero-size
+     guard skips fitting while hidden and fit-on-activate catches it up). */
+  .slot {
+    position: absolute;
+    inset: 0;
+  }
+  .slot.hidden {
+    display: none;
   }
 
   .empty {

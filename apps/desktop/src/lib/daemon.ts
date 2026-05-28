@@ -7,9 +7,10 @@
 // the cross-cutting fix-up logic (selection fallbacks, stale-state cleanup)
 // runs once here as store subscriptions rather than per-component effects.
 
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { derived, get, writable } from "svelte/store";
+import { ByteRing } from "./byteRing";
 import {
   aggregateAgentState,
   sessionBelongsTo,
@@ -26,7 +27,6 @@ import {
   type Request,
   type Response,
   type Session,
-  type SessionOutputPayload,
   type SessionParent,
   type Worktree,
 } from "./types";
@@ -43,7 +43,6 @@ export const projects = writable<Project[]>([]);
 export const worktrees = writable<Worktree[]>([]);
 export const sessions = writable<Session[]>([]);
 
-export const buffers = writable<Record<Id, string>>({});
 export const agentStates = writable<Record<Id, AgentState>>({});
 // Live foreground command per session (the process the user is interacting
 // with in the PTY), pushed by the daemon. Absent until the first report.
@@ -244,6 +243,108 @@ export async function refreshAll(): Promise<void> {
   );
 }
 
+// ---- per-session PTY output (binary channel + bounded byte ring) ----------
+//
+// PTY bytes stream from the Tauri layer over a per-session binary Channel
+// (ADR 0007); they are NEVER stringified in Rust, so xterm's own streaming
+// UTF-8 decoder handles glyphs split across read boundaries. Here we hold each
+// session's recent bytes in a bounded `ByteRing` (the GUI repaint copy; the
+// daemon stays authoritative for scrollback) and fan new tails out to whichever
+// Terminal component is currently mounted for that session.
+
+type OutputSubscriber = {
+  onReset: () => void;
+  onData: (tail: Uint8Array) => void;
+};
+
+const rings = new Map<Id, ByteRing>();
+const channels = new Map<Id, Channel<ArrayBuffer | Uint8Array>>();
+// At most one Terminal is mounted per session at a time (the parent re-keys it),
+// so a single subscriber slot per session is sufficient.
+const subscribers = new Map<Id, OutputSubscriber>();
+
+// The Channel delivers raw bytes as an ArrayBuffer (tauri 2's `Raw` IPC body);
+// normalize whatever form arrives into a Uint8Array for the ring + xterm.
+function toUint8Array(msg: ArrayBuffer | Uint8Array): Uint8Array {
+  return msg instanceof Uint8Array ? msg : new Uint8Array(msg);
+}
+
+function ringFor(sessionId: Id): ByteRing {
+  let ring = rings.get(sessionId);
+  if (!ring) {
+    ring = new ByteRing();
+    rings.set(sessionId, ring);
+  }
+  return ring;
+}
+
+// Subscribe a mounted Terminal to a session's output. `onData` is called with
+// the current ring contents immediately (catch-up) and again with each new tail;
+// `onReset` fires when the ring is reset (a reconnect replay). Returns an
+// unsubscribe.
+export function subscribeSessionOutput(
+  sessionId: Id,
+  subscriber: OutputSubscriber,
+): () => void {
+  subscribers.set(sessionId, subscriber);
+  // Catch up to whatever the ring already holds (e.g. output that arrived
+  // before this terminal mounted, or a scrollback replay on reconnect).
+  const ring = rings.get(sessionId);
+  if (ring && ring.length > 0) subscriber.onData(ring.snapshot());
+  return () => {
+    if (subscribers.get(sessionId) === subscriber) subscribers.delete(sessionId);
+  };
+}
+
+// Register (or re-register) a session's binary output channel with Tauri and
+// reset its ring. Called on session-opened — both for brand-new sessions
+// (empty ring, harmless) and on every reconnect, where the daemon replays the
+// full scrollback as one SessionOutput; resetting here keeps that replay from
+// duplicating the prior bytes.
+function openSessionOutput(sessionId: Id): void {
+  // Fresh ring so a reconnect replay repopulates from zero (no duplication).
+  rings.set(sessionId, new ByteRing());
+  subscribers.get(sessionId)?.onReset();
+
+  let replayMode = true;
+  const channel = new Channel<ArrayBuffer | Uint8Array>();
+  channel.onmessage = (msg) => {
+    const bytes = toUint8Array(msg);
+    if (bytes.length === 0) return;
+    const offsetBefore = ringFor(sessionId).totalSeen;
+
+    // On reconnect, the daemon sends the full replay in one message, which can
+    // exceed the ring capacity. Stream it directly to the subscriber while
+    // retaining only the tail in the ring for future catch-up.
+    if (replayMode) {
+      // Send the full replay to the subscriber without truncation.
+      subscribers.get(sessionId)?.onData(bytes);
+      // Now add it to the ring, accepting that oversized replays will trim to
+      // capacity; future live output will be bounded normally.
+      ringFor(sessionId).append(bytes);
+      replayMode = false;
+      return;
+    }
+
+    // Normal live output path: bounded append and tail delivery.
+    ringFor(sessionId).append(bytes);
+    // Hand the subscriber exactly the new tail still retained by the ring.
+    subscribers.get(sessionId)?.onData(ringFor(sessionId).bytesSince(offsetBefore));
+  };
+  channels.set(sessionId, channel);
+  void invoke("register_session_output", { sessionId, channel });
+}
+
+// Tear down a session's output: drop the ring + channel and tell Tauri to stop
+// routing (and discard any staged bytes).
+function closeSessionOutput(sessionId: Id): void {
+  rings.delete(sessionId);
+  channels.delete(sessionId);
+  // A closing session must not have a trailing resize fire against its dead PTY.
+  clearResizeDebounce(sessionId);
+  void invoke("unregister_session_output", { sessionId });
+}
+
 // ---- connection lifecycle -------------------------------------------------
 
 let unlisteners: UnlistenFn[] = [];
@@ -295,6 +396,10 @@ export async function initDaemon(): Promise<void> {
           const session = event.session as Session;
           sessions.update((items) => upsert(items, session));
           activeSessionId.update((current) => current ?? session.id);
+          // Reset the ring + (re)register the output channel. On a reconnect the
+          // daemon replays the full scrollback right after this event, so the
+          // reset keeps that replay from duplicating the prior bytes.
+          openSessionOutput(session.id);
         }
         if (event.type === "session-closed") {
           const sessionId = event.session_id as Id;
@@ -307,6 +412,7 @@ export async function initDaemon(): Promise<void> {
             delete next[sessionId];
             return next;
           });
+          closeSessionOutput(sessionId);
         }
         if (event.type === "project-removed") {
           // A project was forgotten (possibly by another window). Drop it and
@@ -332,16 +438,6 @@ export async function initDaemon(): Promise<void> {
             items.filter((w) => w.project_id !== projectId),
           );
         }
-      }),
-    );
-
-    unlisteners.push(
-      await listen<SessionOutputPayload>("hitch-session-output", (message) => {
-        const { session_id, data } = message.payload;
-        buffers.update((current) => ({
-          ...current,
-          [session_id]: `${current[session_id] ?? ""}${data}`,
-        }));
       }),
     );
 
@@ -553,8 +649,80 @@ export async function removeWorktree(
   await refreshAll();
 }
 
+// Last grid an active Terminal successfully fitted to, in cols/rows. Used to
+// open the NEXT session's PTY at the right size so it doesn't reflow on first
+// fit. Updated by Terminal.svelte after every successful fit; null until the
+// first terminal has rendered (the very first open then estimates from the DOM).
+let lastTerminalSize: { cols: number; rows: number } | null = null;
+
+// Terminal.svelte calls this after a successful fit with its live term.cols/rows.
+export function recordTerminalSize(cols: number, rows: number): void {
+  if (cols > 0 && rows > 0) lastTerminalSize = { cols, rows };
+}
+
+// The xterm config in Terminal.svelte. Kept here so the offscreen measuring
+// span below uses the exact same font as the real terminal.
+const TERM_FONT_FAMILY =
+  '"Berkeley Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace';
+const TERM_FONT_SIZE_PX = 12.5;
+// `.term` padding from Terminal.svelte's stylesheet (`padding: 12px 14px`).
+const TERM_PADDING_X = 14;
+const TERM_PADDING_Y = 12;
+// Last-resort grid when nothing on the page is measurable (e.g. opening a
+// session before any view has laid out). A sane terminal-ish default.
+const FALLBACK_COLS = 120;
+const FALLBACK_ROWS = 32;
+
+// Estimate the grid a freshly-opened terminal will fit to, so its PTY spawns at
+// (close to) that size. We measure the visible center view area and divide by
+// the cell size derived from the xterm font via an offscreen probe `<span>`.
+// This is only the FIRST-open path; every subsequent open reuses the exact
+// `lastTerminalSize` recorded by a live terminal, so the estimate just needs to
+// be in the right ballpark to avoid a jarring reflow.
+function estimateInitialSize(): { cols: number; rows: number } {
+  if (typeof document === "undefined") {
+    return { cols: FALLBACK_COLS, rows: FALLBACK_ROWS };
+  }
+  // The center pane is where terminals render; fall back to body if absent.
+  const view =
+    document.querySelector(".view") ??
+    document.querySelector(".center") ??
+    document.body;
+  const rect = view?.getBoundingClientRect();
+  if (!rect || rect.width === 0 || rect.height === 0) {
+    return { cols: FALLBACK_COLS, rows: FALLBACK_ROWS };
+  }
+
+  // Offscreen probe with the terminal's exact font. `ch`-style width: measure a
+  // wide run of a monospace glyph and divide, so sub-pixel advance is averaged.
+  const probe = document.createElement("span");
+  probe.style.position = "absolute";
+  probe.style.visibility = "hidden";
+  probe.style.whiteSpace = "pre";
+  probe.style.fontFamily = TERM_FONT_FAMILY;
+  probe.style.fontSize = `${TERM_FONT_SIZE_PX}px`;
+  probe.style.lineHeight = "normal";
+  probe.textContent = "0".repeat(100);
+  document.body.appendChild(probe);
+  const cellWidth = probe.getBoundingClientRect().width / 100;
+  const cellHeight = probe.getBoundingClientRect().height;
+  probe.remove();
+
+  if (cellWidth <= 0 || cellHeight <= 0) {
+    return { cols: FALLBACK_COLS, rows: FALLBACK_ROWS };
+  }
+  // Subtract the `.term` padding the content area loses on both sides.
+  const usableWidth = rect.width - TERM_PADDING_X * 2;
+  const usableHeight = rect.height - TERM_PADDING_Y * 2;
+  const cols = Math.max(1, Math.floor(usableWidth / cellWidth));
+  const rows = Math.max(1, Math.floor(usableHeight / cellHeight));
+  return { cols, rows };
+}
+
 // `command` is an argv (e.g. ["claude"]); null spawns the default shell. This
 // mirrors the daemon's OpenSession.command (Option<Vec<String>>) contract.
+// `cols`/`rows` carry the initial grid so the PTY spawns at the right size and
+// the terminal doesn't visibly reflow on its first fit.
 export async function openSession(
   parent: SessionParent,
   name: string,
@@ -562,11 +730,14 @@ export async function openSession(
 ): Promise<Session | null> {
   try {
     error.set(null);
+    const { cols, rows } = lastTerminalSize ?? estimateInitialSize();
     const response = await daemonRequest<Response & { session: Session }>({
       type: "open-session",
       parent,
       name: name.trim() || "shell",
       command,
+      cols,
+      rows,
     });
     activeSessionId.set(response.session.id);
     return response.session;
@@ -603,11 +774,7 @@ export async function closeSession(session: Session): Promise<void> {
       kill_process: true,
     });
     sessions.update((items) => items.filter((item) => item.id !== session.id));
-    buffers.update((items) => {
-      const next = { ...items };
-      delete next[session.id];
-      return next;
-    });
+    closeSessionOutput(session.id);
   } catch (err) {
     error.set(toMessage(err));
   }
@@ -622,6 +789,42 @@ export async function resizeSession(
     await daemonRequest({ type: "resize-session", session_id: sessionId, cols, rows });
   } catch {
     // Resize is best-effort; keep keystrokes flowing even if the PTY exits.
+  }
+}
+
+// Trailing debounce for the daemon resize notification, keyed per session.
+// xterm's local fit() reflows smoothly on every ResizeObserver tick, but the
+// PTY child only needs the FINAL size: dragging the window or toggling a panel
+// fires a storm of ticks, and telling the child about each intermediate size
+// floods it with SIGWINCH and garbles a running TUI (vim/lazygit). We coalesce
+// those into ONE `resize-session` request that fires ~70 ms after the size
+// settles. Per session so two visible terminals don't share a timer.
+const RESIZE_DEBOUNCE_MS = 70;
+const resizeTimers = new Map<Id, ReturnType<typeof setTimeout>>();
+
+export function resizeSessionDebounced(
+  sessionId: Id,
+  cols: number,
+  rows: number,
+): void {
+  const existing = resizeTimers.get(sessionId);
+  if (existing) clearTimeout(existing);
+  resizeTimers.set(
+    sessionId,
+    setTimeout(() => {
+      resizeTimers.delete(sessionId);
+      void resizeSession(sessionId, cols, rows);
+    }, RESIZE_DEBOUNCE_MS),
+  );
+}
+
+// Drop any pending debounced resize for a session that is going away, so its
+// trailing timer can't fire a request against a dead PTY.
+function clearResizeDebounce(sessionId: Id): void {
+  const existing = resizeTimers.get(sessionId);
+  if (existing) {
+    clearTimeout(existing);
+    resizeTimers.delete(sessionId);
   }
 }
 

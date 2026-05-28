@@ -29,3 +29,10 @@ serde.workspace = true
 serde_json.workspace = true
 hitch-core.workspace = true
 hitch-proto.workspace = true
+
+# macOS-only: at startup we register `ApplePressAndHoldEnabled = NO` via Cocoa so
+# WKWebView lets keys repeat (see lib.rs `run`). These are already in the tree
+# (pulled by Tauri/wry); pinned to the resolved versions to avoid a duplicate.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSUserDefaults", "NSDictionary", "NSString", "NSValue"] }
