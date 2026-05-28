@@ -31,12 +31,20 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 /// round-trip without letting staging grow without bound (ADR 0007).
 const OUTPUT_STAGING_CAPACITY: usize = 1024 * 1024;
 
-/// Routes raw PTY bytes to the webview per session (ADR 0007).
+/// Per-Session webview channel registry, with staging to absorb the Tauri-side
+/// channel-registration round-trip (ADR 0007, ADR 0008).
 ///
-/// Lives in the Tauri process. Channels are kept across an ordinary daemon
-/// disconnect, but a `SessionOpened` replay invalidates that session's channel
-/// until the webview has reset its byte ring and registered a fresh channel;
-/// replay bytes are staged during that registration gap.
+/// Lives in the Tauri process. Deliberately not a peer of the daemon's
+/// `OutputBroadcaster`: the broadcaster owns the dispatcher-thread FIFO between
+/// replay snapshots and live bytes, while this registry owns the gap between
+/// the daemon emitting bytes for a Session and the webview handing a binary
+/// `Channel<&[u8]>` to the Tauri process via `invoke('register_session_output')`.
+/// See ADR 0008 for why these are not unified behind a single interface.
+///
+/// Channels are kept across an ordinary daemon disconnect, but a `SessionOpened`
+/// replay invalidates that session's channel until the webview has reset its byte
+/// ring and registered a fresh channel; replay bytes are staged during that
+/// registration gap.
 ///
 /// Channel type choice (verified against tauri 2.11.2): we store
 /// `Channel<InvokeResponseBody>` and send `InvokeResponseBody::Raw(bytes)`. That
@@ -47,7 +55,7 @@ const OUTPUT_STAGING_CAPACITY: usize = 1024 * 1024;
 /// `new Uint8Array([...]).buffer`, large via the fetch-channel path), matching
 /// the JS side `new Channel<ArrayBuffer>()`.
 #[derive(Default)]
-struct OutputRouter {
+struct WebviewChannelRegistry {
     channels: HashMap<SessionId, Channel<InvokeResponseBody>>,
     /// Bytes that arrived before the channel was registered, per session.
     staging: HashMap<SessionId, Vec<u8>>,
@@ -58,7 +66,7 @@ struct OutputRouter {
     opened_sessions: HashSet<SessionId>,
 }
 
-impl OutputRouter {
+impl WebviewChannelRegistry {
     /// Append `payload` to a session's bounded staging buffer, trimming the head
     /// on overflow so staging never exceeds `OUTPUT_STAGING_CAPACITY`.
     fn stage(&mut self, session_id: SessionId, payload: &[u8]) {
@@ -154,7 +162,7 @@ struct HitchClientInner {
     tray_status: Mutex<Option<MenuItem<Wry>>>,
     /// Per-session PTY-output channels + pre-registration staging (ADR 0007).
     /// One mutex guards both maps; the struct it protects is small.
-    output_router: Mutex<OutputRouter>,
+    channel_registry: Mutex<WebviewChannelRegistry>,
 }
 
 /// The tray's stable id, used to look it up for tooltip updates.
@@ -172,7 +180,7 @@ impl HitchClient {
             pending: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashSet::new()),
             tray_status: Mutex::new(None),
-            output_router: Mutex::new(OutputRouter::default()),
+            channel_registry: Mutex::new(WebviewChannelRegistry::default()),
         }))
     }
 
@@ -533,20 +541,20 @@ fn reader_loop(app: &AppHandle, client: &HitchClient, stream: UnixStream) -> io:
                         // the channel isn't registered yet (registration is a
                         // round-trip the daemon may beat), stage the bytes so
                         // the first prompt/reconnect replay isn't lost.
-                        if let Ok(mut router) = client.0.output_router.lock() {
-                            router.send_or_stage(*session_id, payload);
+                        if let Ok(mut registry) = client.0.channel_registry.lock() {
+                            registry.send_or_stage(*session_id, payload);
                         }
                         continue;
                     }
                     Event::SessionOpened { session } => {
-                        if let Ok(mut router) = client.0.output_router.lock() {
-                            router.prepare_fresh_registration(session.id);
+                        if let Ok(mut registry) = client.0.channel_registry.lock() {
+                            registry.prepare_fresh_registration(session.id);
                         }
                         client.track_session(app, session.id, true)
                     }
                     Event::SessionClosed { session_id, .. } => {
-                        if let Ok(mut router) = client.0.output_router.lock() {
-                            router.close_session(*session_id);
+                        if let Ok(mut registry) = client.0.channel_registry.lock() {
+                            registry.close_session(*session_id);
                         }
                         client.track_session(app, *session_id, false)
                     }
@@ -698,12 +706,12 @@ fn register_session_output(
     session_id: SessionId,
     channel: Channel<InvokeResponseBody>,
 ) -> Result<(), String> {
-    let mut router = state
+    let mut registry = state
         .0
-        .output_router
+        .channel_registry
         .lock()
-        .map_err(|_| "output-router lock poisoned".to_string())?;
-    router.register_channel(session_id, channel);
+        .map_err(|_| "channel-registry lock poisoned".to_string())?;
+    registry.register_channel(session_id, channel);
     Ok(())
 }
 
@@ -714,12 +722,12 @@ fn unregister_session_output(
     state: State<'_, HitchClient>,
     session_id: SessionId,
 ) -> Result<(), String> {
-    let mut router = state
+    let mut registry = state
         .0
-        .output_router
+        .channel_registry
         .lock()
-        .map_err(|_| "output-router lock poisoned".to_string())?;
-    router.unregister_channel(session_id);
+        .map_err(|_| "channel-registry lock poisoned".to_string())?;
+    registry.unregister_channel(session_id);
     Ok(())
 }
 
@@ -789,7 +797,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{tray_status_text, OutputRouter};
+    use super::{tray_status_text, WebviewChannelRegistry};
     use hitch_core::SessionId;
     use std::sync::{Arc, Mutex};
     use tauri::ipc::{Channel, InvokeResponseBody};
@@ -808,22 +816,22 @@ mod tests {
     fn session_opened_preserves_output_that_raced_ahead_of_initial_event() {
         let session_id = SessionId::new();
         let received = Arc::new(Mutex::new(Vec::new()));
-        let mut router = OutputRouter::default();
+        let mut registry = WebviewChannelRegistry::default();
 
-        router.send_or_stage(session_id, b"early-prompt".to_vec());
-        router.prepare_fresh_registration(session_id);
+        registry.send_or_stage(session_id, b"early-prompt".to_vec());
+        registry.prepare_fresh_registration(session_id);
 
         assert_eq!(
-            router.staging.get(&session_id).cloned(),
+            registry.staging.get(&session_id).cloned(),
             Some(b"early-prompt".to_vec())
         );
 
-        router.register_channel(session_id, recording_channel(received.clone()));
+        registry.register_channel(session_id, recording_channel(received.clone()));
         assert_eq!(
             received.lock().unwrap().clone(),
             vec![b"early-prompt".to_vec()]
         );
-        assert!(!router.staging.contains_key(&session_id));
+        assert!(!registry.staging.contains_key(&session_id));
     }
 
     #[test]
@@ -831,18 +839,18 @@ mod tests {
         let session_id = SessionId::new();
         let old_received = Arc::new(Mutex::new(Vec::new()));
         let new_received = Arc::new(Mutex::new(Vec::new()));
-        let mut router = OutputRouter::default();
+        let mut registry = WebviewChannelRegistry::default();
 
-        router.prepare_fresh_registration(session_id);
-        router.register_channel(session_id, recording_channel(old_received.clone()));
-        router.send_or_stage(session_id, b"before-reconnect".to_vec());
+        registry.prepare_fresh_registration(session_id);
+        registry.register_channel(session_id, recording_channel(old_received.clone()));
+        registry.send_or_stage(session_id, b"before-reconnect".to_vec());
         assert_eq!(
             old_received.lock().unwrap().clone(),
             vec![b"before-reconnect".to_vec()]
         );
 
-        router.prepare_fresh_registration(session_id);
-        router.send_or_stage(session_id, b"replayed-scrollback".to_vec());
+        registry.prepare_fresh_registration(session_id);
+        registry.send_or_stage(session_id, b"replayed-scrollback".to_vec());
 
         assert_eq!(
             old_received.lock().unwrap().clone(),
@@ -850,18 +858,18 @@ mod tests {
             "replay must not be delivered over the stale pre-reconnect channel"
         );
         assert_eq!(
-            router.staging.get(&session_id).cloned(),
+            registry.staging.get(&session_id).cloned(),
             Some(b"replayed-scrollback".to_vec())
         );
 
-        router.register_channel(session_id, recording_channel(new_received.clone()));
+        registry.register_channel(session_id, recording_channel(new_received.clone()));
         assert_eq!(
             new_received.lock().unwrap().clone(),
             vec![b"replayed-scrollback".to_vec()]
         );
-        assert!(!router.staging.contains_key(&session_id));
+        assert!(!registry.staging.contains_key(&session_id));
 
-        router.send_or_stage(session_id, b"live-after-registration".to_vec());
+        registry.send_or_stage(session_id, b"live-after-registration".to_vec());
         assert_eq!(
             new_received.lock().unwrap().clone(),
             vec![
@@ -874,80 +882,80 @@ mod tests {
     #[test]
     fn reconnect_session_opened_discards_stale_staging_even_without_channel() {
         let session_id = SessionId::new();
-        let mut router = OutputRouter::default();
+        let mut registry = WebviewChannelRegistry::default();
 
-        router.prepare_fresh_registration(session_id);
-        router.send_or_stage(session_id, b"missed-before-reconnect".to_vec());
-        assert!(router.staging.contains_key(&session_id));
+        registry.prepare_fresh_registration(session_id);
+        registry.send_or_stage(session_id, b"missed-before-reconnect".to_vec());
+        assert!(registry.staging.contains_key(&session_id));
 
-        router.prepare_fresh_registration(session_id);
-        assert!(!router.staging.contains_key(&session_id));
+        registry.prepare_fresh_registration(session_id);
+        assert!(!registry.staging.contains_key(&session_id));
     }
 
     #[test]
     fn registration_flush_failure_restages_staged_bytes() {
         let session_id = SessionId::new();
         let received = Arc::new(Mutex::new(Vec::new()));
-        let mut router = OutputRouter::default();
+        let mut registry = WebviewChannelRegistry::default();
 
-        router.send_or_stage(session_id, b"early-prompt".to_vec());
+        registry.send_or_stage(session_id, b"early-prompt".to_vec());
 
-        router.register_channel(
+        registry.register_channel(
             session_id,
             Channel::new(|_| Err(std::io::Error::other("closed channel").into())),
         );
 
-        assert!(!router.channels.contains_key(&session_id));
+        assert!(!registry.channels.contains_key(&session_id));
         assert_eq!(
-            router.staging.get(&session_id).cloned(),
+            registry.staging.get(&session_id).cloned(),
             Some(b"early-prompt".to_vec())
         );
 
-        router.register_channel(session_id, recording_channel(received.clone()));
+        registry.register_channel(session_id, recording_channel(received.clone()));
         assert_eq!(
             received.lock().unwrap().clone(),
             vec![b"early-prompt".to_vec()]
         );
-        assert!(!router.staging.contains_key(&session_id));
+        assert!(!registry.staging.contains_key(&session_id));
     }
 
     #[test]
     fn send_failure_removes_dead_channel_and_stages_payload() {
         let session_id = SessionId::new();
         let received = Arc::new(Mutex::new(Vec::new()));
-        let mut router = OutputRouter::default();
+        let mut registry = WebviewChannelRegistry::default();
 
-        router.prepare_fresh_registration(session_id);
-        router.register_channel(
+        registry.prepare_fresh_registration(session_id);
+        registry.register_channel(
             session_id,
             Channel::new(|_| Err(std::io::Error::other("closed channel").into())),
         );
 
-        router.send_or_stage(session_id, b"not-lost".to_vec());
+        registry.send_or_stage(session_id, b"not-lost".to_vec());
 
-        assert!(!router.channels.contains_key(&session_id));
+        assert!(!registry.channels.contains_key(&session_id));
         assert_eq!(
-            router.staging.get(&session_id).cloned(),
+            registry.staging.get(&session_id).cloned(),
             Some(b"not-lost".to_vec())
         );
 
-        router.register_channel(session_id, recording_channel(received.clone()));
+        registry.register_channel(session_id, recording_channel(received.clone()));
         assert_eq!(received.lock().unwrap().clone(), vec![b"not-lost".to_vec()]);
-        assert!(!router.staging.contains_key(&session_id));
+        assert!(!registry.staging.contains_key(&session_id));
     }
 
     #[test]
     fn session_closed_forgets_opened_session_state() {
         let session_id = SessionId::new();
-        let mut router = OutputRouter::default();
+        let mut registry = WebviewChannelRegistry::default();
 
-        router.prepare_fresh_registration(session_id);
-        router.close_session(session_id);
-        router.send_or_stage(session_id, b"new-early-prompt".to_vec());
-        router.prepare_fresh_registration(session_id);
+        registry.prepare_fresh_registration(session_id);
+        registry.close_session(session_id);
+        registry.send_or_stage(session_id, b"new-early-prompt".to_vec());
+        registry.prepare_fresh_registration(session_id);
 
         assert_eq!(
-            router.staging.get(&session_id).cloned(),
+            registry.staging.get(&session_id).cloned(),
             Some(b"new-early-prompt".to_vec())
         );
     }
