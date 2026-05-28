@@ -5,7 +5,7 @@
 //! crates (ADR 0005). It wires store + git + PTY + agent-hook installation into
 //! the socket API consumed by the desktop client and `hitch-hook`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::FileTypeExt;
@@ -30,7 +30,9 @@ use hitch_proto::{
     FileDiff, FileStatus, GitStatus, ProtocolError, Request, Response, WorktreeCreateMode,
     MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
-use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize};
+use hitch_pty::{
+    ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY,
+};
 use hitch_store::Store;
 
 fn main() {
@@ -194,12 +196,20 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     listener.set_nonblocking(true)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    // The dispatcher drains a single ordered channel of `DispatchMsg`. PTY reader
+    // threads emit `PtyEvent` (the `ManagedPty` contract), so a thin bridge
+    // forwards each `PtyEvent` into the dispatcher channel as `DispatchMsg::Pty`.
+    // A single FIFO bridge preserves output order; routing replay requests into
+    // the SAME channel is what makes the dispatcher the single serialization
+    // point for the output-vs-replay race (see `OutputBroadcaster`).
+    let (dispatch_tx, dispatch_rx) = mpsc::channel::<DispatchMsg>();
     let (pty_tx, pty_rx) = mpsc::channel::<PtyEvent>();
+    spawn_pty_bridge(pty_rx, dispatch_tx.clone());
     let store = Store::open(&config.store_path).map_err(io::Error::other)?;
     let state = Arc::new(Mutex::new(DaemonState::new(store, config.clone())));
 
     restore_layout(&state, &pty_tx).map_err(|err| io::Error::other(err.message))?;
-    spawn_pty_dispatcher(Arc::clone(&state), pty_rx, Arc::clone(&shutdown));
+    spawn_pty_dispatcher(Arc::clone(&state), dispatch_rx, Arc::clone(&shutdown));
     spawn_command_poller(Arc::clone(&state), Arc::clone(&shutdown));
     spawn_dirty_poller(Arc::clone(&state), Arc::clone(&shutdown));
 
@@ -210,10 +220,13 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
                 let client_id = register_client(&state, &stream)?;
                 let state = Arc::clone(&state);
                 let shutdown = Arc::clone(&shutdown);
-                let pty_tx = pty_tx.clone();
+                let channels = DispatchChannels {
+                    pty_tx: pty_tx.clone(),
+                    dispatch_tx: dispatch_tx.clone(),
+                };
                 thread::Builder::new()
                     .name(format!("hitch-client-{client_id}"))
-                    .spawn(move || handle_client(client_id, stream, state, shutdown, pty_tx))
+                    .spawn(move || handle_client(client_id, stream, state, shutdown, channels))
                     .map_err(io::Error::other)?;
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -237,6 +250,10 @@ struct DaemonState {
     store: Store,
     config: DaemonConfig,
     git: GitClient,
+    /// The dispatcher thread's authoritative output log + readiness gates. Only
+    /// the dispatcher mutates this, so its borrows of `DaemonState` are brief and
+    /// never overlap a client thread's mutation of the same field.
+    broadcaster: OutputBroadcaster,
 }
 
 impl DaemonState {
@@ -251,6 +268,7 @@ impl DaemonState {
             store,
             config,
             git,
+            broadcaster: OutputBroadcaster::default(),
         }
     }
 }
@@ -261,8 +279,135 @@ struct DaemonSession {
     restored_scrollback: Vec<u8>,
 }
 
+/// The dispatcher thread's authoritative, per-session record of "what has been
+/// broadcast so far", plus the set of clients whose output gate is open.
+///
+/// This is the fix for the reconnect data-loss race (ADR 0007). The old replay
+/// snapshotted the PTY reader ring (`pty.scrollback()`), which sits at a
+/// DIFFERENT pipeline stage than the broadcast point: the reader appends to the
+/// ring, *then* queues a `PtyEvent::Output` on the mpsc channel, and the
+/// dispatcher broadcasts that event later. On reconnect a live `SessionOutput`
+/// could reach a client before its replayed `SessionOpened` (which the desktop
+/// uses to reset its byte ring), wiping those bytes; and a naive ring snapshot
+/// would *also* re-broadcast bytes still queued in the channel, duplicating them.
+///
+/// By appending to this log on the SAME thread that broadcasts — the single
+/// dispatcher thread — the log equals exactly the bytes already sent live. A
+/// replay runs on that thread too, so the snapshot it sends and the live stream
+/// that follows it cannot interleave: every byte lands in a client's snapshot OR
+/// in a post-replay broadcast, never both, never neither.
+///
+/// The per-session live log mirrors the reader ring: it holds only bytes the
+/// dispatcher has seen, bounded to the same capacity (`DEFAULT_SCROLLBACK_CAPACITY`,
+/// trimmed at the head on overflow). Restored scrollback stays a separate buffer
+/// prepended at replay time, exactly as the old `restored_scrollback +
+/// pty.scrollback()` composition did.
+#[derive(Default)]
+struct OutputBroadcaster {
+    /// Per-session live broadcast log: the bytes the dispatcher has broadcast,
+    /// bounded to `DEFAULT_SCROLLBACK_CAPACITY` like the reader ring it mirrors.
+    logs: HashMap<SessionId, VecDeque<u8>>,
+    /// Clients whose output gate is open (replay has completed for them).
+    live_clients: HashSet<u64>,
+}
+
+impl OutputBroadcaster {
+    /// Append freshly broadcast `bytes` to a session's live log, trimming the
+    /// head so the log never exceeds `DEFAULT_SCROLLBACK_CAPACITY`. `_restored`
+    /// is accepted for symmetry with `replay_snapshot` (which composes it) but is
+    /// not stored here — the log holds live bytes only, matching the reader ring.
+    fn record_output(&mut self, session_id: SessionId, _restored: &[u8], bytes: &[u8]) {
+        let log = self.logs.entry(session_id).or_default();
+        log.extend(bytes.iter().copied());
+        if log.len() > DEFAULT_SCROLLBACK_CAPACITY {
+            let overflow = log.len() - DEFAULT_SCROLLBACK_CAPACITY;
+            log.drain(..overflow);
+        }
+    }
+
+    /// The bytes a replaying client must receive for one session: the restored
+    /// scrollback first, then the live log. This reproduces the old
+    /// `restored_scrollback + pty.scrollback()` bytes, minus the in-flight gap
+    /// the race exposed — because the log is appended on the dispatcher thread,
+    /// it never contains bytes still queued in the mpsc channel.
+    fn replay_snapshot(&self, session_id: SessionId, restored: &[u8]) -> Vec<u8> {
+        let mut snapshot = restored.to_vec();
+        if let Some(log) = self.logs.get(&session_id) {
+            snapshot.extend(log.iter().copied());
+        }
+        snapshot
+    }
+
+    /// Open a client's output gate. Called by the dispatcher immediately after it
+    /// has replayed every session's snapshot to the client, so the next `Output`
+    /// it processes is the first one broadcast live to this client.
+    fn mark_live(&mut self, client_id: u64) {
+        self.live_clients.insert(client_id);
+    }
+
+    /// Whether a client's output gate is open. The live daemon reads the
+    /// authoritative `ClientSink.live` atomic on the broadcast path (so it never
+    /// re-locks state per sink); this mirror of the gate exists only so the
+    /// `OutputBroadcaster` is a self-contained, single-threaded model the unit
+    /// tests can drive — hence it is consulted only under `cfg(test)`.
+    #[cfg(test)]
+    fn is_live(&self, client_id: u64) -> bool {
+        self.live_clients.contains(&client_id)
+    }
+
+    /// Forget a disconnected client's gate so the set doesn't grow unbounded.
+    fn forget_client(&mut self, client_id: u64) {
+        self.live_clients.remove(&client_id);
+    }
+
+    /// Drop a closed session's live log. The session id is never reused, so its
+    /// log is dead weight once the session exits.
+    fn forget_session(&mut self, session_id: SessionId) {
+        self.logs.remove(&session_id);
+    }
+}
+
+/// A message on the dispatcher's mpsc channel. `Pty` wraps the PTY reader's
+/// events; `ReplayToClient` is enqueued by `handle_client` after it answers a
+/// client's `Hello`. Routing the replay through the same queue makes the
+/// dispatcher the single serialization point: a replay is processed in mpsc
+/// order relative to `PtyEvent::Output`, so output appended before the replay
+/// is in the snapshot and output appended after it is broadcast live — with no
+/// gap and no duplication.
+enum DispatchMsg {
+    Pty(PtyEvent),
+    ReplayToClient { client_id: u64 },
+}
+
+impl From<PtyEvent> for DispatchMsg {
+    fn from(event: PtyEvent) -> Self {
+        DispatchMsg::Pty(event)
+    }
+}
+
+/// The two senders a client thread needs to drive the dispatcher pipeline.
+/// `pty_tx` spawns new sessions' reader threads, whose `PtyEvent`s reach the
+/// dispatcher via the bridge; `dispatch_tx` enqueues this client's replay into
+/// the SAME ordered queue as output, which is what serializes replay against
+/// live broadcasts (see `OutputBroadcaster`). They always travel together, so
+/// they ride as one handle rather than as two parallel parameters.
+#[derive(Clone)]
+struct DispatchChannels {
+    pty_tx: mpsc::Sender<PtyEvent>,
+    dispatch_tx: mpsc::Sender<DispatchMsg>,
+}
+
 struct ClientSink {
     writer: Mutex<UnixStream>,
+    /// Output readiness gate. A freshly accepted client is registered in
+    /// `DaemonState.clients` at accept time (so control-plane broadcasts reach
+    /// it immediately), but it must NOT receive live `SessionOutput` until the
+    /// dispatcher has replayed each session's scrollback to it on the dispatcher
+    /// thread. `false` until that replay completes; the output broadcast path
+    /// skips any sink whose gate is still closed. Non-output broadcasts ignore
+    /// this flag — the desktop upserts those idempotently (ADR 0007), so they
+    /// are not the lossy path and must keep flowing.
+    live: AtomicBool,
 }
 
 fn restore_layout(
@@ -325,6 +470,8 @@ fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &UnixStream) -> io::
         client_id,
         Arc::new(ClientSink {
             writer: Mutex::new(writer),
+            // Closed until the dispatcher replays scrollback to this client.
+            live: AtomicBool::new(false),
         }),
     );
     Ok(client_id)
@@ -333,6 +480,7 @@ fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &UnixStream) -> io::
 fn unregister_client(state: &Arc<Mutex<DaemonState>>, client_id: u64) {
     if let Ok(mut state) = state.lock() {
         state.clients.remove(&client_id);
+        state.broadcaster.forget_client(client_id);
     }
 }
 
@@ -341,7 +489,7 @@ fn handle_client(
     stream: UnixStream,
     state: Arc<Mutex<DaemonState>>,
     shutdown: Arc<AtomicBool>,
-    pty_tx: mpsc::Sender<PtyEvent>,
+    channels: DispatchChannels,
 ) {
     let mut reader = BufReader::new(stream);
 
@@ -388,7 +536,7 @@ fn handle_client(
             id,
             request,
             &shutdown,
-            &pty_tx,
+            &channels,
         ) {
             let _ = send_response(&state, client_id, id, Response::Error { error });
         }
@@ -408,7 +556,7 @@ fn handle_request<R: Read>(
     request_id: u64,
     request: Request,
     shutdown: &Arc<AtomicBool>,
-    pty_tx: &mpsc::Sender<PtyEvent>,
+    channels: &DispatchChannels,
 ) -> Result<(), ProtocolError> {
     match request {
         Request::Hello {
@@ -438,7 +586,14 @@ fn handle_request<R: Read>(
                     protocol_version: PROTOCOL_VERSION,
                 },
             )?;
-            replay_sessions_to_client(state, client_id)?;
+            // Replay must run ON the dispatcher thread so the snapshot it sends
+            // and the live output that follows it are serialized through the same
+            // queue (see `OutputBroadcaster`). Enqueue the request rather than
+            // replaying inline; if the dispatcher has gone, the client simply
+            // gets no scrollback, which is no worse than a disconnect.
+            let _ = channels
+                .dispatch_tx
+                .send(DispatchMsg::ReplayToClient { client_id });
         }
         Request::ListProjects => {
             let projects = {
@@ -541,7 +696,8 @@ fn handle_request<R: Read>(
             cols,
             rows,
         } => {
-            let session = open_session(state, parent, name, command, cols, rows, pty_tx)?;
+            let session =
+                open_session(state, parent, name, command, cols, rows, &channels.pty_tx)?;
             send_response(
                 state,
                 client_id,
@@ -1294,24 +1450,49 @@ fn spawn_command_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool
         .expect("failed to spawn command poller thread");
 }
 
+/// Forward PTY reader events into the dispatcher's single ordered channel as
+/// `DispatchMsg::Pty`. The `ManagedPty` contract emits `PtyEvent`, but replay
+/// requests must travel the SAME queue as output so the dispatcher can serialize
+/// them; this thin FIFO bridge merges the two without reordering output.
+fn spawn_pty_bridge(rx: mpsc::Receiver<PtyEvent>, dispatch_tx: mpsc::Sender<DispatchMsg>) {
+    thread::Builder::new()
+        .name("hitch-pty-bridge".into())
+        .spawn(move || {
+            while let Ok(event) = rx.recv() {
+                if dispatch_tx.send(DispatchMsg::Pty(event)).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("failed to spawn PTY bridge thread");
+}
+
 fn spawn_pty_dispatcher(
     state: Arc<Mutex<DaemonState>>,
-    rx: mpsc::Receiver<PtyEvent>,
+    rx: mpsc::Receiver<DispatchMsg>,
     shutdown: Arc<AtomicBool>,
 ) {
     thread::Builder::new()
         .name("hitch-pty-dispatch".into())
         .spawn(move || {
-            while let Ok(event) = rx.recv() {
-                match event {
-                    PtyEvent::Output { session_id, bytes } => {
+            // Everything below runs on this single thread, which is the whole
+            // point: appending to the broadcast log, opening a client's gate
+            // during replay, and skipping non-live clients on broadcast all see a
+            // consistent, totally-ordered view (see `OutputBroadcaster`).
+            while let Ok(message) = rx.recv() {
+                match message {
+                    DispatchMsg::Pty(PtyEvent::Output { session_id, bytes }) => {
                         persist_scrollback(&state, session_id);
-                        let _ = broadcast_session_output(&state, session_id, &bytes);
+                        // Record into the authoritative log BEFORE broadcasting,
+                        // so the log always equals "what has been broadcast so
+                        // far" — a replay enqueued after this point will include
+                        // these bytes in its snapshot rather than racing them.
+                        record_and_broadcast_output(&state, session_id, &bytes);
                     }
-                    PtyEvent::Exited {
+                    DispatchMsg::Pty(PtyEvent::Exited {
                         session_id,
                         exit_code,
-                    } => {
+                    }) => {
                         // During a graceful "Quit Hitch", kill_all_sessions kills the
                         // PTYs, which fires Exited here. Keep those sessions in the
                         // store so the next launch restores the layout as fresh
@@ -1320,6 +1501,7 @@ fn spawn_pty_dispatcher(
                         let shutting_down = shutdown.load(Ordering::SeqCst);
                         if let Ok(mut state) = state.lock() {
                             state.sessions.remove(&session_id);
+                            state.broadcaster.forget_session(session_id);
                             if !shutting_down {
                                 let _ = state.store.delete_session(session_id);
                             }
@@ -1332,10 +1514,41 @@ fn spawn_pty_dispatcher(
                             },
                         );
                     }
+                    DispatchMsg::ReplayToClient { client_id } => {
+                        // Replay each session's snapshot from the authoritative
+                        // log, then open the client's output gate — both on this
+                        // thread, so every subsequent Output is broadcast to the
+                        // now-live client strictly after its snapshot.
+                        let _ = replay_sessions_to_client(&state, client_id);
+                    }
                 }
             }
         })
         .expect("failed to spawn PTY dispatch thread");
+}
+
+/// Append output to the session's authoritative broadcast log, then write it to
+/// every client whose output gate is open. Runs only on the dispatcher thread.
+/// Holds the state lock once to record, then broadcasts; clients still
+/// mid-replay (gate closed) are skipped by [`broadcast_session_output`].
+fn record_and_broadcast_output(
+    state: &Arc<Mutex<DaemonState>>,
+    session_id: SessionId,
+    bytes: &[u8],
+) {
+    if let Ok(mut state) = state.lock() {
+        // Compose-at-replay-time: the log holds live bytes only; restored
+        // scrollback is prepended in `replay_snapshot`. Pass it for API symmetry.
+        let restored = state
+            .sessions
+            .get(&session_id)
+            .map(|session| session.restored_scrollback.clone())
+            .unwrap_or_default();
+        state
+            .broadcaster
+            .record_output(session_id, &restored, bytes);
+    }
+    let _ = broadcast_session_output(state, session_id, bytes);
 }
 
 fn persist_scrollback(state: &Arc<Mutex<DaemonState>>, session_id: SessionId) {
@@ -1431,6 +1644,19 @@ fn resolve_agent_target(
     Ok((Some(session_id), worktree_id))
 }
 
+/// Replay every session's scrollback to one client, then open its output gate.
+///
+/// MUST run on the dispatcher thread (it is invoked only from the
+/// `DispatchMsg::ReplayToClient` arm). Because the dispatcher is single-threaded,
+/// no `PtyEvent::Output` is broadcast while this runs, so the snapshot taken here
+/// and the live stream that resumes afterwards cannot interleave. Each session's
+/// scrollback comes from the authoritative broadcast log — NOT `pty.scrollback()`
+/// — so it equals exactly the bytes already broadcast, with no in-flight gap and
+/// no duplication once the gate opens.
+///
+/// The gate is opened LAST. If a send fails partway (client disconnected), we
+/// return the error with the gate still closed, so a half-replayed client never
+/// starts receiving live output.
 fn replay_sessions_to_client(
     state: &Arc<Mutex<DaemonState>>,
     client_id: u64,
@@ -1441,8 +1667,10 @@ fn replay_sessions_to_client(
             .sessions
             .values()
             .map(|daemon_session| {
-                let mut scrollback = daemon_session.restored_scrollback.clone();
-                scrollback.extend(daemon_session.pty.scrollback());
+                let scrollback = state.broadcaster.replay_snapshot(
+                    daemon_session.session.id,
+                    &daemon_session.restored_scrollback,
+                );
                 let command = daemon_session.pty.foreground_command();
                 (daemon_session.session.clone(), scrollback, command)
             })
@@ -1468,6 +1696,19 @@ fn replay_sessions_to_client(
         if !scrollback.is_empty() {
             send_output_to_client(state, client_id, session.id, &scrollback)?;
         }
+    }
+
+    // Snapshot fully delivered: open the gate so the dispatcher's next Output
+    // broadcasts reach this client. Setting it on the dispatcher thread, after
+    // the loop, guarantees no live output preceded the snapshot. The broadcast
+    // path reads the sink's `live` atomic; we also mirror the gate in the
+    // broadcaster's set so the unit-tested core stays a self-contained model of
+    // the same state (and `forget_client` can reason about it).
+    if let Ok(mut state) = state.lock() {
+        if let Some(sink) = state.clients.get(&client_id) {
+            sink.live.store(true, Ordering::SeqCst);
+        }
+        state.broadcaster.mark_live(client_id);
     }
     Ok(())
 }
@@ -1547,12 +1788,38 @@ fn broadcast_session_output(
     session_id: SessionId,
     bytes: &[u8],
 ) -> Result<(), ProtocolError> {
-    broadcast_with(state, |sink| write_output_to_sink(sink, session_id, bytes));
+    // Gate on the per-client readiness flag: a client registered at accept time
+    // but not yet replayed has `live == false`, and must NOT receive live output
+    // before its `SessionOpened` replay (which the desktop uses to reset its byte
+    // ring). Skipping it here, on the dispatcher thread, is the second half of the
+    // fix — the dispatcher both opens the gate (during replay) and reads it (here),
+    // so a now-live client only ever sees output broadcast strictly after its
+    // snapshot. Control-plane broadcasts deliberately do NOT gate (see
+    // `broadcast_event`); the desktop upserts those idempotently (ADR 0007).
+    broadcast_with_filter(
+        state,
+        |sink| sink.live.load(Ordering::SeqCst),
+        |sink| write_output_to_sink(sink, session_id, bytes),
+    );
     Ok(())
 }
 
-fn broadcast_with<F>(state: &Arc<Mutex<DaemonState>>, mut send: F)
+/// Broadcast to every registered client. Used by the control plane, which has no
+/// readiness gate: events flow to all clients the moment they connect.
+fn broadcast_with<F>(state: &Arc<Mutex<DaemonState>>, send: F)
 where
+    F: FnMut(&ClientSink) -> io::Result<()>,
+{
+    broadcast_with_filter(state, |_| true, send);
+}
+
+/// Broadcast to the clients accepted by `keep`, dropping any whose write fails.
+/// The output path passes a `keep` that admits only live (replayed) clients; the
+/// control plane passes `|_| true`. Filtering here, rather than inside `send`,
+/// keeps a skipped client off the `dead` list — a closed gate is not a failure.
+fn broadcast_with_filter<K, F>(state: &Arc<Mutex<DaemonState>>, keep: K, mut send: F)
+where
+    K: Fn(&ClientSink) -> bool,
     F: FnMut(&ClientSink) -> io::Result<()>,
 {
     let clients = match state.lock() {
@@ -1566,6 +1833,9 @@ where
 
     let mut dead = Vec::new();
     for (id, sink) in clients {
+        if !keep(&sink) {
+            continue;
+        }
         if send(&sink).is_err() {
             dead.push(id);
         }
@@ -1667,4 +1937,180 @@ fn internal(message: impl Into<String>) -> ProtocolError {
 
 fn poisoned(name: &'static str) -> io::Error {
     io::Error::other(format!("{name} lock poisoned"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutputBroadcaster;
+    use hitch_core::SessionId;
+
+    // A test harness that mirrors the dispatcher thread's single-threaded
+    // serialization: the only legal operations are `record_output` (the
+    // `PtyEvent::Output` handler) and `replay` (the `ReplayToClient` handler).
+    // Both run "on the dispatcher thread", so interleaving them here reproduces
+    // exactly the ordering the real daemon enforces — without any sockets or
+    // threads.
+    struct Harness {
+        broadcaster: OutputBroadcaster,
+        // What each client has actually received, in order: the replay snapshot
+        // first, then every live broadcast after it went live.
+        received: std::collections::HashMap<u64, Vec<u8>>,
+        // The session's persisted scrollback at restore time. Empty for sessions
+        // born in this daemon run; non-empty for sessions restored from the store.
+        restored: Vec<u8>,
+        session_id: SessionId,
+    }
+
+    impl Harness {
+        fn new(restored: &[u8]) -> Self {
+            Self {
+                broadcaster: OutputBroadcaster::default(),
+                received: std::collections::HashMap::new(),
+                restored: restored.to_vec(),
+                session_id: SessionId::new(),
+            }
+        }
+
+        fn connect(&mut self, client_id: u64) {
+            self.received.entry(client_id).or_default();
+        }
+
+        // The `PtyEvent::Output` path: append to the authoritative log, then
+        // broadcast to every client whose readiness gate is open.
+        fn record_output(&mut self, bytes: &[u8]) {
+            self.broadcaster
+                .record_output(self.session_id, &self.restored, bytes);
+            let live: Vec<u64> = self
+                .received
+                .keys()
+                .copied()
+                .filter(|id| self.broadcaster.is_live(*id))
+                .collect();
+            for id in live {
+                self.received.get_mut(&id).unwrap().extend_from_slice(bytes);
+            }
+        }
+
+        // The `ReplayToClient` path: deliver the authoritative snapshot to the
+        // client, then open its gate so subsequent output reaches it live.
+        fn replay(&mut self, client_id: u64) {
+            let snapshot = self
+                .broadcaster
+                .replay_snapshot(self.session_id, &self.restored);
+            self.received
+                .get_mut(&client_id)
+                .unwrap()
+                .extend_from_slice(&snapshot);
+            self.broadcaster.mark_live(client_id);
+        }
+
+        fn received(&self, client_id: u64) -> &[u8] {
+            &self.received[&client_id]
+        }
+    }
+
+    #[test]
+    fn output_before_replay_is_in_snapshot_and_not_redelivered_live() {
+        // The race: a live Output is appended to the log before the client's
+        // replay runs. It must show up in the replay snapshot exactly once and
+        // never be broadcast again afterwards (no duplication).
+        let mut h = Harness::new(b"");
+        h.connect(1);
+        h.record_output(b"pre-replay");
+        h.replay(1);
+        assert_eq!(
+            h.received(1),
+            b"pre-replay",
+            "output before replay must arrive exactly once, inside the snapshot"
+        );
+    }
+
+    #[test]
+    fn output_after_replay_is_delivered_live() {
+        // Output appended after the client went live must reach it as a live
+        // broadcast (no loss).
+        let mut h = Harness::new(b"");
+        h.connect(1);
+        h.replay(1);
+        h.record_output(b"post-replay");
+        assert_eq!(h.received(1), b"post-replay");
+    }
+
+    #[test]
+    fn no_output_reaches_a_client_before_its_replay() {
+        // Until a client is replayed (and thus made live), the output path must
+        // skip it entirely — even though it is a registered client.
+        let mut h = Harness::new(b"");
+        h.connect(1);
+        h.record_output(b"never-seen-without-replay");
+        assert!(
+            h.received(1).is_empty(),
+            "a client must receive nothing before its replay"
+        );
+    }
+
+    #[test]
+    fn brand_new_session_replays_cleanly_from_empty_log() {
+        // A session that has never produced output (empty log, no restored
+        // scrollback) replays as an empty snapshot, then streams live.
+        let mut h = Harness::new(b"");
+        h.connect(1);
+        h.replay(1);
+        assert!(h.received(1).is_empty());
+        h.record_output(b"first-bytes");
+        assert_eq!(h.received(1), b"first-bytes");
+    }
+
+    #[test]
+    fn replay_composes_restored_scrollback_then_live_log() {
+        // Replay must reproduce the same bytes the old `restored_scrollback +
+        // pty.scrollback()` produced: restored bytes first, then everything seen
+        // live so far.
+        let mut h = Harness::new(b"restored-");
+        h.record_output(b"live-1");
+        h.connect(1);
+        h.replay(1);
+        assert_eq!(h.received(1), b"restored-live-1");
+        h.record_output(b"live-2");
+        assert_eq!(h.received(1), b"restored-live-1live-2");
+    }
+
+    #[test]
+    fn interleaved_clients_each_get_every_byte_exactly_once() {
+        // The core invariant across two clients whose replays straddle live
+        // output: every byte reaches each client either in its snapshot or as a
+        // post-replay live broadcast, never both, never neither.
+        let mut h = Harness::new(b"R");
+        h.connect(1);
+        h.replay(1); // client 1 goes live first, snapshot = "R"
+        h.record_output(b"A"); // live to client 1
+        h.connect(2);
+        h.record_output(b"B"); // live to client 1; queued in client 2's snapshot
+        h.replay(2); // client 2 snapshot = "RAB"
+        h.record_output(b"C"); // live to both
+
+        assert_eq!(h.received(1), b"RABC");
+        assert_eq!(h.received(2), b"RABC");
+    }
+
+    #[test]
+    fn live_log_is_bounded_to_scrollback_capacity() {
+        // The authoritative log mirrors the reader ring, so it trims its head to
+        // the same capacity: a late replay returns the most recent window of live
+        // bytes, exactly what `pty.scrollback()` would have. Restored scrollback
+        // is a separate buffer prepended at replay (matching the old behaviour),
+        // so the snapshot is `restored + capped(live_log)`.
+        let mut h = Harness::new(b"R");
+        h.connect(1);
+        let overflow = 10;
+        let blob = vec![b'x'; hitch_pty::DEFAULT_SCROLLBACK_CAPACITY + overflow];
+        h.record_output(&blob);
+        h.replay(1);
+        assert_eq!(
+            h.received(1).len(),
+            // restored ("R") + the live log capped at capacity.
+            1 + hitch_pty::DEFAULT_SCROLLBACK_CAPACITY,
+            "live log must be capped at scrollback capacity, restored prepended on top"
+        );
+    }
 }
