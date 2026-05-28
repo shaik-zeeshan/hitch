@@ -1004,7 +1004,7 @@ fn remove_project(
     project_id: ProjectId,
     force: bool,
 ) -> Result<Vec<SessionId>, ProtocolError> {
-    let (worktree_ids, live_session_ids) = {
+    let (_worktree_ids, live_session_ids) = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
         if !state.projects.contains_key(&project_id) {
             return Err(ProtocolError::new(ErrorCode::NotFound, "project not found"));
@@ -1052,6 +1052,12 @@ fn remove_project(
     // worktrees) in the gap between the pre-snapshot above and this final lock.
     // Recompute the live set under the lock we now hold through the delete so
     // the force decision and the cleanup see the same world.
+    let worktree_ids = state
+        .worktrees
+        .values()
+        .filter(|wt| wt.project_id == project_id)
+        .map(|wt| wt.id)
+        .collect::<Vec<_>>();
     let racing_ids = state
         .sessions
         .values()

@@ -12,12 +12,13 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
 use hitch_core::{ProjectId, Worktree};
+use tempfile::NamedTempFile;
 
 /// Convenient result alias for git operations.
 pub type Result<T> = std::result::Result<T, GitError>;
@@ -995,15 +996,11 @@ fn write_temp_commit_message(subject: &str, body: Option<&str>) -> Result<PathBu
         message.push('\n');
     }
 
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let path = std::env::temp_dir().join(format!(
-        "hitch-commit-message-{}-{nanos}.txt",
-        std::process::id()
-    ));
-    fs::write(&path, message)?;
+    // Create a temp file with mode 0600 (owner read/write only) to avoid exposing
+    // commit messages containing credentials or private details to other users.
+    let mut temp_file = NamedTempFile::new_in(std::env::temp_dir())?;
+    temp_file.write_all(message.as_bytes())?;
+    let (_, path) = temp_file.keep().map_err(|err| GitError::Io(err.error))?;
     Ok(path)
 }
 

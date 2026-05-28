@@ -318,18 +318,19 @@ export async function initDaemon(): Promise<void> {
               .filter((w) => w.project_id === projectId)
               .map((w) => w.id),
           );
-          projects.update((items) => items.filter((p) => p.id !== projectId));
-          worktrees.update((items) =>
-            items.filter((w) => w.project_id !== projectId),
-          );
           if (get(selectedProjectId) === projectId) {
-            selectedProjectId.set(null);
+            const remaining = get(projects).filter((p) => p.id !== projectId);
+            selectedProjectId.set(remaining.length > 0 ? remaining[0].id : null);
             selectedWorktreeId.set(null);
           } else if (
             removedWorktreeIds.has(get(selectedWorktreeId) as Id)
           ) {
             selectedWorktreeId.set(null);
           }
+          projects.update((items) => items.filter((p) => p.id !== projectId));
+          worktrees.update((items) =>
+            items.filter((w) => w.project_id !== projectId),
+          );
         }
       }),
     );
