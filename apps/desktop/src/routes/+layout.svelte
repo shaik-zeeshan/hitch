@@ -17,6 +17,7 @@
   import CreateWorktreeDialog from "$lib/components/CreateWorktreeDialog.svelte";
   import RemoveProjectDialog from "$lib/components/RemoveProjectDialog.svelte";
   import RemoveWorktreeDialog from "$lib/components/RemoveWorktreeDialog.svelte";
+  import { SvelteToast } from "@zerodevx/svelte-toast";
 
   let { children } = $props();
 
@@ -61,6 +62,22 @@
 <CreateWorktreeDialog />
 <RemoveProjectDialog />
 <RemoveWorktreeDialog />
+<SvelteToast
+  options={{
+    reversed: true,
+    intro: { x: 192 },
+    theme: {
+      "--toastBackground": "oklch(22% 0.01 265)",
+      "--toastColor": "oklch(92% 0.005 265)",
+      "--toastBarBackground": "oklch(62% 0.1 265)",
+      "--toastBorderRadius": "6px",
+      "--toastMsgPadding": "0.55rem 0.9rem",
+      "--toastBoxShadow": "0 4px 16px oklch(0% 0 0 / 0.5)",
+      "--toastBarHeight": "3px",
+      "--toastWidth": "240px",
+    },
+  }}
+/>
 
 <style>
   /* WKWebView keep-alive dot — an imperceptible 1px square whose opacity the

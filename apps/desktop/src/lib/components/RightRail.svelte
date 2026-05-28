@@ -5,10 +5,12 @@
   // the selection + loads the diff text). Branch-level +/− stats live in the
   // tree; this panel focuses on file status and commit actions.
   import {
+    commit,
     defaultBase,
     diffPath,
     discardAllFiles,
     discardFile,
+    generateCommitDraft,
     gitBusy,
     gitStatus,
     gitWorktreeId,
@@ -18,9 +20,11 @@
     setFilesStaged,
     viewDiff,
   } from "../daemon";
+  import { autoCommitPush } from "../settings";
   import { STATUS_GLYPH, statusGlyphClass } from "../types";
   import CommitDialog from "./CommitDialog.svelte";
   import CreatePrDialog from "./CreatePrDialog.svelte";
+  import { toast } from "@zerodevx/svelte-toast";
 
   let {
     collapsed = false,
@@ -35,6 +39,37 @@
   const unstaged = $derived(files.filter((f) => !f.staged));
   const ahead = $derived($gitStatus?.ahead ?? 0);
   const isDefaultBranch = $derived(Boolean($defaultBase && $gitStatus?.branch === $defaultBase));
+
+  let autoRunning = $state(false);
+
+  async function handleAutoCommitPush() {
+    if ($gitBusy || autoRunning) return;
+    autoRunning = true;
+    const id = toast.push("Staging files…", { duration: 0, dismissable: false });
+    try {
+      if (unstaged.length > 0) {
+        await setFilesStaged(unstaged.map((f) => f.path), true);
+      }
+      toast.set(id, { msg: "Generating commit message…" });
+      const draft = await generateCommitDraft();
+      toast.set(id, { msg: "Committing…" });
+      await commit(draft.subject, draft.body);
+      toast.set(id, { msg: "Pushing…" });
+      await push();
+      if ($gitStatus?.worktree_id) void loadGitStatus($gitStatus.worktree_id).catch(() => {});
+      toast.set(id, { msg: "Pushed!", duration: 3000, dismissable: true });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.set(id, {
+        msg: `Error: ${msg}`,
+        duration: 6000,
+        dismissable: true,
+        theme: { "--toastBarBackground": "oklch(55% 0.18 25)" },
+      });
+    } finally {
+      autoRunning = false;
+    }
+  }
 
   function confirmDiscardAll() {
     if (files.length === 0 || $gitBusy) return;
@@ -94,10 +129,20 @@
       {/if}
       <span class="branch-acts">
         {#if files.length > 0}
-          <CommitDialog disabled={$gitBusy} triggerClass="chip" />
+          {#if $autoCommitPush}
+            <button
+              class="chip"
+              disabled={$gitBusy || autoRunning}
+              onclick={() => void handleAutoCommitPush()}
+            >
+              Commit & Push
+            </button>
+          {:else}
+            <CommitDialog disabled={$gitBusy} triggerClass="chip" />
+          {/if}
         {/if}
-        {#if ahead > 0}
-          <button class="chip" disabled={$gitBusy} onclick={() => void push()}>
+        {#if ahead > 0 && !$autoCommitPush}
+          <button class="chip" disabled={$gitBusy} onclick={() => void push().catch(() => {})}>
             Push <span class="ar">↑{ahead}</span>
           </button>
         {/if}

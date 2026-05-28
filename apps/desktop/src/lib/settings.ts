@@ -6,6 +6,7 @@ import { writable, type Writable } from "svelte/store";
 const EDITOR_KEY = "hitch.editorApp";
 const DRAFT_PROVIDER_KEY = "hitch.draftProvider";
 const DRAFT_MODEL_KEY = "hitch.draftModel";
+const AUTO_COMMIT_PUSH_KEY = "hitch.autoCommitPush";
 
 // Application name handed to the OS "open with" (macOS: `open -a <app>`). An
 // app name — not a `code`-style CLI shim — so it's PATH-independent and works
@@ -73,6 +74,22 @@ function isDraftProvider(value: string): value is DraftProvider {
   return value === "stub" || value === "claude" || value === "codex";
 }
 
+function persistedBool(key: string, initial: boolean): Writable<boolean> {
+  let start = initial;
+  try {
+    const stored = localStorage.getItem(key);
+    if (stored !== null) start = stored === "true";
+  } catch {}
+  const store = writable(start);
+  store.subscribe((value) => {
+    try {
+      localStorage.setItem(key, String(value));
+    } catch {}
+  });
+  return store;
+}
+
 export const editorApp = persisted(EDITOR_KEY, DEFAULT_EDITOR);
 export const draftProvider = persistedDraftProvider();
 export const draftModel = persisted(DRAFT_MODEL_KEY, DEFAULT_DRAFT_MODEL);
+export const autoCommitPush = persistedBool(AUTO_COMMIT_PUSH_KEY, false);

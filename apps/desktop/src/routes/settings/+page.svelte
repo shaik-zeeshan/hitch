@@ -7,8 +7,9 @@
   import { goto } from "$app/navigation";
   import { listDraftModels } from "$lib/daemon";
   import { onMount } from "svelte";
-  import { Select } from "bits-ui";
+  import { Select, Toggle } from "bits-ui";
   import {
+    autoCommitPush,
     DEFAULT_DRAFT_MODEL,
     DEFAULT_DRAFT_PROVIDER,
     DEFAULT_EDITOR,
@@ -19,7 +20,7 @@
     type DraftProvider,
   } from "$lib/settings";
 
-  type Section = "editor" | "drafts" | "about";
+  type Section = "editor" | "drafts" | "git" | "about";
   const DEFAULT_MODEL_VALUE = "__hitch_cli_default__";
   const providerOptions: Array<{ value: DraftProvider; label: string }> = [
     { value: "stub", label: "Stub (deterministic)" },
@@ -154,6 +155,9 @@
       <button class="nav-row" class:active={section === "drafts"} onclick={() => (section = "drafts")}>
         Drafts
       </button>
+      <button class="nav-row" class:active={section === "git"} onclick={() => (section = "git")}>
+        Git
+      </button>
       <button class="nav-row" class:active={section === "about"} onclick={() => (section = "about")}>
         About
       </button>
@@ -253,6 +257,33 @@
           <div class="row">
             <button class="btn primary" onclick={commitDraftSettings}>Save</button>
             {#if draftSaved}<span class="saved" role="status">Saved</span>{/if}
+          </div>
+        </section>
+      {:else if section === "git"}
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Git</h2>
+            <p class="help">Automatic git workflow settings.</p>
+          </div>
+          <div class="toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-label">Auto commit &amp; push</span>
+              <span class="toggle-desc"
+                >Generate a commit message and push in one click, without opening the dialog.</span
+              >
+            </div>
+            <Toggle.Root
+              pressed={$autoCommitPush}
+              onPressedChange={(v) => autoCommitPush.set(v)}
+              class="toggle-btn"
+              aria-label="Auto commit and push"
+            >
+              {#snippet children({ pressed })}
+                <span class="track" class:on={pressed}>
+                  <span class="thumb"></span>
+                </span>
+              {/snippet}
+            </Toggle.Root>
           </div>
         </section>
       {:else if section === "about"}
@@ -419,5 +450,65 @@
   }
   .about dd.mono {
     font-family: var(--mono);
+  }
+
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    justify-content: space-between;
+    padding: 12px 14px;
+    border-radius: var(--radius);
+    border: 1px solid var(--line);
+    background: var(--bg-2);
+  }
+  .toggle-info {
+    display: grid;
+    gap: 4px;
+  }
+  .toggle-label {
+    font-size: 12.5px;
+    font-weight: 540;
+    color: var(--tx-hi);
+  }
+  .toggle-desc {
+    font-size: 11.5px;
+    color: var(--tx-lo);
+    line-height: 1.45;
+  }
+  :global(.toggle-btn) {
+    flex: none;
+    background: transparent;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+  }
+  .track {
+    display: flex;
+    align-items: center;
+    width: 38px;
+    height: 22px;
+    border-radius: 11px;
+    background: var(--bg-4);
+    border: 1px solid var(--line);
+    padding: 3px;
+    transition: background 0.15s, border-color 0.15s;
+    box-sizing: border-box;
+  }
+  .track.on {
+    background: oklch(62% 0.1 265);
+    border-color: oklch(62% 0.1 265);
+  }
+  .thumb {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--tx-lo);
+    transition: transform 0.15s, background 0.15s;
+    flex: none;
+  }
+  .track.on .thumb {
+    transform: translateX(16px);
+    background: oklch(97% 0 0);
   }
 </style>

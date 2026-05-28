@@ -1041,6 +1041,7 @@ export async function push(): Promise<void> {
     await daemonRequest({ type: "push", worktree_id: worktreeId });
   } catch (err) {
     error.set(toMessage(err));
+    throw err;
   } finally {
     gitBusy.set(false);
   }
