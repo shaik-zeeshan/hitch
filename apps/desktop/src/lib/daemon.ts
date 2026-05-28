@@ -808,9 +808,13 @@ export async function generatePullRequestDraft(base: string | null): Promise<Pul
   return response.draft;
 }
 
-function draftGenerationSettings(): { provider: string; model: string | null } {
+function draftGenerationSettings(): { provider: string; model: string | null } | null {
+  const provider = get(draftProvider);
+  // No explicit desktop choice → omit settings so the daemon keeps its own
+  // configured provider/model default instead of being forced to "stub".
+  if (!provider) return null;
   return {
-    provider: get(draftProvider),
+    provider,
     model: get(draftModel).trim() || null,
   };
 }

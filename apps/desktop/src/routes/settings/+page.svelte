@@ -50,9 +50,12 @@
 
   onMount(() => {
     editor = $editorApp;
-    draftProviderValue = $draftProvider;
+    // `$draftProvider` is null until the user explicitly picks one; show the
+    // default as the editable starting point. Saving it writes a concrete,
+    // explicit choice (see settings.ts).
+    draftProviderValue = $draftProvider ?? DEFAULT_DRAFT_PROVIDER;
     selectedDraftModel = $draftModel || DEFAULT_MODEL_VALUE;
-    lastDraftProvider = $draftProvider;
+    lastDraftProvider = draftProviderValue;
     draftsHydrated = true;
   });
 

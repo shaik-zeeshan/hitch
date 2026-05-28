@@ -1052,8 +1052,35 @@ fn remove_project(
         .delete_project(project_id)
         .map_err(store_error)?;
     state.projects.remove(&project_id);
-    for worktree_id in worktree_ids {
-        state.worktrees.remove(&worktree_id);
+    for worktree_id in &worktree_ids {
+        state.worktrees.remove(worktree_id);
+    }
+
+    // Another client can OpenSession under this project (or one of its
+    // worktrees) in the gap between the pre-snapshot above and this final lock.
+    // Such a session isn't in `live_session_ids`, so without this it would
+    // survive as an orphaned, unreachable PTY pointing at a now-deleted project.
+    // `delete_project` already removed its store row (it deletes sessions by
+    // parent), so we only need to evict it from the live map here and kill +
+    // broadcast it alongside the snapshotted sessions.
+    let orphan_ids = state
+        .sessions
+        .values()
+        .filter(|session| match session.session.parent {
+            SessionParent::Project(id) => id == project_id,
+            SessionParent::Worktree(id) => worktree_ids.contains(&id),
+        })
+        .map(|session| session.session.id)
+        .collect::<Vec<_>>();
+    let orphans = orphan_ids
+        .into_iter()
+        .filter_map(|id| state.sessions.remove(&id).map(|session| (id, session)))
+        .collect::<Vec<_>>();
+    drop(state);
+
+    for (session_id, session) in orphans {
+        let _ = session.pty.kill();
+        closed_session_ids.push(session_id);
     }
     Ok(closed_session_ids)
 }

@@ -45,18 +45,23 @@ function persisted(key: string, initial: string): Writable<string> {
   return store;
 }
 
-function persistedDraftProvider(): Writable<DraftProvider> {
-  let start = DEFAULT_DRAFT_PROVIDER;
+// `null` means the user has never explicitly picked a provider, so draft
+// requests omit the provider override and the daemon falls back to its own
+// configured default (`--draft-provider` / `HITCH_DRAFT_PROVIDER`). A concrete
+// value is only ever stored when the user saves a choice — we deliberately do
+// NOT write the default back on init, which would mask "unset" as "chose stub".
+function persistedDraftProvider(): Writable<DraftProvider | null> {
+  let start: DraftProvider | null = null;
   try {
     const stored = localStorage.getItem(DRAFT_PROVIDER_KEY);
-    start = stored && isDraftProvider(stored) ? stored : DEFAULT_DRAFT_PROVIDER;
+    start = stored && isDraftProvider(stored) ? stored : null;
   } catch {
     // localStorage unavailable; keep an in-memory store.
   }
-  const store = writable<DraftProvider>(start);
+  const store = writable<DraftProvider | null>(start);
   store.subscribe((value) => {
     try {
-      localStorage.setItem(DRAFT_PROVIDER_KEY, value);
+      if (value) localStorage.setItem(DRAFT_PROVIDER_KEY, value);
     } catch {
       // Best-effort persistence.
     }

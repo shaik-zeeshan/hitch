@@ -331,6 +331,12 @@ fn run_headless_provider(
             if let Some(model) = config.model.as_deref() {
                 command.arg("--model").arg(model);
             }
+            // Draft generation is read-only: the prompt already carries the full
+            // git context, so the provider never needs filesystem or shell
+            // access. `--tools ""` disables every built-in tool so pressing
+            // Generate can't edit, run commands in, or otherwise mutate the
+            // worktree, regardless of the user's permission settings.
+            command.arg("--tools").arg("");
             // Request the structured print-mode envelope
             // (`{"type":"result","result":"<text>",...}`); the default `-p`
             // emits free-form text the parser can't reliably unwrap. The
@@ -342,6 +348,11 @@ fn run_headless_provider(
         DraftProviderKind::Codex => {
             let mut command = Command::new(&config.codex);
             command.arg("exec");
+            // Same read-only guarantee as Claude: pin the sandbox to read-only
+            // so an operator's `workspace-write`/`danger-full-access` Codex
+            // config can't let draft generation modify the worktree. Without
+            // this, `codex exec` inherits the user's configured sandbox mode.
+            command.arg("--sandbox").arg("read-only");
             if let Some(model) = config.model.as_deref() {
                 command.arg("--model").arg(model);
             }
@@ -362,6 +373,17 @@ fn run_provider_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // Run the provider as its own process-group leader so a timeout can signal
+    // the whole tree. Otherwise killing only the direct child leaves any
+    // grandchild it spawned (a wrapper shell, an MCP/helper subprocess) alive
+    // holding the inherited stdout/stderr pipes, and the reader-thread joins
+    // below would block long past the configured timeout.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
 
     let mut child = command.spawn().map_err(|err| {
         provider_error(format!(
@@ -389,7 +411,7 @@ fn run_provider_command(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_process_tree(&mut child);
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
@@ -411,6 +433,30 @@ fn run_provider_command(
         return Err(nonzero_provider_error(config.kind.label(), status, &stderr).retryable(true));
     }
     Ok(stdout)
+}
+
+/// Kill the provider and every descendant it spawned. On Unix the provider is
+/// its own process-group leader (see `process_group(0)` at spawn), so signalling
+/// the negated pid reaches grandchildren that inherited the stdout/stderr
+/// pipes; without that, the reader-thread joins would block until those
+/// grandchildren exit, defeating the timeout for wrapper-script providers.
+#[cfg(unix)]
+fn kill_process_tree(child: &mut std::process::Child) {
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: `kill(2)` with a negative pid signals the process group whose id
+    // is `pid`. It has no memory-safety preconditions; an already-gone group
+    // simply returns ESRCH, which we ignore.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    // Belt-and-braces: also signal the leader directly in case the group send
+    // missed it (e.g. the child re-set its own process group).
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 fn read_pipe<T>(mut pipe: T) -> thread::JoinHandle<io::Result<String>>
@@ -753,7 +799,7 @@ mod tests {
         let script = temp_file("empty-commit-body-provider", "sh");
         fs::write(
             &script,
-            "#!/bin/sh\n[ \"$1\" = \"--output-format\" ] || exit 12\n[ \"$2\" = \"json\" ] || exit 13\n[ \"$3\" = \"-p\" ] || exit 14\nprintf '%s\n' '{\"subject\":\"fix: preserve generated body\",\"body\":\"\"}'\n",
+            "#!/bin/sh\n[ \"$1\" = \"--tools\" ] || exit 11\n[ \"$2\" = \"\" ] || exit 12\n[ \"$3\" = \"--output-format\" ] || exit 13\n[ \"$4\" = \"json\" ] || exit 14\n[ \"$5\" = \"-p\" ] || exit 15\nprintf '%s\n' '{\"subject\":\"fix: preserve generated body\",\"body\":\"\"}'\n",
         )
         .unwrap();
         make_executable(&script);
@@ -845,7 +891,7 @@ mod tests {
         let script = temp_file("claude-provider", "sh");
         fs::write(
             &script,
-            "#!/bin/sh\n[ \"$1\" = \"--model\" ] || exit 12\n[ \"$2\" = \"sonnet\" ] || exit 13\n[ \"$3\" = \"--output-format\" ] || exit 14\n[ \"$4\" = \"json\" ] || exit 15\n[ \"$5\" = \"-p\" ] || exit 16\nprintf '%s\n' '{\"type\":\"result\",\"result\":\"{\\\"subject\\\":\\\"feat: generated\\\",\\\"body\\\":\\\"Generated body\\\"}\"}'\n",
+            "#!/bin/sh\n[ \"$1\" = \"--model\" ] || exit 12\n[ \"$2\" = \"sonnet\" ] || exit 13\n[ \"$3\" = \"--tools\" ] || exit 14\n[ \"$4\" = \"\" ] || exit 15\n[ \"$5\" = \"--output-format\" ] || exit 16\n[ \"$6\" = \"json\" ] || exit 17\n[ \"$7\" = \"-p\" ] || exit 18\nprintf '%s\n' '{\"type\":\"result\",\"result\":\"{\\\"subject\\\":\\\"feat: generated\\\",\\\"body\\\":\\\"Generated body\\\"}\"}'\n",
         )
         .unwrap();
         make_executable(&script);
@@ -878,7 +924,7 @@ mod tests {
         let script = temp_file("codex-provider", "sh");
         fs::write(
             &script,
-            "#!/bin/sh\n[ \"$1\" = \"exec\" ] || exit 13\n[ \"$2\" = \"--model\" ] || exit 14\n[ \"$3\" = \"gpt-5-codex\" ] || exit 15\nprintf '%s\n' '{\"title\":\"Generated PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}'\n",
+            "#!/bin/sh\n[ \"$1\" = \"exec\" ] || exit 13\n[ \"$2\" = \"--sandbox\" ] || exit 14\n[ \"$3\" = \"read-only\" ] || exit 15\n[ \"$4\" = \"--model\" ] || exit 16\n[ \"$5\" = \"gpt-5-codex\" ] || exit 17\nprintf '%s\n' '{\"title\":\"Generated PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}'\n",
         )
         .unwrap();
         make_executable(&script);
@@ -905,6 +951,43 @@ mod tests {
         .unwrap();
         assert_eq!(draft.title, "Generated PR");
         assert!(draft.body.contains("## Testing"));
+        let _ = fs::remove_file(script);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_timeout_does_not_block_on_grandchild_holding_the_pipe() {
+        // Regression: a provider that backgrounds a child inheriting stdout must
+        // not keep the daemon blocked past the timeout. Before the
+        // process-group kill, signalling only the direct child left the
+        // grandchild holding the stdout pipe, so the reader-thread join blocked
+        // until that grandchild exited (~30s here) instead of ~1s.
+        let script = temp_file("blocking-grandchild-provider", "sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\n# Grandchild inherits stdout and holds the pipe open well past the timeout.\nsleep 30 &\n# Parent stays alive so the timeout path (not a normal exit) runs.\nsleep 30\n",
+        )
+        .unwrap();
+        make_executable(&script);
+        let cwd = temp_dir("blocking-grandchild-cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Codex,
+            claude: PathBuf::from("claude"),
+            codex: script.clone(),
+            timeout: Duration::from_secs(1),
+            model: None,
+        };
+        let mut command = Command::new(&config.codex);
+        let started = Instant::now();
+        let result = run_provider_command(&mut command, &cwd, &config);
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "expected a timeout error");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "timeout path blocked for {elapsed:?}; the process-group kill should free the inherited pipe promptly"
+        );
         let _ = fs::remove_file(script);
         let _ = fs::remove_dir_all(cwd);
     }
