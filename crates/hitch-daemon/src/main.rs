@@ -398,15 +398,17 @@ struct DispatchChannels {
 
 struct ClientSink {
     writer: Mutex<UnixStream>,
-    /// Output readiness gate. A freshly accepted client is registered in
-    /// `DaemonState.clients` at accept time (so control-plane broadcasts reach
-    /// it immediately), but it must NOT receive live `SessionOutput` until the
-    /// dispatcher has replayed each session's scrollback to it on the dispatcher
-    /// thread. `false` until that replay completes; the output broadcast path
-    /// skips any sink whose gate is still closed. Non-output broadcasts ignore
-    /// this flag — the desktop upserts those idempotently (ADR 0007), so they
-    /// are not the lossy path and must keep flowing.
+    /// Output readiness gate. `false` until the replay thread has delivered the
+    /// full scrollback snapshot and drained any output buffered in `pending`.
+    /// The output broadcast path buffers into `pending` while the gate is closed
+    /// and writes directly once it is open. Non-output broadcasts ignore this
+    /// flag (ADR 0007).
     live: AtomicBool,
+    /// Output buffered while the gate is closed. The replay thread holds this
+    /// lock while draining and writing the buffered bytes, then sets `live=true`
+    /// before releasing — guaranteeing snapshot → pending → live order with no
+    /// gap or duplication.
+    pending: Mutex<Vec<(SessionId, Vec<u8>)>>,
 }
 
 fn restore_layout(
@@ -469,8 +471,8 @@ fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &UnixStream) -> io::
         client_id,
         Arc::new(ClientSink {
             writer: Mutex::new(writer),
-            // Closed until the dispatcher replays scrollback to this client.
             live: AtomicBool::new(false),
+            pending: Mutex::new(Vec::new()),
         }),
     );
     Ok(client_id)
@@ -1691,26 +1693,36 @@ fn replay_sessions_to_client(
         )?;
     }
 
-    // Spawn a thread to send replay output and open the gate. This way, slow
-    // network writes (from slow clients) don't block the dispatcher.
+    // Spawn a thread to send replay output and open the gate so slow clients
+    // don't block the dispatcher. Output that arrives on the dispatcher while
+    // the gate is still closed is buffered in `sink.pending`; we drain that
+    // buffer and set `live=true` under the pending lock so the ordering is
+    // strictly: snapshot bytes → pending bytes → live broadcasts.
     let state_clone = Arc::clone(state);
     thread::spawn(move || {
-        for (session, scrollback, _) in replay_items {
+        for (session, scrollback, _) in &replay_items {
             if !scrollback.is_empty() {
-                let _ = send_output_to_client(&state_clone, client_id, session.id, &scrollback);
+                let _ = send_output_to_client(&state_clone, client_id, session.id, scrollback);
             }
         }
 
-        // Snapshot fully delivered: open the gate so the dispatcher's next Output
-        // broadcasts reach this client. Setting it on a spawned thread, after the
-        // loop, still guarantees the gate opens only after the snapshot is sent.
-        // The broadcast path reads the sink's `live` atomic; we also mirror the
-        // gate in the broadcaster's set so the unit-tested core stays a
-        // self-contained model of the same state.
-        if let Ok(mut state) = state_clone.lock() {
-            if let Some(sink) = state.clients.get(&client_id) {
+        // Drain buffered output and open the gate. Hold the pending lock while
+        // writing the drained bytes so no live broadcast can interleave between
+        // the drain and live=true being stored.
+        let sink = state_clone
+            .lock()
+            .ok()
+            .and_then(|s| s.clients.get(&client_id).map(Arc::clone));
+        if let Some(sink) = sink {
+            if let Ok(mut pending) = sink.pending.lock() {
+                for (session_id, bytes) in pending.drain(..) {
+                    let _ = write_output_to_sink(&sink, session_id, &bytes);
+                }
                 sink.live.store(true, Ordering::SeqCst);
             }
+        }
+        // Mirror the gate in the broadcaster so the unit-tested model stays consistent.
+        if let Ok(mut state) = state_clone.lock() {
             state.broadcaster.mark_live(client_id);
         }
     });
@@ -1793,19 +1805,48 @@ fn broadcast_session_output(
     session_id: SessionId,
     bytes: &[u8],
 ) -> Result<(), ProtocolError> {
-    // Gate on the per-client readiness flag: a client registered at accept time
-    // but not yet replayed has `live == false`, and must NOT receive live output
-    // before its `SessionOpened` replay (which the desktop uses to reset its byte
-    // ring). Skipping it here, on the dispatcher thread, is the second half of the
-    // fix — the dispatcher both opens the gate (during replay) and reads it (here),
-    // so a now-live client only ever sees output broadcast strictly after its
-    // snapshot. Control-plane broadcasts deliberately do NOT gate (see
-    // `broadcast_event`); the desktop upserts those idempotently (ADR 0007).
-    broadcast_with_filter(
-        state,
-        |sink| sink.live.load(Ordering::SeqCst),
-        |sink| write_output_to_sink(sink, session_id, bytes),
-    );
+    // Output gate: a client registered at accept time but whose replay thread
+    // has not yet opened the gate must NOT receive live output before its
+    // snapshot. While the gate is closed we buffer into `sink.pending` instead
+    // of skipping, so bytes that arrive during the replay write window are not
+    // lost. The replay thread drains `pending` and sets `live=true` under the
+    // pending lock, so ordering is: snapshot → pending → live. Control-plane
+    // broadcasts deliberately do NOT gate (see `broadcast_event`; ADR 0007).
+    let clients = match state.lock() {
+        Ok(state) => state
+            .clients
+            .iter()
+            .map(|(id, sink)| (*id, Arc::clone(sink)))
+            .collect::<Vec<_>>(),
+        Err(_) => return Ok(()),
+    };
+
+    let mut dead = Vec::new();
+    for (id, sink) in clients {
+        if !sink.live.load(Ordering::SeqCst) {
+            // Gate closed: buffer rather than drop. Acquire the pending lock and
+            // double-check live in case the replay thread opened the gate between
+            // the first load and acquiring the lock.
+            if let Ok(mut pending) = sink.pending.lock() {
+                if !sink.live.load(Ordering::SeqCst) {
+                    pending.push((session_id, bytes.to_vec()));
+                    continue;
+                }
+                // Gate opened while we waited for the lock — fall through.
+            }
+        }
+        if write_output_to_sink(&sink, session_id, bytes).is_err() {
+            dead.push(id);
+        }
+    }
+
+    if !dead.is_empty() {
+        if let Ok(mut state) = state.lock() {
+            for id in dead {
+                state.clients.remove(&id);
+            }
+        }
+    }
     Ok(())
 }
 
