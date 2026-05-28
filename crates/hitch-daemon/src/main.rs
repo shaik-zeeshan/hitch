@@ -53,38 +53,27 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // On macOS, GUI-launched apps inherit a stripped PATH (/usr/bin:/bin only).
-    // Expand it from the user's login shell before spawning any tools (git, gh,
-    // claude, codex) so they can be found without requiring full absolute paths.
-    expand_login_shell_path();
-
     run_daemon(DaemonConfig::from(args))?;
     Ok(())
 }
 
-/// Resolve the login shell's PATH and apply it to the current process.
-/// This is called once at startup, before any threads are spawned, so
-/// mutating the environment here is safe.
-fn expand_login_shell_path() {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let Ok(output) = Command::new(&shell)
+/// Resolve the user's login-shell PATH. On macOS, GUI apps (and their
+/// descendants) inherit a stripped PATH from launchd; running the login
+/// shell recovers the full user PATH set up by shell profile files.
+fn login_shell_path() -> Option<String> {
+    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty())?;
+    let output = Command::new(&shell)
         .args(["-l", "-c", "printenv PATH"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-    else {
-        return;
-    };
+        .ok()?;
     if !output.status.success() {
-        return;
+        return None;
     }
-    let Ok(path) = String::from_utf8(output.stdout) else {
-        return;
-    };
-    let path = path.trim();
-    if !path.is_empty() {
-        std::env::set_var("PATH", path);
-    }
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim().to_string();
+    if path.is_empty() { None } else { Some(path) }
 }
 
 #[derive(Debug)]
@@ -256,6 +245,12 @@ fn detach_spawn(args: &Args) -> io::Result<()> {
         .arg(args.draft_provider.timeout.as_secs().to_string());
     if let Some(model) = args.draft_provider.model.as_deref() {
         child.arg("--draft-model").arg(model);
+    }
+    // Resolve the login-shell PATH now (in the short-lived --detach process)
+    // and bake it into the daemon's environment. The detached daemon inherits
+    // launchd's stripped PATH otherwise, making claude/codex unfindable.
+    if let Some(path) = login_shell_path() {
+        child.env("PATH", path);
     }
     let child = child
         .stdin(Stdio::null())
