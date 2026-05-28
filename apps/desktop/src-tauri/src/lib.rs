@@ -139,6 +139,11 @@ struct HitchClientInner {
     socket_path: PathBuf,
     next_request_id: AtomicU64,
     connected: AtomicBool,
+    /// Bumped by attach_stream each time a new socket connection is established.
+    /// Reader threads compare their captured generation before calling
+    /// mark_disconnected, so a stale reader from an old connection cannot
+    /// clobber a newer one (e.g. after a protocol-mismatch daemon restart).
+    connection_generation: AtomicU64,
     connect_lock: Mutex<()>,
     writer: Mutex<Option<UnixStream>>,
     pending: Mutex<HashMap<RequestId, mpsc::Sender<Response>>>,
@@ -161,6 +166,7 @@ impl HitchClient {
             socket_path: hitch_proto::transport::default_socket_path(),
             next_request_id: AtomicU64::new(1),
             connected: AtomicBool::new(false),
+            connection_generation: AtomicU64::new(0),
             connect_lock: Mutex::new(()),
             writer: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
@@ -209,7 +215,8 @@ impl HitchClient {
             .map_err(|_| "writer lock poisoned".to_string())? = Some(writer);
         self.0.connected.store(true, Ordering::SeqCst);
 
-        self.start_reader(app.clone(), stream);
+        let generation = self.0.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.start_reader(app.clone(), stream, generation);
         Ok(())
     }
 
@@ -316,14 +323,19 @@ impl HitchClient {
         }
     }
 
-    fn start_reader(&self, app: AppHandle, stream: UnixStream) {
+    fn start_reader(&self, app: AppHandle, stream: UnixStream, generation: u64) {
         let client = self.clone();
         thread::Builder::new()
             .name("hitch-daemon-reader".into())
             .spawn(move || {
                 let result = reader_loop(&app, &client, stream);
                 if let Err(err) = result {
-                    client.mark_disconnected(&app, err.to_string());
+                    // Only disconnect if this reader still owns the active connection.
+                    // A stale reader from a superseded connection must not clobber
+                    // the writer and pending map of the replacement connection.
+                    if client.0.connection_generation.load(Ordering::SeqCst) == generation {
+                        client.mark_disconnected(&app, err.to_string());
+                    }
                 }
             })
             .expect("failed to spawn daemon reader thread");
@@ -412,6 +424,12 @@ impl HitchClient {
     }
 
     fn spawn_daemon(&self) -> Result<(), String> {
+        // In debug builds, always use `cargo run` so the daemon is compiled from
+        // current source. Relying on the sibling binary in target/debug risks using
+        // a stale build with a different protocol version when only one crate was
+        // rebuilt (e.g. `cargo tauri dev` recompiles hitch-desktop but not
+        // hitch-daemon).
+        #[cfg(not(debug_assertions))]
         if let Some(path) = daemon_binary_path() {
             let output = Command::new(&path)
                 .arg("--socket")
@@ -569,6 +587,7 @@ fn read_pty_payload<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     Ok(payload)
 }
 
+#[cfg(not(debug_assertions))]
 fn daemon_binary_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("HITCH_DAEMON_PATH") {
         let path = PathBuf::from(path);
@@ -605,7 +624,10 @@ async fn connect_daemon(app: AppHandle, state: State<'_, HitchClient>) -> Result
             },
         )? {
             Response::Hello { .. } => Ok(()),
-            Response::Error { error } if error.code == ErrorCode::UnsupportedProtocol => {
+            // Any Hello error means the running daemon is incompatible — restart
+            // regardless of error code, since old daemons may serialize error codes
+            // differently (e.g. protocol v2 may use a variant unknown to this client).
+            Response::Error { error } => {
                 client.restart_daemon(
                     &app,
                     format!("restarting incompatible daemon: {}", error.message),
@@ -624,7 +646,6 @@ async fn connect_daemon(app: AppHandle, state: State<'_, HitchClient>) -> Result
                     )),
                 }
             }
-            Response::Error { error } => Err(error.message),
             other => Err(format!("unexpected hello response: {other:?}")),
         }
     })
