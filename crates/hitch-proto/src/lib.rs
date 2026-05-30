@@ -80,6 +80,9 @@ Request:
   create-pull-request(worktree_id, title, body?, base?, draft)
   install-agent-hooks(worktree_id)
   report-agent-state(agent, state, session_id?, cwd?, detail?)
+  ping
+  start-job(request)
+  cancel-job(job_id)
 
 Response:
   hello(protocol_version)
@@ -93,6 +96,8 @@ Response:
   pull-request-created(url)
   commit-draft(draft)
   pull-request-draft(draft)
+  pong
+  job-started(job_id)
   error(error)
 
 Event:
@@ -104,4 +109,6 @@ Event:
   worktree-updated(worktree)
   project-updated(project)
   project-removed(project_id)
+  job-progress(job_id, status, message?)
+  job-completed(job_id, response)
 "#;

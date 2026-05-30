@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -30,6 +30,97 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 /// (1 MiB) so a brand-new session's first prompt survives the registration
 /// round-trip without letting staging grow without bound (ADR 0007).
 const OUTPUT_STAGING_CAPACITY: usize = 1024 * 1024;
+
+/// How often the heartbeat thread pings the daemon, and how long it waits for a
+/// `Pong` before declaring the daemon wedged (ADR 0009). The interval stays
+/// generous: even though long git ops now run as Jobs off the request loop (ADR
+/// 0008), a Ping shares the single connection with PTY input and other control
+/// requests, so a tight timeout would false-positive under load.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Crash-loop guard window + cap. If the GUI has to (re)spawn the daemon more
+/// than `CRASH_LOOP_MAX` times within `CRASH_LOOP_WINDOW`, it stops respawning
+/// and surfaces `failed` + the log reason rather than thrashing (ADR 0009).
+const CRASH_LOOP_MAX: usize = 4;
+// Wide enough to span several `wait_for_daemon` timeouts (a daemon that never
+// binds its socket fails ~10s per attempt), so a genuine crash loop trips before
+// the budget rolls off.
+const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(60);
+
+/// The Daemon Status the GUI surfaces, distinct from any single window's socket
+/// link (`CONTEXT.md`, ADR 0009). Serialized kebab-case to match the frontend
+/// `daemonStatus` store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum DaemonStatus {
+    /// Spawn issued, socket not yet up.
+    Starting,
+    /// A healthy daemon is listening and this GUI is attached + responsive.
+    Running,
+    /// No socket and no live daemon process found — it died or never ran.
+    Unreachable,
+    /// Spawn or startup errored; carries a reason sourced from the daemon log.
+    Failed,
+}
+
+/// Status snapshot pushed to the webview on every transition (`hitch-status`)
+/// and returned by `get_daemon_status`.
+#[derive(Debug, Clone, Serialize)]
+struct StatusPayload {
+    status: DaemonStatus,
+    reason: Option<String>,
+    log_path: String,
+}
+
+/// Bounded record of recent (re)spawn attempts, used to stop a crash-looping
+/// daemon from thrashing (ADR 0009). Pure and clock-injected so the policy is
+/// unit-testable without sleeping.
+struct CrashLoopGuard {
+    window: Duration,
+    max_attempts: usize,
+    attempts: Vec<Instant>,
+}
+
+impl CrashLoopGuard {
+    fn new(max_attempts: usize, window: Duration) -> Self {
+        Self {
+            window,
+            max_attempts,
+            attempts: Vec::new(),
+        }
+    }
+
+    /// Record a spawn attempt at `now`, dropping ones older than the window.
+    /// Returns `true` while the count stays at or below the cap, `false` once the
+    /// daemon has been respawned too many times in the window (crash-looping).
+    fn allow(&mut self, now: Instant) -> bool {
+        self.attempts
+            .retain(|at| now.duration_since(*at) < self.window);
+        self.attempts.push(now);
+        self.attempts.len() <= self.max_attempts
+    }
+
+    /// Clear the record after a healthy attach so a later, unrelated crash starts
+    /// from a clean budget.
+    fn reset(&mut self) {
+        self.attempts.clear();
+    }
+}
+
+/// Read the last `lines` lines of the daemon log at `path`. Returns `None` when
+/// the file is missing (the daemon never wrote one) or empty, so callers fall
+/// back to a generic reason. Kept path-parameterized for unit testing.
+fn read_log_tail(path: &Path, lines: usize) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let all: Vec<&str> = trimmed.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    Some(all[start..].join("\n"))
+}
 
 /// Routes raw PTY bytes to the webview per session (ADR 0007).
 ///
@@ -155,6 +246,17 @@ struct HitchClientInner {
     /// Per-session PTY-output channels + pre-registration staging (ADR 0007).
     /// One mutex guards both maps; the struct it protects is small.
     output_router: Mutex<OutputRouter>,
+    /// The current four-state Daemon Status + its reason (ADR 0009). The tray and
+    /// the `hitch-status` event both read this; `get_daemon_status` returns it.
+    status: Mutex<DaemonStatus>,
+    reason: Mutex<Option<String>>,
+    /// Stops a crash-looping daemon from thrashing the respawn path (ADR 0009).
+    restart_guard: Mutex<CrashLoopGuard>,
+    /// Set while a recovery loop is in flight so a burst of disconnect signals
+    /// (reader error + missed heartbeat) starts exactly one recovery.
+    recovering: AtomicBool,
+    /// Daemon log path, computed once from `$HOME` to match the daemon writer.
+    log_path: PathBuf,
 }
 
 /// The tray's stable id, used to look it up for tooltip updates.
@@ -173,7 +275,53 @@ impl HitchClient {
             sessions: Mutex::new(HashSet::new()),
             tray_status: Mutex::new(None),
             output_router: Mutex::new(OutputRouter::default()),
+            status: Mutex::new(DaemonStatus::Starting),
+            reason: Mutex::new(None),
+            restart_guard: Mutex::new(CrashLoopGuard::new(CRASH_LOOP_MAX, CRASH_LOOP_WINDOW)),
+            recovering: AtomicBool::new(false),
+            log_path: daemon_log_path(),
         }))
+    }
+
+    /// Current Daemon Status snapshot for the tray, events, and `get_daemon_status`.
+    fn status_payload(&self) -> StatusPayload {
+        StatusPayload {
+            status: self
+                .0
+                .status
+                .lock()
+                .map(|s| *s)
+                .unwrap_or(DaemonStatus::Unreachable),
+            reason: self.0.reason.lock().ok().and_then(|r| r.clone()),
+            log_path: self.0.log_path.display().to_string(),
+        }
+    }
+
+    /// Record the Daemon Status, refresh the tray, and push it to the webview.
+    /// Every status transition flows through here so the indicator, tray, and
+    /// `get_daemon_status` never disagree (ADR 0009).
+    fn set_status(&self, app: &AppHandle, status: DaemonStatus, reason: Option<String>) {
+        if let Ok(mut slot) = self.0.status.lock() {
+            *slot = status;
+        }
+        if let Ok(mut slot) = self.0.reason.lock() {
+            *slot = reason.clone();
+        }
+        self.refresh_tray(app);
+        let _ = app.emit(
+            "hitch-status",
+            StatusPayload {
+                status,
+                reason,
+                log_path: self.0.log_path.display().to_string(),
+            },
+        );
+    }
+
+    /// A concise failure reason sourced from the daemon log tail (ADR 0009): the
+    /// last non-empty line (the panic/fatal message), else `None`.
+    fn log_failure_reason(&self) -> Option<String> {
+        read_log_tail(&self.0.log_path, 1)
     }
 
     fn connect(&self, app: &AppHandle) -> Result<(), String> {
@@ -193,11 +341,68 @@ impl HitchClient {
         let stream = match UnixStream::connect(&self.0.socket_path) {
             Ok(stream) => stream,
             Err(_) => {
+                // Socket absent: we must (re)spawn. Guard against a crash loop —
+                // a daemon that dies on startup (corrupt store, bind failure)
+                // must not be respawned forever (ADR 0009).
+                let now = Instant::now();
+                let allowed = self
+                    .0
+                    .restart_guard
+                    .lock()
+                    .map(|mut guard| guard.allow(now))
+                    .unwrap_or(true);
+                if !allowed {
+                    let reason = self.log_failure_reason().unwrap_or_else(|| {
+                        "daemon failed to start repeatedly; stopped retrying".to_string()
+                    });
+                    self.set_status(app, DaemonStatus::Failed, Some(reason.clone()));
+                    return Err(reason);
+                }
+                self.set_status(app, DaemonStatus::Starting, None);
                 self.spawn_daemon()?;
                 self.wait_for_daemon()?
             }
         };
         self.attach_stream(app, stream)
+    }
+
+    /// Connect (spawning if needed) and complete the `Hello` handshake, restarting
+    /// a protocol-incompatible daemon once. On success the Daemon Status becomes
+    /// `running` and the crash-loop budget resets. Shared by the `connect_daemon`
+    /// command and the auto-recovery loop so both diagnose failures identically.
+    fn connect_and_handshake(&self, app: &AppHandle) -> Result<(), String> {
+        self.connect(app)?;
+        let hello = Request::Hello {
+            client_name: "hitch-desktop".into(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let outcome = match self.send_request(app, hello.clone())? {
+            Response::Hello { .. } => Ok(()),
+            // Any Hello error means the running daemon is incompatible — restart
+            // regardless of error code (old daemons may serialize codes this
+            // client can't parse).
+            Response::Error { error } => {
+                self.restart_daemon(
+                    app,
+                    format!("restarting incompatible daemon: {}", error.message),
+                )?;
+                match self.send_request(app, hello)? {
+                    Response::Hello { .. } => Ok(()),
+                    Response::Error { error } => Err(error.message),
+                    other => Err(format!(
+                        "unexpected hello response after daemon restart: {other:?}"
+                    )),
+                }
+            }
+            other => Err(format!("unexpected hello response: {other:?}")),
+        };
+        if outcome.is_ok() {
+            if let Ok(mut guard) = self.0.restart_guard.lock() {
+                guard.reset();
+            }
+            self.set_status(app, DaemonStatus::Running, None);
+        }
+        outcome
     }
 
     fn attach_stream(&self, app: &AppHandle, stream: UnixStream) -> Result<(), String> {
@@ -217,12 +422,45 @@ impl HitchClient {
 
         let generation = self.0.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.start_reader(app.clone(), stream, generation);
+        self.start_heartbeat(app.clone(), generation);
         Ok(())
+    }
+
+    /// Spawn the `Ping`/`Pong` heartbeat for this connection (ADR 0009). It makes
+    /// the `running` status mean *responsive*, not merely socket-open: a wedged
+    /// daemon answers no Pong, so a timed-out Ping triggers recovery. Guarded by
+    /// `connection_generation` like the reader, so a heartbeat from a superseded
+    /// connection can neither fire recovery nor outlive its socket.
+    fn start_heartbeat(&self, app: AppHandle, generation: u64) {
+        let client = self.clone();
+        thread::Builder::new()
+            .name("hitch-daemon-heartbeat".into())
+            .spawn(move || loop {
+                thread::sleep(HEARTBEAT_INTERVAL);
+                if client.0.connection_generation.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                if !client.is_connected() {
+                    return;
+                }
+                // Bypass `connect()` (no respawn from a heartbeat) — dispatch the
+                // Ping directly with a tolerant timeout.
+                let pong = client.dispatch_request(&app, Request::Ping, None, HEARTBEAT_TIMEOUT);
+                if client.0.connection_generation.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                if !matches!(pong, Ok(Response::Pong)) {
+                    client.handle_connection_lost(&app, "daemon stopped responding to heartbeat");
+                    return;
+                }
+            })
+            .expect("failed to spawn daemon heartbeat thread");
     }
 
     fn restart_daemon(&self, app: &AppHandle, reason: String) -> Result<(), String> {
         self.request_daemon_shutdown();
         self.mark_disconnected(app, reason);
+        self.set_status(app, DaemonStatus::Starting, None);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -248,7 +486,24 @@ impl HitchClient {
         pty_payload: Option<Vec<u8>>,
     ) -> Result<Response, String> {
         self.connect(app)?;
+        // Fixed client-side response deadline. With long ops now running as Jobs
+        // (the `StartJob` reply is immediate and the real result rides a
+        // `JobCompleted` event), no synchronous request should approach this; it
+        // remains a backstop against a wedged daemon.
+        self.dispatch_request(app, request, pty_payload, Duration::from_secs(120))
+    }
 
+    /// Write a request and block for its response up to `timeout`, without
+    /// auto-connecting. The heartbeat uses this directly (a missed Pong must not
+    /// trigger a respawn from inside the heartbeat); `send_request_with_payload`
+    /// wraps it with `connect`.
+    fn dispatch_request(
+        &self,
+        app: &AppHandle,
+        request: Request,
+        pty_payload: Option<Vec<u8>>,
+        timeout: Duration,
+    ) -> Result<Response, String> {
         let request_id = self.0.next_request_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         self.0
@@ -285,17 +540,11 @@ impl HitchClient {
 
         if let Err(err) = write_result {
             self.remove_pending(request_id);
-            self.mark_disconnected(app, err.clone());
+            self.handle_connection_lost(app, &err);
             return Err(err);
         }
 
-        // Fixed client-side response deadline. The daemon clamps its
-        // configurable draft timeout safely below this (see
-        // `hitch-daemon`'s `drafts::MAX_TIMEOUT_SECS`, currently 120 - 10s
-        // margin) so a slow draft still produces a daemon response — success
-        // or timeout error — before the client abandons the request and the
-        // reader_loop drops the late reply. Keep these two values in sync.
-        match rx.recv_timeout(Duration::from_secs(120)) {
+        match rx.recv_timeout(timeout) {
             Ok(response) => Ok(response),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.remove_pending(request_id);
@@ -334,7 +583,7 @@ impl HitchClient {
                     // A stale reader from a superseded connection must not clobber
                     // the writer and pending map of the replacement connection.
                     if client.0.connection_generation.load(Ordering::SeqCst) == generation {
-                        client.mark_disconnected(&app, err.to_string());
+                        client.handle_connection_lost(&app, &err.to_string());
                     }
                 }
             })
@@ -363,6 +612,74 @@ impl HitchClient {
         let _ = app.emit("hitch-disconnected", DisconnectedPayload { reason });
     }
 
+    /// Handle an *unexpected* loss of the daemon link (reader EOF/error, missed
+    /// heartbeat, or a failed write). Tears the socket down, surfaces the loss as
+    /// a Daemon Status with a log-sourced reason, then kicks off bounded
+    /// auto-recovery (ADR 0009). The deliberate restart path (`restart_daemon`)
+    /// does NOT route through here — it manages its own reconnect.
+    fn handle_connection_lost(&self, app: &AppHandle, reason: &str) {
+        self.mark_disconnected(app, reason.to_string());
+        // Socket-absent reads as `unreachable`; recovery refines this to
+        // `starting` while retrying and `failed` if the crash-loop guard trips.
+        self.set_status(
+            app,
+            DaemonStatus::Unreachable,
+            self.log_failure_reason()
+                .or_else(|| Some(reason.to_string())),
+        );
+        self.begin_recovery(app);
+    }
+
+    /// Start the auto-recovery loop unless one is already running. The
+    /// `recovering` latch collapses a burst of disconnect signals (reader error
+    /// arriving alongside a missed heartbeat) into a single recovery.
+    fn begin_recovery(&self, app: &AppHandle) {
+        if self.0.recovering.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let client = self.clone();
+        let app = app.clone();
+        thread::Builder::new()
+            .name("hitch-daemon-recovery".into())
+            .spawn(move || {
+                client.recovery_loop(&app);
+                client.0.recovering.store(false, Ordering::SeqCst);
+            })
+            .expect("failed to spawn daemon recovery thread");
+    }
+
+    /// Reconnect with exponential backoff until the daemon is healthy again or
+    /// the crash-loop guard (enforced inside `connect`) gives up and sets
+    /// `failed`. On success the webview is told to re-snapshot; sessions replay
+    /// through the daemon's normal reconnect events (ADR 0007).
+    fn recovery_loop(&self, app: &AppHandle) {
+        let mut delay = Duration::from_millis(300);
+        let max_delay = Duration::from_secs(5);
+        loop {
+            if self.is_connected() {
+                return;
+            }
+            match self.connect_and_handshake(app) {
+                Ok(()) => {
+                    let _ = app.emit("hitch-reconnected", ());
+                    return;
+                }
+                Err(_) => {
+                    // `connect` sets `failed` when the crash-loop guard trips;
+                    // stop retrying then rather than thrash.
+                    if matches!(
+                        self.0.status.lock().map(|status| *status),
+                        Ok(DaemonStatus::Failed)
+                    ) {
+                        return;
+                    }
+                    thread::sleep(delay);
+                    delay = (delay * 2).min(max_delay);
+                }
+            }
+        }
+    }
+
     /// Mirror a session's liveness from a daemon event and refresh the tray.
     fn track_session(&self, app: &AppHandle, session_id: SessionId, alive: bool) {
         let changed = match self.0.sessions.lock() {
@@ -384,7 +701,13 @@ impl HitchClient {
     /// All tray mutation happens on the main thread, where the menu lib is safe.
     fn refresh_tray(&self, app: &AppHandle) {
         let count = self.0.sessions.lock().map(|set| set.len()).unwrap_or(0);
-        let text = tray_status_text(self.is_connected(), count);
+        let status = self
+            .0
+            .status
+            .lock()
+            .map(|s| *s)
+            .unwrap_or(DaemonStatus::Unreachable);
+        let text = tray_status_text(status, count);
         let status_item = self
             .0
             .tray_status
@@ -484,13 +807,22 @@ impl HitchClient {
                 }
             }
         }
-        Err(format!(
-            "daemon did not become ready at {}: {}",
-            self.0.socket_path.display(),
-            last_error
-                .map(|err| err.to_string())
-                .unwrap_or_else(|| "unknown error".into())
-        ))
+        // The socket never came up. The reason almost always lives in the
+        // daemon's own log (a startup panic, a bind/store error) — surface its
+        // tail so the user sees *why* instead of a bare timeout (ADR 0009).
+        let connect_err = last_error
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "unknown error".into());
+        match read_log_tail(&self.0.log_path, 3) {
+            Some(tail) => Err(format!(
+                "daemon did not become ready at {}: {connect_err}\n{tail}",
+                self.0.socket_path.display(),
+            )),
+            None => Err(format!(
+                "daemon did not become ready at {}: {connect_err}",
+                self.0.socket_path.display(),
+            )),
+        }
     }
 }
 
@@ -611,46 +943,67 @@ struct DisconnectedPayload {
     reason: String,
 }
 
+/// Path to the daemon's log. MUST match the daemon's own `daemon_log_path`
+/// (same `$HOME`-based `.hitch/daemon.log`) so the tail the GUI reads is the file
+/// the daemon writes — never derived from the socket parent, to avoid drift
+/// (ADR 0009).
+fn daemon_log_path() -> PathBuf {
+    home_dir().join(".hitch/daemon.log")
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 #[tauri::command]
 async fn connect_daemon(app: AppHandle, state: State<'_, HitchClient>) -> Result<(), String> {
     let client = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || client.connect_and_handshake(&app))
+        .await
+        .map_err(|err| format!("daemon connection task failed: {err}"))?
+}
+
+/// Current Daemon Status + reason + log path for the in-window indicator
+/// (ADR 0009). Pull complement to the pushed `hitch-status` event.
+#[tauri::command]
+fn get_daemon_status(state: State<'_, HitchClient>) -> StatusPayload {
+    state.inner().status_payload()
+}
+
+/// Tail of the daemon log for the status popover's "View log" detail (ADR 0009).
+#[tauri::command]
+fn get_daemon_log_tail(state: State<'_, HitchClient>, lines: Option<usize>) -> Option<String> {
+    read_log_tail(&state.inner().0.log_path, lines.unwrap_or(200))
+}
+
+/// Restart the daemon on demand (the popover/tray "Restart daemon" action).
+/// Wraps the existing restart path so a wedged or failed daemon is recoverable
+/// without the terminal (ADR 0009).
+#[tauri::command]
+async fn restart_daemon_command(app: AppHandle, state: State<'_, HitchClient>) -> Result<(), String> {
+    let client = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        client.connect(&app)?;
-        match client.send_request(
+        if let Ok(mut guard) = client.0.restart_guard.lock() {
+            // A user-initiated restart is an explicit intent, not a crash loop —
+            // clear the budget so it always proceeds.
+            guard.reset();
+        }
+        client.restart_daemon(&app, "user requested daemon restart".to_string())?;
+        client.send_request(
             &app,
             Request::Hello {
                 client_name: "hitch-desktop".into(),
                 protocol_version: PROTOCOL_VERSION,
             },
-        )? {
-            Response::Hello { .. } => Ok(()),
-            // Any Hello error means the running daemon is incompatible — restart
-            // regardless of error code, since old daemons may serialize error codes
-            // differently (e.g. protocol v2 may use a variant unknown to this client).
-            Response::Error { error } => {
-                client.restart_daemon(
-                    &app,
-                    format!("restarting incompatible daemon: {}", error.message),
-                )?;
-                match client.send_request(
-                    &app,
-                    Request::Hello {
-                        client_name: "hitch-desktop".into(),
-                        protocol_version: PROTOCOL_VERSION,
-                    },
-                )? {
-                    Response::Hello { .. } => Ok(()),
-                    Response::Error { error } => Err(error.message),
-                    other => Err(format!(
-                        "unexpected hello response after daemon restart: {other:?}"
-                    )),
-                }
-            }
-            other => Err(format!("unexpected hello response: {other:?}")),
-        }
+        )?;
+        client.set_status(&app, DaemonStatus::Running, None);
+        let _ = app.emit("hitch-reconnected", ());
+        Ok::<(), String>(())
     })
     .await
-    .map_err(|err| format!("daemon connection task failed: {err}"))?
+    .map_err(|err| format!("daemon restart task failed: {err}"))?
 }
 
 #[tauri::command]
@@ -723,18 +1076,20 @@ fn unregister_session_output(
     Ok(())
 }
 
-/// Menu-bar status line, e.g. "Hitch — running 2 sessions". The daemon keeps
-/// running after the window closes, so this is the honest signal that Hitch has
-/// a background presence (ADR 0003).
-fn tray_status_text(connected: bool, count: usize) -> String {
-    if !connected {
-        "Hitch — daemon offline".to_string()
-    } else {
-        match count {
-            0 => "Hitch — no active sessions".to_string(),
+/// Menu-bar status line mirroring the four-state Daemon Status (ADR 0009). The
+/// daemon keeps running after the window closes, so this is the honest signal
+/// that Hitch has a background presence (ADR 0003). Always word + state, never
+/// color alone (design principle #3).
+fn tray_status_text(status: DaemonStatus, count: usize) -> String {
+    match status {
+        DaemonStatus::Starting => "Hitch — starting daemon…".to_string(),
+        DaemonStatus::Unreachable => "Hitch — daemon unreachable".to_string(),
+        DaemonStatus::Failed => "Hitch — daemon failed".to_string(),
+        DaemonStatus::Running => match count {
+            0 => "Hitch — running, no active sessions".to_string(),
             1 => "Hitch — running 1 session".to_string(),
             n => format!("Hitch — running {n} sessions"),
-        }
+        },
     }
 }
 
@@ -749,6 +1104,35 @@ fn show_main_window(app: &AppHandle) {
 fn handle_tray_menu_event(app: &AppHandle, event: MenuEvent) {
     match event.id.as_ref() {
         "show" => show_main_window(app),
+        "view-log" => {
+            // Open the daemon log in the user's default viewer (ADR 0009).
+            let path = app.state::<HitchClient>().0.log_path.clone();
+            let _ = tauri_plugin_opener::open_path(path.display().to_string(), None::<&str>);
+        }
+        "restart-daemon" => {
+            // Restart off the main thread so the menu handler returns promptly.
+            let app = app.clone();
+            thread::spawn(move || {
+                let client = app.state::<HitchClient>().inner().clone();
+                if let Ok(mut guard) = client.0.restart_guard.lock() {
+                    guard.reset();
+                }
+                if client
+                    .restart_daemon(&app, "user requested daemon restart".to_string())
+                    .is_ok()
+                {
+                    let _ = client.send_request(
+                        &app,
+                        Request::Hello {
+                            client_name: "hitch-desktop".into(),
+                            protocol_version: PROTOCOL_VERSION,
+                        },
+                    );
+                    client.set_status(&app, DaemonStatus::Running, None);
+                    let _ = app.emit("hitch-reconnected", ());
+                }
+            });
+        }
         "quit" => {
             // Full quit: stop the daemon (kills sessions) and exit the GUI.
             app.state::<HitchClient>().request_daemon_shutdown();
@@ -762,20 +1146,30 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let status = MenuItem::with_id(
         app,
         "status",
-        tray_status_text(false, 0),
+        tray_status_text(DaemonStatus::Starting, 0),
         false,
         None::<&str>,
     )?;
     let show = MenuItem::with_id(app, "show", "Show Hitch", true, None::<&str>)?;
+    let view_log = MenuItem::with_id(app, "view-log", "View daemon log", true, None::<&str>)?;
+    let restart = MenuItem::with_id(app, "restart-daemon", "Restart daemon", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Hitch", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&status, &PredefinedMenuItem::separator(app)?, &show, &quit],
+        &[
+            &status,
+            &PredefinedMenuItem::separator(app)?,
+            &show,
+            &view_log,
+            &restart,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
     )?;
 
     let builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
-        .tooltip(tray_status_text(false, 0))
+        .tooltip(tray_status_text(DaemonStatus::Starting, 0))
         .icon(tauri::include_image!("icons/tray.png"))
         .icon_as_template(true)
         .on_menu_event(handle_tray_menu_event);
@@ -789,9 +1183,13 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{tray_status_text, OutputRouter};
+    use super::{
+        read_log_tail, tray_status_text, CrashLoopGuard, DaemonStatus, OutputRouter,
+        CRASH_LOOP_MAX,
+    };
     use hitch_core::SessionId;
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
     use tauri::ipc::{Channel, InvokeResponseBody};
 
     fn recording_channel(received: Arc<Mutex<Vec<Vec<u8>>>>) -> Channel<InvokeResponseBody> {
@@ -953,12 +1351,89 @@ mod tests {
     }
 
     #[test]
-    fn tray_status_text_reflects_connection_and_count() {
-        assert_eq!(tray_status_text(false, 0), "Hitch — daemon offline");
-        assert_eq!(tray_status_text(false, 3), "Hitch — daemon offline");
-        assert_eq!(tray_status_text(true, 0), "Hitch — no active sessions");
-        assert_eq!(tray_status_text(true, 1), "Hitch — running 1 session");
-        assert_eq!(tray_status_text(true, 4), "Hitch — running 4 sessions");
+    fn tray_status_text_reflects_status_and_count() {
+        assert_eq!(
+            tray_status_text(DaemonStatus::Starting, 2),
+            "Hitch — starting daemon…"
+        );
+        assert_eq!(
+            tray_status_text(DaemonStatus::Unreachable, 0),
+            "Hitch — daemon unreachable"
+        );
+        assert_eq!(
+            tray_status_text(DaemonStatus::Failed, 0),
+            "Hitch — daemon failed"
+        );
+        assert_eq!(
+            tray_status_text(DaemonStatus::Running, 0),
+            "Hitch — running, no active sessions"
+        );
+        assert_eq!(
+            tray_status_text(DaemonStatus::Running, 1),
+            "Hitch — running 1 session"
+        );
+        assert_eq!(
+            tray_status_text(DaemonStatus::Running, 4),
+            "Hitch — running 4 sessions"
+        );
+    }
+
+    #[test]
+    fn read_log_tail_returns_last_n_lines_and_handles_missing_file() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("hitch-tauri-logtail-{nonce}.log"));
+
+        // Missing file → None, so callers fall back to a generic reason.
+        assert_eq!(read_log_tail(&path, 5), None);
+
+        std::fs::write(&path, "l1\nl2\nl3\nl4\n").unwrap();
+        assert_eq!(read_log_tail(&path, 2).as_deref(), Some("l3\nl4"));
+        // Asking for more lines than exist returns them all.
+        assert_eq!(read_log_tail(&path, 10).as_deref(), Some("l1\nl2\nl3\nl4"));
+        // The single-line reason path picks the most recent line.
+        assert_eq!(read_log_tail(&path, 1).as_deref(), Some("l4"));
+
+        // An empty (whitespace-only) log reads as None, not an empty reason.
+        std::fs::write(&path, "\n\n").unwrap();
+        assert_eq!(read_log_tail(&path, 3), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn crash_loop_guard_stops_after_max_attempts_in_window() {
+        let window = Duration::from_secs(60);
+        let mut guard = CrashLoopGuard::new(CRASH_LOOP_MAX, window);
+        let t0 = Instant::now();
+
+        // The first CRASH_LOOP_MAX attempts within the window are allowed.
+        for i in 0..CRASH_LOOP_MAX {
+            assert!(
+                guard.allow(t0 + Duration::from_secs(i as u64)),
+                "attempt {i} within budget should be allowed"
+            );
+        }
+        // The next attempt within the window trips the guard.
+        assert!(
+            !guard.allow(t0 + Duration::from_secs(CRASH_LOOP_MAX as u64)),
+            "exceeding the cap within the window must stop respawning"
+        );
+
+        // Once the window has fully elapsed, old attempts roll off and a fresh
+        // attempt is allowed again.
+        assert!(guard.allow(t0 + window + Duration::from_secs(1)));
+
+        // An explicit reset (a user-initiated restart) clears the budget.
+        let mut guard = CrashLoopGuard::new(2, window);
+        assert!(guard.allow(t0));
+        assert!(guard.allow(t0));
+        assert!(!guard.allow(t0));
+        guard.reset();
+        assert!(guard.allow(t0));
     }
 }
 
@@ -1012,7 +1487,10 @@ pub fn run() {
             hitch_request,
             send_session_input,
             register_session_output,
-            unregister_session_output
+            unregister_session_output,
+            get_daemon_status,
+            get_daemon_log_tail,
+            restart_daemon_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

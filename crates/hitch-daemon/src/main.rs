@@ -22,7 +22,7 @@ mod drafts;
 use drafts::{CommitDraftInput, DraftProviderConfig, PullRequestDraftInput};
 use hitch_agent::HookInstallOptions;
 use hitch_core::{
-    Project, ProjectId, ProjectKind, Session, SessionId, SessionParent, Worktree, WorktreeId,
+    JobId, Project, ProjectId, ProjectKind, Session, SessionId, SessionParent, Worktree, WorktreeId,
 };
 use hitch_git::{
     staged_diff, CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState, GitClient,
@@ -31,8 +31,8 @@ use hitch_git::{
 use hitch_proto::{
     encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage,
     DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
-    ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode, MAX_PTY_FRAME_LEN,
-    PROTOCOL_VERSION,
+    JobStatus, ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode,
+    MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
 use hitch_pty::{
     ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY,
@@ -252,16 +252,88 @@ fn detach_spawn(args: &Args) -> io::Result<()> {
     if let Some(path) = login_shell_path() {
         child.env("PATH", path);
     }
+    // Redirect the detached daemon's stdout+stderr to a rotated log file beside
+    // the socket/store instead of /dev/null (ADR 0009). This is the one change
+    // that captures the `eprintln!` fatal path, Rust's default panic output, the
+    // panic hook below, and library noise — so a startup crash (socket bind,
+    // store open, panic) leaves a reason the GUI can tail, rather than an opaque
+    // timeout. Rotation happens here (once per spawn = "on start"); the file
+    // handles are inherited by the real daemon, which owns them after we exit.
+    let log = rotate_and_open_log(&daemon_log_path())?;
+    let log_err = log.try_clone()?;
     let child = child
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
         .spawn()?;
     println!("{}", child.id());
     Ok(())
 }
 
+/// Path to the daemon's log, beside the socket and store. Computed from the same
+/// `home_dir()` the store/managed-root defaults use so the Tauri client's
+/// `read_daemon_log_tail` and this writer never drift onto different files
+/// (ADR 0009).
+fn daemon_log_path() -> PathBuf {
+    home_dir().join(".hitch/daemon.log")
+}
+
+/// Rotate `daemon.log` → `daemon.log.prev` and open a fresh log for writing.
+///
+/// Rotate-on-start (not size-based) keeps exactly two files: the current run and
+/// the immediately preceding one. A daemon that crashes and is respawned by the
+/// GUI thus preserves the crash trace in `.prev` while the new run writes a fresh
+/// `daemon.log` — so the failure reason survives its own respawn.
+fn rotate_and_open_log(path: &Path) -> io::Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Rotate only when a previous log exists; a missing file is the first run.
+    if path.exists() {
+        let prev = path.with_extension("log.prev");
+        // A stale `.prev` is overwritten — we keep only the last two runs.
+        let _ = fs::rename(path, &prev);
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+}
+
+/// Install a panic hook that flushes a located panic line to stderr — which the
+/// detached daemon has pointed at `daemon.log` (see `detach_spawn`). Without this
+/// a panicking worker thread (PTY reader, poller, Job worker) would still print
+/// Rust's default message, but the explicit hook guarantees the location and an
+/// explicit flush so the reason reaches the log before the process unwinds.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let message = panic_message(info.payload());
+        eprintln!("hitch-daemon: panic at {location}: {message}");
+        let _ = io::stderr().flush();
+        // Preserve Rust's default behavior (backtrace handling, abort-on-panic).
+        default_hook(info);
+    }));
+}
+
+/// Best-effort extraction of a panic payload's message for the log line.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 fn run_daemon(config: DaemonConfig) -> io::Result<()> {
+    install_panic_hook();
     remove_stale_socket(&config.socket_path)?;
     if let Some(parent) = config.socket_path.parent() {
         fs::create_dir_all(parent)?;
@@ -333,6 +405,11 @@ struct DaemonState {
     /// the dispatcher mutates this, so its borrows of `DaemonState` are brief and
     /// never overlap a client thread's mutation of the same field.
     broadcaster: OutputBroadcaster,
+    /// Live async **Jobs** keyed by id (ADR 0008). Each entry's [`JobControl`] is
+    /// shared with the Job worker thread so `CancelJob` can signal it and kill any
+    /// git/agent child. Ephemeral: never persisted, dropped when the worker
+    /// finishes, and gone entirely on daemon restart.
+    jobs: HashMap<JobId, Arc<JobControl>>,
 }
 
 impl DaemonState {
@@ -348,6 +425,56 @@ impl DaemonState {
             config,
             git,
             broadcaster: OutputBroadcaster::default(),
+            jobs: HashMap::new(),
+        }
+    }
+}
+
+/// Shared control handle for one running **Job** (ADR 0008). The Job registry on
+/// `DaemonState` and the Job worker thread both hold an `Arc<JobControl>`:
+/// `CancelJob` flips `cancelled` and kills any registered child process group;
+/// the worker checks `is_cancelled()` and registers the pid of a cancellable
+/// child (the Draft Generator's provider tree) so the kill reaches grandchildren.
+#[derive(Default)]
+struct JobControl {
+    cancelled: AtomicBool,
+    /// Process-group leader pid of the Job's currently-running child, if any.
+    /// Drafts spawn their provider as its own group leader (see `drafts.rs`), so
+    /// signalling the negated pid reaches the whole tree.
+    child_pgid: Mutex<Option<i32>>,
+}
+
+impl JobControl {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Register (or clear) the pid of the child process group the Job is running,
+    /// so a concurrent cancel can kill it. The worker sets it just after spawn and
+    /// clears it on exit.
+    fn set_child_pgid(&self, pgid: Option<i32>) {
+        if let Ok(mut guard) = self.child_pgid.lock() {
+            *guard = pgid;
+        }
+    }
+
+    /// Signal cancellation and, if a child process group is registered, SIGKILL it
+    /// (process-group kill, mirroring `drafts::kill_process_tree`). Cooperative for
+    /// jobs whose work blocks in a library call with no registered child (git
+    /// push/pull/PR): the flag is set and the result is suppressed, but the in-
+    /// flight subprocess is not force-killed.
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Ok(guard) = self.child_pgid.lock() {
+            if let Some(pgid) = *guard {
+                // SAFETY: `kill(2)` with a negative pid signals the process group;
+                // it has no memory-safety preconditions and an already-gone group
+                // returns ESRCH, which we ignore.
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
         }
     }
 }
@@ -899,88 +1026,34 @@ fn handle_request<R: Read>(
             send_response(state, client_id, request_id, Response::Ack)?;
             broadcast_dirty(state, worktree_id)?;
         }
-        Request::ListDraftModels { provider } => {
-            spawn_response_task(
-                "hitch-draft-models",
-                Arc::clone(state),
-                client_id,
-                request_id,
-                move |state| {
-                    let models = list_draft_models(state, provider)?;
-                    Ok(Response::DraftModels { provider, models })
-                },
-            )?;
+        // Long-running operations run off the request loop as Jobs (ADR 0008).
+        // The bare requests and the explicit `StartJob` wrapper share one
+        // dispatch path; both reply `JobStarted` and broadcast lifecycle events.
+        Request::ListDraftModels { .. }
+        | Request::GenerateCommitDraft { .. }
+        | Request::GeneratePullRequestDraft { .. }
+        | Request::Push { .. }
+        | Request::Pull { .. }
+        | Request::CreatePullRequest { .. } => {
+            dispatch_job(state, client_id, request_id, request)?;
         }
-        Request::GenerateCommitDraft {
-            worktree_id,
-            settings,
-        } => {
-            spawn_response_task(
-                "hitch-commit-draft",
-                Arc::clone(state),
-                client_id,
-                request_id,
-                move |state| {
-                    let draft = generate_commit_draft(state, worktree_id, settings)?;
-                    Ok(Response::CommitDraft { draft })
-                },
-            )?;
+        Request::StartJob { request } => {
+            dispatch_job(state, client_id, request_id, *request)?;
         }
-        Request::GeneratePullRequestDraft {
-            worktree_id,
-            base,
-            settings,
-        } => {
-            spawn_response_task(
-                "hitch-pr-draft",
-                Arc::clone(state),
-                client_id,
-                request_id,
-                move |state| {
-                    let draft = generate_pull_request_draft(state, worktree_id, base, settings)?;
-                    Ok(Response::PullRequestDraft { draft })
-                },
-            )?;
-        }
-        Request::Push { worktree_id } => {
-            let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
-            git.push(&worktree.path, "origin", &worktree.branch, true)
-                .map_err(git_error)?;
+        Request::CancelJob { job_id } => {
+            let control = {
+                let guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+                guard.jobs.get(&job_id).map(Arc::clone)
+            };
+            if let Some(control) = control {
+                control.cancel();
+            }
+            // Cancelling an unknown/finished Job is a no-op success: the worker
+            // may have already completed and removed itself from the registry.
             send_response(state, client_id, request_id, Response::Ack)?;
         }
-        Request::Pull { worktree_id } => {
-            let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
-            git.pull(&worktree.path, "origin", &worktree.branch)
-                .map_err(git_error)?;
-            send_response(state, client_id, request_id, Response::Ack)?;
-        }
-        Request::CreatePullRequest {
-            worktree_id,
-            title,
-            body,
-            base,
-            draft,
-        } => {
-            let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
-            let url = git
-                .create_pr(
-                    &worktree.path,
-                    &CreatePrRequest {
-                        title,
-                        body,
-                        base,
-                        head: Some(worktree.branch),
-                        remote: None,
-                        draft,
-                    },
-                )
-                .map_err(git_error)?;
-            send_response(
-                state,
-                client_id,
-                request_id,
-                Response::PullRequestCreated { url },
-            )?;
+        Request::Ping => {
+            send_response(state, client_id, request_id, Response::Pong)?;
         }
         Request::InstallAgentHooks { worktree_id } => {
             let (path, helper) = {
@@ -1597,15 +1670,17 @@ fn git_diff(
 fn list_draft_models(
     state: &Arc<Mutex<DaemonState>>,
     provider: DraftProvider,
+    cancel: Option<&JobControl>,
 ) -> Result<Vec<String>, ProtocolError> {
     let config = draft_provider_config(state)?;
-    drafts::list_models(&config, provider)
+    drafts::list_models(&config, provider, cancel)
 }
 
 fn generate_commit_draft(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
     settings: Option<DraftGenerationSettings>,
+    cancel: Option<&JobControl>,
 ) -> Result<CommitDraft, ProtocolError> {
     let worktree = refreshed_worktree_context(state, worktree_id)?.1;
     let provider = draft_provider_config(state)?.with_settings(settings);
@@ -1633,6 +1708,7 @@ fn generate_commit_draft(
             staged_paths,
             staged_patch,
         },
+        cancel,
     )
 }
 
@@ -1641,6 +1717,7 @@ fn generate_pull_request_draft(
     worktree_id: WorktreeId,
     base: Option<String>,
     settings: Option<DraftGenerationSettings>,
+    cancel: Option<&JobControl>,
 ) -> Result<PullRequestDraft, ProtocolError> {
     let worktree = refreshed_worktree_context(state, worktree_id)?.1;
     let provider = draft_provider_config(state)?.with_settings(settings);
@@ -1680,6 +1757,7 @@ fn generate_pull_request_draft(
             changed_paths: comparison.changed_paths,
             diff: comparison.diff,
         },
+        cancel,
     )
 }
 
@@ -2132,27 +2210,232 @@ fn replay_sessions_to_client(
     Ok(())
 }
 
-fn spawn_response_task<F>(
+/// Run a long-running request off the per-client request loop as a **Job** (ADR
+/// 0008). Replies to the requester immediately with `JobStarted { job_id }`, then
+/// runs `work` on a worker thread, broadcasting `JobProgress(running)` up front
+/// and `JobProgress(<terminal>)` + `JobCompleted { response }` when it finishes.
+///
+/// The worker receives the shared [`JobControl`] so it can register a cancellable
+/// child (the Draft Generator's provider tree) and check `is_cancelled()`. A
+/// cancelled Job reports `Cancelled` and an `Unavailable` error response,
+/// regardless of what `work` returned. The Job is removed from the registry the
+/// moment `work` returns, so a racing `CancelJob` after completion is a no-op.
+///
+/// This generalizes the former `spawn_response_task`: instead of replying once by
+/// request id, completion travels the broadcast bus keyed by job id, so every
+/// attached GUI observes the same lifecycle.
+fn start_job<F>(
     name: &'static str,
-    state: Arc<Mutex<DaemonState>>,
+    state: &Arc<Mutex<DaemonState>>,
     client_id: u64,
     request_id: u64,
-    job: F,
+    progress: Option<&str>,
+    work: F,
 ) -> Result<(), ProtocolError>
 where
-    F: FnOnce(&Arc<Mutex<DaemonState>>) -> Result<Response, ProtocolError> + Send + 'static,
+    F: FnOnce(&Arc<Mutex<DaemonState>>, &JobControl) -> Result<Response, ProtocolError>
+        + Send
+        + 'static,
 {
-    thread::Builder::new()
-        .name(name.into())
-        .spawn(move || {
-            let response = match job(&state) {
-                Ok(response) => response,
-                Err(error) => Response::Error { error },
-            };
-            let _ = send_response(&state, client_id, request_id, response);
-        })
-        .map(|_| ())
-        .map_err(|err| internal(format!("failed to spawn {name}: {err}")))
+    let job_id = JobId::new();
+    let control = Arc::new(JobControl::default());
+    {
+        let mut guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        guard.jobs.insert(job_id, Arc::clone(&control));
+    }
+
+    // Reply immediately so the request loop is never blocked behind the work.
+    send_response(state, client_id, request_id, Response::JobStarted { job_id })?;
+    let _ = broadcast_event(
+        state,
+        Event::JobProgress {
+            job_id,
+            status: JobStatus::Running,
+            message: progress.map(str::to_string),
+        },
+    );
+
+    let worker_state = Arc::clone(state);
+    let progress = progress.map(str::to_string);
+    let spawn = thread::Builder::new().name(name.into()).spawn(move || {
+        let _ = progress; // kept for symmetry; running note already broadcast
+        let result = work(&worker_state, &control);
+        // Drop the registry entry first so a late CancelJob can't match this id.
+        if let Ok(mut guard) = worker_state.lock() {
+            guard.jobs.remove(&job_id);
+        }
+        let (status, response) = if control.is_cancelled() {
+            (
+                JobStatus::Cancelled,
+                Response::Error {
+                    error: ProtocolError::new(ErrorCode::Unavailable, "job cancelled")
+                        .retryable(true),
+                },
+            )
+        } else {
+            match result {
+                Ok(response) => (JobStatus::Succeeded, response),
+                Err(error) => (JobStatus::Failed, Response::Error { error }),
+            }
+        };
+        let _ = broadcast_event(
+            &worker_state,
+            Event::JobProgress {
+                job_id,
+                status,
+                message: None,
+            },
+        );
+        let _ = broadcast_event(
+            &worker_state,
+            Event::JobCompleted {
+                job_id,
+                response: Box::new(response),
+            },
+        );
+    });
+
+    if spawn.is_err() {
+        if let Ok(mut guard) = state.lock() {
+            guard.jobs.remove(&job_id);
+        }
+        return Err(internal(format!("failed to spawn {name}")));
+    }
+    Ok(())
+}
+
+/// Dispatch the long-running request `request` as a **Job**. Reached both from a
+/// `StartJob` wrapper and from the bare long-op requests (migrated off the inline
+/// request loop, ADR 0008). Fast git reads (`status`/`diff`) never come here —
+/// they stay synchronous.
+fn dispatch_job(
+    state: &Arc<Mutex<DaemonState>>,
+    client_id: u64,
+    request_id: u64,
+    request: Request,
+) -> Result<(), ProtocolError> {
+    match request {
+        Request::Push { worktree_id } => start_job(
+            "hitch-push",
+            state,
+            client_id,
+            request_id,
+            Some("Pushing…"),
+            move |state, _| do_push(state, worktree_id),
+        ),
+        Request::Pull { worktree_id } => start_job(
+            "hitch-pull",
+            state,
+            client_id,
+            request_id,
+            Some("Pulling…"),
+            move |state, _| do_pull(state, worktree_id),
+        ),
+        Request::CreatePullRequest {
+            worktree_id,
+            title,
+            body,
+            base,
+            draft,
+        } => start_job(
+            "hitch-create-pr",
+            state,
+            client_id,
+            request_id,
+            Some("Creating pull request…"),
+            move |state, _| do_create_pr(state, worktree_id, title, body, base, draft),
+        ),
+        Request::ListDraftModels { provider } => start_job(
+            "hitch-draft-models",
+            state,
+            client_id,
+            request_id,
+            None,
+            move |state, control| {
+                let models = list_draft_models(state, provider, Some(control))?;
+                Ok(Response::DraftModels { provider, models })
+            },
+        ),
+        Request::GenerateCommitDraft {
+            worktree_id,
+            settings,
+        } => start_job(
+            "hitch-commit-draft",
+            state,
+            client_id,
+            request_id,
+            Some("Generating commit message…"),
+            move |state, control| {
+                let draft = generate_commit_draft(state, worktree_id, settings, Some(control))?;
+                Ok(Response::CommitDraft { draft })
+            },
+        ),
+        Request::GeneratePullRequestDraft {
+            worktree_id,
+            base,
+            settings,
+        } => start_job(
+            "hitch-pr-draft",
+            state,
+            client_id,
+            request_id,
+            Some("Generating PR description…"),
+            move |state, control| {
+                let draft =
+                    generate_pull_request_draft(state, worktree_id, base, settings, Some(control))?;
+                Ok(Response::PullRequestDraft { draft })
+            },
+        ),
+        _ => Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "this request type cannot run as a Job",
+        )),
+    }
+}
+
+fn do_push(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+) -> Result<Response, ProtocolError> {
+    let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
+    git.push(&worktree.path, "origin", &worktree.branch, true)
+        .map_err(git_error)?;
+    Ok(Response::Ack)
+}
+
+fn do_pull(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+) -> Result<Response, ProtocolError> {
+    let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
+    git.pull(&worktree.path, "origin", &worktree.branch)
+        .map_err(git_error)?;
+    Ok(Response::Ack)
+}
+
+fn do_create_pr(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+    title: String,
+    body: Option<String>,
+    base: Option<String>,
+    draft: bool,
+) -> Result<Response, ProtocolError> {
+    let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
+    let url = git
+        .create_pr(
+            &worktree.path,
+            &CreatePrRequest {
+                title,
+                body,
+                base,
+                head: Some(worktree.branch),
+                remote: None,
+                draft,
+            },
+        )
+        .map_err(git_error)?;
+    Ok(Response::PullRequestCreated { url })
 }
 
 fn send_response(
@@ -2582,5 +2865,83 @@ mod tests {
             1 + hitch_pty::DEFAULT_SCROLLBACK_CAPACITY,
             "live log must be capped at scrollback capacity, restored prepended on top"
         );
+    }
+
+    #[test]
+    fn rotate_and_open_log_preserves_previous_run_and_opens_fresh() {
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-log-rotate-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("daemon.log");
+        let prev_path = dir.join("daemon.log.prev");
+
+        // First run: no prior log, nothing to rotate, fresh file opened empty.
+        {
+            let mut file = super::rotate_and_open_log(&log_path).unwrap();
+            writeln!(file, "first run crash").unwrap();
+        }
+        assert!(!prev_path.exists(), "first run must not create a .prev");
+
+        // Second run: the prior log rotates to .prev and a fresh log opens. The
+        // crash trace from the first run survives its respawn in .prev.
+        {
+            let mut file = super::rotate_and_open_log(&log_path).unwrap();
+            writeln!(file, "second run starting").unwrap();
+        }
+        let prev = std::fs::read_to_string(&prev_path).unwrap();
+        assert!(prev.contains("first run crash"));
+        let current = std::fs::read_to_string(&log_path).unwrap();
+        assert!(current.contains("second run starting"));
+        assert!(
+            !current.contains("first run crash"),
+            "fresh log must be truncated, not appended to"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_control_cancel_kills_registered_child_process_group() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        // A long-lived child in its own process group, exactly as the Draft
+        // Generator spawns its provider. `CancelJob` must reach it via the
+        // process-group SIGKILL path so it dies promptly rather than running its
+        // full sleep.
+        let control = super::JobControl::default();
+        let mut child = {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd.process_group(0);
+            cmd.spawn().expect("spawn sleep")
+        };
+        control.set_child_pgid(Some(child.id() as i32));
+
+        control.cancel();
+        assert!(control.is_cancelled());
+
+        let started = Instant::now();
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(_) => break,
+                None if started.elapsed() > Duration::from_secs(5) => {
+                    let _ = child.kill();
+                    panic!("cancel did not kill the registered child process group");
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
     }
 }

@@ -13,21 +13,16 @@ const DEFAULT_TIMEOUT_SECS: u64 = 90;
 const MAX_DIFF_CHARS: usize = 48_000;
 const MAX_STDERR_CHARS: usize = 4_000;
 
-/// The desktop client abandons a request after this many seconds (see
-/// `apps/desktop/src-tauri/src/lib.rs`). The daemon's draft timeout is clamped
-/// below it so the daemon always sends its response — success or timeout error
-/// — before the client gives up and drops the late reply.
-const CLIENT_RESPONSE_TIMEOUT_SECS: u64 = 120;
-/// Margin reserved for the daemon to format and write its response (and for the
-/// kill/wait/join path on a timeout) before the client's deadline elapses.
-const CLIENT_RESPONSE_MARGIN_SECS: u64 = 10;
-/// Hard upper bound on a draft provider timeout. Stays safely below the client
-/// response timeout so a successful draft is never dropped.
-const MAX_TIMEOUT_SECS: u64 = CLIENT_RESPONSE_TIMEOUT_SECS - CLIENT_RESPONSE_MARGIN_SECS;
+/// Standalone sanity bound on a draft provider timeout (ten minutes). Draft
+/// generation now runs as an async **Job** (ADR 0008), so it is no longer
+/// clamped below the desktop client's synchronous response deadline — the Job's
+/// result rides a `JobCompleted` event rather than a request reply, and the Job
+/// is independently cancellable. This cap only stops a misconfigured timeout
+/// from wedging a worker indefinitely.
+const MAX_TIMEOUT_SECS: u64 = 600;
 
 /// Clamp a configured draft timeout into the supported range: at least one
-/// second, and never above [`MAX_TIMEOUT_SECS`] so the daemon responds before
-/// the client's fixed response timeout.
+/// second, and never above [`MAX_TIMEOUT_SECS`].
 fn clamp_timeout_secs(secs: u64) -> Duration {
     Duration::from_secs(secs.clamp(1, MAX_TIMEOUT_SECS))
 }
@@ -163,6 +158,7 @@ pub(crate) struct PullRequestDraftInput {
 pub(crate) fn list_models(
     config: &DraftProviderConfig,
     provider: DraftProvider,
+    cancel: Option<&crate::JobControl>,
 ) -> Result<Vec<String>, ProtocolError> {
     match provider {
         DraftProvider::Stub => Ok(vec!["stub".into()]),
@@ -187,7 +183,7 @@ pub(crate) fn list_models(
             codex_config.timeout = codex_config.timeout.min(Duration::from_secs(5));
             let mut command = Command::new(&codex_config.codex);
             command.arg("debug").arg("models");
-            let output = run_provider_command(&mut command, Path::new("."), &codex_config)?;
+            let output = run_provider_command(&mut command, Path::new("."), &codex_config, cancel)?;
             let models = parse_codex_models(&output);
             if models.is_empty() {
                 Ok(vec![
@@ -205,12 +201,13 @@ pub(crate) fn list_models(
 pub(crate) fn generate_commit_draft(
     config: &DraftProviderConfig,
     input: CommitDraftInput,
+    cancel: Option<&crate::JobControl>,
 ) -> Result<CommitDraft, ProtocolError> {
     match config.kind {
         DraftProviderKind::Stub => Ok(stub_commit_draft(&input.staged_paths, &input.staged_patch)),
         DraftProviderKind::Claude | DraftProviderKind::Codex => {
             let prompt = commit_prompt(&input.staged_paths, &input.staged_patch);
-            let output = run_headless_provider(config, &input.worktree_path, prompt)?;
+            let output = run_headless_provider(config, &input.worktree_path, prompt, cancel)?;
             let mut draft = parse_commit_draft_output(&output)?;
             if draft.body.trim().is_empty() {
                 draft.body = commit_body_from_context(&input.staged_paths, &input.staged_patch);
@@ -223,6 +220,7 @@ pub(crate) fn generate_commit_draft(
 pub(crate) fn generate_pull_request_draft(
     config: &DraftProviderConfig,
     input: PullRequestDraftInput,
+    cancel: Option<&crate::JobControl>,
 ) -> Result<PullRequestDraft, ProtocolError> {
     match config.kind {
         DraftProviderKind::Stub => Ok(stub_pull_request_draft(
@@ -239,7 +237,7 @@ pub(crate) fn generate_pull_request_draft(
                 &input.changed_paths,
                 &input.diff,
             );
-            let output = run_headless_provider(config, &input.worktree_path, prompt)?;
+            let output = run_headless_provider(config, &input.worktree_path, prompt, cancel)?;
             parse_pull_request_draft_output(&output)
         }
     }
@@ -330,6 +328,7 @@ fn run_headless_provider(
     config: &DraftProviderConfig,
     cwd: &Path,
     prompt: String,
+    cancel: Option<&crate::JobControl>,
 ) -> Result<String, ProtocolError> {
     let mut command = match config.kind {
         DraftProviderKind::Stub => unreachable!("stub provider does not spawn a CLI"),
@@ -367,13 +366,14 @@ fn run_headless_provider(
             command
         }
     };
-    run_provider_command(&mut command, cwd, config)
+    run_provider_command(&mut command, cwd, config, cancel)
 }
 
 fn run_provider_command(
     command: &mut Command,
     cwd: &Path,
     config: &DraftProviderConfig,
+    cancel: Option<&crate::JobControl>,
 ) -> Result<String, ProtocolError> {
     command
         .current_dir(cwd)
@@ -437,15 +437,41 @@ fn run_provider_command(
     let stdout_reader = read_pipe(stdout);
     let stderr_reader = read_pipe(stderr);
 
+    // Register this child's process group so a `CancelJob` can SIGKILL the whole
+    // tree (the child is its own group leader, see `process_group(0)` above).
+    if let Some(control) = cancel {
+        control.set_child_pgid(Some(child.id() as i32));
+    }
+
     let deadline = Instant::now() + config.timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
+            // The Job was cancelled: kill the provider tree and stop waiting,
+            // mirroring the timeout path. The `start_job` runner reports the Job
+            // as cancelled regardless of this error.
+            Ok(None) if cancel.is_some_and(|control| control.is_cancelled()) => {
+                kill_process_tree(&mut child);
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                if let Some(control) = cancel {
+                    control.set_child_pgid(None);
+                }
+                return Err(provider_error(format!(
+                    "{} draft provider cancelled",
+                    config.kind.label()
+                ))
+                .retryable(true));
+            }
             Ok(None) if Instant::now() >= deadline => {
                 kill_process_tree(&mut child);
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
+                if let Some(control) = cancel {
+                    control.set_child_pgid(None);
+                }
                 return Err(provider_error(format!(
                     "{} draft provider timed out after {}s",
                     config.kind.label(),
@@ -457,6 +483,11 @@ fn run_provider_command(
             Err(err) => return Err(provider_error(format!("draft provider failed: {err}"))),
         }
     };
+
+    // Child exited on its own; it can no longer be the cancel target.
+    if let Some(control) = cancel {
+        control.set_child_pgid(None);
+    }
 
     let stdout = join_reader(stdout_reader)?;
     let stderr = join_reader(stderr_reader)?;
@@ -850,6 +881,7 @@ mod tests {
                 staged_paths: vec![PathBuf::from("src/lib.rs")],
                 staged_patch: "diff --git a/src/lib.rs b/src/lib.rs\n+new\n-old\n".into(),
             },
+            None,
         )
         .unwrap();
         assert_eq!(draft.subject, "fix: preserve generated body");
@@ -920,13 +952,13 @@ mod tests {
     }
 
     #[test]
-    fn timeout_is_clamped_below_client_response_deadline() {
+    fn timeout_is_clamped_to_sane_bounds() {
         let mut config = config_with_model(None);
-        // A huge configured timeout is capped so the daemon responds before the
-        // client's fixed response timeout.
+        // A huge configured timeout is capped at the standalone sanity bound.
+        // Draft generation runs as a cancellable Job now, so the cap is no longer
+        // tied to any client response deadline (ADR 0008).
         config.set_timeout_secs("100000").unwrap();
         assert_eq!(config.timeout.as_secs(), MAX_TIMEOUT_SECS);
-        assert!(MAX_TIMEOUT_SECS < CLIENT_RESPONSE_TIMEOUT_SECS);
 
         // A zero/sub-second timeout floors at one second.
         config.set_timeout_secs("0").unwrap();
@@ -966,6 +998,7 @@ mod tests {
                 staged_paths: vec![PathBuf::from("tracked.txt")],
                 staged_patch: "+change".into(),
             },
+            None,
         )
         .unwrap();
         assert_eq!(draft.subject, "feat: generated");
@@ -1002,6 +1035,7 @@ mod tests {
                 changed_paths: vec![PathBuf::from("tracked.txt")],
                 diff: "+change".into(),
             },
+            None,
         )
         .unwrap();
         assert_eq!(draft.title, "Generated PR");
@@ -1036,7 +1070,7 @@ mod tests {
         };
         let mut command = Command::new(&config.codex);
         let started = Instant::now();
-        let result = run_provider_command(&mut command, &cwd, &config);
+        let result = run_provider_command(&mut command, &cwd, &config, None);
         let elapsed = started.elapsed();
         assert!(result.is_err(), "expected a timeout error");
         assert!(

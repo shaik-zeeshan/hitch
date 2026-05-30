@@ -5,6 +5,7 @@
   // the selection + loads the diff text). Branch-level +/− stats live in the
   // tree; this panel focuses on file status and commit actions.
   import {
+    cancelJob,
     commit,
     defaultBase,
     diffPath,
@@ -14,6 +15,7 @@
     gitBusy,
     gitStatus,
     gitWorktreeId,
+    jobs,
     loadGitStatus,
     pull,
     push,
@@ -41,6 +43,11 @@
   const ahead = $derived($gitStatus?.ahead ?? 0);
   const behind = $derived($gitStatus?.behind ?? 0);
   const isDefaultBranch = $derived(Boolean($defaultBase && $gitStatus?.branch === $defaultBase));
+
+  // The live git/draft Job, if any — surfaced as a Cancel affordance (ADR 0008).
+  const runningJob = $derived(
+    Object.values($jobs).find((j) => j.status === "running" || j.status === "queued") ?? null,
+  );
 
   let autoRunning = $state(false);
 
@@ -151,6 +158,15 @@
         <span class="from">from {$defaultBase}</span>
       {/if}
       <span class="branch-acts">
+        {#if runningJob}
+          <button
+            class="chip cancel"
+            title="Cancel the running operation"
+            onclick={() => void cancelJob(runningJob.id)}
+          >
+            Cancel
+          </button>
+        {/if}
         {#if files.length > 0}
           {#if $autoCommitPush}
             <button
@@ -331,6 +347,13 @@
   }
   .chip .ar.down {
     color: var(--warn);
+  }
+  :global(.chip.cancel) {
+    color: oklch(80% 0.08 25);
+    border-color: oklch(58% 0.14 25 / 0.4);
+  }
+  :global(.chip.cancel:hover) {
+    color: var(--err);
   }
   .branch-acts {
     margin-left: auto;

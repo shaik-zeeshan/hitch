@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.hitch.desktop",
   "build": {
-    "beforeDevCommand": "bun run dev",
+    "beforeDevCommand": "cargo build -p hitch-daemon && bun run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "bun run build",
     "frontendDist": "../build"

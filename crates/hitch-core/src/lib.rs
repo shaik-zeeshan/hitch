@@ -13,7 +13,7 @@ mod session;
 mod worktree;
 
 pub use agent::AgentState;
-pub use ids::{ProjectId, SessionId, WorktreeId};
+pub use ids::{JobId, ProjectId, SessionId, WorktreeId};
 pub use project::{Project, ProjectKind};
 pub use session::{Session, SessionParent};
 pub use worktree::Worktree;

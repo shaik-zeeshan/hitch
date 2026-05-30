@@ -19,10 +19,12 @@ import {
   type BranchSummary,
   type ChangedFile,
   type CommitDraft,
+  type DaemonStatus,
   type FileStatus,
   type GitStatus,
   type HitchEvent,
   type Id,
+  type JobStatus,
   type PrFields,
   type PullRequestDraft,
   type Project,
@@ -40,6 +42,30 @@ export type Connection = "connecting" | "ready" | "offline";
 
 export const connection = writable<Connection>("connecting");
 export const error = writable<string | null>(null);
+
+// ---- Daemon Status (ADR 0009) ---------------------------------------------
+//
+// The four-state liveness of the daemon process itself, pushed from src-tauri
+// over `hitch-status`. `connection` (above) is the narrower per-window socket
+// link, derived from this for the git-poll guard and the existing banner.
+export const daemonStatus = writable<DaemonStatus>("starting");
+export const daemonReason = writable<string | null>(null);
+export const daemonLogPath = writable<string | null>(null);
+
+// ---- Jobs (ADR 0008) ------------------------------------------------------
+//
+// Long-running daemon ops (push/pull/PR/drafts) run as Jobs: the desktop sends
+// `StartJob`, gets `JobStarted { job_id }`, and the real result arrives later in
+// a `JobCompleted` event. This store mirrors live Jobs by id for quiet progress;
+// `runJob` (below) bridges the event flow back to a Promise so callers keep
+// their async API.
+export type Job = {
+  id: Id;
+  status: JobStatus;
+  message: string | null;
+  kind: string | null;
+};
+export const jobs = writable<Record<Id, Job>>({});
 
 export const projects = writable<Project[]>([]);
 export const worktrees = writable<Worktree[]>([]);
@@ -182,6 +208,91 @@ export async function daemonRequest<T extends Response>(
 
 function toMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+// ---- Job dispatch (ADR 0008) ----------------------------------------------
+//
+// `runJob` wraps a long-running request in `StartJob`, registers a pending
+// resolver keyed by the returned job id, and resolves/rejects it when the
+// matching `JobCompleted` event arrives (handled in the hitch-event listener).
+// Callers (push/pull/draft fns) keep an ordinary Promise API.
+type JobPending = {
+  resolve: (response: Response) => void;
+  reject: (error: Error) => void;
+};
+const jobPending = new Map<Id, JobPending>();
+
+export async function runJob<T extends Response>(
+  request: Request,
+  kind: string | null = null,
+): Promise<T> {
+  const started = await daemonRequest<Response & { job_id: Id }>({
+    type: "start-job",
+    request,
+  });
+  const jobId = started.job_id;
+  jobs.update((current) => ({
+    ...current,
+    [jobId]: { id: jobId, status: "running", message: null, kind },
+  }));
+  return new Promise<T>((resolve, reject) => {
+    jobPending.set(jobId, {
+      resolve: (response) => resolve(response as T),
+      reject,
+    });
+  });
+}
+
+// Update the live Jobs store from a `JobProgress` event. Exported as the seam
+// the event listener and the unit tests both drive.
+export function applyJobProgress(
+  jobId: Id,
+  status: JobStatus,
+  message: string | null,
+): void {
+  jobs.update((current) => ({
+    ...current,
+    [jobId]: { id: jobId, status, message, kind: current[jobId]?.kind ?? null },
+  }));
+}
+
+// Resolve a Job from its `JobCompleted` event: the wrapped response rides inside.
+export function completeJob(jobId: Id, response: Response): void {
+  const pending = jobPending.get(jobId);
+  jobPending.delete(jobId);
+  jobs.update((current) => {
+    if (!(jobId in current)) return current;
+    const next = { ...current };
+    delete next[jobId];
+    return next;
+  });
+  if (!pending) return;
+  if (isError(response)) {
+    pending.reject(new Error(response.error.message));
+  } else {
+    pending.resolve(response);
+  }
+}
+
+// Reject every in-flight Job when the daemon link drops. Jobs are ephemeral and
+// do NOT survive a daemon restart (CONTEXT.md): a Job that was running when the
+// daemon stopped is reported failed so the user can re-trigger.
+function failAllJobs(reason: string): void {
+  const message = `daemon restarted: ${reason}`;
+  for (const [, pending] of jobPending) {
+    pending.reject(new Error(message));
+  }
+  jobPending.clear();
+  jobs.set({});
+}
+
+// Ask the daemon to cancel a running Job (signals its worker to kill any child).
+export async function cancelJob(jobId: Id): Promise<void> {
+  try {
+    await daemonRequest({ type: "cancel-job", job_id: jobId });
+  } catch (err) {
+    error.set(toMessage(err));
+  }
 }
 
 function upsert<T extends { id: Id }>(items: T[], item: T): T[] {
@@ -394,6 +505,16 @@ export async function initDaemon(): Promise<void> {
           const command = (event.command as string | null) ?? null;
           sessionCommands.update((current) => ({ ...current, [sessionId]: command }));
         }
+        if (event.type === "job-progress") {
+          applyJobProgress(
+            event.job_id as Id,
+            event.status as JobStatus,
+            (event.message as string | null) ?? null,
+          );
+        }
+        if (event.type === "job-completed") {
+          completeJob(event.job_id as Id, event.response as Response);
+        }
         if (event.type === "session-opened") {
           const session = event.session as Session;
           sessions.update((items) => upsert(items, session));
@@ -447,15 +568,65 @@ export async function initDaemon(): Promise<void> {
       await listen<{ reason: string }>("hitch-disconnected", (message) => {
         connection.set("offline");
         error.set(message.payload.reason);
+        // The daemon link dropped; ephemeral Jobs cannot survive it (ADR 0008).
+        failAllJobs(message.payload.reason);
       }),
     );
 
+    // Daemon Status drives the four-state model + the derived connection. The
+    // Rust side pushes this on every transition (starting/running/unreachable/
+    // failed) with a log-sourced reason on failure (ADR 0009).
+    unlisteners.push(
+      await listen<{ status: DaemonStatus; reason: string | null; log_path: string }>(
+        "hitch-status",
+        (message) => {
+          applyDaemonStatus(message.payload.status, message.payload.reason);
+          daemonLogPath.set(message.payload.log_path);
+        },
+      ),
+    );
+
+    // Auto-recovery re-attached the socket; re-snapshot so projects/worktrees/
+    // sessions reflect the live daemon (sessions also replay via events).
+    unlisteners.push(
+      await listen("hitch-reconnected", () => {
+        void refreshAll().catch((err) => error.set(toMessage(err)));
+      }),
+    );
+
+    // Seed the log path up front so "View log" works even if the first connect
+    // fails (the status events also carry it).
+    try {
+      const snapshot = await invoke<{ log_path: string }>("get_daemon_status");
+      daemonLogPath.set(snapshot.log_path);
+    } catch {
+      // Non-fatal: the status events populate the path on the next transition.
+    }
+
     await invoke("connect_daemon");
-    connection.set("ready");
+    applyDaemonStatus("running", null);
     await refreshAll();
   } catch (err) {
+    applyDaemonStatus("failed", toMessage(err));
+  }
+}
+
+// Apply a Daemon Status to the stores, deriving the narrower `connection` the
+// git-poll guard and the offline banner read. Exported as the seam the
+// `hitch-status` listener and the unit tests both drive.
+export function applyDaemonStatus(status: DaemonStatus, reason: string | null): void {
+  daemonStatus.set(status);
+  daemonReason.set(reason);
+  if (status === "running") {
+    connection.set("ready");
+    error.set(null);
+  } else if (status === "starting") {
+    connection.set("connecting");
+  } else {
+    // unreachable | failed
     connection.set("offline");
-    error.set(toMessage(err));
+    if (reason) error.set(reason);
+    failAllJobs(reason ?? status);
   }
 }
 
@@ -466,16 +637,51 @@ export function disposeDaemon(): void {
   booted = false;
 }
 
-// Re-run the connect handshake on demand — the "daemon went away" recovery path.
+// Re-run the connect handshake on demand — the manual "daemon went away" path.
+// Auto-recovery (ADR 0009) usually handles this, but the button stays for a
+// daemon the GUI has given up on (crash-loop `failed`).
 export async function reconnect(): Promise<void> {
   error.set(null);
-  connection.set("connecting");
+  applyDaemonStatus("starting", null);
   try {
     await invoke("connect_daemon");
-    connection.set("ready");
+    applyDaemonStatus("running", null);
     await refreshAll();
   } catch (err) {
-    connection.set("offline");
+    applyDaemonStatus("failed", toMessage(err));
+  }
+}
+
+// Restart the daemon from the UI (status popover / tray "Restart daemon").
+export async function restartDaemon(): Promise<void> {
+  error.set(null);
+  applyDaemonStatus("starting", null);
+  try {
+    await invoke("restart_daemon_command");
+    applyDaemonStatus("running", null);
+    await refreshAll();
+  } catch (err) {
+    applyDaemonStatus("failed", toMessage(err));
+  }
+}
+
+// Fetch the daemon log tail for the status popover.
+export async function fetchDaemonLogTail(lines = 200): Promise<string | null> {
+  try {
+    return await invoke<string | null>("get_daemon_log_tail", { lines });
+  } catch {
+    return null;
+  }
+}
+
+// Open the daemon log file in the OS default viewer (status popover / tray).
+export async function openDaemonLog(): Promise<void> {
+  const path = get(daemonLogPath);
+  if (!path) return;
+  try {
+    const { openPath } = await import("@tauri-apps/plugin-opener");
+    await openPath(path);
+  } catch (err) {
     error.set(toMessage(err));
   }
 }
@@ -992,33 +1198,39 @@ export async function commit(subject: string, body: string | null = null): Promi
 }
 
 export async function listDraftModels(provider: DraftProvider): Promise<string[]> {
-  const response = await daemonRequest<Response & { models: string[] }>({
-    type: "list-draft-models",
-    provider,
-  });
+  const response = await runJob<Response & { models: string[] }>(
+    { type: "list-draft-models", provider },
+    "draft-models",
+  );
   return response.models;
 }
 
 export async function generateCommitDraft(): Promise<CommitDraft> {
   const worktreeId = get(gitWorktreeId);
   if (!worktreeId) throw new Error("Select a git worktree first.");
-  const response = await daemonRequest<Response & { draft: CommitDraft }>({
-    type: "generate-commit-draft",
-    worktree_id: worktreeId,
-    settings: draftGenerationSettings(),
-  });
+  const response = await runJob<Response & { draft: CommitDraft }>(
+    {
+      type: "generate-commit-draft",
+      worktree_id: worktreeId,
+      settings: draftGenerationSettings(),
+    },
+    "commit-draft",
+  );
   return response.draft;
 }
 
 export async function generatePullRequestDraft(base: string | null): Promise<PullRequestDraft> {
   const worktreeId = get(gitWorktreeId);
   if (!worktreeId) throw new Error("Select a git worktree first.");
-  const response = await daemonRequest<Response & { draft: PullRequestDraft }>({
-    type: "generate-pull-request-draft",
-    worktree_id: worktreeId,
-    base: base?.trim() || null,
-    settings: draftGenerationSettings(),
-  });
+  const response = await runJob<Response & { draft: PullRequestDraft }>(
+    {
+      type: "generate-pull-request-draft",
+      worktree_id: worktreeId,
+      base: base?.trim() || null,
+      settings: draftGenerationSettings(),
+    },
+    "pr-draft",
+  );
   return response.draft;
 }
 
@@ -1039,7 +1251,7 @@ export async function push(): Promise<void> {
   gitBusy.set(true);
   try {
     error.set(null);
-    await daemonRequest({ type: "push", worktree_id: worktreeId });
+    await runJob({ type: "push", worktree_id: worktreeId }, "push");
   } catch (err) {
     error.set(toMessage(err));
     throw err;
@@ -1054,7 +1266,7 @@ export async function pull(): Promise<void> {
   gitBusy.set(true);
   try {
     error.set(null);
-    await daemonRequest({ type: "pull", worktree_id: worktreeId });
+    await runJob({ type: "pull", worktree_id: worktreeId }, "pull");
   } catch (err) {
     error.set(toMessage(err));
     throw err;
@@ -1067,14 +1279,17 @@ export async function pull(): Promise<void> {
 export async function createPr(fields: PrFields): Promise<void> {
   const worktreeId = get(gitWorktreeId);
   if (!worktreeId) return;
-  const response = await daemonRequest<Response & { url: string }>({
-    type: "create-pull-request",
-    worktree_id: worktreeId,
-    title: fields.title,
-    body: fields.body,
-    base: fields.base,
-    draft: fields.draft,
-  });
+  const response = await runJob<Response & { url: string }>(
+    {
+      type: "create-pull-request",
+      worktree_id: worktreeId,
+      title: fields.title,
+      body: fields.body,
+      base: fields.base,
+      draft: fields.draft,
+    },
+    "create-pr",
+  );
   prUrl.set(response.url);
 }
 

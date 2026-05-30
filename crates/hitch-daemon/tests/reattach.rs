@@ -276,6 +276,8 @@ fn slow_draft_generation_does_not_block_follow_up_requests() {
         },
     );
 
+    // Start a slow draft as a Job; the JobStarted reply returns immediately so
+    // the request loop is free for follow-up requests.
     client.send_request(
         5,
         Request::GenerateCommitDraft {
@@ -283,33 +285,12 @@ fn slow_draft_generation_does_not_block_follow_up_requests() {
             settings: None,
         },
     );
+    let job_id = client.read_job_started(5);
+
+    // A git status issued while the slow draft Job is still running must not wait
+    // behind it — proof the Job runs off the request loop.
     let started = Instant::now();
-    client.send_request(
-        6,
-        Request::GitStatus {
-            worktree_id: worktree.id,
-        },
-    );
-
-    let mut draft = None;
-    let status = loop {
-        match client.read_packet() {
-            Packet::Control(ControlMessage::Response {
-                id: 5,
-                response: Response::CommitDraft { draft: received },
-            }) => draft = Some(received),
-            Packet::Control(ControlMessage::Response {
-                id: 6,
-                response: Response::GitStatus { status },
-            }) => break status,
-            Packet::Control(ControlMessage::Response {
-                response: Response::Error { error },
-                ..
-            }) => panic!("request failed while waiting for git status: {error:?}"),
-            Packet::Control(_) | Packet::Output { .. } => continue,
-        }
-    };
-
+    let status = client.git_status(6, worktree.id);
     assert!(status.dirty);
     assert!(
         started.elapsed() < Duration::from_millis(800),
@@ -317,10 +298,67 @@ fn slow_draft_generation_does_not_block_follow_up_requests() {
         started.elapsed()
     );
 
-    if draft.is_none() {
-        draft = Some(client.generate_commit_draft_response(5));
+    // The draft eventually completes via its JobCompleted event.
+    let draft = match client.read_job_completed(job_id) {
+        Response::CommitDraft { draft } => draft,
+        other => panic!("unexpected slow-draft job response: {other:?}"),
+    };
+    assert_eq!(draft.subject, "test: async draft");
+
+    client.shutdown(7);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(repo);
+    let _ = std::fs::remove_file(codex);
+}
+
+#[test]
+fn cancel_job_kills_running_draft_and_completes_promptly() {
+    // A draft Job spawns a slow provider child in its own process group.
+    // `CancelJob` must SIGKILL that tree so the Job completes (as cancelled) far
+    // sooner than the provider's own 1s sleep (ADR 0008).
+    let socket = test_socket_path("cancel-draft");
+    let repo = test_dir_path("cancel-draft-repo");
+    let codex = write_slow_codex_stub();
+    init_git_repo(&repo);
+    let mut daemon = DaemonGuard::start_with_codex(&socket, &codex);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &repo);
+    let worktree = client.list_worktrees(3, project.id).remove(0);
+
+    std::fs::write(repo.join("tracked.txt"), "staged cancel\n").unwrap();
+    client.ack(
+        4,
+        Request::StageFiles {
+            worktree_id: worktree.id,
+            paths: vec!["tracked.txt".into()],
+        },
+    );
+
+    client.send_request(
+        5,
+        Request::GenerateCommitDraft {
+            worktree_id: worktree.id,
+            settings: None,
+        },
+    );
+    let job_id = client.read_job_started(5);
+
+    // Give the worker a moment to spawn the provider child, then cancel it.
+    std::thread::sleep(Duration::from_millis(150));
+    let started = Instant::now();
+    client.ack(6, Request::CancelJob { job_id });
+
+    match client.read_job_completed(job_id) {
+        Response::Error { error } => assert!(error.retryable),
+        other => panic!("cancelled draft job should complete with an error: {other:?}"),
     }
-    assert_eq!(draft.unwrap().subject, "test: async draft");
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "cancel did not kill the provider promptly: took {:?}",
+        started.elapsed()
+    );
 
     client.shutdown(7);
     daemon.wait_for_exit();
@@ -429,12 +467,16 @@ fn stage_commit_push_and_create_pr_round_trip_over_socket() {
             body: None,
         },
     );
-    client.ack(
+    // Push now runs as a Job (ADR 0008): JobStarted then JobCompleted{Ack}.
+    match client.run_job(
         7,
         Request::Push {
             worktree_id: worktree.id,
         },
-    );
+    ) {
+        Response::Ack => {}
+        other => panic!("push job did not ack: {other:?}"),
+    }
 
     // The committed worktree is clean again, and the bare remote has the commit.
     assert!(!client.git_status(8, worktree.id).dirty);
@@ -681,18 +723,11 @@ impl TestClient {
     }
 
     fn generate_commit_draft_response(&mut self, id: u64) -> CommitDraft {
-        loop {
-            match self.read_packet() {
-                Packet::Control(ControlMessage::Response {
-                    id: response_id,
-                    response: Response::CommitDraft { draft },
-                }) if response_id == id => return draft,
-                Packet::Control(ControlMessage::Response {
-                    response: Response::Error { error },
-                    ..
-                }) => panic!("generate commit draft failed: {error:?}"),
-                Packet::Control(_) | Packet::Output { .. } => continue,
-            }
+        let job_id = self.read_job_started(id);
+        match self.read_job_completed(job_id) {
+            Response::CommitDraft { draft } => draft,
+            Response::Error { error } => panic!("generate commit draft failed: {error:?}"),
+            other => panic!("unexpected commit draft job response: {other:?}"),
         }
     }
 
@@ -702,26 +737,17 @@ impl TestClient {
         worktree_id: hitch_core::WorktreeId,
         base: Option<String>,
     ) -> PullRequestDraft {
-        self.send_request(
+        match self.run_job(
             id,
             Request::GeneratePullRequestDraft {
                 worktree_id,
                 base,
                 settings: None,
             },
-        );
-        loop {
-            match self.read_packet() {
-                Packet::Control(ControlMessage::Response {
-                    id: response_id,
-                    response: Response::PullRequestDraft { draft },
-                }) if response_id == id => return draft,
-                Packet::Control(ControlMessage::Response {
-                    response: Response::Error { error },
-                    ..
-                }) => panic!("generate PR draft failed: {error:?}"),
-                Packet::Control(_) | Packet::Output { .. } => continue,
-            }
+        ) {
+            Response::PullRequestDraft { draft } => draft,
+            Response::Error { error } => panic!("generate PR draft failed: {error:?}"),
+            other => panic!("unexpected PR draft job response: {other:?}"),
         }
     }
 
@@ -733,7 +759,7 @@ impl TestClient {
         base: Option<String>,
         draft: bool,
     ) -> String {
-        self.send_request(
+        match self.run_job(
             id,
             Request::CreatePullRequest {
                 worktree_id,
@@ -742,19 +768,10 @@ impl TestClient {
                 base,
                 draft,
             },
-        );
-        loop {
-            match self.read_packet() {
-                Packet::Control(ControlMessage::Response {
-                    id: response_id,
-                    response: Response::PullRequestCreated { url },
-                }) if response_id == id => return url,
-                Packet::Control(ControlMessage::Response {
-                    response: Response::Error { error },
-                    ..
-                }) => panic!("create pr failed: {error:?}"),
-                Packet::Control(_) | Packet::Output { .. } => continue,
-            }
+        ) {
+            Response::PullRequestCreated { url } => url,
+            Response::Error { error } => panic!("create pr failed: {error:?}"),
+            other => panic!("unexpected create-pr job response: {other:?}"),
         }
     }
 
@@ -773,6 +790,54 @@ impl TestClient {
                 Packet::Control(_) | Packet::Output { .. } => continue,
             }
         }
+    }
+
+    // ---- Job helpers (ADR 0008) ------------------------------------------
+    //
+    // Long-running ops (push/pull/PR/drafts) now reply `JobStarted { job_id }`
+    // synchronously and deliver their real `Response` later inside a
+    // `JobCompleted` event. These mirror the desktop client's StartJob ->
+    // JobStarted -> JobCompleted handling.
+
+    /// Read the synchronous `JobStarted` reply for `request_id`, returning its id.
+    fn read_job_started(&mut self, request_id: u64) -> hitch_core::JobId {
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id,
+                    response: Response::JobStarted { job_id },
+                }) if id == request_id => return job_id,
+                Packet::Control(ControlMessage::Response {
+                    id,
+                    response: Response::Error { error },
+                }) if id == request_id => panic!("job rejected: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
+
+    /// Read the `JobCompleted` event for `job_id`, returning the wrapped response.
+    fn read_job_completed(&mut self, job_id: hitch_core::JobId) -> Response {
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::JobCompleted {
+                            job_id: completed,
+                            response,
+                        },
+                }) if completed == job_id => return *response,
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
+
+    /// Send a long-running request and block until its Job completes, returning
+    /// the wrapped response.
+    fn run_job(&mut self, id: u64, request: Request) -> Response {
+        self.send_request(id, request);
+        let job_id = self.read_job_started(id);
+        self.read_job_completed(job_id)
     }
 
     fn open_session(&mut self, id: u64, parent: SessionParent, command: Vec<String>) -> Session {

@@ -33,6 +33,19 @@ export type Session = {
 
 export type AgentState = "running" | "needs-approval" | "completed" | "error";
 
+// Daemon Status — the daemon process's own liveness, distinct from this window's
+// socket link (CONTEXT.md, ADR 0009). Mirrors src-tauri's `DaemonStatus`.
+export type DaemonStatus = "starting" | "running" | "unreachable" | "failed";
+
+// Lifecycle of an async Job (CONTEXT.md, ADR 0008). Mirrors hitch-proto's
+// `JobStatus`.
+export type JobStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
 export type FileStatus =
   | "added"
   | "modified"
