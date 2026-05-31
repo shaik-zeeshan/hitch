@@ -73,9 +73,14 @@
     collapsed = { ...collapsed, [p.id]: !collapsed[p.id] };
   }
 
+  // Clicking a project row selects it (for ⌘K context + the quick-add target)
+  // and toggles its worktree list. It deliberately does NOT pick a worktree:
+  // the daemon clears any stale selection, so the project row highlights and the
+  // center shows "choose a worktree" until the user picks one. `main` is no
+  // longer auto-selected.
   function selectProject(p: Project) {
     selectedProjectId.set(p.id);
-    if (p.kind === "git-backed") collapsed = { ...collapsed, [p.id]: false };
+    if (p.kind === "git-backed") toggleExpand(p);
   }
 
   function selectWorktree(w: Worktree) {
@@ -244,7 +249,6 @@
                       <span class="status {AGENT_LABEL[wtStatus].cls}">{AGENT_LABEL[wtStatus].label}</span>
                     </span>
                   {/if}
-                  {#if worktree.is_main}<span class="wt-main">main</span>{/if}
                 </button>
               {/snippet}
             </ContextMenu.Trigger>
@@ -326,6 +330,10 @@
     align-items: center;
     gap: 7px;
     width: 100%;
+    /* Never let a long branch/project name push the icons or status word out of
+       the rail — the flexible label is the only part that shrinks + ellipsizes. */
+    min-width: 0;
+    overflow: hidden;
     text-align: left;
     font: inherit;
     padding: 6px 8px;
@@ -420,12 +428,6 @@
   }
   .diffstat .del {
     color: var(--err);
-  }
-  .wt-main {
-    font-size: 10px;
-    color: var(--tx-lo);
-    font-family: var(--mono);
-    flex: none;
   }
 
   /* project rows read as group headers */

@@ -1160,6 +1160,13 @@ fn list_worktrees(
     state: &Arc<Mutex<DaemonState>>,
     project_id: ProjectId,
 ) -> Result<Vec<Worktree>, ProtocolError> {
+    // Pick up any worktrees git knows about that Hitch hasn't registered yet —
+    // ones the user created outside Hitch, or that already existed when the
+    // project was added. Listing runs on add-project, clone, create, and every
+    // GUI refresh/reconnect, so this is the single place external worktrees get
+    // imported. Best-effort: a discovery failure must not break listing.
+    import_discovered_worktrees(state, project_id);
+
     let worktrees = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
         state
@@ -1174,6 +1181,55 @@ fn list_worktrees(
             refresh_worktree_branch_from_disk(state, worktree).map(|(worktree, _)| worktree)
         })
         .collect()
+}
+
+/// Canonicalize a path for identity comparison, falling back to the path as
+/// given when it can't be resolved (e.g. it no longer exists on disk).
+fn canonical_or_self(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Register any on-disk git worktrees the store doesn't yet know about for a
+/// git-backed project. Matches existing worktrees by canonical path so the main
+/// worktree (inserted at add-project time) and already-tracked worktrees are
+/// never duplicated. Best-effort and silent: a non-git project, a discovery
+/// error, or a store error leaves the current set untouched rather than failing
+/// the surrounding `list-worktrees`.
+fn import_discovered_worktrees(state: &Arc<Mutex<DaemonState>>, project_id: ProjectId) {
+    let (root, existing_paths) = {
+        let Ok(state) = state.lock() else { return };
+        let Some(project) = state.projects.get(&project_id) else {
+            return;
+        };
+        if project.kind != ProjectKind::GitBacked {
+            return;
+        }
+        let root = project.root.clone();
+        let existing: HashSet<PathBuf> = state
+            .store
+            .list_worktrees(project_id)
+            .unwrap_or_default()
+            .iter()
+            .map(|worktree| canonical_or_self(&worktree.path))
+            .collect();
+        (root, existing)
+    };
+
+    let Ok(discovered) = GitRepository::discover(&root).and_then(|repo| repo.worktrees()) else {
+        return;
+    };
+
+    for found in discovered {
+        let path = canonical_or_self(&found.path);
+        if existing_paths.contains(&path) {
+            continue;
+        }
+        let worktree = Worktree::new(project_id, path, found.branch, found.is_main);
+        let Ok(mut state) = state.lock() else { return };
+        if state.store.insert_worktree(&worktree).is_ok() {
+            state.worktrees.insert(worktree.id, worktree);
+        }
+    }
 }
 
 fn list_branches(

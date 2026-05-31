@@ -10,8 +10,11 @@ import type { Project, Worktree } from "./types";
 // ⌘K command palette.
 export const commandOpen = writable(false);
 
-// Add-project dialog (local folder / clone remote).
-export const addProjectOpen = writable(false);
+// Clone-remote dialog. Adding a LOCAL project no longer uses a dialog — it
+// opens the native folder picker directly (see `pickAndAddProject`); this
+// store drives only the remote-clone form, reachable from the ⌘K palette and
+// the left-rail Add-project menu.
+export const cloneProjectOpen = writable(false);
 
 // Create-worktree dialog, scoped to the project it creates under (null = closed).
 export const createWorktreeFor = writable<Project | null>(null);

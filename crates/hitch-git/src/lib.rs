@@ -112,6 +112,25 @@ impl GitRepository {
     pub fn current_branch(&self) -> Result<String> {
         current_branch(&self.root)
     }
+
+    /// List every working tree git knows about for this repository: the main
+    /// worktree plus each linked worktree on disk. Used to import worktrees a
+    /// project already has (created outside Hitch) so they auto-appear.
+    pub fn worktrees(&self) -> Result<Vec<DiscoveredWorktree>> {
+        discover_worktrees(&self.root)
+    }
+}
+
+/// A working tree git reports for a repository — the main checkout or a linked
+/// worktree — with the branch it currently has checked out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredWorktree {
+    /// Absolute path to the working tree on disk.
+    pub path: PathBuf,
+    /// The branch checked out there (falls back to the worktree name if detached).
+    pub branch: String,
+    /// True for the repository's main worktree (the original checkout).
+    pub is_main: bool,
 }
 
 /// Paths and executables used for write-side commands.
@@ -901,6 +920,43 @@ pub fn default_branch(repo_path: impl AsRef<Path>) -> Result<String> {
 pub fn current_branch(repo_path: impl AsRef<Path>) -> Result<String> {
     let repo = Repository::discover(repo_path.as_ref())?;
     current_branch_from_repo(&repo)
+}
+
+/// List the main worktree plus every linked worktree git tracks for a repo.
+///
+/// Linked worktrees whose directory no longer exists on disk (stale/prunable
+/// entries) are skipped so callers only see worktrees they can actually open.
+pub fn discover_worktrees(repo_path: impl AsRef<Path>) -> Result<Vec<DiscoveredWorktree>> {
+    let repo = Repository::discover(repo_path.as_ref())?;
+    let main_root = repo.workdir().ok_or(GitError::BareRepository)?.to_path_buf();
+
+    let mut out = vec![DiscoveredWorktree {
+        branch: current_branch_from_repo(&repo).unwrap_or_else(|_| "HEAD".into()),
+        path: main_root,
+        is_main: true,
+    }];
+
+    for name in repo.worktrees()?.iter().flatten() {
+        let Ok(worktree) = repo.find_worktree(name) else {
+            continue;
+        };
+        let path = worktree.path().to_path_buf();
+        // Skip linked worktrees whose directory is gone (prunable but not pruned).
+        if !path.is_dir() {
+            continue;
+        }
+        let branch = Repository::open(&path)
+            .ok()
+            .and_then(|wt_repo| current_branch_from_repo(&wt_repo).ok())
+            .unwrap_or_else(|| name.to_string());
+        out.push(DiscoveredWorktree {
+            path,
+            branch,
+            is_main: false,
+        });
+    }
+
+    Ok(out)
 }
 
 /// Build the managed worktree path Hitch owns for a project branch.
@@ -1870,6 +1926,50 @@ mod tests {
         };
         let err = client.create_worktree(fixture.path(), &second).unwrap_err();
         assert!(matches!(err, GitError::CommandFailed { .. }));
+    }
+
+    #[test]
+    fn discover_worktrees_reports_main_plus_created_linked_worktrees() {
+        let fixture = RepoFixture::new();
+        let managed = TempDir::new().unwrap();
+        let client = GitClient::default();
+
+        // Only the main worktree exists at first.
+        let initial = discover_worktrees(fixture.path()).unwrap();
+        assert_eq!(initial.len(), 1);
+        assert!(initial[0].is_main);
+        assert_eq!(
+            canonical_or_self(&initial[0].path),
+            canonical_or_self(fixture.path())
+        );
+
+        // Create a linked worktree on a fresh branch.
+        let request = CreateWorktreeRequest {
+            project_id: ProjectId::new(),
+            project_name: "hitch".into(),
+            managed_root: managed.path().into(),
+            branch: "feature/discover".into(),
+            checkout: WorktreeCheckout::NewBranch,
+            base: Some("main".into()),
+        };
+        let created = client.create_worktree(fixture.path(), &request).unwrap();
+
+        // Discovery now reports both, with the linked worktree's branch.
+        let found = discover_worktrees(fixture.path()).unwrap();
+        assert_eq!(found.len(), 2, "found {found:?}");
+        let linked = found
+            .iter()
+            .find(|w| !w.is_main)
+            .expect("linked worktree discovered");
+        assert_eq!(linked.branch, "feature/discover");
+        assert_eq!(
+            canonical_or_self(&linked.path),
+            canonical_or_self(&created.path)
+        );
+    }
+
+    fn canonical_or_self(path: &Path) -> PathBuf {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
     }
 
     #[test]

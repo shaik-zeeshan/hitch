@@ -13,6 +13,7 @@
     gitStatus,
     gitWorktreeId,
     openSession,
+    pickAndAddProject,
     projects,
     selectedParent,
     selectedProject,
@@ -21,7 +22,7 @@
     sessions,
     worktrees,
   } from "../daemon";
-  import { addProjectOpen, commandOpen, createPrOpen, createWorktreeFor } from "../overlays";
+  import { cloneProjectOpen, commandOpen, createPrOpen, createWorktreeFor } from "../overlays";
   import { AGENT_LABEL, type Session, type Worktree } from "../types";
 
   const projectName = (id: string) => $projects.find((p) => p.id === id)?.name ?? "";
@@ -171,13 +172,25 @@
                 {/if}
                 <Command.Item
                   class="p-item"
-                  value="add project local clone"
-                  onSelect={() => run(() => addProjectOpen.set(true))}
+                  value="add project local folder open"
+                  onSelect={() => run(() => void pickAndAddProject())}
                 >
-                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"
-                    ><line x1="8" y1="3" x2="8" y2="13" /><line x1="3" y1="8" x2="13" y2="8" /></svg
+                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                    ><path d="M1.5 4.5a2 2 0 0 1 2-2h3l1.5 1.6h4.5a2 2 0 0 1 2 2v5.4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z" /></svg
                   >
-                  <span class="pi-label">Add project…</span>
+                  <span class="pi-label">Add local project…</span>
+                </Command.Item>
+                <Command.Item
+                  class="p-item"
+                  value="clone remote repository git project"
+                  onSelect={() => run(() => cloneProjectOpen.set(true))}
+                >
+                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                    ><circle cx="4" cy="4" r="1.8" /><circle cx="4" cy="12" r="1.8" /><circle cx="12" cy="6" r="1.8" /><path
+                      d="M4 5.8v4.4M5.7 4.5c3 0 4.6 0 5.3 0M11 7.7c0 1.5-1.4 2.4-3.2 2.4H5.8"
+                    /></svg
+                  >
+                  <span class="pi-label">Clone remote repository…</span>
                 </Command.Item>
               </Command.GroupItems>
             </Command.Group>

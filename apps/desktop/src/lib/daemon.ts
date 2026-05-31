@@ -9,6 +9,7 @@
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import { derived, get, writable } from "svelte/store";
 import { ByteRing } from "./byteRing";
 import {
@@ -903,6 +904,24 @@ export async function addProject(root: string): Promise<void> {
   await refreshAll();
 }
 
+// Open the native folder picker and add the chosen directory as a project.
+// The picker IS the local add-project flow (no intermediate text-field dialog):
+// the daemon detects git vs plain on its own. Cancelling is a silent no-op;
+// failures surface in the `error` store like the other fire-and-forget actions.
+export async function pickAndAddProject(): Promise<void> {
+  try {
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      title: "Add a project folder",
+    });
+    if (typeof picked !== "string") return;
+    await addProject(picked);
+  } catch (err) {
+    error.set(toMessage(err));
+  }
+}
+
 export async function cloneProject(
   remoteUrl: string,
   destination: string,
@@ -1421,20 +1440,22 @@ projects.subscribe(($projects) => {
   }
 });
 
-// Keep the selected worktree valid for the selected project: plain projects
-// have none; git projects fall back to main (or the first) when the current
-// selection no longer belongs to the project.
+// Keep the selected worktree valid for the selected project, but never auto-
+// pick one. Plain projects have no worktrees; switching git projects (or
+// removing the selected worktree) invalidates the current selection — in both
+// cases we clear it to null rather than jumping into `main`. Clicking a project
+// then expands it and shows the "choose a worktree" state; the user picks the
+// worktree explicitly, so `main` is no longer special on selection.
 derived([selectedProject, projectWorktrees], (v) => v).subscribe(
   ([$project, $worktrees]) => {
     const selected = get(selectedWorktreeId);
+    if (selected === null) return;
     if ($project?.kind === "plain") {
-      if (selected !== null) selectedWorktreeId.set(null);
+      selectedWorktreeId.set(null);
       return;
     }
     if ($project && !$worktrees.some((w) => w.id === selected)) {
-      selectedWorktreeId.set(
-        $worktrees.find((w) => w.is_main)?.id ?? $worktrees[0]?.id ?? null,
-      );
+      selectedWorktreeId.set(null);
     }
   },
 );
