@@ -32,8 +32,7 @@ use hitch_proto::{
     encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage,
     DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
     JobRequest, JobStatus, PrInfo, ProtocolError, PullRequestDraft, Request, Response,
-    WorktreeCreateMode,
-    MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
+    WorktreeCreateMode, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
 use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY};
 use hitch_store::Store;
@@ -1165,12 +1164,12 @@ fn list_worktrees(
     state: &Arc<Mutex<DaemonState>>,
     project_id: ProjectId,
 ) -> Result<Vec<Worktree>, ProtocolError> {
-    // Pick up any worktrees git knows about that Hitch hasn't registered yet —
-    // ones the user created outside Hitch, or that already existed when the
-    // project was added. Listing runs on add-project, clone, create, and every
-    // GUI refresh/reconnect, so this is the single place external worktrees get
-    // imported. Best-effort: a discovery failure must not break listing.
-    import_discovered_worktrees(state, project_id);
+    // Pick up any worktrees git knows about that Hitch hasn't registered yet,
+    // and prune tracked linked worktrees whose directory is now gone. Listing
+    // runs on add-project, clone, create, and every GUI refresh/reconnect, so
+    // this is the single place external worktrees get reconciled. Best-effort:
+    // a discovery failure must not break listing.
+    reconcile_discovered_worktrees(state, project_id);
 
     let worktrees = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
@@ -1200,14 +1199,16 @@ fn is_hitch_managed_worktree(path: &Path, managed_root: &Path) -> bool {
     canonical_or_self(path).starts_with(canonical_or_self(managed_root))
 }
 
-/// Register any on-disk git worktrees the store doesn't yet know about for a
-/// git-backed project. Matches existing worktrees by canonical path so the main
-/// worktree (inserted at add-project time) and already-tracked worktrees are
-/// never duplicated. Best-effort and silent: a non-git project, a discovery
-/// error, or a store error leaves the current set untouched rather than failing
-/// the surrounding `list-worktrees`.
-fn import_discovered_worktrees(state: &Arc<Mutex<DaemonState>>, project_id: ProjectId) {
-    let (root, existing_paths) = {
+/// Reconcile a git-backed project's stored worktrees against what git currently
+/// reports: register newly discovered worktrees and prune tracked linked
+/// worktrees whose directory is now gone or no longer belongs to the repo.
+/// Matches existing worktrees by canonical path so the main worktree (inserted
+/// at add-project time) and already-tracked linked worktrees are never
+/// duplicated. Best-effort and silent: a non-git project, a discovery error,
+/// or a store error leaves the current set as intact as possible rather than
+/// failing the surrounding `list-worktrees`.
+fn reconcile_discovered_worktrees(state: &Arc<Mutex<DaemonState>>, project_id: ProjectId) {
+    let (root, stored_worktrees) = {
         let Ok(state) = state.lock() else { return };
         let Some(project) = state.projects.get(&project_id) else {
             return;
@@ -1215,23 +1216,31 @@ fn import_discovered_worktrees(state: &Arc<Mutex<DaemonState>>, project_id: Proj
         if project.kind != ProjectKind::GitBacked {
             return;
         }
-        let root = project.root.clone();
-        let existing: HashSet<PathBuf> = state
-            .store
-            .list_worktrees(project_id)
-            .unwrap_or_default()
-            .iter()
-            .map(|worktree| canonical_or_self(&worktree.path))
-            .collect();
-        (root, existing)
+        let stored = state.store.list_worktrees(project_id).unwrap_or_default();
+        (project.root.clone(), stored)
     };
 
     let Ok(discovered) = GitRepository::discover(&root).and_then(|repo| repo.worktrees()) else {
         return;
     };
 
+    let mut discovered_by_path = HashMap::new();
     for found in discovered {
-        let path = canonical_or_self(&found.path);
+        discovered_by_path.insert(canonical_or_self(&found.path), found);
+    }
+
+    for worktree in &stored_worktrees {
+        if discovered_by_path.contains_key(&canonical_or_self(&worktree.path)) {
+            continue;
+        }
+        prune_missing_worktree(state, worktree.id);
+    }
+
+    let existing_paths: HashSet<PathBuf> = stored_worktrees
+        .iter()
+        .map(|worktree| canonical_or_self(&worktree.path))
+        .collect();
+    for (path, found) in discovered_by_path {
         if existing_paths.contains(&path) {
             continue;
         }
@@ -1240,6 +1249,31 @@ fn import_discovered_worktrees(state: &Arc<Mutex<DaemonState>>, project_id: Proj
         if state.store.insert_worktree(&worktree).is_ok() {
             state.worktrees.insert(worktree.id, worktree);
         }
+    }
+}
+
+fn prune_missing_worktree(state: &Arc<Mutex<DaemonState>>, worktree_id: WorktreeId) {
+    let live_session_ids = {
+        let Ok(state) = state.lock() else { return };
+        state
+            .sessions
+            .values()
+            .filter(|session| session.session.parent == SessionParent::Worktree(worktree_id))
+            .map(|session| session.session.id)
+            .collect::<Vec<_>>()
+    };
+
+    for session_id in live_session_ids {
+        match close_session(state, session_id, true) {
+            Ok(()) => {}
+            Err(err) if err.code == ErrorCode::NotFound => {}
+            Err(_) => return,
+        }
+    }
+
+    let Ok(mut state) = state.lock() else { return };
+    if state.store.delete_worktree(worktree_id).is_ok() {
+        state.worktrees.remove(&worktree_id);
     }
 }
 
@@ -3391,6 +3425,120 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
+    fn list_worktrees_prunes_missing_linked_worktrees() {
+        use hitch_core::{Project, ProjectKind, Session, SessionParent, Worktree};
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        fn run(command: &mut Command, what: &str) {
+            let status = command.status().unwrap();
+            assert!(status.success(), "{what} failed with {status}");
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-reconcile-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("state.db");
+        let managed_root = dir.join("managed");
+        let project_root = dir.join("repo");
+        let linked_path = dir.join("linked-feature");
+        std::fs::create_dir_all(&managed_root).unwrap();
+
+        let mut git = Command::new("git");
+        git.arg("init").arg(&project_root);
+        run(&mut git, "git init");
+
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["config", "user.email", "hitch@example.com"]);
+        run(&mut git, "git config user.email");
+
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["config", "user.name", "Hitch Tests"]);
+        run(&mut git, "git config user.name");
+
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["branch", "-M", "main"]);
+        run(&mut git, "git branch -M main");
+
+        std::fs::write(project_root.join("README.md"), "hello\n").unwrap();
+
+        let mut git = Command::new("git");
+        git.arg("-C").arg(&project_root).args(["add", "README.md"]);
+        run(&mut git, "git add README.md");
+
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["commit", "-m", "initial"]);
+        run(&mut git, "git commit");
+
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["worktree", "add", "-b", "feature/stale"])
+            .arg(&linked_path);
+        run(&mut git, "git worktree add");
+
+        let config = super::DaemonConfig {
+            socket_path: dir.join("daemon.sock"),
+            store_path: store_path.clone(),
+            managed_root,
+            hook_helper: dir.join("hook"),
+            git: PathBuf::from("git"),
+            gh: PathBuf::from("gh"),
+            draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+        };
+        let store = hitch_store::Store::open(&store_path).unwrap();
+        let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
+            store, config,
+        )));
+
+        let project = Project::new("hitch", &project_root, ProjectKind::GitBacked);
+        let main = Worktree::new(project.id, &project_root, "main", true);
+        let linked = Worktree::new(project.id, &linked_path, "feature/stale", false);
+        let session = Session::new("shell", SessionParent::Worktree(linked.id), &linked_path);
+        {
+            let mut guard = state.lock().unwrap();
+            guard.store.insert_project(&project).unwrap();
+            guard.store.insert_worktree(&main).unwrap();
+            guard.store.insert_worktree(&linked).unwrap();
+            guard.store.insert_session(&session).unwrap();
+            guard.projects.insert(project.id, project.clone());
+            guard.worktrees.insert(main.id, main.clone());
+            guard.worktrees.insert(linked.id, linked.clone());
+        }
+
+        std::fs::remove_dir_all(&linked_path).unwrap();
+
+        let listed = super::list_worktrees(&state, project.id).unwrap();
+        assert_eq!(listed, vec![main.clone()]);
+
+        let guard = state.lock().unwrap();
+        assert_eq!(
+            guard.store.list_worktrees(project.id).unwrap(),
+            vec![main.clone()]
+        );
+        assert_eq!(guard.store.get_worktree(linked.id).unwrap(), None);
+        assert_eq!(guard.store.get_session(session.id).unwrap(), None);
+        assert!(guard.worktrees.contains_key(&main.id));
+        assert!(!guard.worktrees.contains_key(&linked.id));
+
+        drop(guard);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
     fn remove_worktree_rejects_externally_managed_paths() {
         use hitch_core::{Project, ProjectKind, Worktree};
         use std::path::PathBuf;
@@ -3441,7 +3589,10 @@ mod tests {
             err.message,
             "externally managed worktrees cannot be removed by Hitch"
         );
-        assert!(external_path.exists(), "external worktree path must be untouched");
+        assert!(
+            external_path.exists(),
+            "external worktree path must be untouched"
+        );
         assert!(state.lock().unwrap().worktrees.contains_key(&worktree.id));
 
         drop(state);

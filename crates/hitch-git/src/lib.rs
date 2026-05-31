@@ -972,7 +972,10 @@ pub fn current_branch(repo_path: impl AsRef<Path>) -> Result<String> {
 /// entries) are skipped so callers only see worktrees they can actually open.
 pub fn discover_worktrees(repo_path: impl AsRef<Path>) -> Result<Vec<DiscoveredWorktree>> {
     let repo = Repository::discover(repo_path.as_ref())?;
-    let main_root = repo.workdir().ok_or(GitError::BareRepository)?.to_path_buf();
+    let main_root = repo
+        .workdir()
+        .ok_or(GitError::BareRepository)?
+        .to_path_buf();
 
     let mut out = vec![DiscoveredWorktree {
         branch: current_branch_from_repo(&repo).unwrap_or_else(|_| "HEAD".into()),
