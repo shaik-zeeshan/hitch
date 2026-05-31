@@ -482,6 +482,10 @@ impl JobControl {
 struct DaemonSession {
     session: Session,
     pty: Arc<ManagedPty>,
+    /// Bytes to prepend ahead of the live broadcast log when a client replays
+    /// this session. Always empty since ADR 0003 reopens restored sessions as
+    /// fresh terminals (no cross-restart scrollback); kept as the seam the
+    /// broadcaster's `replay_snapshot` composes against.
     restored_scrollback: Vec<u8>,
 }
 
@@ -642,14 +646,13 @@ fn restore_layout(
         if !session.cwd.is_dir() {
             continue;
         }
-        let restored_scrollback = {
-            let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
-            state
-                .store
-                .load_scrollback(session.id)
-                .map_err(store_error)?
-                .unwrap_or_default()
-        };
+        // ADR 0003: across a daemon restart the live PTY processes are gone, so
+        // each saved session reopens as a FRESH terminal. We deliberately do NOT
+        // replay the previous run's persisted scrollback. The respawned shell
+        // prints its own banner/prompt; prepending the old run's transcript on
+        // top stacked two banners (old + new), which read as duplicated output.
+        // The in-memory broadcast log still drives same-daemon reattach; only
+        // cross-restart history is dropped.
         let pty = ManagedPty::spawn(
             PtySpawnConfig::new(session.id, session.cwd.clone()).command(None),
             pty_tx.clone(),
@@ -661,7 +664,7 @@ fn restore_layout(
             DaemonSession {
                 session,
                 pty,
-                restored_scrollback,
+                restored_scrollback: Vec::new(),
             },
         );
     }
@@ -1949,7 +1952,6 @@ fn spawn_pty_dispatcher(
             while let Ok(message) = rx.recv() {
                 match message {
                     DispatchMsg::Pty(PtyEvent::Output { session_id, bytes }) => {
-                        persist_scrollback(&state, session_id);
                         // Record into the authoritative log BEFORE broadcasting,
                         // so the log always equals "what has been broadcast so
                         // far" — a replay enqueued after this point will include
@@ -2009,16 +2011,6 @@ fn record_and_broadcast_output(
         state.broadcaster.record_output(session_id, bytes);
     }
     let _ = broadcast_session_output(state, session_id, bytes);
-}
-
-fn persist_scrollback(state: &Arc<Mutex<DaemonState>>, session_id: SessionId) {
-    if let Ok(state) = state.lock() {
-        if let Some(session) = state.sessions.get(&session_id) {
-            let mut bytes = session.restored_scrollback.clone();
-            bytes.extend(session.pty.scrollback());
-            let _ = state.store.save_scrollback(session_id, &bytes);
-        }
-    }
 }
 
 fn read_control_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
