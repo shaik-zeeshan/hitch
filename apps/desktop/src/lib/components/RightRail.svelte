@@ -4,6 +4,8 @@
   // file row opens its diff (the diff tab itself lands in slice 7; here it sets
   // the selection + loads the diff text). Branch-level +/− stats live in the
   // tree; this panel focuses on file status and commit actions.
+  import { DropdownMenu } from "bits-ui";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import {
     cancelJob,
     cancellableJobForSelectedWorktree,
@@ -17,6 +19,8 @@
     gitStatus,
     gitWorktreeId,
     loadGitStatus,
+    loadPrStatus,
+    prInfo,
     pull,
     push,
     setFileStaged,
@@ -24,6 +28,7 @@
     viewDiff,
   } from "../daemon";
   import { autoCommitPush } from "../settings";
+  import { commitOpen, createPrOpen } from "../overlays";
   import { STATUS_GLYPH, statusGlyphClass } from "../types";
   import CommitDialog from "./CommitDialog.svelte";
   import CreatePrDialog from "./CreatePrDialog.svelte";
@@ -48,6 +53,55 @@
 
   let autoRunning = $state(false);
 
+  // ---- smart actions ------------------------------------------------------
+  // One state machine drives both the split button's primary action and the
+  // enabled/disabled state of every item in its dropdown. The primary always
+  // does the *next* meaningful step; the dropdown exposes each step directly,
+  // greyed out (with a reason) when it doesn't apply to the current status.
+  const pr = $derived($prInfo);
+  const hasChanges = $derived(files.length > 0);
+  const onDefault = $derived(isDefaultBranch);
+  const busy = $derived($gitBusy || autoRunning);
+
+  function openCommit() {
+    commitOpen.set(true);
+  }
+  function openCreatePr() {
+    createPrOpen.set(true);
+  }
+  async function openPr() {
+    if (pr) await openUrl(pr.url);
+  }
+
+  // The headline action: the first applicable step in commit → pull → push →
+  // create-PR → open-PR order. `null` run means nothing to do (e.g. clean +
+  // synced on the default branch) and the button renders disabled.
+  type PrimaryAction = { label: string; run: (() => void) | null };
+  const primary = $derived<PrimaryAction>(
+    hasChanges
+      ? $autoCommitPush
+        ? { label: "Commit & Push", run: () => void handleAutoCommitPush() }
+        : { label: "Commit…", run: openCommit }
+      : behind > 0
+        ? { label: `Pull ↓${behind}`, run: () => void handleManualPull() }
+        : ahead > 0
+          ? { label: `Push ↑${ahead}`, run: () => void handleManualPush() }
+          : !onDefault && $gitWorktreeId && !pr
+            ? { label: "Create PR", run: openCreatePr }
+            : pr
+              ? { label: `Open PR #${pr.number}`, run: () => void openPr() }
+              : { label: "Up to date", run: null },
+  );
+
+  // Per-step availability + the reason shown when a step is unavailable, so the
+  // dropdown reads as a checklist of what this worktree can do right now.
+  const pushReason = $derived(ahead > 0 ? "" : "Nothing to push");
+  const pullReason = $derived(behind > 0 ? "" : "Up to date with remote");
+  const commitReason = $derived(hasChanges ? "" : "No changes to commit");
+  const createPrReason = $derived(
+    onDefault ? "On the default branch" : !$gitWorktreeId ? "No worktree selected" : "",
+  );
+
   function shortError(err: unknown): string {
     const msg = err instanceof Error ? err.message : String(err);
     const first = msg.split("\n")[0].trim();
@@ -68,7 +122,10 @@
       await commit(draft.subject, draft.body);
       toast.loading("Pushing…", { id });
       await push();
-      if ($gitStatus?.worktree_id) void loadGitStatus($gitStatus.worktree_id).catch(() => {});
+      if ($gitStatus?.worktree_id) {
+        void loadGitStatus($gitStatus.worktree_id).catch(() => {});
+        void loadPrStatus($gitStatus.worktree_id);
+      }
       toast.success(draft.subject, { id });
     } catch (err) {
       toast.error(shortError(err), { id });
@@ -82,7 +139,10 @@
     const id = toast.loading("Pushing…");
     try {
       await push();
-      if ($gitStatus?.worktree_id) void loadGitStatus($gitStatus.worktree_id).catch(() => {});
+      if ($gitStatus?.worktree_id) {
+        void loadGitStatus($gitStatus.worktree_id).catch(() => {});
+        void loadPrStatus($gitStatus.worktree_id);
+      }
       toast.success(`Pushed ↑${count}`, { id });
     } catch (err) {
       toast.error(shortError(err), { id });
@@ -125,7 +185,11 @@
       title="Refresh"
       aria-label="Refresh status"
       disabled={!$gitWorktreeId}
-      onclick={() => $gitWorktreeId && void loadGitStatus($gitWorktreeId)}
+      onclick={() => {
+        if (!$gitWorktreeId) return;
+        void loadGitStatus($gitWorktreeId);
+        void loadPrStatus($gitWorktreeId);
+      }}
     >
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
         ><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5V5h-2.5" /></svg
@@ -145,52 +209,140 @@
 
   {#if $gitStatus}
     <div class="ch-branch">
-      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="var(--tx-lo)" stroke-width="1.3"
+      <svg class="branch-ico" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="var(--tx-lo)" stroke-width="1.3"
         ><circle cx="4" cy="4" r="1.8" /><circle cx="4" cy="12" r="1.8" /><circle cx="12" cy="6" r="1.8" /><path
           d="M4 5.8v4.4M5.7 4.5c3 0 4.6 0 5.3 0M11 7.7c0 1.5-1.4 2.4-3.2 2.4H5.8"
         /></svg
       >
-      <span class="b">{$gitStatus.branch}</span>
+      <span class="b" title={$gitStatus.branch}>{$gitStatus.branch}</span>
       {#if $defaultBase && $defaultBase !== $gitStatus.branch}
         <span class="from">from {$defaultBase}</span>
       {/if}
-      <span class="branch-acts">
-        {#if cancellableJob}
+      {#if pr}
+        <a
+          class="pr-badge {pr.draft ? 'draft' : pr.state.toLowerCase()}"
+          href={pr.url}
+          title="{pr.draft ? 'Draft' : pr.state} pull request #{pr.number} — open on GitHub"
+          onclick={(e) => {
+            e.preventDefault();
+            void openPr();
+          }}>#{pr.number}</a
+        >
+      {/if}
+    </div>
+
+    <div class="ch-actions">
+      {#if cancellableJob}
+        <button
+          class="splitbtn solo cancel"
+          title="Cancel the running operation"
+          onclick={() => void cancelJob(cancellableJob.id)}
+        >
+          Cancel
+        </button>
+      {:else}
+        <div class="splitbtn">
           <button
-            class="chip cancel"
-            title="Cancel the running operation"
-            onclick={() => void cancelJob(cancellableJob.id)}
+            class="split-main"
+            disabled={!primary.run || busy}
+            onclick={() => primary.run?.()}
           >
-            Cancel
+            {primary.label}
           </button>
-        {/if}
-        {#if files.length > 0}
-          {#if $autoCommitPush}
-            <button
-              class="chip"
-              disabled={$gitBusy || autoRunning}
-              onclick={() => void handleAutoCommitPush()}
-            >
-              Commit & Push
-            </button>
-          {:else}
-            <CommitDialog disabled={$gitBusy} triggerClass="chip" />
-          {/if}
-        {/if}
-        {#if behind > 0}
-          <button class="chip" disabled={$gitBusy} onclick={() => void handleManualPull()}>
-            Pull <span class="ar down">↓{behind}</span>
-          </button>
-        {/if}
-        {#if ahead > 0 && !$autoCommitPush}
-          <button class="chip" disabled={$gitBusy} onclick={() => void handleManualPush()}>
-            Push <span class="ar">↑{ahead}</span>
-          </button>
-        {/if}
-        {#if !isDefaultBranch && $gitWorktreeId}
-          <CreatePrDialog disabled={$gitBusy} triggerClass="chip" />
-        {/if}
-      </span>
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger>
+              {#snippet child({ props })}
+                <button
+                  {...props}
+                  class="split-caret"
+                  aria-label="More git actions"
+                  title="More git actions"
+                >
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                    ><path d="M4 6l4 4 4-4" /></svg
+                  >
+                </button>
+              {/snippet}
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content class="menu act-menu" align="end" side="bottom" sideOffset={6}>
+                <DropdownMenu.Item class="mi" disabled={!hasChanges} title={commitReason} onSelect={openCommit}>
+                  <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                    ><circle cx="8" cy="8" r="2.4" /><path d="M1.5 8h4.1M10.4 8h4.1" /></svg
+                  >
+                  Commit…
+                </DropdownMenu.Item>
+                <DropdownMenu.Item
+                  class="mi"
+                  disabled={!hasChanges || busy}
+                  title={commitReason}
+                  onSelect={() => void handleAutoCommitPush()}
+                >
+                  <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                    ><circle cx="5" cy="8" r="2.2" /><path d="M7.2 8H10M10 5.5 12.5 8 10 10.5" /></svg
+                  >
+                  Commit &amp; Push
+                </DropdownMenu.Item>
+                <DropdownMenu.Separator class="m-sep" />
+                <DropdownMenu.Item
+                  class="mi"
+                  disabled={ahead === 0 || busy}
+                  title={pushReason}
+                  onSelect={() => void handleManualPush()}
+                >
+                  <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"
+                    ><path d="M8 13V4M4.5 7.5 8 4l3.5 3.5" /></svg
+                  >
+                  Push <span class="mi-k">↑{ahead}</span>
+                </DropdownMenu.Item>
+                <DropdownMenu.Item
+                  class="mi"
+                  disabled={behind === 0 || busy}
+                  title={pullReason}
+                  onSelect={() => void handleManualPull()}
+                >
+                  <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"
+                    ><path d="M8 3v9M4.5 8.5 8 12l3.5-3.5" /></svg
+                  >
+                  Pull <span class="mi-k">↓{behind}</span>
+                </DropdownMenu.Item>
+                <DropdownMenu.Separator class="m-sep" />
+                {#if pr}
+                  <DropdownMenu.Item class="mi" onSelect={() => void openPr()}>
+                    <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                      ><circle cx="4" cy="4" r="1.8" /><circle cx="4" cy="12" r="1.8" /><circle cx="12" cy="12" r="1.8" /><path
+                        d="M4 5.8v4.4M12 5.5v4.7M12 5.5c0-2-1.6-2.5-3.2-2.5H6"
+                      /></svg
+                    >
+                    Open PR #{pr.number} <span class="mi-k">↗</span>
+                  </DropdownMenu.Item>
+                {:else}
+                  <DropdownMenu.Item
+                    class="mi"
+                    disabled={Boolean(createPrReason)}
+                    title={createPrReason}
+                    onSelect={openCreatePr}
+                  >
+                    <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"
+                      ><path d="M8 4v8M4 8h8" /></svg
+                    >
+                    Create PR…
+                  </DropdownMenu.Item>
+                {/if}
+                <DropdownMenu.Separator class="m-sep" />
+                <DropdownMenu.Item
+                  class="mi toggle"
+                  closeOnSelect={false}
+                  onSelect={() => autoCommitPush.update((v) => !v)}
+                >
+                  <span class="check" class:on={$autoCommitPush} aria-hidden="true">✓</span>
+                  Auto-generate commit message
+                </DropdownMenu.Item>
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
+        </div>
+      {/if}
     </div>
   {/if}
 
@@ -290,6 +442,10 @@
     {/if}
   </div>
 
+  <!-- Mounted once, triggerless: opened from the action menu (and the ⌘K
+       palette) via the commitOpen / createPrOpen stores. -->
+  <CommitDialog triggerless />
+  <CreatePrDialog triggerless />
 </aside>
 
 <style>
@@ -325,65 +481,162 @@
     flex: 1;
   }
 
+  /* Branch row — its own line so a long name truncates instead of crowding
+     the actions (which now live on the row below). */
   .ch-branch {
     flex: none;
     display: flex;
     align-items: center;
     gap: 7px;
-    padding: 7px 10px 7px 12px;
-    border-bottom: 1px solid var(--line-soft);
+    min-width: 0;
+    padding: 7px 10px 5px 12px;
     font-size: 11px;
     color: var(--tx-md);
   }
+  .ch-branch .branch-ico {
+    flex: none;
+  }
   .ch-branch .b {
+    flex: 0 1 auto;
+    min-width: 0;
     font-family: var(--mono);
     color: var(--tx-hi);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .ch-branch .from {
+    flex: none;
     color: var(--tx-lo);
+    white-space: nowrap;
   }
-  .chip .ar.down {
-    color: var(--warn);
-  }
-  :global(.chip.cancel) {
-    color: oklch(80% 0.08 25);
-    border-color: oklch(58% 0.14 25 / 0.4);
-  }
-  :global(.chip.cancel:hover) {
-    color: var(--err);
-  }
-  .branch-acts {
+  .pr-badge {
+    flex: none;
     margin-left: auto;
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex-shrink: 0;
-  }
-  :global(.chip) {
-    font: inherit;
-    font-size: 10.5px;
-    padding: 2px 7px;
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
     border-radius: 99px;
+    text-decoration: none;
     border: 1px solid var(--line);
     background: var(--bg-3);
     color: var(--tx-md);
+    transition: background var(--t-fast);
+  }
+  .pr-badge.open {
+    color: var(--ok);
+    border-color: oklch(62% 0.14 150 / 0.4);
+  }
+  .pr-badge.merged {
+    color: oklch(72% 0.13 300);
+    border-color: oklch(60% 0.14 300 / 0.4);
+  }
+  .pr-badge.closed {
+    color: var(--err);
+    border-color: oklch(58% 0.14 25 / 0.4);
+  }
+  .pr-badge.draft {
+    color: var(--tx-lo);
+  }
+  .pr-badge:hover {
+    background: var(--bg-4);
+  }
+
+  /* Action row — a state-driven split button: the primary does the next
+     meaningful step, the caret opens the full menu of granular actions. */
+  .ch-actions {
+    flex: none;
+    padding: 0 10px 9px 12px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .splitbtn {
+    display: flex;
+    align-items: stretch;
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--bg-3);
+    overflow: hidden;
+  }
+  .split-main {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    font-size: 11.5px;
+    font-weight: 500;
+    padding: 5px 10px;
+    text-align: center;
+    color: var(--tx-hi);
+    background: transparent;
+    border: 0;
     cursor: pointer;
     white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: background var(--t-fast);
+  }
+  .split-main:hover:not(:disabled) {
+    background: var(--bg-4);
+  }
+  .split-main:disabled {
+    color: var(--tx-lo);
+    cursor: default;
+  }
+  .split-caret {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 26px;
+    border: 0;
+    border-left: 1px solid var(--line);
+    background: transparent;
+    color: var(--tx-md);
+    cursor: pointer;
     transition:
       background var(--t-fast),
       color var(--t-fast);
   }
-  :global(.chip:hover) {
+  .split-caret:hover {
     background: var(--bg-4);
     color: var(--tx-hi);
   }
-  :global(.chip:disabled) {
-    opacity: 0.4;
-    cursor: default;
+  .split-caret svg {
+    width: 13px;
+    height: 13px;
   }
-  .chip .ar {
+  /* Cancel state replaces the whole split with one destructive button. */
+  .splitbtn.solo {
+    font: inherit;
+    font-size: 11.5px;
+    font-weight: 500;
+    padding: 5px 10px;
+    justify-content: center;
+    cursor: pointer;
+    color: oklch(80% 0.08 25);
+    border-color: oklch(58% 0.14 25 / 0.4);
+    transition:
+      background var(--t-fast),
+      color var(--t-fast);
+  }
+  .splitbtn.solo.cancel:hover {
+    color: var(--err);
+    background: oklch(58% 0.14 25 / 0.12);
+  }
+
+  /* Disabled menu items read as "unavailable, here's why" (title tooltip). */
+  :global(.act-menu .mi[data-disabled]) {
+    opacity: 0.4;
+    pointer-events: none;
+  }
+  :global(.act-menu .mi .check) {
+    width: 14px;
+    flex: none;
+    text-align: center;
+    color: transparent;
+  }
+  :global(.act-menu .mi .check.on) {
     color: var(--ok);
-    font-family: var(--mono);
   }
 
   .ch-list {

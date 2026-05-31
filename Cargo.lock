@@ -1578,6 +1578,7 @@ dependencies = [
  "git2",
  "hitch-core",
  "libc",
+ "serde_json",
  "tempfile",
 ]
 

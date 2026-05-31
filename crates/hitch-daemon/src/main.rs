@@ -31,7 +31,8 @@ use hitch_git::{
 use hitch_proto::{
     encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage,
     DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
-    JobRequest, JobStatus, ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode,
+    JobRequest, JobStatus, PrInfo, ProtocolError, PullRequestDraft, Request, Response,
+    WorktreeCreateMode,
     MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
 use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY};
@@ -997,6 +998,10 @@ fn handle_request<R: Read>(
             let status = git_status(state, worktree_id)?;
             send_response(state, client_id, request_id, Response::GitStatus { status })?;
         }
+        Request::PrStatus { worktree_id } => {
+            let pr = pr_status(state, worktree_id)?;
+            send_response(state, client_id, request_id, Response::PrStatus { pr })?;
+        }
         Request::GitDiff { worktree_id, path } => {
             let diff = git_diff(state, worktree_id, path)?;
             send_response(state, client_id, request_id, Response::FileDiff { diff })?;
@@ -1696,6 +1701,20 @@ fn git_status(
         deletions: summary.deletions.min(u32::MAX as usize) as u32,
         files: summary.entries.iter().map(status_entry_to_proto).collect(),
     })
+}
+
+fn pr_status(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+) -> Result<Option<PrInfo>, ProtocolError> {
+    let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
+    let pr = git.pr_status(&worktree.path).map_err(git_error)?;
+    Ok(pr.map(|pr| PrInfo {
+        number: pr.number,
+        url: pr.url,
+        state: pr.state,
+        draft: pr.draft,
+    }))
 }
 
 fn git_diff(

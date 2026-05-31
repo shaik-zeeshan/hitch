@@ -418,6 +418,40 @@ impl GitClient {
         create_pr_with_client(self, repo_path.as_ref(), request, Some(control))
     }
 
+    /// Look up the PR (if any) GitHub associates with the worktree's current
+    /// branch via `gh pr view`. Returns `Ok(None)` when there is no PR for the
+    /// branch (or when `gh` can't determine one — unauthenticated, no remote,
+    /// offline): callers treat "unknown" the same as "none" and keep offering
+    /// Create-PR, so a transient failure never blocks the flow. Only the JSON
+    /// shape is trusted; malformed output also degrades to `None`.
+    pub fn pr_status(&self, repo_path: impl AsRef<Path>) -> Result<Option<PrInfo>> {
+        let args = vec![
+            os("pr"),
+            os("view"),
+            os("--json"),
+            os("number,url,state,isDraft"),
+        ];
+        let output = match self.run_gh(repo_path.as_ref(), args) {
+            Ok(output) => output,
+            // gh exits non-zero when the branch has no PR (and on auth/network
+            // errors). Either way we have no PR to show.
+            Err(GitError::CommandFailed { .. }) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&output.stdout) else {
+            return Ok(None);
+        };
+        let (Some(number), Some(url)) = (value["number"].as_u64(), value["url"].as_str()) else {
+            return Ok(None);
+        };
+        Ok(Some(PrInfo {
+            number,
+            url: url.to_string(),
+            state: value["state"].as_str().unwrap_or_default().to_string(),
+            draft: value["isDraft"].as_bool().unwrap_or(false),
+        }))
+    }
+
     fn run_git(&self, cwd: &Path, args: Vec<OsString>) -> Result<CommandOutput> {
         run_command(&self.git, cwd, args, None)
     }
@@ -579,6 +613,16 @@ pub struct CreatePrRequest {
     pub head: Option<String>,
     /// Remote to push to when the branch has no upstream or is ahead. Defaults to `origin`.
     pub remote: Option<String>,
+    pub draft: bool,
+}
+
+/// An existing GitHub pull request for the current branch, as reported by `gh`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrInfo {
+    pub number: u64,
+    pub url: String,
+    /// `gh`'s PR state, e.g. `OPEN`, `CLOSED`, `MERGED`.
+    pub state: String,
     pub draft: bool,
 }
 

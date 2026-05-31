@@ -7,7 +7,13 @@
   import { createPr, defaultBase, generatePullRequestDraft, gitStatus, prUrl } from "../daemon";
   import { createPrOpen } from "../overlays";
 
-  let { disabled = false, triggerClass = "btn grow" }: { disabled?: boolean; triggerClass?: string } = $props();
+  // `triggerless`: mount the dialog without its own trigger button, so another
+  // surface (the Changes-panel action menu) can open it via the createPrOpen store.
+  let {
+    disabled = false,
+    triggerClass = "btn grow",
+    triggerless = false,
+  }: { disabled?: boolean; triggerClass?: string; triggerless?: boolean } = $props();
 
   let title = $state("");
   let body = $state("");
@@ -93,7 +99,9 @@
 </script>
 
 <Dialog.Root bind:open={$createPrOpen}>
-  <Dialog.Trigger class={triggerClass} {disabled}>Create PR…</Dialog.Trigger>
+  {#if !triggerless}
+    <Dialog.Trigger class={triggerClass} {disabled}>Create PR…</Dialog.Trigger>
+  {/if}
   <Dialog.Portal>
     <Dialog.Overlay class="modal-back" />
     <Dialog.Content class="modal" aria-describedby={undefined}>

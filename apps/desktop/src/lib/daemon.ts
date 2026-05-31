@@ -28,6 +28,7 @@ import {
   type JobStatus,
   type JobRequest,
   type PrFields,
+  type PrInfo,
   type PullRequestDraft,
   type Project,
   type Request,
@@ -96,10 +97,15 @@ export const diffText = writable<string | null>(null);
 export const diffActive = writable<boolean>(false);
 export const gitBusy = writable<boolean>(false);
 export const prUrl = writable<string | null>(null);
+// The PR (if any) GitHub has for the selected worktree's branch. `null` = none
+// known (or not yet checked). Fetched on-demand — on worktree switch and after
+// commit/push/create-PR — never polled, since each check shells out to `gh`.
+export const prInfo = writable<PrInfo | null>(null);
 
 const diffCache = new Map<string, string>();
 let diffRequestSeq = 0;
 let statusRequestSeq = 0;
+let prRequestSeq = 0;
 let statusPollTimer: ReturnType<typeof setInterval> | null = null;
 let statusPollInFlight = false;
 
@@ -835,6 +841,27 @@ export async function loadGitStatus(worktreeId: Id): Promise<GitStatus> {
   return response.status;
 }
 
+// Fetch the PR for a worktree's branch and store it. On-demand only (worktree
+// switch + after git ops). A seq guard drops a slow response once the selected
+// worktree has moved on, mirroring loadGitStatus. Failures clear to `null` so
+// the UI falls back to offering Create-PR rather than getting stuck.
+export async function loadPrStatus(worktreeId: Id): Promise<void> {
+  const requestSeq = ++prRequestSeq;
+  try {
+    const response = await daemonRequest<Response & { pr: PrInfo | null }>({
+      type: "pr-status",
+      worktree_id: worktreeId,
+    });
+    if (requestSeq === prRequestSeq && get(gitWorktreeId) === worktreeId) {
+      prInfo.set(response.pr ?? null);
+    }
+  } catch {
+    if (requestSeq === prRequestSeq && get(gitWorktreeId) === worktreeId) {
+      prInfo.set(null);
+    }
+  }
+}
+
 function stopGitStatusPolling(): void {
   if (statusPollTimer) clearInterval(statusPollTimer);
   statusPollTimer = null;
@@ -1429,6 +1456,8 @@ export async function createPr(fields: PrFields): Promise<void> {
     "create-pr",
   );
   prUrl.set(response.url);
+  // Refresh so the action menu flips from "Create PR" to "Open PR".
+  void loadPrStatus(worktreeId);
 }
 
 // ---- selection fix-up + cleanup (run once, here, as subscriptions) --------
@@ -1540,9 +1569,11 @@ gitWorktreeId.subscribe(($id) => {
   gitStatus.set(null);
   closeDiff();
   prUrl.set(null);
+  prInfo.set(null);
   stopGitStatusPolling();
   if ($id) {
     void loadGitStatus($id).catch((err) => error.set(toMessage(err)));
+    void loadPrStatus($id);
     startGitStatusPolling($id);
   }
 });

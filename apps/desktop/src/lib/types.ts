@@ -78,6 +78,14 @@ export type FileDiff = {
   diff: string;
 };
 
+// An existing GitHub PR for a worktree's current branch (from `gh pr view`).
+export type PrInfo = {
+  number: number;
+  url: string;
+  state: string;
+  draft: boolean;
+};
+
 export type PrFields = {
   title: string;
   body: string | null;

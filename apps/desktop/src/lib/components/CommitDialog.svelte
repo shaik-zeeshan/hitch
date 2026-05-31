@@ -12,7 +12,13 @@
   } from "../daemon";
   import { commitOpen } from "../overlays";
 
-  let { disabled = false, triggerClass = "btn primary full" }: { disabled?: boolean; triggerClass?: string } = $props();
+  // `triggerless`: mount the dialog without its own trigger button, so another
+  // surface (the Changes-panel action menu) can open it via the commitOpen store.
+  let {
+    disabled = false,
+    triggerClass = "btn primary full",
+    triggerless = false,
+  }: { disabled?: boolean; triggerClass?: string; triggerless?: boolean } = $props();
 
   let subject = $state("");
   let body = $state("");
@@ -114,7 +120,9 @@
 </script>
 
 <Dialog.Root bind:open={$commitOpen}>
-  <Dialog.Trigger class={triggerClass} {disabled}>Commit…</Dialog.Trigger>
+  {#if !triggerless}
+    <Dialog.Trigger class={triggerClass} {disabled}>Commit…</Dialog.Trigger>
+  {/if}
   <Dialog.Portal>
     <Dialog.Overlay class="modal-back" />
     <Dialog.Content class="modal" aria-describedby={undefined}>

@@ -175,6 +175,9 @@ pub enum Request {
 
     /// Read current git status for a worktree.
     GitStatus { worktree_id: WorktreeId },
+    /// Look up the GitHub PR (if any) for a worktree's current branch via `gh`.
+    /// On-demand (not polled): the daemon shells out to `gh pr view`.
+    PrStatus { worktree_id: WorktreeId },
     /// Read a file-level diff for a path in a worktree.
     GitDiff {
         worktree_id: WorktreeId,
@@ -422,6 +425,10 @@ pub enum Response {
     GitStatus {
         status: GitStatus,
     },
+    PrStatus {
+        /// `None` when the branch has no PR (or `gh` could not determine one).
+        pr: Option<PrInfo>,
+    },
     FileDiff {
         diff: FileDiff,
     },
@@ -549,6 +556,16 @@ pub struct GitStatus {
     #[serde(default)]
     pub deletions: u32,
     pub files: Vec<ChangedFile>,
+}
+
+/// An existing GitHub pull request for a worktree's current branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrInfo {
+    pub number: u64,
+    pub url: String,
+    /// `gh`'s PR state, e.g. `OPEN`, `CLOSED`, `MERGED`.
+    pub state: String,
+    pub draft: bool,
 }
 
 /// One changed path in a worktree.
