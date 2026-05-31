@@ -1065,15 +1065,19 @@ fn handle_request<R: Read>(
             send_response(state, client_id, request_id, Response::Pong)?;
         }
         Request::InstallAgentHooks { worktree_id } => {
-            let (path, helper) = {
+            let (path, helper, git) = {
                 let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
                 let worktree = state
                     .worktrees
                     .get(&worktree_id)
                     .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?;
-                (worktree.path.clone(), state.config.hook_helper.clone())
+                (
+                    worktree.path.clone(),
+                    state.config.hook_helper.clone(),
+                    state.config.git.clone(),
+                )
             };
-            hitch_agent::install_hooks(&path, &HookInstallOptions::new(helper))
+            hitch_agent::install_hooks(&path, &HookInstallOptions::new(helper).with_git(git))
                 .map_err(|err| ProtocolError::new(ErrorCode::AgentHookFailed, err.to_string()))?;
             send_response(state, client_id, request_id, Response::Ack)?;
         }
@@ -1145,12 +1149,20 @@ fn add_project_from_root(
 
     let main_worktree =
         branch.map(|branch| Worktree::new(project.id, project_root, branch, true, false));
-    let hook_helper = {
+    let (hook_helper, git) = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
-        state.config.hook_helper.clone()
+        (state.config.hook_helper.clone(), state.config.git.clone())
     };
+    // Hook installation is best-effort: a malformed or unwritable agent config
+    // must not block adding an otherwise usable repository. Agent-state tracking
+    // degrades until the config is fixed; opening/reconciling reinstalls hooks.
+    // This mirrors the create-worktree and session-open paths below.
     if let Some(worktree) = &main_worktree {
-        install_agent_hooks_for_worktree_path(&project.root, &worktree.path, &hook_helper)?;
+        if let Err(err) =
+            install_agent_hooks_for_worktree_path(&project.root, &worktree.path, &hook_helper, &git)
+        {
+            eprintln!("hitch-daemon: {}", err.message);
+        }
     }
     let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
     state.store.insert_project(&project).map_err(store_error)?;
@@ -1202,7 +1214,7 @@ fn install_agent_hooks_for_worktree_id(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
 ) -> Result<(), ProtocolError> {
-    let (project_root, worktree_path, helper) = {
+    let (project_root, worktree_path, helper, git) = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
         let worktree = state
             .worktrees
@@ -1216,28 +1228,33 @@ fn install_agent_hooks_for_worktree_id(
             project.root.clone(),
             worktree.path.clone(),
             state.config.hook_helper.clone(),
+            state.config.git.clone(),
         )
     };
-    install_agent_hooks_for_worktree_path(&project_root, &worktree_path, &helper)
+    install_agent_hooks_for_worktree_path(&project_root, &worktree_path, &helper, &git)
 }
 
 fn install_agent_hooks_for_worktree_path(
     project_root: &Path,
     worktree_path: &Path,
     helper: &Path,
+    git: &Path,
 ) -> Result<(), ProtocolError> {
-    hitch_agent::install_hooks(worktree_path, &HookInstallOptions::new(helper))
-        .map(|_| ())
-        .map_err(|err| {
-            ProtocolError::new(
-                ErrorCode::AgentHookFailed,
-                format!(
-                    "failed to install agent hooks for worktree {} in project {}: {err}",
-                    worktree_path.display(),
-                    project_root.display()
-                ),
-            )
-        })
+    hitch_agent::install_hooks(
+        worktree_path,
+        &HookInstallOptions::new(helper).with_git(git),
+    )
+    .map(|_| ())
+    .map_err(|err| {
+        ProtocolError::new(
+            ErrorCode::AgentHookFailed,
+            format!(
+                "failed to install agent hooks for worktree {} in project {}: {err}",
+                worktree_path.display(),
+                project_root.display()
+            ),
+        )
+    })
 }
 
 /// Reconcile a git-backed project's stored worktrees against what git currently
@@ -1286,7 +1303,7 @@ fn reconcile_discovered_worktrees(state: &Arc<Mutex<DaemonState>>, project_id: P
             continue;
         }
         let worktree = Worktree::new(project_id, path, found.branch, found.is_main, false);
-        let Ok((project_root, helper)) = ({
+        let Ok((project_root, helper, git)) = ({
             let state = state.lock();
             state.map(|state| {
                 (
@@ -1296,13 +1313,20 @@ fn reconcile_discovered_worktrees(state: &Arc<Mutex<DaemonState>>, project_id: P
                         .map(|project| project.root.clone())
                         .unwrap_or_default(),
                     state.config.hook_helper.clone(),
+                    state.config.git.clone(),
                 )
             })
         }) else {
             return;
         };
-        if install_agent_hooks_for_worktree_path(&project_root, &worktree.path, &helper).is_err() {
-            continue;
+        // Hook installation is best-effort: a malformed or unwritable agent
+        // config must not hide an otherwise valid externally-created worktree
+        // from list-worktrees. Record it regardless; agent-state tracking just
+        // degrades until the config is fixed (reopening reinstalls hooks).
+        if let Err(err) =
+            install_agent_hooks_for_worktree_path(&project_root, &worktree.path, &helper, &git)
+        {
+            eprintln!("hitch-daemon: {}", err.message);
         }
         let Ok(mut state) = state.lock() else { return };
         if state.store.insert_worktree(&worktree).is_ok() {
@@ -1429,7 +1453,7 @@ fn create_worktree(
     mode: WorktreeCreateMode,
     control: Option<&JobControl>,
 ) -> Result<Worktree, ProtocolError> {
-    let (project, managed_root, git, hook_helper) = {
+    let (project, managed_root, git, hook_helper, git_path) = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
         let project = state
             .projects
@@ -1441,6 +1465,7 @@ fn create_worktree(
             state.config.managed_root.clone(),
             state.git.clone(),
             state.config.hook_helper.clone(),
+            state.config.git.clone(),
         )
     };
     if project.kind != ProjectKind::GitBacked {
@@ -1470,9 +1495,12 @@ fn create_worktree(
     // so the checkout git just created never becomes an orphan that Hitch can't
     // see (which would conflict with retries on the same branch/path). Agent-state
     // tracking degrades until the config is fixed; reopening reinstalls hooks.
-    if let Err(err) =
-        install_agent_hooks_for_worktree_path(&project.root, &worktree.path, &hook_helper)
-    {
+    if let Err(err) = install_agent_hooks_for_worktree_path(
+        &project.root,
+        &worktree.path,
+        &hook_helper,
+        &git_path,
+    ) {
         eprintln!("hitch-daemon: {}", err.message);
     }
     let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
@@ -3329,6 +3357,159 @@ mod tests {
                 output.stdout.is_empty(),
                 "git status was dirty: {}",
                 String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+
+    #[test]
+    fn add_project_succeeds_when_hook_install_fails() {
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::sync::{Arc, Mutex};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-addproj-{nonce}"));
+        let project_root = dir.join("repo");
+        std::fs::create_dir_all(&project_root).unwrap();
+        run_git(&project_root, ["init", "--initial-branch=main"]);
+        // A malformed agent config makes hook installation fail. Adding the
+        // project must still succeed (best-effort hooks), so the repo stays
+        // usable as a plain terminal.
+        std::fs::create_dir_all(project_root.join(".claude")).unwrap();
+        std::fs::write(project_root.join(".claude/settings.local.json"), "not json").unwrap();
+
+        let store_path = dir.join("state.db");
+        let config = super::DaemonConfig {
+            socket_path: dir.join("daemon.sock"),
+            store_path: store_path.clone(),
+            managed_root: dir.join("managed"),
+            hook_helper: dir.join("hitch-hook"),
+            git: PathBuf::from("git"),
+            gh: PathBuf::from("gh"),
+            draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+        };
+        let store = hitch_store::Store::open(&store_path).unwrap();
+        let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
+
+        let project = super::add_project_from_root(&state, &project_root, None).unwrap();
+
+        let guard = state.lock().unwrap();
+        assert!(guard.projects.contains_key(&project.id));
+        assert!(
+            guard
+                .worktrees
+                .values()
+                .any(|worktree| worktree.project_id == project.id),
+            "main worktree should be registered even though hooks failed"
+        );
+        drop(guard);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        fn run_git<const N: usize>(cwd: &std::path::Path, args: [&str; N]) {
+            let output = Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_registers_discovered_worktree_when_hook_install_fails() {
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::sync::{Arc, Mutex};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-reconcile-{nonce}"));
+        let project_root = dir.join("repo");
+        std::fs::create_dir_all(&project_root).unwrap();
+        run_git(&project_root, ["init", "--initial-branch=main"]);
+        run_git(&project_root, ["config", "user.name", "Hitch Test"]);
+        run_git(
+            &project_root,
+            ["config", "user.email", "hitch@example.test"],
+        );
+        std::fs::write(project_root.join("tracked.txt"), "initial\n").unwrap();
+        run_git(&project_root, ["add", "tracked.txt"]);
+        run_git(&project_root, ["commit", "-m", "initial"]);
+        // An externally-created linked worktree git knows about but Hitch has
+        // not registered yet.
+        let feature_path = dir.join("feature");
+        run_git(
+            &project_root,
+            [
+                "worktree",
+                "add",
+                feature_path.to_str().unwrap(),
+                "-b",
+                "feature",
+            ],
+        );
+        // A malformed agent config makes hook installation fail for that worktree.
+        std::fs::create_dir_all(feature_path.join(".claude")).unwrap();
+        std::fs::write(feature_path.join(".claude/settings.local.json"), "not json").unwrap();
+
+        let store_path = dir.join("state.db");
+        let config = super::DaemonConfig {
+            socket_path: dir.join("daemon.sock"),
+            store_path: store_path.clone(),
+            managed_root: dir.join("managed"),
+            hook_helper: dir.join("hitch-hook"),
+            git: PathBuf::from("git"),
+            gh: PathBuf::from("gh"),
+            draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+        };
+        let store = hitch_store::Store::open(&store_path).unwrap();
+        let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
+        // Register the project + main worktree, leaving the linked worktree for
+        // reconciliation to discover.
+        let project = super::add_project_from_root(&state, &project_root, None).unwrap();
+
+        super::reconcile_discovered_worktrees(&state, project.id);
+
+        let guard = state.lock().unwrap();
+        let feature_canonical = feature_path.canonicalize().unwrap();
+        assert!(
+            guard.worktrees.values().any(|worktree| {
+                worktree
+                    .path
+                    .canonicalize()
+                    .map(|path| path == feature_canonical)
+                    .unwrap_or(false)
+            }),
+            "discovered worktree should be registered even though hooks failed"
+        );
+        drop(guard);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        fn run_git<const N: usize>(cwd: &std::path::Path, args: [&str; N]) {
+            let output = Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
             );
         }
     }

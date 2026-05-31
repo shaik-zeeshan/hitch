@@ -311,6 +311,57 @@ describe("agent state propagation", () => {
       vi.useRealTimers();
     }
   });
+
+  it("clears worktree hook state when the last session for it closes", () => {
+    worktrees.set([
+      {
+        id: "w1",
+        project_id: "p1",
+        path: "/repo",
+        branch: "main",
+        is_main: true,
+        is_hitch_managed: false,
+      },
+    ]);
+    sessions.set([
+      { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+    ]);
+    // Agent reported running, then the tab is closed before a Stop hook fires.
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: "s1",
+      worktree_id: "w1",
+      agent: "claude-code",
+      state: "running",
+      detail: null,
+    } as any);
+    expect(get(worktreeAgentStates)).toEqual({ w1: "running" });
+
+    applyHitchEvent({ type: "session-closed", session_id: "s1", exit_code: null } as any);
+    expect(get(worktreeAgentStates)).toEqual({});
+    expect(get(agentStateByWorktree)).toEqual({});
+  });
+
+  it("keeps worktree hook state while another session for it stays open", () => {
+    worktrees.set([
+      {
+        id: "w1",
+        project_id: "p1",
+        path: "/repo",
+        branch: "main",
+        is_main: true,
+        is_hitch_managed: false,
+      },
+    ]);
+    sessions.set([
+      { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+      { id: "s2", name: "shell", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+    ]);
+    worktreeAgentStates.set({ w1: "running" });
+
+    applyHitchEvent({ type: "session-closed", session_id: "s1", exit_code: null } as any);
+    expect(get(worktreeAgentStates)).toEqual({ w1: "running" });
+  });
 });
 
 describe("connect snapshot refresh failures", () => {

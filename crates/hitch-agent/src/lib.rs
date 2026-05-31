@@ -9,6 +9,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use hitch_core::AgentState;
 use serde_json::{json, Map, Value};
@@ -79,13 +80,25 @@ pub fn registry() -> &'static [AgentDescriptor] {
 pub struct HookInstallOptions {
     /// Absolute path to the `hitch-hook` helper binary written into agent config.
     pub helper_path: PathBuf,
+    /// Path to the `git` binary used to detect whether a legacy `.gitignore` is
+    /// tracked before cleaning it up. Defaults to `git` on `PATH`; the daemon
+    /// overrides it with its configured `--git` path via [`Self::with_git`].
+    pub git_path: PathBuf,
 }
 
 impl HookInstallOptions {
     pub fn new(helper_path: impl Into<PathBuf>) -> Self {
         Self {
             helper_path: helper_path.into(),
+            git_path: PathBuf::from("git"),
         }
+    }
+
+    /// Override the `git` binary used for tracked-file detection.
+    #[must_use]
+    pub fn with_git(mut self, git_path: impl Into<PathBuf>) -> Self {
+        self.git_path = git_path.into();
+        self
     }
 }
 
@@ -119,7 +132,15 @@ pub fn install_hooks(
     let helper_path = normalize_helper_path(&options.helper_path)?;
 
     let mut installed_configs = Vec::new();
-    let local_config_entries = [".claude/settings.local.json", ".codex/hooks.json"];
+    // `.codex/config.local.json` is the obsolete pre-`hooks.json` Codex config.
+    // It's still excluded so worktrees migrated from a pre-exclude install (which
+    // ignored it via the now-removed root `.gitignore`) don't expose that orphan
+    // file as dirty once `remove_legacy_gitignore_entries` strips the old line.
+    let local_config_entries = [
+        ".claude/settings.local.json",
+        ".codex/hooks.json",
+        ".codex/config.local.json",
+    ];
 
     install_claude_hooks(worktree_path, &helper_path, &mut installed_configs)?;
 
@@ -131,7 +152,8 @@ pub fn install_hooks(
     // of `.git/info/exclude`. Now that we exclude locally, strip those legacy
     // Hitch-owned entries so migrated worktrees don't keep (or depend on) the
     // deprecated tracked file.
-    let legacy_gitignore_removed = remove_legacy_gitignore_entries(worktree_path)?;
+    let legacy_gitignore_removed =
+        remove_legacy_gitignore_entries(worktree_path, &options.git_path)?;
 
     Ok(HookInstallSummary {
         installed_configs,
@@ -148,13 +170,24 @@ const LEGACY_GITIGNORE_ENTRIES: &[&str] =
 /// added are preserved; if stripping ours empties the file, the file is deleted
 /// (matching what a fresh exclude-based install leaves behind). Returns whether
 /// anything changed.
-fn remove_legacy_gitignore_entries(worktree_path: &Path) -> Result<bool, AgentHookError> {
+///
+/// Only Hitch's own untracked droppings are touched: a `.gitignore` the user has
+/// committed is left entirely alone, since deleting or rewriting a tracked file
+/// would dirty the repo and discard ignore rules the user owns.
+fn remove_legacy_gitignore_entries(
+    worktree_path: &Path,
+    git_path: &Path,
+) -> Result<bool, AgentHookError> {
     let path = worktree_path.join(".gitignore");
     let existing = match fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(err.into()),
     };
+
+    if gitignore_is_tracked(worktree_path, git_path) {
+        return Ok(false);
+    }
 
     let retained = existing
         .lines()
@@ -172,6 +205,22 @@ fn remove_legacy_gitignore_entries(worktree_path: &Path) -> Result<bool, AgentHo
         fs::write(&path, updated)?;
     }
     Ok(true)
+}
+
+/// Whether `.gitignore` is tracked by git in `worktree_path`. Returns `true` only
+/// when git positively reports the file as tracked; a missing git binary, a
+/// non-repository directory, or an untracked file all yield `false` so the
+/// legacy cleanup still runs in the common (untracked) case.
+fn gitignore_is_tracked(worktree_path: &Path, git_path: &Path) -> bool {
+    Command::new(git_path)
+        .current_dir(worktree_path)
+        .args(["ls-files", "--error-unmatch", "--", ".gitignore"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn install_claude_hooks(
@@ -753,6 +802,64 @@ mod tests {
         assert_eq!(gitignore, "node_modules/\ntarget/\n");
         assert!(!gitignore.contains(".claude/settings.local.json"));
         assert!(!gitignore.contains(".codex/config.local.json"));
+
+        fs::remove_dir_all(worktree).unwrap();
+    }
+
+    #[test]
+    fn install_preserves_tracked_legacy_gitignore() {
+        let worktree = temp_dir("tracked-legacy-gitignore");
+        init_git_repo(&worktree);
+        // A user-committed `.gitignore` that happens to hold only the legacy
+        // lines must not be deleted: that would dirty the repo with a tracked
+        // deletion and discard rules the user owns.
+        fs::write(
+            worktree.join(".gitignore"),
+            ".claude/settings.local.json\n.codex/config.local.json\n",
+        )
+        .unwrap();
+        git(&worktree, ["add", ".gitignore"]);
+        git(&worktree, ["commit", "-m", "track gitignore"]);
+
+        let summary =
+            install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        assert!(!summary.legacy_gitignore_removed);
+        assert!(worktree.join(".gitignore").exists());
+        let gitignore = fs::read_to_string(worktree.join(".gitignore")).unwrap();
+        assert!(gitignore.contains(".claude/settings.local.json"));
+        assert!(gitignore.contains(".codex/config.local.json"));
+        // The tracked file is untouched and the agent configs are locally
+        // excluded, so the worktree stays clean.
+        assert_git_status_clean(&worktree);
+
+        fs::remove_dir_all(worktree).unwrap();
+    }
+
+    #[test]
+    fn migrated_worktree_keeps_legacy_codex_config_excluded() {
+        let worktree = temp_dir("legacy-codex-config");
+        init_git_repo(&worktree);
+        // Pre-exclude state: legacy `.gitignore` plus the orphaned Codex config
+        // that the old install left behind on disk.
+        fs::write(
+            worktree.join(".gitignore"),
+            ".claude/settings.local.json\n.codex/config.local.json\n",
+        )
+        .unwrap();
+        fs::create_dir_all(worktree.join(".codex")).unwrap();
+        fs::write(worktree.join(".codex/config.local.json"), "{}\n").unwrap();
+
+        let summary =
+            install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        assert!(summary.legacy_gitignore_removed);
+        assert!(!worktree.join(".gitignore").exists());
+        let exclude = fs::read_to_string(worktree.join(".git/info/exclude")).unwrap();
+        assert!(exclude.contains(".codex/config.local.json"));
+        // Removing the legacy `.gitignore` line must not expose the orphaned
+        // config: the local exclude keeps the repo clean.
+        assert_git_status_clean(&worktree);
 
         fs::remove_dir_all(worktree).unwrap();
     }

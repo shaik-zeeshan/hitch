@@ -722,6 +722,11 @@ export function applyHitchEvent(event: HitchEvent): void {
   }
   if (event.type === "session-closed") {
     const sessionId = event.session_id as Id;
+    // Capture the worktree parent before dropping the session so we can clear
+    // its standalone hook state below if this was the last live session.
+    const closing = get(sessions).find((s) => s.id === sessionId);
+    const closingWorktreeId =
+      closing?.parent.kind === "worktree" ? closing.parent.id : null;
     sessions.update((items) => items.filter((s) => s.id !== sessionId));
     activeSessionId.update((current) => (current === sessionId ? null : current));
     agentStates.update((current) => {
@@ -741,6 +746,29 @@ export function applyHitchEvent(event: HitchEvent): void {
       return next;
     });
     closeSessionOutput(sessionId);
+    // The session's own agent state is gone above, but the worktree-keyed hook
+    // state (set by cwd-resolved hooks) lingers. If no live session remains for
+    // that worktree, drop it so a worktree whose agent never fired a terminal
+    // hook before the tab closed stops showing "working" forever.
+    if (closingWorktreeId !== null) {
+      const stillLive = get(sessions).some(
+        (s) => s.parent.kind === "worktree" && s.parent.id === closingWorktreeId,
+      );
+      if (!stillLive) {
+        worktreeAgentStates.update((current) => {
+          if (!(closingWorktreeId in current)) return current;
+          const next = { ...current };
+          delete next[closingWorktreeId];
+          return next;
+        });
+        dismissedWorktreeAgentStates.update((current) => {
+          if (!(closingWorktreeId in current)) return current;
+          const next = { ...current };
+          delete next[closingWorktreeId];
+          return next;
+        });
+      }
+    }
   }
   if (event.type === "project-removed") {
     // A project was forgotten (possibly by another window). Drop it and
