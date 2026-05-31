@@ -862,13 +862,25 @@ fn remove_worktree_with_client(
         args.push(os("--force"));
     }
     args.push(path_os(&request.path));
-    let output = client.run_git(repo_path, args)?;
+    let output = match client.run_git(repo_path, args) {
+        Ok(output) => output,
+        Err(err) if already_removed_worktree(&err, &request.path) => CommandOutput::default(),
+        Err(err) => return Err(err),
+    };
 
     if let Some(branch) = &request.delete_branch {
         client.run_git(repo_path, vec![os("branch"), os("-d"), os(branch)])?;
     }
 
     Ok(output)
+}
+
+fn already_removed_worktree(err: &GitError, path: &Path) -> bool {
+    !path.exists()
+        && matches!(
+            err,
+            GitError::CommandFailed { stderr, .. } if stderr.contains("is not a working tree")
+        )
 }
 
 fn create_pr_with_client(
@@ -1673,6 +1685,44 @@ mod tests {
             .unwrap()
             .iter()
             .any(|branch| branch.name == "feature/remove"));
+    }
+
+    #[test]
+    fn removing_worktree_already_removed_externally_is_idempotent() {
+        let fixture = RepoFixture::new();
+        let managed = TempDir::new().unwrap();
+        let client = GitClient::default();
+        let request = CreateWorktreeRequest {
+            project_id: ProjectId::new(),
+            project_name: "hitch".into(),
+            managed_root: managed.path().into(),
+            branch: "feature/external-remove".into(),
+            checkout: WorktreeCheckout::NewBranch,
+            base: Some("main".into()),
+        };
+        let worktree = client.create_worktree(fixture.path(), &request).unwrap();
+
+        run_real_git(
+            fixture.path(),
+            [
+                "worktree",
+                "remove",
+                "--force",
+                worktree.path.to_str().unwrap(),
+            ],
+        );
+        assert!(!worktree.path.exists());
+
+        client
+            .remove_worktree(
+                fixture.path(),
+                &RemoveWorktreeRequest {
+                    path: worktree.path,
+                    force: true,
+                    delete_branch: None,
+                },
+            )
+            .unwrap();
     }
 
     #[test]
