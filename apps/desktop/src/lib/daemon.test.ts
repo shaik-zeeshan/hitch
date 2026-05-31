@@ -306,6 +306,13 @@ describe("job store: StartJob -> JobCompleted", () => {
         kind: "push",
         worktreeId: "w-local",
       },
+      prStatus: {
+        id: "prStatus",
+        status: "running",
+        message: null,
+        kind: "pr-status",
+        worktreeId: "w-pr-status",
+      },
     });
 
     selectedWorktreeId.set("w-local");
@@ -313,6 +320,9 @@ describe("job store: StartJob -> JobCompleted", () => {
 
     selectedWorktreeId.set("w-foreign");
     expect(get(cancellableJobForSelectedWorktree)?.id).toBe("foreign");
+
+    selectedWorktreeId.set("w-pr-status");
+    expect(get(cancellableJobForSelectedWorktree)).toBeNull();
 
     selectedWorktreeId.set("w-missing");
     expect(get(cancellableJobForSelectedWorktree)).toBeNull();
@@ -352,7 +362,7 @@ describe("job store: StartJob -> JobCompleted", () => {
     });
   });
 
-  it("marks every daemon-cancellable job kind as cancellable", () => {
+  it("marks foreground cancellable job kinds as cancellable", () => {
     expect(
       isJobCancellable({
         id: "j-clone",
@@ -398,6 +408,15 @@ describe("job store: StartJob -> JobCompleted", () => {
         worktreeId: "w1",
       }),
     ).toBe(true);
+    expect(
+      isJobCancellable({
+        id: "j-pr-status",
+        status: "running",
+        message: null,
+        kind: "pr-status",
+        worktreeId: "w1",
+      }),
+    ).toBe(false);
     expect(
       isJobCancellable({
         id: "j6b",

@@ -12,6 +12,7 @@
   import { Dialog, Select } from "bits-ui";
   import { createWorktree, defaultBase, listBranches, openSession } from "../daemon";
   import { createWorktreeFor } from "../overlays";
+  import { localBranchNameForRemote, remoteBranchChoices } from "../branchChoices";
   import type { BranchSummary } from "../types";
 
   const project = $derived($createWorktreeFor);
@@ -38,9 +39,6 @@
     const n = Math.floor(Math.random() * 90) + 10;
     return `${pick(ADJECTIVES)}-${pick(NOUNS)}-${n}`;
   }
-  function localBranchNameForRemote(name: string): string {
-    return name.split("/").slice(1).join("/") || name;
-  }
 
   let query = $state("");
   let base = $state("");
@@ -55,9 +53,7 @@
   const ql = $derived(q.toLowerCase());
   const localBranches = $derived(branches.filter((b) => !b.is_remote));
   const localBranchNames = $derived(new Set(localBranches.map((b) => b.name)));
-  const remoteBranches = $derived(
-    branches.filter((b) => b.is_remote && !localBranchNames.has(localBranchNameForRemote(b.name))),
-  );
+  const remoteBranches = $derived(remoteBranchChoices(branches));
   const localMatches = $derived(
     q ? localBranches.filter((b) => b.name.toLowerCase().includes(ql)) : localBranches,
   );

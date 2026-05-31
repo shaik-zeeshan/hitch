@@ -302,15 +302,17 @@
                   >
                   Copy path
                 </ContextMenu.Item>
-                <ContextMenu.Separator class="m-sep" />
-                <ContextMenu.Item class="mi danger" onSelect={() => removeWorktreeTarget.set(worktree)}>
-                  <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                    ><path
-                      d="M3 4.5h10M6 4.5V3.2a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V4.5M4.5 4.5l.6 8a1 1 0 0 0 1 1h3.8a1 1 0 0 0 1-1l.6-8"
-                    /></svg
-                  >
-                  Remove worktree…
-                </ContextMenu.Item>
+                {#if worktree.is_hitch_managed && !worktree.is_main}
+                  <ContextMenu.Separator class="m-sep" />
+                  <ContextMenu.Item class="mi danger" onSelect={() => removeWorktreeTarget.set(worktree)}>
+                    <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                      ><path
+                        d="M3 4.5h10M6 4.5V3.2a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V4.5M4.5 4.5l.6 8a1 1 0 0 0 1 1h3.8a1 1 0 0 0 1-1l.6-8"
+                      /></svg
+                    >
+                    Remove worktree…
+                  </ContextMenu.Item>
+                {/if}
               </ContextMenu.Content>
             </ContextMenu.Portal>
           </ContextMenu.Root>

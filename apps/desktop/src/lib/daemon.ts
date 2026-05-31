@@ -245,7 +245,6 @@ const cancellableJobKinds = new Set([
   "push",
   "pull",
   "create-pr",
-  "pr-status",
   "draft-models",
   "commit-draft",
   "pr-draft",

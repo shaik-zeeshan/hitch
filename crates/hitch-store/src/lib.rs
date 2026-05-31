@@ -110,6 +110,10 @@ impl Store {
                 ALTER TABLE worktrees
                     ADD COLUMN is_hitch_managed INTEGER NOT NULL DEFAULT 0 CHECK (is_hitch_managed IN (0, 1));
 
+                UPDATE worktrees
+                    SET is_hitch_managed = 1
+                    WHERE is_main = 0;
+
                 PRAGMA user_version = 2;
                 "#,
             )?;
@@ -620,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v1_worktrees_as_not_hitch_managed() {
+    fn migrates_v1_main_as_unmanaged_and_linked_worktrees_as_hitch_managed() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             r#"
@@ -657,7 +661,8 @@ mod tests {
         .unwrap();
 
         let project_id = ProjectId::new();
-        let worktree_id = WorktreeId::new();
+        let main_id = WorktreeId::new();
+        let linked_id = WorktreeId::new();
         conn.execute(
             "INSERT INTO projects (id, name, root, kind) VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -671,7 +676,18 @@ mod tests {
         conn.execute(
             "INSERT INTO worktrees (id, project_id, path, branch, is_main) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                id_to_string(worktree_id.as_uuid()),
+                id_to_string(main_id.as_uuid()),
+                id_to_string(project_id.as_uuid()),
+                "/tmp/hitch",
+                "main",
+                1
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO worktrees (id, project_id, path, branch, is_main) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id_to_string(linked_id.as_uuid()),
                 id_to_string(project_id.as_uuid()),
                 "/tmp/hitch-linked",
                 "feature",
@@ -681,9 +697,12 @@ mod tests {
         .unwrap();
 
         let store = Store::from_connection(conn).unwrap();
-        let worktree = store.get_worktree(worktree_id).unwrap().unwrap();
-        assert!(!worktree.is_main);
-        assert!(!worktree.is_hitch_managed);
+        let main = store.get_worktree(main_id).unwrap().unwrap();
+        let linked = store.get_worktree(linked_id).unwrap().unwrap();
+        assert!(main.is_main);
+        assert!(!main.is_hitch_managed);
+        assert!(!linked.is_main);
+        assert!(linked.is_hitch_managed);
     }
 
     #[test]
