@@ -174,13 +174,50 @@ fn describe_handshake_failure(outcome: &Result<Response, String>) -> String {
     }
 }
 
-/// Read the daemon's pid from the pidfile it writes beside the socket. This is
-/// the only handle on a daemon we could not complete a `Hello` with (a protocol
-/// mismatch returns no pid), so it's what makes force-killing such a daemon
-/// possible. Returns `None` if the file is absent or unparsable.
+/// Read the daemon's pid from the pidfile it writes beside the socket, but only
+/// when a live daemon still holds the pidfile's advisory lock. This is the only
+/// handle on a daemon we could not complete a `Hello` with (a protocol mismatch
+/// returns no pid), so it's what makes force-killing such a daemon possible — but
+/// a pidfile left by an unclean exit names a pid the OS may have since reused, and
+/// SIGKILLing that would hit an unrelated process. The daemon holds the lock for
+/// its whole lifetime (see `write_pidfile`), so a *free* lock means the writer is
+/// gone and the pid is unsafe to target. Returns `None` if the file is absent,
+/// unparsable, or stale (lock free).
 fn read_daemon_pidfile(socket_path: &Path) -> Option<u32> {
     let path = hitch_proto::transport::pidfile_path(socket_path);
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    let pid: u32 = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
+    if pidfile_is_stale(&path) {
+        return None;
+    }
+    Some(pid)
+}
+
+/// Whether the pidfile's advisory lock is free — i.e. no live daemon holds it, so
+/// the pid it names belongs to a dead (and possibly reused) process. We probe by
+/// trying to take the lock non-blocking: success means it was free (stale), so we
+/// release it again immediately and report stale. Any failure (lock held, or we
+/// can't open the file) is treated as *not* stale, preserving the existing
+/// recovery behaviour rather than risking a wedged daemon we can't kill.
+#[cfg(unix)]
+fn pidfile_is_stale(path: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    // SAFETY: `flock` on a valid fd; `LOCK_NB` so the probe never blocks.
+    let acquired = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if acquired {
+        // SAFETY: same valid fd we just locked; release so we don't hold it.
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+    acquired
+}
+
+#[cfg(not(unix))]
+fn pidfile_is_stale(_path: &Path) -> bool {
+    false
 }
 
 fn wait_for_socket_release(path: &Path, timeout: Duration) -> Result<(), String> {
@@ -420,8 +457,11 @@ impl HitchClient {
         // disconnected first — and disconnecting clears the cached pid — so in the
         // protocol-mismatch / never-handshook case the cached pid is `None` and the
         // pidfile (which the live daemon always writes on startup) identifies the
-        // daemon actually holding the socket. The cached pid only wins on the rare
-        // path where we still hold a live handshake, and then it matches the pidfile.
+        // daemon actually holding the socket — but only when its advisory lock is
+        // still held, so a stale pidfile from an unclean exit can't make us SIGKILL
+        // a reused pid (see `read_daemon_pidfile`). The cached pid only wins on the
+        // rare path where we still hold a live handshake, and then it matches the
+        // pidfile.
         let daemon_pid = self
             .0
             .daemon_pid
@@ -1634,6 +1674,37 @@ mod tests {
         assert_eq!(read_log_tail(&path, 3), None);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_daemon_pidfile_skips_stale_pid_but_returns_locked_one() {
+        use std::os::unix::io::AsRawFd;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket_path = std::env::temp_dir().join(format!("hitch-pidfile-{nonce}.sock"));
+        let pidfile = hitch_proto::transport::pidfile_path(&socket_path);
+        std::fs::write(&pidfile, "424242").unwrap();
+
+        // No live owner holds the lock → the pidfile is stale → no kill target.
+        assert_eq!(super::read_daemon_pidfile(&socket_path), None);
+
+        // Hold the advisory lock like a live daemon would → the pid is returned.
+        let held = std::fs::File::open(&pidfile).unwrap();
+        // SAFETY: flock on a valid fd held for the duration of the assertion.
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert_eq!(super::read_daemon_pidfile(&socket_path), Some(424242));
+        drop(held);
+
+        // Lock released → stale again.
+        assert_eq!(super::read_daemon_pidfile(&socket_path), None);
+        let _ = std::fs::remove_file(&pidfile);
     }
 
     #[test]

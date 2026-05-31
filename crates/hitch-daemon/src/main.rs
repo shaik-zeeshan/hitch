@@ -6,9 +6,10 @@
 //! the socket API consumed by the desktop client and `hitch-hook`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -351,14 +352,17 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     // never completed a `Hello` handshake (e.g. a protocol mismatch — the path
     // that returns no pid in the response). Best-effort: a missing pidfile only
     // costs the client its force-kill fast path, it does not break startup.
-    write_pidfile(&config.socket_path);
+    let pid_lock = write_pidfile(&config.socket_path);
     // The setup that follows (`Store::open`, `restore_layout`, the accept loop)
     // can early-return via `?`. Own the pidfile + socket with a guard so they are
     // cleared on *every* exit path: otherwise a failed startup would leave a
     // pidfile pointing at our now-dead pid, which the GUI could later SIGKILL once
     // the OS reuses that pid. Normal shutdown cleanup runs before the guard drops.
+    // The guard also holds the pidfile's advisory lock for our whole lifetime, so a
+    // client can tell a live daemon from a stale pidfile before force-killing a pid.
     let _daemon_files = DaemonFileGuard {
         socket_path: config.socket_path.clone(),
+        _pid_lock: pid_lock,
     };
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -414,6 +418,10 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
 /// pidfile is written so no exit path can leak a stale pid (see `write_pidfile`).
 struct DaemonFileGuard {
     socket_path: PathBuf,
+    // Held open for the daemon's whole lifetime so the advisory pidfile lock stays
+    // taken; dropping it (clean exit or unwind) releases the lock, and the OS
+    // releases it on an unclean kill too. Never read — only its lifetime matters.
+    _pid_lock: Option<File>,
 }
 
 impl Drop for DaemonFileGuard {
@@ -423,21 +431,38 @@ impl Drop for DaemonFileGuard {
     }
 }
 
-/// Write our pid to the daemon's pidfile (see `transport::pidfile_path`). The
-/// pidfile is the GUI's only handle on a daemon it could not handshake with, so
-/// a stale entry from a crashed daemon must never linger: `truncate` overwrites
-/// any prior pid, and the bind that precedes this call guarantees we are the
-/// sole owner of this socket path.
-fn write_pidfile(socket_path: &Path) {
+/// Write our pid to the daemon's pidfile (see `transport::pidfile_path`) and take
+/// an exclusive advisory lock on it, held via the returned handle for our whole
+/// lifetime. The lock is what lets a client tell a *live* daemon (lock held) from
+/// a *stale* pidfile left by an unclean exit (lock free) before it force-kills the
+/// pid named there — without it, PID reuse could send the kill to an unrelated
+/// process. The OS drops the lock when this process exits by any means, so an
+/// abrupt kill can't strand it.
+///
+/// The pidfile is the GUI's only handle on a daemon it could not handshake with,
+/// so a stale entry must never linger: `truncate` overwrites any prior pid, and
+/// the bind that precedes this call guarantees we are the sole owner of this
+/// socket path. Any failure here only disables forced recovery; it never blocks
+/// startup, so we return `None` and carry on.
+fn write_pidfile(socket_path: &Path) -> Option<File> {
     let path = hitch_proto::transport::pidfile_path(socket_path);
-    if let Ok(mut file) = fs::OpenOptions::new()
+    let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&path)
-    {
-        let _ = write!(file, "{}", std::process::id());
+        .ok()?;
+    // SAFETY: `flock` on a freshly opened, valid fd. `LOCK_NB` so a contended lock
+    // fails fast instead of blocking startup. We already own the socket bind, so
+    // contention is not expected; if it happens, skip writing a pid we can't defend
+    // with the lock rather than leave a kill-target we don't own.
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if !locked {
+        return None;
     }
+    let _ = write!(file, "{}", std::process::id());
+    let _ = file.flush();
+    Some(file)
 }
 
 struct DaemonState {

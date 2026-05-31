@@ -118,16 +118,25 @@ export const prByWorktree = writable<Record<Id, PrInfo | null>>({});
 // (e.g. right after creating a PR).
 let prByWorktreeSeq = 0;
 const prByWorktreeApplied = new Map<Id, number>();
-function writePrByWorktree(worktreeId: Id, pr: PrInfo | null, seq: number): void {
-  if (seq < (prByWorktreeApplied.get(worktreeId) ?? 0)) return;
+// Returns whether this write was the freshest seen for `worktreeId` (i.e. it
+// actually applied). Callers gate the selected worktree's single `prInfo` on the
+// result so an unrelated project's batched lookup can't drop a newer per-worktree
+// result through a shared global counter.
+function writePrByWorktree(worktreeId: Id, pr: PrInfo | null, seq: number): boolean {
+  if (seq < (prByWorktreeApplied.get(worktreeId) ?? 0)) return false;
   prByWorktreeApplied.set(worktreeId, seq);
   prByWorktree.update((map) => ({ ...map, [worktreeId]: pr }));
+  return true;
+}
+// True while no newer per-worktree write has landed — lets the failure path clear
+// the selected `prInfo` without clobbering a fresher success or touching the chip.
+function isFreshestPr(worktreeId: Id, seq: number): boolean {
+  return seq >= (prByWorktreeApplied.get(worktreeId) ?? 0);
 }
 
 const diffCache = new Map<string, string>();
 let diffRequestSeq = 0;
 let statusRequestSeq = 0;
-let prRequestSeq = 0;
 let statusPollTimer: ReturnType<typeof setInterval> | null = null;
 let statusPollInFlight = false;
 let prPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -889,7 +898,6 @@ export async function loadGitStatus(worktreeId: Id): Promise<GitStatus> {
 // worktree has moved on, mirroring loadGitStatus. Failures clear to `null` so
 // the UI falls back to offering Create-PR rather than getting stuck.
 export async function loadPrStatus(worktreeId: Id): Promise<void> {
-  const requestSeq = ++prRequestSeq;
   const freshnessSeq = ++prByWorktreeSeq;
   try {
     const response = await runJob<Response & { pr: PrInfo | null }>(
@@ -897,14 +905,17 @@ export async function loadPrStatus(worktreeId: Id): Promise<void> {
       "pr-status",
     );
     // The result is authoritative for `worktreeId` regardless of which worktree
-    // is selected now, so always feed the per-worktree map; only the selected
-    // worktree's single `prInfo` is gated by the seq/selection guard.
-    writePrByWorktree(worktreeId, response.pr ?? null, freshnessSeq);
-    if (requestSeq === prRequestSeq && get(gitWorktreeId) === worktreeId) {
+    // is selected now, so always feed the per-worktree map; the selected
+    // worktree's single `prInfo` is gated by the same per-worktree freshness
+    // guard so an unrelated project's batched lookup can't drop this result.
+    const applied = writePrByWorktree(worktreeId, response.pr ?? null, freshnessSeq);
+    if (applied && get(gitWorktreeId) === worktreeId) {
       prInfo.set(response.pr ?? null);
     }
   } catch {
-    if (requestSeq === prRequestSeq && get(gitWorktreeId) === worktreeId) {
+    // Clear only if no newer lookup for this worktree has landed, so a slow
+    // failure can't wipe a fresher success. Leave the chip map untouched.
+    if (isFreshestPr(worktreeId, freshnessSeq) && get(gitWorktreeId) === worktreeId) {
       prInfo.set(null);
     }
   }
@@ -945,18 +956,18 @@ export async function loadProjectPrStatuses(
   // per-worktree `loadPrStatus` must not clobber that fresher status. The same
   // stamp gates the selected worktree's single `prInfo`, mirroring loadPrStatus.
   const freshnessSeq = ++prByWorktreeSeq;
-  const requestSeq = ++prRequestSeq;
   try {
     const response = await runJob<
       Response & { statuses: { worktree_id: Id; pr: PrInfo | null }[] }
     >({ type: "project-pr-statuses", project_id: projectId }, "pr-status");
     const selectedId = get(gitWorktreeId);
     for (const status of response.statuses) {
-      writePrByWorktree(status.worktree_id, status.pr ?? null, freshnessSeq);
+      const applied = writePrByWorktree(status.worktree_id, status.pr ?? null, freshnessSeq);
       // Keep the selected worktree's action state (Create vs Open PR) in step with
-      // its sidebar chip; both now flow from the same batched lookup. Gated like
-      // loadPrStatus so a slower batched response can't regress a newer result.
-      if (requestSeq === prRequestSeq && selectedId === status.worktree_id) {
+      // its sidebar chip; both now flow from the same batched lookup. Gated by the
+      // per-worktree freshness guard so a slower batched response can't regress a
+      // newer per-worktree result.
+      if (applied && selectedId === status.worktree_id) {
         prInfo.set(status.pr ?? null);
       }
     }

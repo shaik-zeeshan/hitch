@@ -552,10 +552,12 @@ fn pr_list_for_branches_with_client(
     if !search.contains("head:") {
         return Ok(Vec::new());
     }
-    // The search already constrains the result to our PRs on the requested
-    // branches (≈ one per branch), so this limit is just headroom — generous
-    // enough that an old+new PR on every branch still fits without truncation.
-    let limit = branches.len().saturating_mul(4).clamp(30, 500).to_string();
+    // `head:` matches by *prefix* in GitHub search, so a short worktree branch
+    // (e.g. `fix`) pulls in every authored PR whose head merely starts with it
+    // (`fix/…`). Without headroom that spillover could evict the exact PR we need
+    // under the limit, dropping the chip. Keep it generous; the exact-match
+    // filter below discards the spillover once it's fetched.
+    let limit = branches.len().saturating_mul(8).clamp(100, 1000).to_string();
     // `--state all` so a worktree whose PR has already merged still shows a chip;
     // `headRefName` is the branch we map back to each worktree.
     let args = vec![
@@ -597,6 +599,12 @@ fn pr_list_for_branches_with_client(
         ) else {
             continue;
         };
+        // `head:` is a prefix match, so the OR'd query can return PRs on branches
+        // that only start with a requested one. Keep exact matches only, so a
+        // prefix hit is never mapped onto the wrong worktree.
+        if !branches.iter().any(|branch| branch.as_str() == head) {
+            continue;
+        }
         prs.push((
             head.to_string(),
             PrInfo {
