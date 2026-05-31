@@ -192,6 +192,10 @@ fn read_daemon_pidfile(socket_path: &Path) -> Option<u32> {
     Some(pid)
 }
 
+fn daemon_pid_for_force_kill(socket_path: &Path, cached_pid: Option<u32>) -> Option<u32> {
+    cached_pid.or_else(|| read_daemon_pidfile(socket_path))
+}
+
 /// Whether the pidfile's advisory lock is free — i.e. no live daemon holds it, so
 /// the pid it names belongs to a dead (and possibly reused) process. We probe by
 /// trying to take the lock non-blocking: success means it was free (stale), so we
@@ -451,23 +455,17 @@ impl HitchClient {
         }
     }
 
-    fn force_kill_daemon(&self) -> Result<(), String> {
-        // Prefer the pid from the last successful Hello; fall back to the daemon's
-        // pidfile. We reach here via `restart_daemon`, which marks the connection
-        // disconnected first — and disconnecting clears the cached pid — so in the
-        // protocol-mismatch / never-handshook case the cached pid is `None` and the
-        // pidfile (which the live daemon always writes on startup) identifies the
-        // daemon actually holding the socket — but only when its advisory lock is
-        // still held, so a stale pidfile from an unclean exit can't make us SIGKILL
-        // a reused pid (see `read_daemon_pidfile`). The cached pid only wins on the
-        // rare path where we still hold a live handshake, and then it matches the
-        // pidfile.
-        let daemon_pid = self
-            .0
-            .daemon_pid
-            .lock()
-            .map_err(|_| "daemon pid lock poisoned".to_string())?
-            .or_else(|| read_daemon_pidfile(&self.0.socket_path))
+    fn cached_daemon_pid(&self) -> Option<u32> {
+        self.0.daemon_pid.lock().ok().and_then(|slot| *slot)
+    }
+
+    fn force_kill_daemon(&self, preferred_pid: Option<u32>) -> Result<(), String> {
+        // Heartbeat recovery has a trustworthy pid from the last successful Hello,
+        // but `restart_daemon` must disconnect before it can respawn; pass that pid
+        // in before `mark_disconnected` clears it. Protocol-mismatch restarts pass
+        // `None` and use the pidfile instead, because a cached pid from an older
+        // daemon could be stale while an upgraded daemon owns the socket.
+        let daemon_pid = daemon_pid_for_force_kill(&self.0.socket_path, preferred_pid)
             .ok_or_else(|| "cannot force-restart daemon: daemon pid is unknown".to_string())?;
         #[cfg(unix)]
         unsafe {
@@ -583,10 +581,7 @@ impl HitchClient {
                     if attempt + 1 == MAX_HANDSHAKE_ATTEMPTS {
                         break;
                     }
-                    self.restart_daemon(
-                        app,
-                        format!("{INCOMPATIBLE_DAEMON_PREFIX}: {last_err}"),
-                    )?;
+                    self.restart_daemon(app, format!("{INCOMPATIBLE_DAEMON_PREFIX}: {last_err}"))?;
                 }
             }
         }
@@ -696,6 +691,11 @@ impl HitchClient {
             // works across protocol versions.
             self.request_daemon_shutdown();
             let force_kill = should_force_kill_daemon(&reason);
+            let force_kill_pid = if reason == HEARTBEAT_LOST_REASON {
+                self.cached_daemon_pid()
+            } else {
+                None
+            };
             self.mark_disconnected(app, reason.clone());
             self.record_spawn_attempt(app)?;
             self.set_status(app, DaemonStatus::Starting, None);
@@ -706,7 +706,7 @@ impl HitchClient {
             // hard-fail on it. In every case we then wait for the socket to be
             // released so we never spawn a second daemon over a live one.
             if force_kill {
-                let _ = self.force_kill_daemon();
+                let _ = self.force_kill_daemon(force_kill_pid);
             }
             wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)?;
 
@@ -1707,6 +1707,32 @@ mod tests {
         let _ = std::fs::remove_file(&pidfile);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn force_kill_pid_selection_prefers_cached_pid_when_pidfile_is_missing_or_stale() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket_path = std::env::temp_dir().join(format!("hitch-force-pid-{nonce}.sock"));
+        let pidfile = hitch_proto::transport::pidfile_path(&socket_path);
+
+        assert_eq!(
+            super::daemon_pid_for_force_kill(&socket_path, Some(12345)),
+            Some(12345)
+        );
+        assert_eq!(super::daemon_pid_for_force_kill(&socket_path, None), None);
+
+        std::fs::write(&pidfile, "424242").unwrap();
+        assert_eq!(
+            super::daemon_pid_for_force_kill(&socket_path, Some(12345)),
+            Some(12345)
+        );
+        assert_eq!(super::daemon_pid_for_force_kill(&socket_path, None), None);
+        let _ = std::fs::remove_file(&pidfile);
+    }
+
     #[test]
     fn crash_loop_guard_stops_after_max_attempts_in_window() {
         let window = Duration::from_secs(60);
@@ -1803,8 +1829,9 @@ mod tests {
             "connection reset"
         );
         // An unexpected variant is described rather than silently dropped.
-        assert!(describe_handshake_failure(&Ok(Response::Ack))
-            .starts_with("unexpected hello response"));
+        assert!(
+            describe_handshake_failure(&Ok(Response::Ack)).starts_with("unexpected hello response")
+        );
     }
 
     #[cfg(unix)]

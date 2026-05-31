@@ -519,23 +519,38 @@ fn pr_status_with_client(
     }))
 }
 
-/// Build the `gh pr list --search` query that scopes a batched PR lookup to the
-/// current user's PRs whose head is one of `branches`. GitHub search ANDs distinct
-/// qualifiers and ORs repeated ones, so this reads as
-/// `author:@me AND (head:b1 OR head:b2 OR …)`. `author:@me` is what keeps the
-/// result to PRs we own — without it a worktree branch with a common name (`main`,
-/// `patch-1`) would pull every fork's same-named PR and could bury (and, under the
-/// limit, truncate away) our own. Blank branch names (e.g. a detached worktree)
-/// contribute no `head:` term. Valid git branch names contain no spaces or `:`,
-/// so they need no quoting in the search expression.
+/// Build the `gh pr list --search` query that scopes a batched PR lookup to PRs
+/// whose head is one of `branches`. GitHub treats spaces as `AND`, so multiple
+/// branch heads must be explicitly grouped with `OR`: `(head:b1 OR head:b2)`.
+/// Do not add `author:@me` here: `gh pr view` for the selected worktree returns
+/// the PR for the current branch regardless of author, and the batched path must
+/// preserve teammate- or bot-authored PRs for the same branch. Blank branch names
+/// (e.g. a detached worktree) contribute no `head:` term.
 fn pr_branch_search(branches: &[String]) -> String {
-    let mut search = String::from("author:@me");
+    let head_count = branches.iter().filter(|branch| !branch.is_empty()).count();
+    if head_count == 0 {
+        return String::new();
+    }
+
+    let mut search = String::new();
+    if head_count > 1 {
+        search.push('(');
+    }
+    let mut first = true;
     for branch in branches {
         if branch.is_empty() {
             continue;
         }
-        search.push_str(" head:");
+        if first {
+            first = false;
+        } else {
+            search.push_str(" OR ");
+        }
+        search.push_str("head:");
         search.push_str(branch);
+    }
+    if head_count > 1 {
+        search.push(')');
     }
     search
 }
@@ -547,17 +562,21 @@ fn pr_list_for_branches_with_client(
     control: Option<&dyn CommandControl>,
 ) -> Result<Vec<(String, PrInfo)>> {
     let search = pr_branch_search(branches);
-    // No real branches to look up — `author:@me` alone would match every PR we
-    // ever opened, which we don't want, so bail before spending a `gh` call.
-    if !search.contains("head:") {
+    // No real branches to look up — an empty query would match every PR, which
+    // we don't want, so bail before spending a `gh` call.
+    if search.is_empty() {
         return Ok(Vec::new());
     }
     // `head:` matches by *prefix* in GitHub search, so a short worktree branch
-    // (e.g. `fix`) pulls in every authored PR whose head merely starts with it
-    // (`fix/…`). Without headroom that spillover could evict the exact PR we need
-    // under the limit, dropping the chip. Keep it generous; the exact-match
+    // (e.g. `fix`) pulls in every PR whose head merely starts with it (`fix/…`).
+    // Without headroom that spillover could evict the exact PR we need under the
+    // limit, dropping the chip. Keep it generous; the exact-match
     // filter below discards the spillover once it's fetched.
-    let limit = branches.len().saturating_mul(8).clamp(100, 1000).to_string();
+    let limit = branches
+        .len()
+        .saturating_mul(8)
+        .clamp(100, 1000)
+        .to_string();
     // `--state all` so a worktree whose PR has already merged still shows a chip;
     // `headRefName` is the branch we map back to each worktree.
     let args = vec![
@@ -1703,17 +1722,53 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn pr_branch_search_ands_author_with_ored_heads_and_skips_blanks() {
-        // Distinct qualifiers AND, repeated `head:` OR: "mine AND (b1 OR b2)".
+    fn pr_branch_search_groups_ored_heads_and_skips_blanks() {
+        // Parentheses keep the head terms grouped as one branch disjunction.
         assert_eq!(
             pr_branch_search(&["feature".into(), "fix/bug".into()]),
-            "author:@me head:feature head:fix/bug"
+            "(head:feature OR head:fix/bug)"
         );
-        // A detached worktree contributes no head term; `author:@me` alone is not
-        // a branch lookup, so callers treat a head-less query as "nothing to ask".
+        // A detached worktree contributes no head term; an empty query is not a
+        // branch lookup, so callers treat it as "nothing to ask".
         let only_blank = pr_branch_search(&[String::new()]);
-        assert_eq!(only_blank, "author:@me");
+        assert_eq!(only_blank, "");
         assert!(!only_blank.contains("head:"));
+    }
+
+    #[test]
+    fn pr_list_for_branches_queries_ored_heads_without_author_filter() {
+        let fixture = RepoFixture::new();
+        let bin = TempDir::new().unwrap();
+        let log = bin.path().join("calls.log");
+        let gh = fake_program(
+            bin.path().join("gh"),
+            &log,
+            r#"[{"number":41,"url":"https://github.test/pr/41","state":"OPEN","isDraft":false,"headRefName":"feature"},{"number":42,"url":"https://github.test/pr/42","state":"MERGED","isDraft":true,"headRefName":"fix/bug"}]"#,
+        );
+        let client = GitClient::with_programs("git", gh);
+        let branches = vec!["feature".into(), "fix/bug".into()];
+
+        let prs = pr_list_for_branches_with_client(&client, fixture.path(), &branches, None)
+            .expect("PR list should parse fake gh output");
+
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].0, "feature");
+        assert_eq!(prs[0].1.number, 41);
+        assert_eq!(prs[1].0, "fix/bug");
+        assert_eq!(prs[1].1.number, 42);
+        let calls = fs::read_to_string(log).unwrap();
+        let gh_call = calls
+            .lines()
+            .find(|line| line.starts_with("gh pr list "))
+            .expect("gh pr list should be invoked");
+        assert!(
+            gh_call.contains("--search (head:feature OR head:fix/bug)"),
+            "unexpected gh call: {gh_call}"
+        );
+        assert!(
+            !gh_call.contains("author:@me"),
+            "batched worktree PR lookup must keep teammate-authored PRs: {gh_call}"
+        );
     }
 
     #[test]

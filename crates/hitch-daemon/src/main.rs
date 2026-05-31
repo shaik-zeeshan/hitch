@@ -1857,9 +1857,9 @@ fn project_pr_statuses(
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
         state.git.clone()
     };
-    // Scope the lookup to exactly our worktree branches (+ `author:@me`) so a long
-    // PR history can't truncate our branches out of the result and a same-named
-    // fork PR from another contributor can't attach to a worktree (owner-aware).
+    // Scope the lookup to our worktree branches so a long PR history can't
+    // truncate them out of the result. The git layer exact-matches headRefName
+    // after GitHub's prefix search returns.
     let branches: Vec<String> = worktrees.iter().map(|w| w.branch.clone()).collect();
     let prs = git
         .pr_list_for_branches_with_control(&repo_path, &branches, control)
