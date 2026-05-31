@@ -282,7 +282,7 @@ describe("job store: StartJob -> JobCompleted", () => {
     expect(get(selectedWorktreeId)).toBe("w-new");
   });
 
-  it("tracks the active worktree's cancellable draft job only", () => {
+  it("tracks the active worktree's cancellable job", () => {
     jobs.set({
       foreign: {
         id: "foreign",
@@ -351,7 +351,61 @@ describe("job store: StartJob -> JobCompleted", () => {
     });
   });
 
-  it("only marks draft/model jobs as cancellable", () => {
+  it("marks every daemon-cancellable job kind as cancellable", () => {
+    expect(
+      isJobCancellable({
+        id: "j-clone",
+        status: "running",
+        message: null,
+        kind: "clone",
+        worktreeId: null,
+      }),
+    ).toBe(true);
+    expect(
+      isJobCancellable({
+        id: "j-worktree",
+        status: "queued",
+        message: null,
+        kind: "create-worktree",
+        worktreeId: "w1",
+      }),
+    ).toBe(true);
+    expect(
+      isJobCancellable({
+        id: "j-push",
+        status: "running",
+        message: null,
+        kind: "push",
+        worktreeId: "w1",
+      }),
+    ).toBe(true);
+    expect(
+      isJobCancellable({
+        id: "j-pull",
+        status: "running",
+        message: null,
+        kind: "pull",
+        worktreeId: "w1",
+      }),
+    ).toBe(true);
+    expect(
+      isJobCancellable({
+        id: "j-pr",
+        status: "running",
+        message: null,
+        kind: "create-pr",
+        worktreeId: "w1",
+      }),
+    ).toBe(true);
+    expect(
+      isJobCancellable({
+        id: "j6b",
+        status: "queued",
+        message: null,
+        kind: "draft-models",
+        worktreeId: "w1",
+      }),
+    ).toBe(true);
     expect(
       isJobCancellable({
         id: "j5",
@@ -372,18 +426,12 @@ describe("job store: StartJob -> JobCompleted", () => {
     ).toBe(true);
     expect(
       isJobCancellable({
-        id: "j6b",
-        status: "queued",
+        id: "j8",
+        status: "running",
         message: null,
-        kind: "draft-models",
+        kind: null,
         worktreeId: "w1",
       }),
-    ).toBe(true);
-    expect(
-      isJobCancellable({ id: "j7", status: "running", message: null, kind: "push", worktreeId: "w1" }),
-    ).toBe(false);
-    expect(
-      isJobCancellable({ id: "j8", status: "running", message: null, kind: null, worktreeId: "w1" }),
     ).toBe(false);
   });
 

@@ -29,7 +29,11 @@ fn main() {
         let daemon_dst = binaries_dir.join(format!("hitch-daemon-{target}"));
         std::fs::copy(&daemon_src, &daemon_dst).expect("failed to copy hitch-daemon");
     } else {
-        let build_flag = if profile == "release" { " --release" } else { "" };
+        let build_flag = if profile == "release" {
+            " --release"
+        } else {
+            ""
+        };
         println!(
             "cargo:warning=hitch-daemon not found at {}; run `cargo build -p hitch-daemon{build_flag}` first",
             daemon_src.display()

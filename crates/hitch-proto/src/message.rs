@@ -16,8 +16,10 @@ use serde::{Deserialize, Serialize};
 /// v8 added the `Ping`/`Pong` heartbeat (ADR 0009) and the async **Job**
 /// messages — `StartJob`/`CancelJob`, `JobStarted`, and the `JobProgress`/
 /// `JobCompleted` events (ADR 0008). v9 extends `JobProgress` with optional
-/// job-kind metadata so reconnecting clients can rebuild the live Job store.
-pub const PROTOCOL_VERSION: u16 = 9;
+/// job-kind metadata so reconnecting clients can rebuild the live Job store. v10
+/// adds the daemon pid to `Response::Hello` so a heartbeat-wedged daemon can be
+/// force-restarted by pid.
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -398,6 +400,7 @@ pub enum Response {
     /// Successful compatibility handshake.
     Hello {
         protocol_version: u16,
+        daemon_pid: u32,
     },
     /// Command succeeded and has no body.
     Ack,
@@ -1066,6 +1069,7 @@ mod tests {
         vec![
             Response::Hello {
                 protocol_version: PROTOCOL_VERSION,
+                daemon_pid: 42,
             },
             Response::Ack,
             Response::Projects {

@@ -29,6 +29,7 @@ serde.workspace = true
 serde_json.workspace = true
 hitch-core.workspace = true
 hitch-proto.workspace = true
+libc = "0.2"
 
 # macOS-only: at startup we register `ApplePressAndHoldEnabled = NO` via Cocoa so
 # WKWebView lets keys repeat (see lib.rs `run`). These are already in the tree

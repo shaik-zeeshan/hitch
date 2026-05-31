@@ -146,6 +146,9 @@ fn is_handshake_timeout(reason: &str) -> bool {
         .strip_prefix(HANDSHAKE_FAILURE_PREFIX)
         .is_some_and(|inner| inner == DAEMON_RESPONSE_TIMEOUT_REASON)
 }
+fn should_force_kill_daemon(reason: &str) -> bool {
+    reason == HEARTBEAT_LOST_REASON
+}
 
 fn wait_for_socket_release(path: &Path, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
@@ -299,6 +302,9 @@ struct HitchClientInner {
     /// Set while the user-requested restart path intentionally drops the old
     /// socket. EOF from that socket is expected and must not start auto-recovery.
     suppress_recovery: AtomicBool,
+    /// Pid reported by the last successful Hello handshake. Auto-recovery uses
+    /// it to SIGKILL a heartbeat-wedged daemon before waiting on socket release.
+    daemon_pid: Mutex<Option<u32>>,
     /// Daemon log path, computed once from `$HOME` to match the daemon writer.
     log_path: PathBuf,
 }
@@ -324,6 +330,7 @@ impl HitchClient {
             restart_guard: Mutex::new(CrashLoopGuard::new(CRASH_LOOP_MAX, CRASH_LOOP_WINDOW)),
             recovering: AtomicBool::new(false),
             suppress_recovery: AtomicBool::new(false),
+            daemon_pid: Mutex::new(None),
             log_path: daemon_log_path(),
         }))
     }
@@ -367,6 +374,39 @@ impl HitchClient {
     /// last non-empty line (the panic/fatal message), else `None`.
     fn log_failure_reason(&self) -> Option<String> {
         read_log_tail(&self.0.log_path, 1)
+    }
+    fn set_daemon_pid(&self, daemon_pid: Option<u32>) {
+        if let Ok(mut slot) = self.0.daemon_pid.lock() {
+            *slot = daemon_pid;
+        }
+    }
+
+    fn force_kill_daemon(&self) -> Result<(), String> {
+        let daemon_pid = self
+            .0
+            .daemon_pid
+            .lock()
+            .map_err(|_| "daemon pid lock poisoned".to_string())?
+            .ok_or_else(|| "cannot force-restart daemon: daemon pid is unknown".to_string())?;
+        #[cfg(unix)]
+        unsafe {
+            if libc::kill(daemon_pid as i32, libc::SIGKILL) != 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(format!("failed to kill wedged daemon {daemon_pid}: {err}"));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            return Err("force-restarting the daemon is unsupported on this platform".into());
+        }
+        wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)
+    }
+
+    fn record_startup_failure(&self, app: &AppHandle, err: String) -> String {
+        self.set_status(app, DaemonStatus::Failed, Some(err.clone()));
+        err
     }
 
     fn record_spawn_attempt(&self, app: &AppHandle) -> Result<(), String> {
@@ -420,8 +460,10 @@ impl HitchClient {
                 // must not be respawned forever (ADR 0009).
                 self.record_spawn_attempt(app)?;
                 self.set_status(app, DaemonStatus::Starting, None);
-                self.spawn_daemon()?;
-                self.wait_for_daemon()?
+                self.spawn_daemon()
+                    .map_err(|err| self.record_startup_failure(app, err))?;
+                self.wait_for_daemon()
+                    .map_err(|err| self.record_startup_failure(app, err))?
             }
         };
         self.attach_stream(app, stream)
@@ -438,7 +480,10 @@ impl HitchClient {
             protocol_version: PROTOCOL_VERSION,
         };
         let outcome = match self.send_request(app, hello.clone()) {
-            Ok(Response::Hello { .. }) => Ok(()),
+            Ok(Response::Hello { daemon_pid, .. }) => {
+                self.set_daemon_pid(Some(daemon_pid));
+                Ok(())
+            }
             // Any Hello error means the running daemon is incompatible — restart
             // regardless of error code (old daemons may serialize codes this
             // client can't parse).
@@ -448,7 +493,10 @@ impl HitchClient {
                     format!("restarting incompatible daemon: {}", error.message),
                 )?;
                 match self.send_request(app, hello) {
-                    Ok(Response::Hello { .. }) => Ok(()),
+                    Ok(Response::Hello { daemon_pid, .. }) => {
+                        self.set_daemon_pid(Some(daemon_pid));
+                        Ok(())
+                    }
                     Ok(Response::Error { error }) => Err(error.message),
                     Ok(other) => Err(format!(
                         "unexpected hello response after daemon restart: {other:?}"
@@ -481,7 +529,8 @@ impl HitchClient {
                 protocol_version: PROTOCOL_VERSION,
             },
         ) {
-            Ok(Response::Hello { .. }) => {
+            Ok(Response::Hello { daemon_pid, .. }) => {
+                self.set_daemon_pid(Some(daemon_pid));
                 self.mark_running(app);
                 let _ = app.emit("hitch-reconnected", ());
                 Ok(())
@@ -568,11 +617,17 @@ impl HitchClient {
         self.0.suppress_recovery.store(true, Ordering::SeqCst);
         let result = (|| {
             self.request_daemon_shutdown();
-            self.mark_disconnected(app, reason);
+            let force_kill = should_force_kill_daemon(&reason);
+            self.mark_disconnected(app, reason.clone());
+            if force_kill {
+                self.force_kill_daemon()?;
+            }
             self.record_spawn_attempt(app)?;
             self.set_status(app, DaemonStatus::Starting, None);
 
-            wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)?;
+            if !force_kill {
+                wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)?;
+            }
 
             self.spawn_daemon()?;
             let stream = self.wait_for_daemon()?;
@@ -1245,10 +1300,9 @@ fn handle_tray_menu_event(app: &AppHandle, event: MenuEvent) {
                 if let Ok(mut guard) = client.0.restart_guard.lock() {
                     guard.reset();
                 }
-                if let Err(err) = client.restart_daemon_and_handshake(
-                    &app,
-                    "user requested daemon restart".to_string(),
-                ) {
+                if let Err(err) = client
+                    .restart_daemon_and_handshake(&app, "user requested daemon restart".to_string())
+                {
                     client.set_status(&app, DaemonStatus::Failed, Some(err));
                 }
             });
@@ -1304,9 +1358,9 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_control_message, read_log_tail, recovery_mode_for_loss, tray_status_text,
-        wait_for_socket_release, ControlMessage, CrashLoopGuard, DaemonStatus, HitchClient,
-        OutputRouter, RecoveryMode, Request, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
+        read_control_message, read_log_tail, recovery_mode_for_loss, should_force_kill_daemon,
+        tray_status_text, wait_for_socket_release, ControlMessage, CrashLoopGuard, DaemonStatus,
+        HitchClient, OutputRouter, RecoveryMode, Request, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
     };
     use hitch_core::SessionId;
     #[cfg(unix)]
@@ -1586,13 +1640,20 @@ mod tests {
             RecoveryMode::RestartDaemon
         );
         assert_eq!(
-            recovery_mode_for_loss("daemon handshake failed: timed out waiting for daemon response"),
+            recovery_mode_for_loss(
+                "daemon handshake failed: timed out waiting for daemon response"
+            ),
             RecoveryMode::RestartDaemon
         );
+        assert!(should_force_kill_daemon(HEARTBEAT_LOST_REASON));
+        assert!(!should_force_kill_daemon(
+            "daemon handshake failed: timed out waiting for daemon response"
+        ));
         assert_eq!(
             recovery_mode_for_loss("daemon socket closed"),
             RecoveryMode::Reconnect
         );
+        assert!(!should_force_kill_daemon("daemon socket closed"));
     }
 
     #[cfg(unix)]
@@ -1628,7 +1689,10 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
 
-        client.0.connected.store(true, std::sync::atomic::Ordering::SeqCst);
+        client
+            .0
+            .connected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         *client.0.writer.lock().unwrap() = Some(writer);
 
         client.clear_connection_state(HEARTBEAT_LOST_REASON, false);
@@ -1640,10 +1704,7 @@ mod tests {
 
         let mut reader = std::io::BufReader::new(reader);
         let message = read_control_message(&mut reader).unwrap().unwrap();
-        assert_eq!(
-            message,
-            ControlMessage::request(1, Request::ShutdownDaemon)
-        );
+        assert_eq!(message, ControlMessage::request(1, Request::ShutdownDaemon));
     }
 }
 

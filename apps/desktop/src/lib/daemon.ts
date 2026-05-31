@@ -230,7 +230,16 @@ type EarlyCompletion = { response: Response; receivedAt: number };
 const earlyCompletions = new Map<Id, EarlyCompletion>();
 const locallyStartedJobs = new Set<Id>();
 let startingJobRequests = 0;
-const cancellableJobKinds = new Set(["draft-models", "commit-draft", "pr-draft"]);
+const cancellableJobKinds = new Set([
+  "clone",
+  "create-worktree",
+  "push",
+  "pull",
+  "create-pr",
+  "draft-models",
+  "commit-draft",
+  "pr-draft",
+]);
 
 export function isJobCancellable(job: Job | null | undefined): boolean {
   return Boolean(job?.kind && cancellableJobKinds.has(job.kind));

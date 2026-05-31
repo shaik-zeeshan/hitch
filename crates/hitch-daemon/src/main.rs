@@ -31,12 +31,10 @@ use hitch_git::{
 use hitch_proto::{
     encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage,
     DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
-    JobRequest, JobStatus, ProtocolError, PullRequestDraft, Request, Response,
-    WorktreeCreateMode, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
+    JobRequest, JobStatus, ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode,
+    MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
-use hitch_pty::{
-    ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY,
-};
+use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY};
 use hitch_store::Store;
 
 fn main() {
@@ -73,7 +71,11 @@ fn login_shell_path() -> Option<String> {
     }
     let path = String::from_utf8(output.stdout).ok()?;
     let path = path.trim().to_string();
-    if path.is_empty() { None } else { Some(path) }
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 #[derive(Debug)]
@@ -819,6 +821,7 @@ fn handle_request<R: Read>(
                 request_id,
                 Response::Hello {
                     protocol_version: PROTOCOL_VERSION,
+                    daemon_pid: std::process::id(),
                 },
             )?;
             // Replay must run ON the dispatcher thread so the snapshot it sends
@@ -932,8 +935,7 @@ fn handle_request<R: Read>(
             cols,
             rows,
         } => {
-            let session =
-                open_session(state, parent, name, command, cols, rows, &channels.pty_tx)?;
+            let session = open_session(state, parent, name, command, cols, rows, &channels.pty_tx)?;
             send_response(
                 state,
                 client_id,
@@ -2228,8 +2230,10 @@ fn replay_sessions_to_client(
 
 /// Run a long-running request off the per-client request loop as a **Job** (ADR
 /// 0008). Replies to the requester immediately with `JobStarted { job_id }`, then
-/// runs `work` on a worker thread, broadcasting `JobProgress(running)` up front
-/// and `JobProgress(<terminal>)` + `JobCompleted { response }` when it finishes.
+/// releases the worker and best-effort broadcasts `JobProgress(running)`.
+/// Completion still arrives as `JobProgress(<terminal>)` + `JobCompleted { response }`.
+/// Keeping the release ahead of the running broadcast prevents a wedged peer
+/// client from blocking the job before it starts.
 ///
 /// The worker receives the shared [`JobControl`] so it can register a cancellable
 /// child (the Draft Generator's provider tree) and check `is_cancelled()`. A
@@ -2331,8 +2335,8 @@ where
         return Err(internal(format!("failed to spawn {name}: {err}")));
     }
 
-    // Reply only after the worker thread exists; then release it after the
-    // running event so clients never observe completion before JobStarted.
+    // Reply only after the worker thread exists; then release it immediately so a
+    // blocked peer-client broadcast cannot prevent the Job from starting.
     if let Err(err) = send_response(
         state,
         client_id,
@@ -2345,6 +2349,12 @@ where
         let _ = start_tx.send(false);
         return Err(err);
     }
+    if start_tx.send(true).is_err() {
+        if let Ok(mut guard) = state.lock() {
+            guard.jobs.remove(&job_id);
+        }
+        return Err(internal(format!("failed to release {name} worker")));
+    }
     let _ = broadcast_job_event(
         state,
         Event::JobProgress {
@@ -2354,7 +2364,6 @@ where
             kind: kind.map(str::to_string),
         },
     );
-    let _ = start_tx.send(true);
     Ok(())
 }
 
@@ -2385,9 +2394,20 @@ fn dispatch_job(
                     let guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
                     guard.git.clone()
                 };
-                let root = clone_project(&git, &remote_url, &destination, name.as_deref(), Some(control))?;
+                let root = clone_project(
+                    &git,
+                    &remote_url,
+                    &destination,
+                    name.as_deref(),
+                    Some(control),
+                )?;
                 let project = add_project_from_root(state, &root, name.as_deref())?;
-                let _ = broadcast_event(state, Event::ProjectUpdated { project: project.clone() });
+                let _ = broadcast_event(
+                    state,
+                    Event::ProjectUpdated {
+                        project: project.clone(),
+                    },
+                );
                 Ok(Response::Projects {
                     projects: vec![project],
                 })
@@ -2406,7 +2426,8 @@ fn dispatch_job(
             Some("create-worktree"),
             Some("Creating worktree…"),
             move |state, control| {
-                let worktree = create_worktree(state, project_id, branch, base, mode, Some(control))?;
+                let worktree =
+                    create_worktree(state, project_id, branch, base, mode, Some(control))?;
                 let _ = broadcast_event(
                     state,
                     Event::WorktreeUpdated {
@@ -2449,7 +2470,9 @@ fn dispatch_job(
             request_id,
             Some("create-pr"),
             Some("Creating pull request…"),
-            move |state, control| do_create_pr(state, worktree_id, title, body, base, draft, control),
+            move |state, control| {
+                do_create_pr(state, worktree_id, title, body, base, draft, control)
+            },
         ),
         JobRequest::ListDraftModels { provider } => start_job(
             "hitch-draft-models",
@@ -3122,6 +3145,95 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn start_job_releases_worker_before_running_broadcast() {
+        use std::os::unix::net::UnixStream;
+        use std::path::PathBuf;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-start-job-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("state.db");
+        let config = super::DaemonConfig {
+            socket_path: dir.join("daemon.sock"),
+            store_path: store_path.clone(),
+            managed_root: dir.join("managed"),
+            hook_helper: dir.join("hook"),
+            git: PathBuf::from("git"),
+            gh: PathBuf::from("gh"),
+            draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+        };
+        let store = hitch_store::Store::open(&store_path).unwrap();
+        let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
+            store, config,
+        )));
+
+        let (request_writer, _request_reader) = UnixStream::pair().unwrap();
+        let (peer_writer, _peer_reader) = UnixStream::pair().unwrap();
+        let requester = Arc::new(super::ClientSink {
+            writer: Mutex::new(request_writer),
+            live: AtomicBool::new(true),
+            jobs_live: AtomicBool::new(true),
+            pending: Mutex::new(Vec::new()),
+            pending_job_events: Mutex::new(Vec::new()),
+        });
+        let blocked = Arc::new(super::ClientSink {
+            writer: Mutex::new(peer_writer),
+            live: AtomicBool::new(true),
+            jobs_live: AtomicBool::new(true),
+            pending: Mutex::new(Vec::new()),
+            pending_job_events: Mutex::new(Vec::new()),
+        });
+        {
+            let mut guard = state.lock().unwrap();
+            guard.clients.insert(1, requester);
+            guard.clients.insert(2, Arc::clone(&blocked));
+        }
+
+        let blocked_writer = blocked.writer.lock().unwrap();
+        let started = Arc::new(AtomicBool::new(false));
+        let started_flag = Arc::clone(&started);
+        let worker_state = Arc::clone(&state);
+        let handle = std::thread::spawn(move || {
+            super::start_job(
+                "hitch-test-job",
+                &worker_state,
+                1,
+                7,
+                Some("push"),
+                Some("Pushing…"),
+                move |_, _| {
+                    started_flag.store(true, Ordering::SeqCst);
+                    Ok(super::Response::Ack)
+                },
+            )
+            .unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !started.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            started.load(Ordering::SeqCst),
+            "worker should start even while a peer client's running-event write is blocked"
+        );
+
+        drop(blocked_writer);
+        handle.join().unwrap();
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn shutdown_cancels_and_drains_active_jobs() {
         use std::path::PathBuf;
@@ -3148,7 +3260,9 @@ mod tests {
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
-        let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(store, config)));
+        let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
+            store, config,
+        )));
 
         let job_id = hitch_core::JobId::new();
         let control = Arc::new(super::JobControl::default());

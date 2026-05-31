@@ -9,6 +9,8 @@
 //! A feature crate: depends only on `hitch-core`, never on another Hitch feature
 //! crate.
 
+use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
+use hitch_core::{ProjectId, Worktree};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
@@ -19,8 +21,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
-use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
-use hitch_core::{ProjectId, Worktree};
 use tempfile::NamedTempFile;
 
 /// Convenient result alias for git operations.
@@ -263,7 +263,11 @@ impl GitClient {
     }
 
     /// Clone a repository using the system git executable.
-    pub fn clone_repo(&self, remote_url: &str, destination: impl AsRef<Path>) -> Result<CommandOutput> {
+    pub fn clone_repo(
+        &self,
+        remote_url: &str,
+        destination: impl AsRef<Path>,
+    ) -> Result<CommandOutput> {
         self.run_git(
             Path::new("."),
             vec![os("clone"), os(remote_url), path_os(destination.as_ref())],
@@ -330,10 +334,7 @@ impl GitClient {
         remote: &str,
         branch: &str,
     ) -> Result<CommandOutput> {
-        self.run_git(
-            repo_path.as_ref(),
-            vec![os("pull"), os(remote), os(branch)],
-        )
+        self.run_git(repo_path.as_ref(), vec![os("pull"), os(remote), os(branch)])
     }
 
     /// Pull a branch as a cancellable child process.
@@ -1183,7 +1184,10 @@ fn ahead_behind(repo_path: &Path) -> Result<(u32, u32)> {
     };
     let upstream_oid = branch_target_oid(&upstream)?;
     let (ahead, behind) = repo.graph_ahead_behind(local_oid, upstream_oid)?;
-    Ok((ahead.min(u32::MAX as usize) as u32, behind.min(u32::MAX as usize) as u32))
+    Ok((
+        ahead.min(u32::MAX as usize) as u32,
+        behind.min(u32::MAX as usize) as u32,
+    ))
 }
 
 fn branch_needs_push(repo_path: &Path, branch: &str) -> Result<bool> {
@@ -1221,13 +1225,23 @@ fn run_command(
     control: Option<&dyn CommandControl>,
 ) -> Result<CommandOutput> {
     let Some(control) = control else {
-        let output = Command::new(program).current_dir(cwd).args(&args).output()?;
+        let output = Command::new(program)
+            .current_dir(cwd)
+            .args(&args)
+            .output()?;
         let stdout = String::from_utf8(output.stdout)?;
         let stderr = String::from_utf8(output.stderr)?;
         if output.status.success() {
             return Ok(CommandOutput { stdout, stderr });
         }
-        return Err(command_failed(program, cwd, &args, output.status.code(), stdout, stderr));
+        return Err(command_failed(
+            program,
+            cwd,
+            &args,
+            output.status.code(),
+            stdout,
+            stderr,
+        ));
     };
 
     if control.is_cancelled() {
@@ -1307,7 +1321,9 @@ fn run_command(
     }
 }
 
-fn spawn_pipe_reader<R: Read + Send + 'static>(mut pipe: R) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+fn spawn_pipe_reader<R: Read + Send + 'static>(
+    mut pipe: R,
+) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
     thread::spawn(move || {
         let mut output = Vec::new();
         pipe.read_to_end(&mut output)?;
@@ -1315,7 +1331,9 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(mut pipe: R) -> thread::JoinHandl
     })
 }
 
-fn join_pipe_reader(handle: thread::JoinHandle<std::io::Result<Vec<u8>>>) -> std::io::Result<Vec<u8>> {
+fn join_pipe_reader(
+    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> std::io::Result<Vec<u8>> {
     match handle.join() {
         Ok(result) => result,
         Err(_) => Err(std::io::Error::other("command output reader panicked")),
@@ -1766,7 +1784,9 @@ mod tests {
         fixture.git(["checkout", "--orphan", "feature/unborn"]);
         fixture.git(["rm", "-rf", "--cached", "."]);
 
-        assert!(commits_since(fixture.path(), "main", 10).unwrap().is_empty());
+        assert!(commits_since(fixture.path(), "main", 10)
+            .unwrap()
+            .is_empty());
         assert!(changed_paths_since(fixture.path(), "main")
             .unwrap()
             .is_empty());
@@ -2084,7 +2104,10 @@ mod tests {
 
         assert_eq!(output.stdout, "done");
         assert_eq!(output.stderr, "");
-        assert!(control.is_cancelled(), "test precondition: cancel should flip after exit");
+        assert!(
+            control.is_cancelled(),
+            "test precondition: cancel should flip after exit"
+        );
         let pgids = control.pgids.lock().unwrap();
         assert!(pgids.first().is_some_and(|pgid| pgid.is_some()));
         assert_eq!(pgids.last().copied(), Some(None));
@@ -2109,7 +2132,8 @@ mod tests {
             cancel.cancel();
         });
 
-        let err = run_command(&script, temp.path(), Vec::new(), Some(control.as_ref())).unwrap_err();
+        let err =
+            run_command(&script, temp.path(), Vec::new(), Some(control.as_ref())).unwrap_err();
         trigger.join().unwrap();
 
         match err {
