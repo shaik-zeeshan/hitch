@@ -54,11 +54,11 @@ export const daemonLogPath = writable<string | null>(null);
 
 // ---- Jobs (ADR 0008) ------------------------------------------------------
 //
-// Long-running daemon ops (push/pull/PR/drafts) run as Jobs: the desktop sends
-// `StartJob`, gets `JobStarted { job_id }`, and the real result arrives later in
-// a `JobCompleted` event. This store mirrors live Jobs by id for quiet progress;
-// `runJob` (below) bridges the event flow back to a Promise so callers keep
-// their async API.
+// Long-running daemon ops (push/pull/PR/drafts/worktree creation) run as Jobs:
+// the desktop sends `StartJob`, gets `JobStarted { job_id }`, and the real
+// result arrives later in a `JobCompleted` event. This store mirrors live Jobs
+// by id for quiet progress; `runJob` (below) bridges the event flow back to a
+// Promise so callers keep their async API.
 export type Job = {
   id: Id;
   status: JobStatus;
@@ -904,13 +904,16 @@ export async function createWorktree(
 ): Promise<Worktree | null> {
   const trimmed = branch.trim();
   if (!trimmed) return null;
-  const response = await daemonRequest<Response & { worktrees: Worktree[] }>({
-    type: "create-worktree",
-    project_id: projectId,
-    branch: trimmed,
-    base,
-    mode,
-  });
+  const response = await runJob<Response & { worktrees: Worktree[] }>(
+    {
+      type: "create-worktree",
+      project_id: projectId,
+      branch: trimmed,
+      base,
+      mode,
+    },
+    "create-worktree",
+  );
   const created = response.worktrees[0] ?? null;
   if (created) selectedWorktreeId.set(created.id);
   await refreshAll();

@@ -25,8 +25,8 @@ use hitch_core::{
     JobId, Project, ProjectId, ProjectKind, Session, SessionId, SessionParent, Worktree, WorktreeId,
 };
 use hitch_git::{
-    staged_diff, CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState, GitClient,
-    GitRepository, RemoveWorktreeRequest, StatusEntry, WorktreeCheckout,
+    staged_diff, CommandControl, CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState,
+    GitClient, GitRepository, RemoveWorktreeRequest, StatusEntry, WorktreeCheckout,
 };
 use hitch_proto::{
     encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage,
@@ -387,6 +387,8 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
         }
     }
 
+    cancel_active_jobs(&state);
+    wait_for_jobs_to_finish(&state);
     kill_all_sessions(&state);
     let _ = fs::remove_file(config.socket_path);
     Ok(())
@@ -459,10 +461,9 @@ impl JobControl {
     }
 
     /// Signal cancellation and, if a child process group is registered, SIGKILL it
-    /// (process-group kill, mirroring `drafts::kill_process_tree`). Cooperative for
-    /// jobs whose work blocks in a library call with no registered child (git
-    /// push/pull/PR): the flag is set and the result is suppressed, but the in-
-    /// flight subprocess is not force-killed.
+    /// (process-group kill, mirroring `drafts::kill_process_tree`). Jobs that run
+    /// a subprocess-backed `git`/`gh` command register that group too, so daemon
+    /// shutdown can cancel them before exit rather than orphaning background work.
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
         if let Ok(guard) = self.child_pgid.lock() {
@@ -476,6 +477,16 @@ impl JobControl {
                 }
             }
         }
+    }
+}
+
+impl CommandControl for JobControl {
+    fn is_cancelled(&self) -> bool {
+        JobControl::is_cancelled(self)
+    }
+
+    fn set_child_pgid(&self, pgid: Option<i32>) {
+        JobControl::set_child_pgid(self, pgid);
     }
 }
 
@@ -866,22 +877,8 @@ fn handle_request<R: Read>(
                 Response::Worktrees { worktrees },
             )?;
         }
-        Request::CreateWorktree {
-            project_id,
-            branch,
-            base,
-            mode,
-        } => {
-            let worktree = create_worktree(state, project_id, branch, base, mode)?;
-            send_response(
-                state,
-                client_id,
-                request_id,
-                Response::Worktrees {
-                    worktrees: vec![worktree.clone()],
-                },
-            )?;
-            broadcast_event(state, Event::WorktreeUpdated { worktree })?;
+        Request::CreateWorktree { .. } => {
+            dispatch_job(state, client_id, request_id, request)?;
         }
         Request::RemoveWorktree {
             worktree_id,
@@ -1212,9 +1209,11 @@ fn refresh_worktree_branch_from_disk(
 }
 
 fn clone_project(
+    git: &GitClient,
     remote_url: &str,
     destination: &Path,
     name: Option<&str>,
+    control: Option<&JobControl>,
 ) -> Result<PathBuf, ProtocolError> {
     let target = match name {
         Some(name) => destination.join(name),
@@ -1224,18 +1223,11 @@ fn clone_project(
         fs::create_dir_all(parent)
             .map_err(|err| ProtocolError::new(ErrorCode::InvalidRequest, err.to_string()))?;
     }
-    let output = Command::new("git")
-        .arg("clone")
-        .arg(remote_url)
-        .arg(&target)
-        .output()
-        .map_err(|err| ProtocolError::new(ErrorCode::GitFailed, err.to_string()))?;
-    if !output.status.success() {
-        return Err(ProtocolError::new(
-            ErrorCode::GitFailed,
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ));
+    match control {
+        Some(control) => git.clone_repo_with_control(remote_url, &target, control),
+        None => git.clone_repo(remote_url, &target),
     }
+    .map_err(git_error)?;
     Ok(target)
 }
 
@@ -1245,6 +1237,7 @@ fn create_worktree(
     branch: String,
     base: Option<String>,
     mode: WorktreeCreateMode,
+    control: Option<&JobControl>,
 ) -> Result<Worktree, ProtocolError> {
     let (project, managed_root, git) = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
@@ -1266,22 +1259,22 @@ fn create_worktree(
         ));
     }
 
-    let worktree = git
-        .create_worktree(
-            &project.root,
-            &CreateWorktreeRequest {
-                project_id,
-                project_name: project.name,
-                managed_root,
-                branch,
-                checkout: match mode {
-                    WorktreeCreateMode::NewBranch => WorktreeCheckout::NewBranch,
-                    WorktreeCreateMode::ExistingBranch => WorktreeCheckout::ExistingBranch,
-                },
-                base,
-            },
-        )
-        .map_err(git_error)?;
+    let request = CreateWorktreeRequest {
+        project_id,
+        project_name: project.name,
+        managed_root,
+        branch,
+        checkout: match mode {
+            WorktreeCreateMode::NewBranch => WorktreeCheckout::NewBranch,
+            WorktreeCreateMode::ExistingBranch => WorktreeCheckout::ExistingBranch,
+        },
+        base,
+    };
+    let worktree = match control {
+        Some(control) => git.create_worktree_with_control(&project.root, &request, control),
+        None => git.create_worktree(&project.root, &request),
+    }
+    .map_err(git_error)?;
     let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
     state
         .store
@@ -2330,12 +2323,40 @@ fn dispatch_job(
             client_id,
             request_id,
             Some("Cloning…"),
-            move |state, _| {
-                let root = clone_project(&remote_url, &destination, name.as_deref())?;
+            move |state, control| {
+                let git = {
+                    let guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+                    guard.git.clone()
+                };
+                let root = clone_project(&git, &remote_url, &destination, name.as_deref(), Some(control))?;
                 let project = add_project_from_root(state, &root, name.as_deref())?;
                 let _ = broadcast_event(state, Event::ProjectUpdated { project: project.clone() });
                 Ok(Response::Projects {
                     projects: vec![project],
+                })
+            },
+        ),
+        Request::CreateWorktree {
+            project_id,
+            branch,
+            base,
+            mode,
+        } => start_job(
+            "hitch-create-worktree",
+            state,
+            client_id,
+            request_id,
+            Some("Creating worktree…"),
+            move |state, control| {
+                let worktree = create_worktree(state, project_id, branch, base, mode, Some(control))?;
+                let _ = broadcast_event(
+                    state,
+                    Event::WorktreeUpdated {
+                        worktree: worktree.clone(),
+                    },
+                );
+                Ok(Response::Worktrees {
+                    worktrees: vec![worktree],
                 })
             },
         ),
@@ -2345,7 +2366,7 @@ fn dispatch_job(
             client_id,
             request_id,
             Some("Pushing…"),
-            move |state, _| do_push(state, worktree_id),
+            move |state, control| do_push(state, worktree_id, control),
         ),
         Request::Pull { worktree_id } => start_job(
             "hitch-pull",
@@ -2353,7 +2374,7 @@ fn dispatch_job(
             client_id,
             request_id,
             Some("Pulling…"),
-            move |state, _| do_pull(state, worktree_id),
+            move |state, control| do_pull(state, worktree_id, control),
         ),
         Request::CreatePullRequest {
             worktree_id,
@@ -2367,7 +2388,7 @@ fn dispatch_job(
             client_id,
             request_id,
             Some("Creating pull request…"),
-            move |state, _| do_create_pr(state, worktree_id, title, body, base, draft),
+            move |state, control| do_create_pr(state, worktree_id, title, body, base, draft, control),
         ),
         Request::ListDraftModels { provider } => start_job(
             "hitch-draft-models",
@@ -2420,9 +2441,10 @@ fn dispatch_job(
 fn do_push(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
+    control: &JobControl,
 ) -> Result<Response, ProtocolError> {
     let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
-    git.push(&worktree.path, "origin", &worktree.branch, true)
+    git.push_with_control(&worktree.path, "origin", &worktree.branch, true, control)
         .map_err(git_error)?;
     Ok(Response::Ack)
 }
@@ -2430,9 +2452,10 @@ fn do_push(
 fn do_pull(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
+    control: &JobControl,
 ) -> Result<Response, ProtocolError> {
     let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
-    git.pull(&worktree.path, "origin", &worktree.branch)
+    git.pull_with_control(&worktree.path, "origin", &worktree.branch, control)
         .map_err(git_error)?;
     Ok(Response::Ack)
 }
@@ -2444,10 +2467,11 @@ fn do_create_pr(
     body: Option<String>,
     base: Option<String>,
     draft: bool,
+    control: &JobControl,
 ) -> Result<Response, ProtocolError> {
     let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
     let url = git
-        .create_pr(
+        .create_pr_with_control(
             &worktree.path,
             &CreatePrRequest {
                 title,
@@ -2457,6 +2481,7 @@ fn do_create_pr(
                 remote: None,
                 draft,
             },
+            control,
         )
         .map_err(git_error)?;
     Ok(Response::PullRequestCreated { url })
@@ -2649,6 +2674,28 @@ fn write_output_to_sink(sink: &ClientSink, session_id: SessionId, bytes: &[u8]) 
     writer.flush()
 }
 
+fn cancel_active_jobs(state: &Arc<Mutex<DaemonState>>) {
+    let jobs = match state.lock() {
+        Ok(state) => state.jobs.values().cloned().collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+    for control in jobs {
+        control.cancel();
+    }
+}
+
+fn wait_for_jobs_to_finish(state: &Arc<Mutex<DaemonState>>) {
+    loop {
+        let done = match state.lock() {
+            Ok(state) => state.jobs.is_empty(),
+            Err(_) => true,
+        };
+        if done {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
 fn kill_all_sessions(state: &Arc<Mutex<DaemonState>>) {
     let sessions = match state.lock() {
         Ok(mut state) => state
@@ -2967,5 +3014,59 @@ mod tests {
                 None => std::thread::sleep(Duration::from_millis(20)),
             }
         }
+    }
+    #[test]
+    fn shutdown_cancels_and_drains_active_jobs() {
+        use std::path::PathBuf;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-shutdown-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("state.db");
+        let config = super::DaemonConfig {
+            socket_path: dir.join("daemon.sock"),
+            store_path: store_path.clone(),
+            managed_root: dir.join("managed"),
+            hook_helper: dir.join("hook"),
+            git: PathBuf::from("git"),
+            gh: PathBuf::from("gh"),
+            draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+        };
+        let store = hitch_store::Store::open(&store_path).unwrap();
+        let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(store, config)));
+
+        let job_id = hitch_core::JobId::new();
+        let control = Arc::new(super::JobControl::default());
+        state.lock().unwrap().jobs.insert(job_id, Arc::clone(&control));
+
+        let worker_state = Arc::clone(&state);
+        let worker_control = Arc::clone(&control);
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+        let observed_cancel_clone = Arc::clone(&observed_cancel);
+        let worker = std::thread::spawn(move || {
+            while !worker_control.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            observed_cancel_clone.store(true, Ordering::SeqCst);
+            worker_state.lock().unwrap().jobs.remove(&job_id);
+        });
+
+        super::cancel_active_jobs(&state);
+        super::wait_for_jobs_to_finish(&state);
+        worker.join().unwrap();
+
+        assert!(observed_cancel.load(Ordering::SeqCst));
+        assert!(state.lock().unwrap().jobs.is_empty());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

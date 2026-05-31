@@ -25,12 +25,14 @@ import {
   cancelJob,
   completeJob,
   connection,
+  createWorktree,
   daemonReason,
   daemonStatus,
   error,
   isJobCancellable,
   jobs,
   runJob,
+  selectedWorktreeId,
 } from "./daemon";
 
 // Flush the StartJob promise chain (runJob -> daemonRequest -> invoke) so the
@@ -41,6 +43,7 @@ beforeEach(() => {
   invokeMock.mockReset();
   jobs.set({});
   error.set(null);
+  selectedWorktreeId.set(null);
 });
 
 describe("daemon status mapping", () => {
@@ -126,6 +129,53 @@ describe("job store: StartJob -> JobCompleted", () => {
 
     await expect(promise).resolves.toMatchObject({ url: "https://x/pull/fast" });
     expect(get(jobs)["j-fast"]).toBeUndefined();
+  });
+
+  it("routes create-worktree through StartJob and resolves the created worktree", async () => {
+    invokeMock.mockImplementation(async (_command: string, { request }: { request: { type: string } }) => {
+      switch (request.type) {
+        case "start-job":
+          return { type: "job-started", job_id: "j-worktree" };
+        case "list-projects":
+          return { type: "projects", projects: [] };
+        case "list-sessions":
+          return { type: "sessions", sessions: [] };
+        default:
+          throw new Error(`unexpected request ${request.type}`);
+      }
+    });
+
+    const promise = createWorktree("p1", "feat/demo", "main", "new-branch");
+    await flush();
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "create-worktree",
+          project_id: "p1",
+          branch: "feat/demo",
+          base: "main",
+          mode: "new-branch",
+        },
+      },
+    });
+
+    completeJob("j-worktree", {
+      type: "worktrees",
+      worktrees: [
+        {
+          id: "w-new",
+          project_id: "p1",
+          path: "/tmp/w-new",
+          branch: "feat/demo",
+          is_main: false,
+        },
+      ],
+    });
+
+    await expect(promise).resolves.toMatchObject({ id: "w-new", branch: "feat/demo" });
+    expect(get(selectedWorktreeId)).toBe("w-new");
   });
 
   it("reflects progress transitions, including cancellation", () => {

@@ -39,6 +39,9 @@ const OUTPUT_STAGING_CAPACITY: usize = 1024 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
 const HEARTBEAT_LOST_REASON: &str = "daemon stopped responding to heartbeat";
+const DAEMON_RESPONSE_TIMEOUT_REASON: &str = "timed out waiting for daemon response";
+const HANDSHAKE_FAILURE_PREFIX: &str = "daemon handshake failed: ";
+const DAEMON_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Crash-loop guard window + cap. If the GUI has to (re)spawn the daemon more
 /// than `CRASH_LOOP_MAX` times within `CRASH_LOOP_WINDOW`, it stops respawning
@@ -131,10 +134,32 @@ fn read_log_tail(path: &Path, lines: usize) -> Option<String> {
 }
 
 fn recovery_mode_for_loss(reason: &str) -> RecoveryMode {
-    if reason == HEARTBEAT_LOST_REASON {
+    if reason == HEARTBEAT_LOST_REASON || is_handshake_timeout(reason) {
         RecoveryMode::RestartDaemon
     } else {
         RecoveryMode::Reconnect
+    }
+}
+
+fn is_handshake_timeout(reason: &str) -> bool {
+    reason
+        .strip_prefix(HANDSHAKE_FAILURE_PREFIX)
+        .is_some_and(|inner| inner == DAEMON_RESPONSE_TIMEOUT_REASON)
+}
+
+fn wait_for_socket_release(path: &Path, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if UnixStream::connect(path).is_err() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "refusing to spawn replacement daemon: {} is still accepting connections",
+                path.display(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -547,13 +572,7 @@ impl HitchClient {
             self.record_spawn_attempt(app)?;
             self.set_status(app, DaemonStatus::Starting, None);
 
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if UnixStream::connect(&self.0.socket_path).is_err() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
+            wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)?;
 
             self.spawn_daemon()?;
             let stream = self.wait_for_daemon()?;
@@ -1215,10 +1234,12 @@ fn handle_tray_menu_event(app: &AppHandle, event: MenuEvent) {
                 if let Ok(mut guard) = client.0.restart_guard.lock() {
                     guard.reset();
                 }
-                let _ = client.restart_daemon_and_handshake(
+                if let Err(err) = client.restart_daemon_and_handshake(
                     &app,
                     "user requested daemon restart".to_string(),
-                );
+                ) {
+                    client.set_status(&app, DaemonStatus::Failed, Some(err));
+                }
             });
         }
         "quit" => {
@@ -1272,10 +1293,13 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_log_tail, recovery_mode_for_loss, tray_status_text, CrashLoopGuard, DaemonStatus,
-        OutputRouter, RecoveryMode, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
+        read_log_tail, recovery_mode_for_loss, tray_status_text, wait_for_socket_release,
+        CrashLoopGuard, DaemonStatus, OutputRouter, RecoveryMode, CRASH_LOOP_MAX,
+        HEARTBEAT_LOST_REASON,
     };
     use hitch_core::SessionId;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tauri::ipc::{Channel, InvokeResponseBody};
@@ -1545,15 +1569,43 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_timeout_uses_restart_recovery() {
+    fn heartbeat_and_handshake_timeouts_use_restart_recovery() {
         assert_eq!(
             recovery_mode_for_loss(HEARTBEAT_LOST_REASON),
+            RecoveryMode::RestartDaemon
+        );
+        assert_eq!(
+            recovery_mode_for_loss("daemon handshake failed: timed out waiting for daemon response"),
             RecoveryMode::RestartDaemon
         );
         assert_eq!(
             recovery_mode_for_loss("daemon socket closed"),
             RecoveryMode::Reconnect
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_refuses_to_spawn_over_a_live_socket() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-tauri-socket-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("daemon.sock");
+
+        let listener = UnixListener::bind(&path).unwrap();
+        let err = wait_for_socket_release(&path, Duration::from_millis(150)).unwrap_err();
+        assert!(err.contains("still accepting connections"));
+
+        drop(listener);
+        assert!(wait_for_socket_release(&path, Duration::from_millis(150)).is_ok());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
