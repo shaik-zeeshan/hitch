@@ -277,7 +277,7 @@ fn detach_spawn(args: &Args) -> io::Result<()> {
 /// `read_daemon_log_tail` and this writer never drift onto different files
 /// (ADR 0009).
 fn daemon_log_path() -> PathBuf {
-    home_dir().join(".hitch/daemon.log")
+    data_dir().join("daemon.log")
 }
 
 /// Rotate `daemon.log` → `daemon.log.prev` and open a fresh log for writing.
@@ -2988,12 +2988,20 @@ fn remove_stale_socket(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Per-instance data directory under `$HOME`. `.hitch` for release builds,
+/// `.hitch-dev` for debug builds, so a dev daemon never shares a store, managed
+/// worktrees, or log with an installed release daemon (see
+/// `hitch_proto::transport::instance_dir_name`).
+fn data_dir() -> PathBuf {
+    home_dir().join(hitch_proto::transport::instance_dir_name())
+}
+
 fn default_store_path() -> PathBuf {
-    home_dir().join(".hitch/hitch.sqlite")
+    data_dir().join("hitch.sqlite")
 }
 
 fn default_managed_worktree_root() -> PathBuf {
-    home_dir().join(".hitch/worktrees")
+    data_dir().join("worktrees")
 }
 
 fn default_hook_helper_path() -> PathBuf {

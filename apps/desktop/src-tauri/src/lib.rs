@@ -1133,11 +1133,15 @@ struct DisconnectedPayload {
 }
 
 /// Path to the daemon's log. MUST match the daemon's own `daemon_log_path`
-/// (same `$HOME`-based `.hitch/daemon.log`) so the tail the GUI reads is the file
-/// the daemon writes — never derived from the socket parent, to avoid drift
-/// (ADR 0009).
+/// (same `$HOME`-based per-instance dir, `.hitch/daemon.log` for release and
+/// `.hitch-dev/daemon.log` for debug) so the tail the GUI reads is the file the
+/// daemon writes — never derived from the socket parent, to avoid drift. The
+/// GUI and the daemon agree on the namespace because both honour their own
+/// build profile (ADR 0009).
 fn daemon_log_path() -> PathBuf {
-    home_dir().join(".hitch/daemon.log")
+    home_dir()
+        .join(hitch_proto::transport::instance_dir_name())
+        .join("daemon.log")
 }
 
 fn home_dir() -> PathBuf {
@@ -1742,6 +1746,13 @@ pub fn run() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             disable_press_and_hold();
+            // Debug builds run their own isolated daemon (`.hitch-dev`); label the
+            // window so it's obvious which build you're looking at when a dev build
+            // and an installed release build are open side by side.
+            #[cfg(debug_assertions)]
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_title("Hitch (dev)");
+            }
             build_tray(app)?;
             Ok(())
         })

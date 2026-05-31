@@ -15,9 +15,46 @@ use crate::framing::{
 };
 use crate::message::ControlMessage;
 
-/// Default daemon socket path for the current user.
+/// Isolation namespace for this build, so a debug build and an installed
+/// release build run fully independent daemons (separate socket, store,
+/// worktrees, and log) and can coexist without touching each other's sessions.
+///
+/// Keyed on the build profile: release builds get the empty namespace, debug
+/// builds get `dev`. Because `cargo tauri dev` and `cargo run -p hitch-daemon`
+/// are both debug while the bundled app and its `--release` sidecar daemon are
+/// both release, every Hitch process self-selects the matching namespace with
+/// no flags to thread through spawn. `HITCH_INSTANCE` overrides it (an empty
+/// value forces the release namespace).
+pub fn instance_namespace() -> String {
+    if let Some(value) = std::env::var_os("HITCH_INSTANCE") {
+        return value.to_string_lossy().trim().to_string();
+    }
+    if cfg!(debug_assertions) {
+        "dev".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// The namespace rendered as a path infix: `""` for release, `"-dev"` for debug.
+fn instance_infix() -> String {
+    let namespace = instance_namespace();
+    if namespace.is_empty() {
+        String::new()
+    } else {
+        format!("-{namespace}")
+    }
+}
+
+/// Name of the per-instance data directory under `$HOME` (`.hitch` for release,
+/// `.hitch-dev` for debug). Holds the store, managed worktrees, and daemon log.
+pub fn instance_dir_name() -> String {
+    format!(".hitch{}", instance_infix())
+}
+
+/// Default daemon socket path for the current user and build namespace.
 pub fn default_socket_path() -> PathBuf {
-    std::env::temp_dir().join(format!("hitch-{}.sock", current_uid()))
+    std::env::temp_dir().join(format!("hitch{}-{}.sock", instance_infix(), current_uid()))
 }
 
 /// Blocking client connection to the daemon socket.
