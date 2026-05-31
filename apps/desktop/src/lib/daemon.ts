@@ -24,6 +24,7 @@ import {
   type FileStatus,
   type GitStatus,
   type HitchEvent,
+  type KnownAgent,
   type Id,
   type JobStatus,
   type JobRequest,
@@ -78,6 +79,8 @@ export const worktrees = writable<Worktree[]>([]);
 export const sessions = writable<Session[]>([]);
 
 export const agentStates = writable<Record<Id, AgentState>>({});
+export const worktreeAgentStates = writable<Record<Id, AgentState>>({});
+export const sessionAgents = writable<Record<Id, KnownAgent>>({});
 // Live foreground command per session (the process the user is interacting
 // with in the PTY), pushed by the daemon. Absent until the first report.
 export const sessionCommands = writable<Record<Id, string | null>>({});
@@ -162,15 +165,16 @@ export const activeSession = derived(
 // Roll up per-session agent state to the worktree and project rows so a
 // collapsed tree still shows which branch needs attention.
 export const agentStateByWorktree = derived(
-  [worktrees, sessions, agentStates],
-  ([$worktrees, $sessions, $agentStates]) => {
+  [worktrees, sessions, agentStates, worktreeAgentStates],
+  ([$worktrees, $sessions, $agentStates, $worktreeAgentStates]) => {
     const map: Record<Id, AgentState> = {};
     for (const worktree of $worktrees) {
-      const agg = aggregateAgentState(
-        $sessions
+      const agg = aggregateAgentState([
+        $worktreeAgentStates[worktree.id],
+        ...$sessions
           .filter((s) => s.parent.kind === "worktree" && s.parent.id === worktree.id)
           .map((s) => $agentStates[s.id]),
-      );
+      ]);
       if (agg) map[worktree.id] = agg;
     }
     return map;
@@ -178,22 +182,23 @@ export const agentStateByWorktree = derived(
 );
 
 export const agentStateByProject = derived(
-  [projects, worktrees, sessions, agentStates],
-  ([$projects, $worktrees, $sessions, $agentStates]) => {
+  [projects, worktrees, sessions, agentStates, worktreeAgentStates],
+  ([$projects, $worktrees, $sessions, $agentStates, $worktreeAgentStates]) => {
     const map: Record<Id, AgentState> = {};
     for (const project of $projects) {
       const projectWorktreeIds = new Set(
         $worktrees.filter((w) => w.project_id === project.id).map((w) => w.id),
       );
-      const agg = aggregateAgentState(
-        $sessions
+      const agg = aggregateAgentState([
+        ...Array.from(projectWorktreeIds, (id) => $worktreeAgentStates[id]),
+        ...$sessions
           .filter(
             (s) =>
               (s.parent.kind === "project" && s.parent.id === project.id) ||
               (s.parent.kind === "worktree" && projectWorktreeIds.has(s.parent.id)),
           )
           .map((s) => $agentStates[s.id]),
-      );
+      ]);
       if (agg) map[project.id] = agg;
     }
     return map;
@@ -579,6 +584,109 @@ function closeSessionOutput(sessionId: Id): void {
   void invoke("unregister_session_output", { sessionId });
 }
 
+export function applyHitchEvent(event: HitchEvent): void {
+  if (event.type === "project-updated") {
+    projects.update((items) => upsert(items, event.project as Project));
+  }
+  if (event.type === "worktree-updated") {
+    worktrees.update((items) => upsert(items, event.worktree as Worktree));
+  }
+  if (event.type === "worktree-dirty") {
+    const worktreeId = event.worktree_id as Id;
+    const dirty = event.dirty as boolean;
+    dirtyWorktrees.update((current) =>
+      current[worktreeId] === dirty ? current : { ...current, [worktreeId]: dirty },
+    );
+    // Refresh the full status so the tree's line stats and, when selected,
+    // the Changes panel track filesystem changes live.
+    void loadGitStatus(worktreeId).catch(() => {});
+  }
+  if (event.type === "agent-state") {
+    const sessionId = event.session_id as Id | null;
+    const worktreeId = event.worktree_id as Id | null;
+    const state = event.state as AgentState;
+    const agent = event.agent as KnownAgent;
+    if (sessionId) {
+      agentStates.update((current) => ({ ...current, [sessionId]: state }));
+      sessionAgents.update((current) => ({ ...current, [sessionId]: agent }));
+    }
+    if (worktreeId) {
+      worktreeAgentStates.update((current) => ({ ...current, [worktreeId]: state }));
+    }
+  }
+  if (event.type === "session-command") {
+    const sessionId = event.session_id as Id;
+    const command = (event.command as string | null) ?? null;
+    sessionCommands.update((current) => ({ ...current, [sessionId]: command }));
+  }
+  if (event.type === "job-progress") {
+    applyJobProgress(
+      event.job_id as Id,
+      event.status as JobStatus,
+      (event.message as string | null) ?? null,
+      (event.kind as string | null) ?? null,
+    );
+  }
+  if (event.type === "job-completed") {
+    completeJob(event.job_id as Id, event.response as Response);
+  }
+  if (event.type === "session-opened") {
+    const session = event.session as Session;
+    sessions.update((items) => upsert(items, session));
+    activeSessionId.update((current) => current ?? session.id);
+    // Reset the ring + (re)register the output channel. On a reconnect the
+    // daemon replays the full scrollback right after this event, so the
+    // reset keeps that replay from duplicating the prior bytes.
+    openSessionOutput(session.id);
+  }
+  if (event.type === "session-closed") {
+    const sessionId = event.session_id as Id;
+    sessions.update((items) => items.filter((s) => s.id !== sessionId));
+    activeSessionId.update((current) => (current === sessionId ? null : current));
+    agentStates.update((current) => {
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
+    sessionAgents.update((current) => {
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
+    sessionCommands.update((current) => {
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
+    closeSessionOutput(sessionId);
+  }
+  if (event.type === "project-removed") {
+    // A project was forgotten (possibly by another window). Drop it and
+    // its worktrees locally; the daemon also broadcasts session-closed for
+    // any sessions it killed, so those are pruned above.
+    const projectId = event.project_id as Id;
+    const removedWorktreeIds = new Set(
+      get(worktrees)
+        .filter((w) => w.project_id === projectId)
+        .map((w) => w.id),
+    );
+    if (get(selectedProjectId) === projectId) {
+      const remaining = get(projects).filter((p) => p.id !== projectId);
+      selectedProjectId.set(remaining.length > 0 ? remaining[0].id : null);
+      selectedWorktreeId.set(null);
+    } else if (removedWorktreeIds.has(get(selectedWorktreeId) as Id)) {
+      selectedWorktreeId.set(null);
+    }
+    projects.update((items) => items.filter((p) => p.id !== projectId));
+    worktrees.update((items) => items.filter((w) => w.project_id !== projectId));
+    worktreeAgentStates.update((current) => {
+      const next = { ...current };
+      for (const id of removedWorktreeIds) delete next[id];
+      return next;
+    });
+  }
+}
+
 // ---- connection lifecycle -------------------------------------------------
 
 let unlisteners: UnlistenFn[] = [];
@@ -594,96 +702,7 @@ export async function initDaemon(): Promise<void> {
   connection.set("connecting");
   try {
     unlisteners.push(
-      await listen<HitchEvent>("hitch-event", (message) => {
-        const event = message.payload;
-        if (event.type === "project-updated") {
-          projects.update((items) => upsert(items, event.project as Project));
-        }
-        if (event.type === "worktree-updated") {
-          worktrees.update((items) => upsert(items, event.worktree as Worktree));
-        }
-        if (event.type === "worktree-dirty") {
-          const worktreeId = event.worktree_id as Id;
-          const dirty = event.dirty as boolean;
-          dirtyWorktrees.update((current) =>
-            current[worktreeId] === dirty
-              ? current
-              : { ...current, [worktreeId]: dirty },
-          );
-          // Refresh the full status so the tree's line stats and, when selected,
-          // the Changes panel track filesystem changes live.
-          void loadGitStatus(worktreeId).catch(() => {});
-        }
-        if (event.type === "agent-state") {
-          const sessionId = event.session_id as Id | null;
-          const state = event.state as AgentState;
-          if (sessionId) {
-            agentStates.update((current) => ({ ...current, [sessionId]: state }));
-          }
-        }
-        if (event.type === "session-command") {
-          const sessionId = event.session_id as Id;
-          const command = (event.command as string | null) ?? null;
-          sessionCommands.update((current) => ({ ...current, [sessionId]: command }));
-        }
-        if (event.type === "job-progress") {
-          applyJobProgress(
-            event.job_id as Id,
-            event.status as JobStatus,
-            (event.message as string | null) ?? null,
-            (event.kind as string | null) ?? null,
-          );
-        }
-        if (event.type === "job-completed") {
-          completeJob(event.job_id as Id, event.response as Response);
-        }
-        if (event.type === "session-opened") {
-          const session = event.session as Session;
-          sessions.update((items) => upsert(items, session));
-          activeSessionId.update((current) => current ?? session.id);
-          // Reset the ring + (re)register the output channel. On a reconnect the
-          // daemon replays the full scrollback right after this event, so the
-          // reset keeps that replay from duplicating the prior bytes.
-          openSessionOutput(session.id);
-        }
-        if (event.type === "session-closed") {
-          const sessionId = event.session_id as Id;
-          sessions.update((items) => items.filter((s) => s.id !== sessionId));
-          activeSessionId.update((current) =>
-            current === sessionId ? null : current,
-          );
-          sessionCommands.update((current) => {
-            const next = { ...current };
-            delete next[sessionId];
-            return next;
-          });
-          closeSessionOutput(sessionId);
-        }
-        if (event.type === "project-removed") {
-          // A project was forgotten (possibly by another window). Drop it and
-          // its worktrees locally; the daemon also broadcasts session-closed for
-          // any sessions it killed, so those are pruned above.
-          const projectId = event.project_id as Id;
-          const removedWorktreeIds = new Set(
-            get(worktrees)
-              .filter((w) => w.project_id === projectId)
-              .map((w) => w.id),
-          );
-          if (get(selectedProjectId) === projectId) {
-            const remaining = get(projects).filter((p) => p.id !== projectId);
-            selectedProjectId.set(remaining.length > 0 ? remaining[0].id : null);
-            selectedWorktreeId.set(null);
-          } else if (
-            removedWorktreeIds.has(get(selectedWorktreeId) as Id)
-          ) {
-            selectedWorktreeId.set(null);
-          }
-          projects.update((items) => items.filter((p) => p.id !== projectId));
-          worktrees.update((items) =>
-            items.filter((w) => w.project_id !== projectId),
-          );
-        }
-      }),
+      await listen<HitchEvent>("hitch-event", (message) => applyHitchEvent(message.payload)),
     );
 
     unlisteners.push(
@@ -1554,6 +1573,12 @@ sessions.subscribe(($sessions) => {
 sessions.subscribe(($sessions) => {
   const liveIds = new Set($sessions.map((s) => s.id));
   agentStates.update((current) => {
+    const next = Object.fromEntries(
+      Object.entries(current).filter(([id]) => liveIds.has(id)),
+    );
+    return Object.keys(next).length === Object.keys(current).length ? current : next;
+  });
+  sessionAgents.update((current) => {
     const next = Object.fromEntries(
       Object.entries(current).filter(([id]) => liveIds.has(id)),
     );

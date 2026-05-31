@@ -1145,6 +1145,13 @@ fn add_project_from_root(
 
     let main_worktree =
         branch.map(|branch| Worktree::new(project.id, project_root, branch, true, false));
+    let hook_helper = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        state.config.hook_helper.clone()
+    };
+    if let Some(worktree) = &main_worktree {
+        install_agent_hooks_for_worktree_path(&project.root, &worktree.path, &hook_helper)?;
+    }
     let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
     state.store.insert_project(&project).map_err(store_error)?;
     state.projects.insert(project.id, project.clone());
@@ -1189,6 +1196,48 @@ fn list_worktrees(
 /// given when it can't be resolved (e.g. it no longer exists on disk).
 fn canonical_or_self(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn install_agent_hooks_for_worktree_id(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+) -> Result<(), ProtocolError> {
+    let (project_root, worktree_path, helper) = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        let worktree = state
+            .worktrees
+            .get(&worktree_id)
+            .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?;
+        let project = state
+            .projects
+            .get(&worktree.project_id)
+            .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "project not found"))?;
+        (
+            project.root.clone(),
+            worktree.path.clone(),
+            state.config.hook_helper.clone(),
+        )
+    };
+    install_agent_hooks_for_worktree_path(&project_root, &worktree_path, &helper)
+}
+
+fn install_agent_hooks_for_worktree_path(
+    project_root: &Path,
+    worktree_path: &Path,
+    helper: &Path,
+) -> Result<(), ProtocolError> {
+    hitch_agent::install_hooks(worktree_path, &HookInstallOptions::new(helper))
+        .map(|_| ())
+        .map_err(|err| {
+            ProtocolError::new(
+                ErrorCode::AgentHookFailed,
+                format!(
+                    "failed to install agent hooks for worktree {} in project {}: {err}",
+                    worktree_path.display(),
+                    project_root.display()
+                ),
+            )
+        })
 }
 
 /// Reconcile a git-backed project's stored worktrees against what git currently
@@ -1237,6 +1286,24 @@ fn reconcile_discovered_worktrees(state: &Arc<Mutex<DaemonState>>, project_id: P
             continue;
         }
         let worktree = Worktree::new(project_id, path, found.branch, found.is_main, false);
+        let Ok((project_root, helper)) = ({
+            let state = state.lock();
+            state.map(|state| {
+                (
+                    state
+                        .projects
+                        .get(&project_id)
+                        .map(|project| project.root.clone())
+                        .unwrap_or_default(),
+                    state.config.hook_helper.clone(),
+                )
+            })
+        }) else {
+            return;
+        };
+        if install_agent_hooks_for_worktree_path(&project_root, &worktree.path, &helper).is_err() {
+            continue;
+        }
         let Ok(mut state) = state.lock() else { return };
         if state.store.insert_worktree(&worktree).is_ok() {
             state.worktrees.insert(worktree.id, worktree);
@@ -1362,7 +1429,7 @@ fn create_worktree(
     mode: WorktreeCreateMode,
     control: Option<&JobControl>,
 ) -> Result<Worktree, ProtocolError> {
-    let (project, managed_root, git) = {
+    let (project, managed_root, git, hook_helper) = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
         let project = state
             .projects
@@ -1373,6 +1440,7 @@ fn create_worktree(
             project,
             state.config.managed_root.clone(),
             state.git.clone(),
+            state.config.hook_helper.clone(),
         )
     };
     if project.kind != ProjectKind::GitBacked {
@@ -1398,6 +1466,7 @@ fn create_worktree(
         None => git.create_worktree(&project.root, &request),
     }
     .map_err(git_error)?;
+    install_agent_hooks_for_worktree_path(&project.root, &worktree.path, &hook_helper)?;
     let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
     state
         .store
@@ -1610,6 +1679,9 @@ fn open_session(
     rows: u16,
     pty_tx: &mpsc::Sender<PtyEvent>,
 ) -> Result<Session, ProtocolError> {
+    if let SessionParent::Worktree(worktree_id) = parent {
+        install_agent_hooks_for_worktree_id(state, worktree_id)?;
+    }
     let cwd = session_parent_cwd(state, parent)?;
     let session = Session::new(name, parent, cwd.clone());
     // Spawn at the client's initial grid so the terminal doesn't visibly reflow
@@ -2211,28 +2283,36 @@ fn resolve_agent_target(
     session_id: Option<SessionId>,
     cwd: Option<&Path>,
 ) -> Result<(Option<SessionId>, Option<WorktreeId>), ProtocolError> {
+    let cwd = cwd.map(canonical_or_self);
     let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
     let matched_session = session_id
         .and_then(|id| state.sessions.get(&id).map(|session| (id, session)))
         .or_else(|| {
-            cwd.and_then(|cwd| {
+            cwd.as_deref().and_then(|cwd| {
                 state
                     .sessions
                     .iter()
-                    .find(|(_, session)| session.session.cwd == cwd)
+                    .find(|(_, session)| canonical_or_self(&session.session.cwd) == cwd)
                     .map(|(id, session)| (*id, session))
             })
         });
 
-    let Some((session_id, daemon_session)) = matched_session else {
-        return Ok((session_id, None));
-    };
+    if let Some((session_id, daemon_session)) = matched_session {
+        let worktree_id = match daemon_session.session.parent {
+            SessionParent::Worktree(worktree_id) => Some(worktree_id),
+            SessionParent::Project(_) => None,
+        };
+        return Ok((Some(session_id), worktree_id));
+    }
 
-    let worktree_id = match daemon_session.session.parent {
-        SessionParent::Worktree(worktree_id) => Some(worktree_id),
-        SessionParent::Project(_) => None,
-    };
-    Ok((Some(session_id), worktree_id))
+    let worktree_id = cwd.as_deref().and_then(|cwd| {
+        state
+            .worktrees
+            .values()
+            .find(|worktree| cwd.starts_with(canonical_or_self(&worktree.path)))
+            .map(|worktree| worktree.id)
+    });
+    Ok((session_id, worktree_id))
 }
 
 /// Replay every session's scrollback to one client, then open its output gate.
@@ -3007,8 +3087,19 @@ fn default_managed_worktree_root() -> PathBuf {
 fn default_hook_helper_path() -> PathBuf {
     std::env::current_exe()
         .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("hitch-hook")))
+        .map(|path| hook_helper_path_for_daemon_exe(&path))
         .unwrap_or_else(|| PathBuf::from("hitch-hook"))
+}
+
+fn hook_helper_path_for_daemon_exe(exe: &Path) -> PathBuf {
+    let Some(parent) = exe.parent() else {
+        return PathBuf::from("hitch-hook");
+    };
+    let Some(file_name) = exe.file_name().and_then(|name| name.to_str()) else {
+        return parent.join("hitch-hook");
+    };
+    let suffix = file_name.strip_prefix("hitch-daemon").unwrap_or_default();
+    parent.join(format!("hitch-hook{suffix}"))
 }
 
 fn home_dir() -> PathBuf {
@@ -3108,6 +3199,22 @@ mod tests {
     }
 
     #[test]
+    fn hook_helper_path_tracks_tauri_sidecar_suffix() {
+        assert_eq!(
+            super::hook_helper_path_for_daemon_exe(std::path::Path::new(
+                "/app/binaries/hitch-daemon-aarch64-apple-darwin"
+            )),
+            std::path::PathBuf::from("/app/binaries/hitch-hook-aarch64-apple-darwin")
+        );
+        assert_eq!(
+            super::hook_helper_path_for_daemon_exe(std::path::Path::new(
+                "/target/debug/hitch-daemon"
+            )),
+            std::path::PathBuf::from("/target/debug/hitch-hook")
+        );
+    }
+
+    #[test]
     fn output_before_replay_is_in_snapshot_and_not_redelivered_live() {
         // The race: a live Output is appended to the log before the client's
         // replay runs. It must show up in the replay snapshot exactly once and
@@ -3116,11 +3223,146 @@ mod tests {
         h.connect(1);
         h.record_output(b"pre-replay");
         h.replay(1);
+
         assert_eq!(
             h.received(1),
             b"pre-replay",
             "output before replay must arrive exactly once, inside the snapshot"
         );
+    }
+
+    #[test]
+    fn installing_hooks_for_worktree_writes_agent_configs() {
+        use hitch_core::{Project, ProjectKind, Worktree};
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::sync::{Arc, Mutex};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-hooks-{nonce}"));
+        let project_root = dir.join("repo");
+        std::fs::create_dir_all(&project_root).unwrap();
+        run_git(&project_root, ["init", "--initial-branch=main"]);
+        let store_path = dir.join("state.db");
+        let config = super::DaemonConfig {
+            socket_path: dir.join("daemon.sock"),
+            store_path: store_path.clone(),
+            managed_root: dir.join("managed"),
+            hook_helper: dir.join("hitch-hook"),
+            git: PathBuf::from("git"),
+            gh: PathBuf::from("gh"),
+            draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+        };
+        let store = hitch_store::Store::open(&store_path).unwrap();
+        let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
+        let project = Project::new("hitch", &project_root, ProjectKind::GitBacked);
+        let worktree = Worktree::new(project.id, &project_root, "main", true, false);
+        {
+            let mut guard = state.lock().unwrap();
+            guard.store.insert_project(&project).unwrap();
+            guard.store.insert_worktree(&worktree).unwrap();
+            guard.projects.insert(project.id, project);
+            guard.worktrees.insert(worktree.id, worktree.clone());
+        }
+
+        super::install_agent_hooks_for_worktree_id(&state, worktree.id).unwrap();
+
+        let claude =
+            std::fs::read_to_string(project_root.join(".claude/settings.local.json")).unwrap();
+        assert!(claude.contains("hitch-hook"));
+        assert!(claude.contains("--agent claude-code"));
+        let codex = std::fs::read_to_string(project_root.join(".codex/hooks.json")).unwrap();
+        assert!(codex.contains("--agent codex"));
+        assert!(codex.contains("PermissionRequest"));
+        assert!(!project_root.join(".gitignore").exists());
+        let exclude = std::fs::read_to_string(project_root.join(".git/info/exclude")).unwrap();
+        assert!(exclude.contains(".claude/settings.local.json"));
+        assert!(exclude.contains(".codex/hooks.json"));
+        assert_git_status_clean(&project_root);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        fn run_git<const N: usize>(cwd: &std::path::Path, args: [&str; N]) {
+            let output = Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn assert_git_status_clean(cwd: &std::path::Path) {
+            let output = Command::new("git")
+                .current_dir(cwd)
+                .args(["status", "--porcelain"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git status failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "git status was dirty: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+
+    #[test]
+    fn hook_report_from_worktree_subdirectory_resolves_worktree_without_session() {
+        use hitch_core::{Project, ProjectKind, Worktree};
+        use std::path::PathBuf;
+        use std::sync::{Arc, Mutex};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-resolve-hook-{nonce}"));
+        let project_root = dir.join("repo");
+        let subdir = project_root.join("src");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let store_path = dir.join("state.db");
+        let config = super::DaemonConfig {
+            socket_path: dir.join("daemon.sock"),
+            store_path: store_path.clone(),
+            managed_root: dir.join("managed"),
+            hook_helper: dir.join("hitch-hook"),
+            git: PathBuf::from("git"),
+            gh: PathBuf::from("gh"),
+            draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+        };
+        let store = hitch_store::Store::open(&store_path).unwrap();
+        let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
+        let project = Project::new("hitch", &project_root, ProjectKind::GitBacked);
+        let worktree = Worktree::new(project.id, &project_root, "main", true, false);
+        {
+            let mut guard = state.lock().unwrap();
+            guard.store.insert_project(&project).unwrap();
+            guard.store.insert_worktree(&worktree).unwrap();
+            guard.projects.insert(project.id, project);
+            guard.worktrees.insert(worktree.id, worktree.clone());
+        }
+
+        let (session_id, worktree_id) =
+            super::resolve_agent_target(&state, None, Some(&subdir)).unwrap();
+        assert_eq!(session_id, None);
+        assert_eq!(worktree_id, Some(worktree.id));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -65,7 +65,7 @@ const REGISTRY: &[AgentDescriptor] = &[
         display_name: "Codex",
         executable: "codex",
         default_args: CODEX_ARGS,
-        local_config_path: ".codex/config.local.json",
+        local_config_path: ".codex/hooks.json",
     },
 ];
 
@@ -93,7 +93,7 @@ impl HookInstallOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookInstallSummary {
     pub installed_configs: Vec<InstalledHookConfig>,
-    pub gitignore_updated: bool,
+    pub local_exclude_updated: bool,
 }
 
 /// One local agent config touched by hook installation.
@@ -116,19 +116,17 @@ pub fn install_hooks(
     let helper_path = normalize_helper_path(&options.helper_path)?;
 
     let mut installed_configs = Vec::new();
-    let mut gitignore_entries = Vec::new();
+    let local_config_entries = [".claude/settings.local.json", ".codex/hooks.json"];
 
     install_claude_hooks(worktree_path, &helper_path, &mut installed_configs)?;
-    gitignore_entries.push(".claude/settings.local.json");
 
     install_codex_hooks(worktree_path, &helper_path, &mut installed_configs)?;
-    gitignore_entries.push(".codex/config.local.json");
 
-    let gitignore_updated = ensure_gitignored(worktree_path, &gitignore_entries)?;
+    let local_exclude_updated = ensure_locally_excluded(worktree_path, &local_config_entries)?;
 
     Ok(HookInstallSummary {
         installed_configs,
-        gitignore_updated,
+        local_exclude_updated,
     })
 }
 
@@ -141,8 +139,10 @@ fn install_claude_hooks(
     let overlay = json!({
         "hooks": {
             "UserPromptSubmit": [claude_hook_entry(helper_path, "user-prompt-submit", AgentState::Running)],
-            "Notification": [claude_hook_entry(helper_path, "notification", AgentState::NeedsApproval)],
-            "Stop": [claude_hook_entry(helper_path, "stop", AgentState::Completed)]
+            "PermissionRequest": [claude_hook_entry(helper_path, "permission-request", AgentState::NeedsApproval)],
+            "Notification": [claude_hook_entry_with_matcher(helper_path, "permission_prompt", "notification", AgentState::NeedsApproval)],
+            "Stop": [claude_hook_entry(helper_path, "stop", AgentState::Completed)],
+            "StopFailure": [claude_hook_entry(helper_path, "stop-failure", AgentState::Error)]
         }
     });
     merge_json_file(&path, overlay)?;
@@ -158,9 +158,13 @@ fn install_codex_hooks(
     helper_path: &Path,
     installed_configs: &mut Vec<InstalledHookConfig>,
 ) -> Result<(), AgentHookError> {
-    let path = worktree_path.join(".codex/config.local.json");
+    let path = worktree_path.join(".codex/hooks.json");
     let overlay = json!({
-        "notify": [hook_command(helper_path, AgentKind::Codex, "notify", None)]
+        "hooks": {
+            "UserPromptSubmit": [codex_hook_entry(helper_path, "user-prompt-submit", AgentState::Running)],
+            "PermissionRequest": [codex_hook_entry(helper_path, "permission-request", AgentState::NeedsApproval)],
+            "Stop": [codex_hook_entry(helper_path, "stop", AgentState::Completed)]
+        }
     });
     merge_json_file(&path, overlay)?;
     installed_configs.push(InstalledHookConfig {
@@ -170,9 +174,27 @@ fn install_codex_hooks(
     Ok(())
 }
 
-fn claude_hook_entry(helper_path: &Path, event: &str, state: AgentState) -> Value {
+fn codex_hook_entry(helper_path: &Path, event: &str, state: AgentState) -> Value {
     json!({
         "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": hook_command(helper_path, AgentKind::Codex, event, Some(state))
+        }]
+    })
+}
+fn claude_hook_entry(helper_path: &Path, event: &str, state: AgentState) -> Value {
+    claude_hook_entry_with_matcher(helper_path, "", event, state)
+}
+
+fn claude_hook_entry_with_matcher(
+    helper_path: &Path,
+    matcher: &str,
+    event: &str,
+    state: AgentState,
+) -> Value {
+    json!({
+        "matcher": matcher,
         "hooks": [{
             "type": "command",
             "command": hook_command(helper_path, AgentKind::ClaudeCode, event, Some(state))
@@ -271,8 +293,13 @@ fn merge_preserving_existing(base: &mut Value, overlay: Value) {
     }
 }
 
-fn ensure_gitignored(worktree_path: &Path, entries: &[&str]) -> Result<bool, AgentHookError> {
-    let path = worktree_path.join(".gitignore");
+fn ensure_locally_excluded(worktree_path: &Path, entries: &[&str]) -> Result<bool, AgentHookError> {
+    let Some(git_dir) = resolve_git_dir(worktree_path)? else {
+        return Ok(false);
+    };
+    let info_dir = git_dir.join("info");
+    fs::create_dir_all(&info_dir)?;
+    let path = info_dir.join("exclude");
     let existing = match fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
@@ -282,7 +309,7 @@ fn ensure_gitignored(worktree_path: &Path, entries: &[&str]) -> Result<bool, Age
     let existing_lines = existing
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect::<Vec<_>>();
     let missing = entries
         .iter()
@@ -304,6 +331,40 @@ fn ensure_gitignored(worktree_path: &Path, entries: &[&str]) -> Result<bool, Age
     }
     fs::write(path, updated)?;
     Ok(true)
+}
+
+fn resolve_git_dir(worktree_path: &Path) -> Result<Option<PathBuf>, AgentHookError> {
+    let dot_git = worktree_path.join(".git");
+    match fs::metadata(&dot_git) {
+        Ok(metadata) if metadata.is_dir() => Ok(Some(dot_git)),
+        Ok(_) => resolve_git_dir_file(worktree_path, &dot_git).map(Some),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn resolve_git_dir_file(worktree_path: &Path, dot_git: &Path) -> Result<PathBuf, AgentHookError> {
+    let contents = fs::read_to_string(dot_git)?;
+    let raw_path = contents
+        .trim()
+        .strip_prefix("gitdir:")
+        .ok_or_else(|| AgentHookError::InvalidGitDirFile {
+            path: dot_git.into(),
+            message: "missing gitdir prefix".into(),
+        })?
+        .trim();
+    if raw_path.is_empty() {
+        return Err(AgentHookError::InvalidGitDirFile {
+            path: dot_git.into(),
+            message: "empty gitdir path".into(),
+        });
+    }
+    let git_dir = PathBuf::from(raw_path);
+    if git_dir.is_absolute() {
+        Ok(git_dir)
+    } else {
+        Ok(worktree_path.join(git_dir))
+    }
 }
 
 fn normalize_helper_path(path: &Path) -> Result<PathBuf, AgentHookError> {
@@ -331,6 +392,10 @@ pub enum AgentHookError {
         path: PathBuf,
         message: String,
     },
+    InvalidGitDirFile {
+        path: PathBuf,
+        message: String,
+    },
 }
 
 impl fmt::Display for AgentHookError {
@@ -344,6 +409,9 @@ impl fmt::Display for AgentHookError {
             Self::InvalidConfigShape { path, message } => {
                 write!(f, "invalid config shape in {}: {message}", path.display())
             }
+            Self::InvalidGitDirFile { path, message } => {
+                write!(f, "invalid gitdir file {}: {message}", path.display())
+            }
         }
     }
 }
@@ -354,7 +422,7 @@ impl std::error::Error for AgentHookError {
             Self::Io(err) => Some(err),
             Self::Serde(err) => Some(err),
             Self::InvalidJson { source, .. } => Some(source),
-            Self::InvalidConfigShape { .. } => None,
+            Self::InvalidConfigShape { .. } | Self::InvalidGitDirFile { .. } => None,
         }
     }
 }
@@ -403,7 +471,7 @@ mod tests {
         let summary =
             install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
 
-        assert!(summary.gitignore_updated);
+        assert!(!summary.local_exclude_updated);
         assert_eq!(summary.installed_configs.len(), 2);
 
         let config: Value = serde_json::from_str(
@@ -422,9 +490,18 @@ mod tests {
                 && value.to_string().contains("--state needs-approval")
         }));
 
-        let gitignore = fs::read_to_string(worktree.join(".gitignore")).unwrap();
-        assert!(gitignore.contains(".claude/settings.local.json"));
-        assert!(gitignore.contains(".codex/config.local.json"));
+        let codex: Value =
+            serde_json::from_str(&fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap())
+                .unwrap();
+        let prompt_hooks = codex["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert!(prompt_hooks.iter().any(|value| {
+            value.to_string().contains("--agent codex")
+                && value.to_string().contains("--event")
+                && value.to_string().contains("user-prompt-submit")
+                && value.to_string().contains("--state running")
+        }));
+
+        assert!(!worktree.join(".gitignore").exists());
 
         fs::remove_dir_all(worktree).unwrap();
     }
@@ -432,30 +509,98 @@ mod tests {
     #[test]
     fn install_is_idempotent() {
         let worktree = temp_dir("idempotent");
-        install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+        init_git_repo(&worktree);
+        let first =
+            install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+        assert!(first.local_exclude_updated);
         let first_claude =
             fs::read_to_string(worktree.join(".claude/settings.local.json")).unwrap();
-        let first_codex = fs::read_to_string(worktree.join(".codex/config.local.json")).unwrap();
-        let first_gitignore = fs::read_to_string(worktree.join(".gitignore")).unwrap();
+        let first_codex = fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap();
+        let first_exclude = fs::read_to_string(worktree.join(".git/info/exclude")).unwrap();
 
         let second =
             install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
 
-        assert!(!second.gitignore_updated);
+        assert!(!second.local_exclude_updated);
         assert_eq!(
             fs::read_to_string(worktree.join(".claude/settings.local.json")).unwrap(),
             first_claude
         );
         assert_eq!(
-            fs::read_to_string(worktree.join(".codex/config.local.json")).unwrap(),
+            fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap(),
             first_codex
         );
         assert_eq!(
-            fs::read_to_string(worktree.join(".gitignore")).unwrap(),
-            first_gitignore
+            fs::read_to_string(worktree.join(".git/info/exclude")).unwrap(),
+            first_exclude
         );
 
         fs::remove_dir_all(worktree).unwrap();
+    }
+
+    #[test]
+    fn install_updates_local_exclude_in_git_directory() {
+        let worktree = temp_dir("exclude");
+        init_git_repo(&worktree);
+
+        let summary =
+            install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        assert!(summary.local_exclude_updated);
+        assert!(!worktree.join(".gitignore").exists());
+        let exclude = fs::read_to_string(worktree.join(".git/info/exclude")).unwrap();
+        assert!(exclude.contains(".claude/settings.local.json"));
+        assert!(exclude.contains(".codex/hooks.json"));
+        assert_git_status_clean(&worktree);
+
+        fs::remove_dir_all(worktree).unwrap();
+    }
+
+    #[test]
+    fn install_resolves_relative_linked_worktree_gitdir() {
+        let root = temp_dir("linked-relative-root");
+        let worktree = root.join("linked");
+        let git_dir = root.join("main/.git/worktrees/linked");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(git_dir.join("info")).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            "gitdir: ../main/.git/worktrees/linked\n",
+        )
+        .unwrap();
+
+        let summary =
+            install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        assert!(summary.local_exclude_updated);
+        let exclude = fs::read_to_string(git_dir.join("info/exclude")).unwrap();
+        assert!(exclude.contains(".claude/settings.local.json"));
+        assert!(exclude.contains(".codex/hooks.json"));
+        assert!(!worktree.join(".gitignore").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_resolves_absolute_linked_worktree_gitdir() {
+        let root = temp_dir("linked-absolute-root");
+        let worktree = root.join("linked");
+        let git_dir = root.join("main/.git/worktrees/linked");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(git_dir.join("info")).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+
+        install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        let exclude = fs::read_to_string(git_dir.join("info/exclude")).unwrap();
+        assert!(exclude.contains(".claude/settings.local.json"));
+        assert!(exclude.contains(".codex/hooks.json"));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -469,6 +614,46 @@ mod tests {
         assert!(matches!(err, AgentHookError::InvalidConfigShape { .. }));
 
         fs::remove_dir_all(worktree).unwrap();
+    }
+
+    fn init_git_repo(path: &Path) {
+        git(path, ["init", "--initial-branch=main"]);
+        git(path, ["config", "user.name", "Hitch Test"]);
+        git(path, ["config", "user.email", "hitch@example.test"]);
+        fs::write(path.join("tracked.txt"), "initial\n").unwrap();
+        git(path, ["add", "tracked.txt"]);
+        git(path, ["commit", "-m", "initial"]);
+    }
+
+    fn assert_git_status_clean(path: &Path) {
+        let output = std::process::Command::new("git")
+            .current_dir(path)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "git status was dirty: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    fn git<const N: usize>(cwd: &Path, args: [&str; N]) {
+        let output = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn temp_dir(name: &str) -> PathBuf {

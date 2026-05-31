@@ -5,7 +5,7 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
-use hitch_core::{AgentState, SessionId};
+use hitch_core::{AgentState, SessionId, SESSION_ID_ENV};
 use hitch_proto::transport::UnixSocketClient;
 use hitch_proto::{ControlMessage, KnownAgent, Request};
 
@@ -49,13 +49,18 @@ where
     let args = HookArgs::parse(args)?;
     let mut payload = String::new();
     stdin.read_to_string(&mut payload)?;
+    if payload.is_empty() {
+        if let Some(arg_payload) = args.payload {
+            payload = arg_payload;
+        }
+    }
 
     let state = args
         .state
         .unwrap_or_else(|| infer_state(args.agent, args.event.as_deref(), &payload));
     let cwd = match args.cwd {
         Some(cwd) => Some(cwd),
-        None => std::env::current_dir().ok(),
+        None => cwd_from_payload(&payload).or_else(|| std::env::current_dir().ok()),
     };
     let detail = args.detail.or_else(|| detail_from_payload(&payload));
 
@@ -79,6 +84,7 @@ struct HookArgs {
     session_id: Option<SessionId>,
     cwd: Option<PathBuf>,
     detail: Option<String>,
+    payload: Option<String>,
 }
 
 impl HookArgs {
@@ -93,12 +99,13 @@ impl HookArgs {
         let mut agent = None;
         let mut event = None;
         let mut state = None;
-        let mut session_id = std::env::var("HITCH_SESSION_ID")
+        let mut session_id = std::env::var(SESSION_ID_ENV)
             .ok()
             .map(|value| parse_session_id(&value))
             .transpose()?;
         let mut cwd = None;
         let mut detail = None;
+        let mut payload = None;
 
         let mut iter = args.into_iter().map(Into::into);
         while let Some(arg) = iter.next() {
@@ -116,6 +123,9 @@ impl HookArgs {
                 "--cwd" => cwd = Some(PathBuf::from(required_value(&mut iter, "--cwd")?)),
                 "--detail" => detail = Some(required_value(&mut iter, "--detail")?),
                 "--help" | "-h" => return Err(HookError::Usage(usage())),
+                other if !other.starts_with('-') && payload.is_none() => {
+                    payload = Some(other.to_owned());
+                }
                 other => {
                     return Err(HookError::Usage(format!(
                         "unknown argument: {other}\n{}",
@@ -134,6 +144,7 @@ impl HookArgs {
             session_id,
             cwd,
             detail,
+            payload,
         })
     }
 }
@@ -213,6 +224,15 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+fn cwd_from_payload(payload: &str) -> Option<PathBuf> {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()?
+        .get("cwd")?
+        .as_str()
+        .filter(|cwd| !cwd.is_empty())
+        .map(PathBuf::from)
+}
+
 fn detail_from_payload(payload: &str) -> Option<String> {
     let payload = payload.trim();
     if payload.is_empty() {
@@ -220,10 +240,24 @@ fn detail_from_payload(payload: &str) -> Option<String> {
     }
 
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
-        for key in ["message", "detail", "error", "reason", "title"] {
+        for key in [
+            "message",
+            "detail",
+            "error",
+            "reason",
+            "title",
+            "last_assistant_message",
+        ] {
             if let Some(text) = value.get(key).and_then(|value| value.as_str()) {
                 return Some(truncate(text, 240));
             }
+        }
+        if let Some(text) = value
+            .get("tool_input")
+            .and_then(|value| value.get("description"))
+            .and_then(|value| value.as_str())
+        {
+            return Some(truncate(text, 240));
         }
     }
 
@@ -349,18 +383,47 @@ mod tests {
         assert_eq!(
             infer_state(
                 KnownAgent::Codex,
-                Some("notify"),
-                r#"{"message":"permission requested"}"#
+                Some("permission-request"),
+                r#"{"tool_input":{"description":"permission requested"}}"#
             ),
             AgentState::NeedsApproval
         );
         assert_eq!(
             infer_state(
                 KnownAgent::Codex,
-                Some("notify"),
-                r#"{"message":"run completed"}"#
+                Some("stop"),
+                r#"{"last_assistant_message":"run completed"}"#
             ),
             AgentState::Completed
+        );
+    }
+
+    #[test]
+    fn hook_payload_can_arrive_as_trailing_argument() {
+        let args = HookArgs::parse([
+            "--agent",
+            "codex",
+            "--event",
+            "permission-request",
+            r#"{"message":"permission requested"}"#,
+        ])
+        .unwrap();
+        assert_eq!(
+            infer_state(
+                KnownAgent::Codex,
+                args.event.as_deref(),
+                args.payload.as_deref().unwrap()
+            ),
+            AgentState::NeedsApproval
+        );
+    }
+
+    #[test]
+    fn uses_hook_payload_cwd_when_no_cwd_arg_is_given() {
+        let payload = r#"{"cwd":"/repo/from-payload","hook_event_name":"UserPromptSubmit"}"#;
+        assert_eq!(
+            cwd_from_payload(payload),
+            Some(PathBuf::from("/repo/from-payload"))
         );
     }
 
@@ -384,7 +447,7 @@ mod tests {
                 "--agent".to_string(),
                 "codex".to_string(),
                 "--event".to_string(),
-                "notify".to_string(),
+                "permission-request".to_string(),
                 "--socket".to_string(),
                 socket_for_client.display().to_string(),
                 "--cwd".to_string(),

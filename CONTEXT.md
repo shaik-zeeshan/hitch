@@ -29,7 +29,7 @@ A known AI coding CLI that Hitch has integration for (e.g. Claude Code, Codex) �
 _Avoid_: Harness, Assistant.
 
 **Agent State**:
-The current status of an Agent running in a Session, reported by the agent's own hook system (Claude Code `Notification`/`Stop` hooks, Codex notify) over a local channel — not inferred from terminal output. Values: *running*, *needs-approval*, *completed*, *error*. A Session not running a known Agent has no Agent State.
+The current status of an Agent running in a Session, reported by the agent's own hook system (Claude Code lifecycle hooks, Codex lifecycle hooks) over a local channel — not inferred from terminal output. Values: *running*, *needs-approval*, *completed*, *error*. A Session not running a known Agent has no Agent State.
 _Avoid_: Status (too generic).
 
 **Agent Registry**:
@@ -37,7 +37,7 @@ Hitch's built-in set of known Agents (Claude Code, Codex to start), each with a 
 _Avoid_: Plugins, Providers.
 
 **Hook helper**:
-A small `hitch` CLI invoked by an Agent's installed hook; it reports the Agent's state to the **Daemon**'s local socket. Hitch installs the hook by merging it into a per-Worktree, gitignored agent-local config (e.g. `.claude/settings.local.json`) without overwriting the user's own keys.
+A small `hitch` CLI invoked by an Agent's installed hook; it reports the Agent's state to the **Daemon**'s local socket. Hitch installs the hook by merging it into a per-Worktree, gitignored agent-local config (e.g. `.claude/settings.local.json`, `.codex/hooks.json`) without overwriting the user's own keys.
 _Avoid_: Notifier, Bridge.
 
 **Job**:

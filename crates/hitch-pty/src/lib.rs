@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
-use hitch_core::SessionId;
+use hitch_core::{SessionId, SESSION_ID_ENV};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 const DEFAULT_COLS: u16 = 120;
@@ -142,9 +142,11 @@ impl ManagedPty {
         let pair = pty_system.openpty(config.size.into())?;
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
-        let child = pair
-            .slave
-            .spawn_command(build_command(&config.command, &config.cwd))?;
+        let child = pair.slave.spawn_command(build_command(
+            &config.session_id,
+            &config.command,
+            &config.cwd,
+        ))?;
         drop(pair.slave);
 
         let pty = Arc::new(Self {
@@ -259,7 +261,11 @@ fn spawn_reader_thread(
         .expect("failed to spawn PTY reader thread");
 }
 
-fn build_command(command: &Option<Vec<String>>, cwd: &Path) -> CommandBuilder {
+fn build_command(
+    session_id: &SessionId,
+    command: &Option<Vec<String>>,
+    cwd: &Path,
+) -> CommandBuilder {
     let mut builder = if let Some(command) = command {
         let mut builder = CommandBuilder::new(&command[0]);
         if command.len() > 1 {
@@ -273,6 +279,7 @@ fn build_command(command: &Option<Vec<String>>, cwd: &Path) -> CommandBuilder {
         builder
     };
     builder.env("TERM", "xterm-256color");
+    builder.env(SESSION_ID_ENV, session_id.to_string());
     builder.cwd(cwd);
     builder
 }
@@ -286,18 +293,136 @@ fn command_name_for_pid(pid: libc::pid_t) -> Option<String> {
         return None;
     }
     let path = std::str::from_utf8(&buf[..ret as usize]).ok()?;
-    std::path::Path::new(path)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
+    let executable = std::path::Path::new(path).file_name()?.to_string_lossy();
+    normalize_command_name(&executable, command_line_args_for_pid(pid).as_deref())
 }
 
 #[cfg(target_os = "linux")]
 fn command_name_for_pid(pid: libc::pid_t) -> Option<String> {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
     let name = comm.trim();
-    (!name.is_empty()).then(|| name.to_string())
+    if name.is_empty() {
+        return None;
+    }
+    let args = command_line_args_for_pid(pid);
+    normalize_command_name(name, args.as_deref())
 }
 
+fn normalize_command_name(executable: &str, args: Option<&[String]>) -> Option<String> {
+    runtime_agent_command(executable, args)
+        .map(str::to_string)
+        .or_else(|| Some(executable.to_string()))
+}
+
+fn runtime_agent_command(executable: &str, args: Option<&[String]>) -> Option<&'static str> {
+    if !executable.eq_ignore_ascii_case("node") {
+        return None;
+    }
+
+    for arg in args? {
+        if path_basename_or_stem_eq(arg, "codex") {
+            return Some("codex");
+        }
+        if path_basename_or_stem_eq(arg, "claude") || arg_contains_ascii(arg, "claude-code") {
+            return Some("claude");
+        }
+    }
+
+    None
+}
+
+fn path_basename_or_stem_eq(path: &str, expected: &str) -> bool {
+    let Some(name) = std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    name.eq_ignore_ascii_case(expected)
+        || std::path::Path::new(name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case(expected))
+}
+
+fn arg_contains_ascii(arg: &str, needle: &str) -> bool {
+    arg.as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+#[cfg(target_os = "macos")]
+fn command_line_args_for_pid(pid: libc::pid_t) -> Option<Vec<String>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size = 0_usize;
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+
+    let mut buf = vec![0_u8; size];
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    buf.truncate(size);
+    parse_macos_procargs(&buf)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_procargs(buf: &[u8]) -> Option<Vec<String>> {
+    let argc = i32::from_ne_bytes(buf.get(..std::mem::size_of::<i32>())?.try_into().ok()?);
+    if argc <= 0 {
+        return None;
+    }
+
+    let mut idx = std::mem::size_of::<i32>();
+    while idx < buf.len() && buf[idx] != 0 {
+        idx += 1;
+    }
+    while idx < buf.len() && buf[idx] == 0 {
+        idx += 1;
+    }
+
+    parse_nul_args(&buf[idx..], argc as usize)
+}
+
+#[cfg(target_os = "linux")]
+fn command_line_args_for_pid(pid: libc::pid_t) -> Option<Vec<String>> {
+    parse_nul_args(
+        &std::fs::read(format!("/proc/{pid}/cmdline")).ok()?,
+        usize::MAX,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn parse_nul_args(buf: &[u8], limit: usize) -> Option<Vec<String>> {
+    let args = buf
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .take(limit)
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect::<Vec<_>>();
+    (!args.is_empty()).then_some(args)
+}
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn command_name_for_pid(_pid: libc::pid_t) -> Option<String> {
     None
@@ -407,6 +532,38 @@ mod tests {
     }
 
     #[test]
+    fn node_runtime_commands_report_agent_cli_names() {
+        assert_eq!(
+            normalize_command_name(
+                "node",
+                Some(&[
+                    "node".into(),
+                    "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js".into(),
+                ]),
+            ),
+            Some("codex".into()),
+        );
+        assert_eq!(
+            normalize_command_name(
+                "node",
+                Some(&[
+                    "node".into(),
+                    "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js".into(),
+                ]),
+            ),
+            Some("claude".into()),
+        );
+    }
+
+    #[test]
+    fn ordinary_node_commands_still_report_node() {
+        assert_eq!(
+            normalize_command_name("node", Some(&["node".into(), "server.js".into()])),
+            Some("node".into()),
+        );
+    }
+
+    #[test]
     fn spawned_pty_streams_output_into_scrollback() {
         let (tx, rx) = mpsc::channel();
         let session_id = SessionId::new();
@@ -425,6 +582,27 @@ mod tests {
         let output = collect_output(&rx, Duration::from_secs(3));
         assert!(String::from_utf8_lossy(&output).contains("hitch-pty-test"));
         assert!(String::from_utf8_lossy(&pty.scrollback()).contains("hitch-pty-test"));
+    }
+
+    #[test]
+    fn spawned_pty_exports_hitch_session_id() {
+        let (tx, rx) = mpsc::channel();
+        let session_id = SessionId::new();
+        let pty = ManagedPty::spawn(
+            PtySpawnConfig::new(session_id, std::env::current_dir().unwrap())
+                .command(Some(vec![
+                    "/bin/sh".into(),
+                    "-lc".into(),
+                    format!("printf %s \"${SESSION_ID_ENV}\""),
+                ]))
+                .scrollback_capacity(1024),
+            tx,
+        )
+        .unwrap();
+
+        let output = collect_output(&rx, Duration::from_secs(3));
+        assert!(String::from_utf8_lossy(&output).contains(&session_id.to_string()));
+        assert!(String::from_utf8_lossy(&pty.scrollback()).contains(&session_id.to_string()));
     }
 
     fn collect_output(rx: &mpsc::Receiver<PtyEvent>, timeout: Duration) -> Vec<u8> {

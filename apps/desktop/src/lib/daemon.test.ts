@@ -20,7 +20,12 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import {
+  agentStateByProject,
+  agentStateByWorktree,
+  agentStates,
+  sessionAgents,
   applyDaemonStatus,
+  applyHitchEvent,
   applyJobProgress,
   cancellableJobForSelectedWorktree,
   cancelJob,
@@ -34,10 +39,14 @@ import {
   initDaemon,
   isJobCancellable,
   jobs,
+  projects,
   reconnect,
   restartDaemon,
   runJob,
   selectedWorktreeId,
+  sessions,
+  worktreeAgentStates,
+  worktrees,
 } from "./daemon";
 
 // Flush the StartJob promise chain (runJob -> daemonRequest -> invoke) so the
@@ -53,6 +62,12 @@ beforeEach(() => {
   daemonStatus.set("starting");
   connection.set("connecting");
   selectedWorktreeId.set(null);
+  projects.set([]);
+  worktrees.set([]);
+  sessions.set([]);
+  agentStates.set({});
+  worktreeAgentStates.set({});
+  sessionAgents.set({});
 });
 
 describe("daemon status mapping", () => {
@@ -77,6 +92,7 @@ describe("daemon status mapping", () => {
     expect(get(connection)).toBe("offline");
   });
 
+
   it("fails in-flight jobs when the daemon becomes unreachable", async () => {
     invokeMock.mockResolvedValueOnce({ type: "job-started", job_id: "j-lost" });
     const pending = runJob({ type: "push", worktree_id: "w1" });
@@ -87,6 +103,66 @@ describe("daemon status mapping", () => {
     applyDaemonStatus("unreachable", "socket closed");
     await expect(pending).rejects.toThrow(/daemon restarted/);
     expect(get(jobs)).toEqual({});
+  });
+});
+
+describe("agent state propagation", () => {
+  it("rolls hook reports up from session and worktree events", () => {
+    projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
+    worktrees.set([
+      {
+        id: "w1",
+        project_id: "p1",
+        path: "/repo",
+        branch: "main",
+        is_main: true,
+        is_hitch_managed: false,
+      },
+      {
+        id: "w2",
+        project_id: "p1",
+        path: "/repo/.hitch/worktrees/feature",
+        branch: "feature",
+        is_main: false,
+        is_hitch_managed: true,
+      },
+    ]);
+    sessions.set([
+      {
+        id: "s1",
+        name: "claude",
+        parent: { kind: "worktree", id: "w1" },
+        cwd: "/repo",
+      },
+    ]);
+
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: "s1",
+      worktree_id: "w1",
+      agent: "claude-code",
+      state: "running",
+      detail: null,
+    } as any);
+    expect(get(agentStates)).toEqual({ s1: "running" });
+    expect(get(sessionAgents)).toEqual({ s1: "claude-code" });
+    expect(get(worktreeAgentStates)).toEqual({ w1: "running" });
+    expect(get(agentStateByWorktree)).toEqual({ w1: "running" });
+    expect(get(agentStateByProject)).toEqual({ p1: "running" });
+
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: null,
+      worktree_id: "w2",
+      agent: "codex",
+      state: "needs-approval",
+      detail: "permission requested",
+    } as any);
+    expect(get(agentStateByWorktree)).toEqual({
+      w1: "running",
+      w2: "needs-approval",
+    });
+    expect(get(agentStateByProject)).toEqual({ p1: "needs-approval" });
   });
 });
 
