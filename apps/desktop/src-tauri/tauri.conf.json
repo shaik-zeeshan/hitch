@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "cargo build -p hitch-daemon && bun run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bun run build",
+    "beforeBuildCommand": "bun run prepare-daemon-sidecar && bun run build",
     "frontendDist": "../build"
   },
   "app": {

@@ -12,7 +12,7 @@
     "preview": "turbo --filter=hitch-desktop preview",
     "desktop": "bun --cwd apps/desktop tauri",
     "desktop:dev": "bun --cwd apps/desktop tauri dev",
-    "desktop:build": "cargo build -p hitch-daemon --release && bun --cwd apps/desktop tauri build",
+    "desktop:build": "bun --cwd apps/desktop tauri build",
     "rust:check": "cargo check --workspace",
     "rust:test": "cargo test --workspace"
   },
