@@ -258,16 +258,27 @@ export const agentStateByWorktree = derived(
 );
 
 export const agentStateByProject = derived(
-  [projects, worktrees, agentStateByWorktree],
-  ([$projects, $worktrees, $agentStateByWorktree]) => {
+  [projects, worktrees, agentStateByWorktree, sessions, agentStates],
+  ([$projects, $worktrees, $agentStateByWorktree, $sessions, $agentStates]) => {
     const map: Record<Id, AgentState> = {};
     for (const project of $projects) {
       const projectWorktreeIds = new Set(
         $worktrees.filter((w) => w.project_id === project.id).map((w) => w.id),
       );
-      const agg = aggregateAgentState(
-        Array.from(projectWorktreeIds, (id) => $agentStateByWorktree[id]),
+      const states = Array.from(
+        projectWorktreeIds,
+        (id) => $agentStateByWorktree[id],
       );
+      // A plain project can also host sessions parented to the project itself
+      // (not a worktree); surface their state on the project row too. Unlike a
+      // worktree badge, a project badge is not suppressed while selected, so
+      // these always count toward the aggregate.
+      for (const session of $sessions) {
+        if (session.parent.kind === "project" && session.parent.id === project.id) {
+          states.push($agentStates[session.id]);
+        }
+      }
+      const agg = aggregateAgentState(states);
       if (agg) map[project.id] = agg;
     }
     return map;

@@ -207,10 +207,13 @@ fn remove_legacy_gitignore_entries(
     Ok(true)
 }
 
-/// Whether `.gitignore` is tracked by git in `worktree_path`. Returns `true` only
-/// when git positively reports the file as tracked; a missing git binary, a
-/// non-repository directory, or an untracked file all yield `false` so the
-/// legacy cleanup still runs in the common (untracked) case.
+/// Whether `.gitignore` is tracked by git in `worktree_path`. Returns `true` when
+/// git reports the file as tracked, and — conservatively — also when git cannot
+/// be run at all (a missing or misconfigured binary), so a tracked `.gitignore`
+/// is never mutated just because we failed to ask. A successful `git` run that
+/// reports the file as untracked (including a non-repository directory, where the
+/// command exits non-zero) yields `false`, letting the legacy cleanup proceed in
+/// the common untracked case.
 fn gitignore_is_tracked(worktree_path: &Path, git_path: &Path) -> bool {
     Command::new(git_path)
         .current_dir(worktree_path)
@@ -219,8 +222,9 @@ fn gitignore_is_tracked(worktree_path: &Path, git_path: &Path) -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        // Could not even spawn git: assume tracked so we don't risk rewriting a
+        // file the user owns.
+        .map_or(true, |status| status.success())
 }
 
 fn install_claude_hooks(
@@ -441,7 +445,10 @@ fn merge_preserving_existing(base: &mut Value, overlay: Value) {
 }
 
 fn ensure_locally_excluded(worktree_path: &Path, entries: &[&str]) -> Result<bool, AgentHookError> {
-    let Some(git_dir) = resolve_git_dir(worktree_path)? else {
+    // Git reads `info/exclude` from the *common* git dir shared by every linked
+    // worktree, not from a linked worktree's per-worktree gitdir, so excludes
+    // must be written there or they are silently ignored.
+    let Some(git_dir) = resolve_common_git_dir(worktree_path)? else {
         return Ok(false);
     };
     let info_dir = git_dir.join("info");
@@ -478,6 +485,36 @@ fn ensure_locally_excluded(worktree_path: &Path, entries: &[&str]) -> Result<boo
     }
     fs::write(path, updated)?;
     Ok(true)
+}
+
+/// Resolve the *common* git directory for `worktree_path`.
+///
+/// Git applies `$GIT_DIR/info/exclude` from the common git dir, which is shared
+/// by the main worktree and every linked worktree — not from a linked worktree's
+/// per-worktree gitdir (`<repo>/.git/worktrees/<name>`). A linked worktree's
+/// gitdir contains a `commondir` file pointing at that shared dir; for the main
+/// worktree the resolved gitdir already is the common dir.
+fn resolve_common_git_dir(worktree_path: &Path) -> Result<Option<PathBuf>, AgentHookError> {
+    let Some(git_dir) = resolve_git_dir(worktree_path)? else {
+        return Ok(None);
+    };
+    let common = match fs::read_to_string(git_dir.join("commondir")) {
+        Ok(contents) => {
+            let trimmed = contents.trim();
+            let candidate = Path::new(trimmed);
+            if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                // A relative `commondir` is resolved against the gitdir. The
+                // embedded `..` segments are left for the OS to resolve at I/O
+                // time; we only ever join `info/exclude` onto this path.
+                git_dir.join(trimmed)
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => git_dir,
+        Err(err) => return Err(err.into()),
+    };
+    Ok(Some(common))
 }
 
 fn resolve_git_dir(worktree_path: &Path) -> Result<Option<PathBuf>, AgentHookError> {
@@ -759,6 +796,44 @@ mod tests {
         let exclude = fs::read_to_string(git_dir.join("info/exclude")).unwrap();
         assert!(exclude.contains(".claude/settings.local.json"));
         assert!(exclude.contains(".codex/hooks.json"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_excludes_are_honored_in_real_linked_worktree() {
+        // The real bug: Git reads `info/exclude` from the common git dir, so an
+        // exclude written into a linked worktree's per-worktree gitdir is silently
+        // ignored and the worktree shows the hook configs as untracked. Drive real
+        // `git` end-to-end to prove the installed excludes actually hide them.
+        let root = temp_dir("real-linked");
+        let main = root.join("main");
+        fs::create_dir_all(&main).unwrap();
+        // `init_git_repo` already configures a user and lands an initial commit,
+        // so the repo is ready for `git worktree add`.
+        init_git_repo(&main);
+
+        let feature = root.join("feature");
+        git(&main, ["worktree", "add", "--quiet", feature.to_str().unwrap()]);
+
+        let summary =
+            install_hooks(&feature, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+        assert!(summary.local_exclude_updated);
+
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&feature)
+            .output()
+            .expect("git status");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            !stdout.contains(".claude/settings.local.json"),
+            "claude config should be excluded, got: {stdout}"
+        );
+        assert!(
+            !stdout.contains(".codex/hooks.json"),
+            "codex config should be excluded, got: {stdout}"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

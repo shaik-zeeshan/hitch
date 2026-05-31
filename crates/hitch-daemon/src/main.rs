@@ -2348,11 +2348,20 @@ fn resolve_agent_target(
     }
 
     let worktree_id = cwd.as_deref().and_then(|cwd| {
+        // Worktrees can nest (e.g. a linked worktree under `<repo>/.hitch/...`),
+        // so several paths may prefix `cwd`. `worktrees` is a HashMap with
+        // arbitrary iteration order, so pick the deepest (longest) matching path
+        // rather than whichever happens to be visited first.
         state
             .worktrees
             .values()
-            .find(|worktree| cwd.starts_with(canonical_or_self(&worktree.path)))
-            .map(|worktree| worktree.id)
+            .filter_map(|worktree| {
+                let path = canonical_or_self(&worktree.path);
+                cwd.starts_with(&path)
+                    .then(|| (worktree.id, path.components().count()))
+            })
+            .max_by_key(|&(_, depth)| depth)
+            .map(|(id, _)| id)
     });
     Ok((session_id, worktree_id))
 }
