@@ -9,15 +9,18 @@
 //! A feature crate: depends only on `hitch-core`, never on another Hitch feature
 //! crate.
 
+use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
+use hitch_core::{ProjectId, Worktree};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-
-use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
-use hitch_core::{ProjectId, Worktree};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 use tempfile::NamedTempFile;
 
 /// Convenient result alias for git operations.
@@ -116,6 +119,14 @@ impl GitRepository {
 pub struct GitClient {
     git: PathBuf,
     gh: PathBuf,
+}
+/// Hooks a long-running `git`/`gh` child into a higher-level cancellation path.
+///
+/// The daemon's Job registry implements this so `ShutdownDaemon`/`CancelJob`
+/// can kill the subprocess group and wait for the worker to drain before exit.
+pub trait CommandControl {
+    fn is_cancelled(&self) -> bool;
+    fn set_child_pgid(&self, pgid: Option<i32>);
 }
 
 impl Default for GitClient {
@@ -251,6 +262,32 @@ impl GitClient {
         result
     }
 
+    /// Clone a repository using the system git executable.
+    pub fn clone_repo(
+        &self,
+        remote_url: &str,
+        destination: impl AsRef<Path>,
+    ) -> Result<CommandOutput> {
+        self.run_git(
+            Path::new("."),
+            vec![os("clone"), os(remote_url), path_os(destination.as_ref())],
+        )
+    }
+
+    /// Clone a repository as a cancellable child process.
+    pub fn clone_repo_with_control(
+        &self,
+        remote_url: &str,
+        destination: impl AsRef<Path>,
+        control: &dyn CommandControl,
+    ) -> Result<CommandOutput> {
+        self.run_git_with_control(
+            Path::new("."),
+            vec![os("clone"), os(remote_url), path_os(destination.as_ref())],
+            control,
+        )
+    }
+
     /// Push a branch using the system git executable.
     pub fn push(
         &self,
@@ -267,6 +304,23 @@ impl GitClient {
         self.run_git(repo_path.as_ref(), args)
     }
 
+    /// Push a branch as a cancellable child process.
+    pub fn push_with_control(
+        &self,
+        repo_path: impl AsRef<Path>,
+        remote: &str,
+        branch: &str,
+        set_upstream: bool,
+        control: &dyn CommandControl,
+    ) -> Result<CommandOutput> {
+        let mut args = vec![os("push")];
+        if set_upstream {
+            args.push(os("-u"));
+        }
+        args.extend([os(remote), os(branch)]);
+        self.run_git_with_control(repo_path.as_ref(), args, control)
+    }
+
     /// Fetch from a remote using the system git executable.
     pub fn fetch(&self, repo_path: impl AsRef<Path>, remote: &str) -> Result<CommandOutput> {
         self.run_git(repo_path.as_ref(), vec![os("fetch"), os(remote)])
@@ -280,9 +334,21 @@ impl GitClient {
         remote: &str,
         branch: &str,
     ) -> Result<CommandOutput> {
-        self.run_git(
+        self.run_git(repo_path.as_ref(), vec![os("pull"), os(remote), os(branch)])
+    }
+
+    /// Pull a branch as a cancellable child process.
+    pub fn pull_with_control(
+        &self,
+        repo_path: impl AsRef<Path>,
+        remote: &str,
+        branch: &str,
+        control: &dyn CommandControl,
+    ) -> Result<CommandOutput> {
+        self.run_git_with_control(
             repo_path.as_ref(),
             vec![os("pull"), os(remote), os(branch)],
+            control,
         )
     }
 
@@ -292,7 +358,17 @@ impl GitClient {
         repo_path: impl AsRef<Path>,
         request: &CreateWorktreeRequest,
     ) -> Result<Worktree> {
-        create_worktree_with_client(self, repo_path.as_ref(), request)
+        create_worktree_with_client(self, repo_path.as_ref(), request, None)
+    }
+
+    /// Create a Hitch-managed worktree as a cancellable child process.
+    pub fn create_worktree_with_control(
+        &self,
+        repo_path: impl AsRef<Path>,
+        request: &CreateWorktreeRequest,
+        control: &dyn CommandControl,
+    ) -> Result<Worktree> {
+        create_worktree_with_client(self, repo_path.as_ref(), request, Some(control))
     }
 
     /// Remove a worktree with git's own safety checks, keeping the branch by default.
@@ -310,15 +386,43 @@ impl GitClient {
         repo_path: impl AsRef<Path>,
         request: &CreatePrRequest,
     ) -> Result<String> {
-        create_pr_with_client(self, repo_path.as_ref(), request)
+        create_pr_with_client(self, repo_path.as_ref(), request, None)
+    }
+
+    /// Create a GitHub PR as a cancellable child process.
+    pub fn create_pr_with_control(
+        &self,
+        repo_path: impl AsRef<Path>,
+        request: &CreatePrRequest,
+        control: &dyn CommandControl,
+    ) -> Result<String> {
+        create_pr_with_client(self, repo_path.as_ref(), request, Some(control))
     }
 
     fn run_git(&self, cwd: &Path, args: Vec<OsString>) -> Result<CommandOutput> {
-        run_command(&self.git, cwd, args)
+        run_command(&self.git, cwd, args, None)
+    }
+
+    fn run_git_with_control(
+        &self,
+        cwd: &Path,
+        args: Vec<OsString>,
+        control: &dyn CommandControl,
+    ) -> Result<CommandOutput> {
+        run_command(&self.git, cwd, args, Some(control))
     }
 
     fn run_gh(&self, cwd: &Path, args: Vec<OsString>) -> Result<CommandOutput> {
-        run_command(&self.gh, cwd, args)
+        run_command(&self.gh, cwd, args, None)
+    }
+
+    fn run_gh_with_control(
+        &self,
+        cwd: &Path,
+        args: Vec<OsString>,
+        control: &dyn CommandControl,
+    ) -> Result<CommandOutput> {
+        run_command(&self.gh, cwd, args, Some(control))
     }
 }
 
@@ -815,6 +919,7 @@ fn create_worktree_with_client(
     client: &GitClient,
     repo_path: &Path,
     request: &CreateWorktreeRequest,
+    control: Option<&dyn CommandControl>,
 ) -> Result<Worktree> {
     let target = request.target_path();
     if let Some(parent) = target.parent() {
@@ -835,7 +940,10 @@ fn create_worktree_with_client(
         }
     }
 
-    client.run_git(repo_path, args)?;
+    match control {
+        Some(control) => client.run_git_with_control(repo_path, args, control)?,
+        None => client.run_git(repo_path, args)?,
+    };
     Ok(Worktree::new(
         request.project_id,
         target,
@@ -887,6 +995,7 @@ fn create_pr_with_client(
     client: &GitClient,
     repo_path: &Path,
     request: &CreatePrRequest,
+    control: Option<&dyn CommandControl>,
 ) -> Result<String> {
     let branch = match &request.head {
         Some(head) => head.clone(),
@@ -899,7 +1008,10 @@ fn create_pr_with_client(
     let remote = request.remote.as_deref().unwrap_or("origin");
 
     if branch_needs_push(repo_path, &branch)? {
-        client.push(repo_path, remote, &branch, true)?;
+        match control {
+            Some(control) => client.push_with_control(repo_path, remote, &branch, true, control)?,
+            None => client.push(repo_path, remote, &branch, true)?,
+        };
     }
 
     let mut args = vec![
@@ -919,7 +1031,10 @@ fn create_pr_with_client(
         args.push(os("--draft"));
     }
 
-    let output = client.run_gh(repo_path, args)?;
+    let output = match control {
+        Some(control) => client.run_gh_with_control(repo_path, args, control)?,
+        None => client.run_gh(repo_path, args)?,
+    };
     Ok(output.stdout.trim().to_string())
 }
 
@@ -1081,7 +1196,10 @@ fn ahead_behind(repo_path: &Path) -> Result<(u32, u32)> {
     };
     let upstream_oid = branch_target_oid(&upstream)?;
     let (ahead, behind) = repo.graph_ahead_behind(local_oid, upstream_oid)?;
-    Ok((ahead.min(u32::MAX as usize) as u32, behind.min(u32::MAX as usize) as u32))
+    Ok((
+        ahead.min(u32::MAX as usize) as u32,
+        behind.min(u32::MAX as usize) as u32,
+    ))
 }
 
 fn branch_needs_push(repo_path: &Path, branch: &str) -> Result<bool> {
@@ -1112,27 +1230,146 @@ fn branch_target_oid(branch: &git2::Branch<'_>) -> Result<Oid> {
         .ok_or_else(|| GitError::Git(git2::Error::from_str("branch has no direct target")))
 }
 
-fn run_command(program: &Path, cwd: &Path, args: Vec<OsString>) -> Result<CommandOutput> {
-    let output = Command::new(program)
+fn run_command(
+    program: &Path,
+    cwd: &Path,
+    args: Vec<OsString>,
+    control: Option<&dyn CommandControl>,
+) -> Result<CommandOutput> {
+    let Some(control) = control else {
+        let output = Command::new(program)
+            .current_dir(cwd)
+            .args(&args)
+            .output()?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        if output.status.success() {
+            return Ok(CommandOutput { stdout, stderr });
+        }
+        return Err(command_failed(
+            program,
+            cwd,
+            &args,
+            output.status.code(),
+            stdout,
+            stderr,
+        ));
+    };
+
+    if control.is_cancelled() {
+        return Err(command_failed(
+            program,
+            cwd,
+            &args,
+            None,
+            String::new(),
+            "command cancelled".to_string(),
+        ));
+    }
+
+    let mut command = Command::new(program);
+    command
         .current_dir(cwd)
         .args(&args)
-        .output()?;
-    let stdout = String::from_utf8(output.stdout)?;
-    let stderr = String::from_utf8(output.stderr)?;
-    if output.status.success() {
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command.spawn()?;
+    control.set_child_pgid(Some(child.id() as i32));
+    let stdout_reader = spawn_pipe_reader(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("failed to capture command stdout"))?,
+    );
+    let stderr_reader = spawn_pipe_reader(
+        child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("failed to capture command stderr"))?,
+    );
+
+    let mut cancelled = false;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if control.is_cancelled() => {
+                cancelled = true;
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = child.kill();
+                }
+                break child.wait()?;
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    control.set_child_pgid(None);
+
+    let stdout = String::from_utf8(join_pipe_reader(stdout_reader)?)?;
+    let stderr = String::from_utf8(join_pipe_reader(stderr_reader)?)?;
+    if status.success() && !cancelled {
         Ok(CommandOutput { stdout, stderr })
     } else {
-        Err(GitError::CommandFailed {
-            program: program.to_string_lossy().into_owned(),
-            args: args
-                .iter()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect(),
-            cwd: cwd.to_path_buf(),
-            code: output.status.code(),
-            stdout: stdout.into_boxed_str(),
-            stderr: stderr.into_boxed_str(),
-        })
+        Err(command_failed(
+            program,
+            cwd,
+            &args,
+            status.code(),
+            stdout,
+            if cancelled && stderr.trim().is_empty() {
+                "command cancelled".to_string()
+            } else {
+                stderr
+            },
+        ))
+    }
+}
+
+fn spawn_pipe_reader<R: Read + Send + 'static>(
+    mut pipe: R,
+) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        pipe.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn join_pipe_reader(
+    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> std::io::Result<Vec<u8>> {
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::other("command output reader panicked")),
+    }
+}
+
+fn command_failed(
+    program: &Path,
+    cwd: &Path,
+    args: &[OsString],
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+) -> GitError {
+    GitError::CommandFailed {
+        program: program.to_string_lossy().into_owned(),
+        args: args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
+        cwd: cwd.to_path_buf(),
+        code,
+        stdout: stdout.into_boxed_str(),
+        stderr: stderr.into_boxed_str(),
     }
 }
 
@@ -1559,7 +1796,9 @@ mod tests {
         fixture.git(["checkout", "--orphan", "feature/unborn"]);
         fixture.git(["rm", "-rf", "--cached", "."]);
 
-        assert!(commits_since(fixture.path(), "main", 10).unwrap().is_empty());
+        assert!(commits_since(fixture.path(), "main", 10)
+            .unwrap()
+            .is_empty());
         assert!(changed_paths_since(fixture.path(), "main")
             .unwrap()
             .is_empty());
@@ -1862,6 +2101,143 @@ mod tests {
 
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    }
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    };
+
+    struct TestControl {
+        cancelled: AtomicBool,
+        pgids: Mutex<Vec<Option<i32>>>,
+        cancel_on_clear: bool,
+    }
+
+    impl TestControl {
+        fn new(cancel_on_clear: bool) -> Self {
+            Self {
+                cancelled: AtomicBool::new(false),
+                pgids: Mutex::new(Vec::new()),
+                cancel_on_clear,
+            }
+        }
+
+        fn cancel(&self) {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl CommandControl for TestControl {
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+
+        fn set_child_pgid(&self, pgid: Option<i32>) {
+            self.pgids.lock().unwrap().push(pgid);
+            if self.cancel_on_clear && pgid.is_none() {
+                self.cancel();
+            }
+        }
+    }
+
+    #[test]
+    fn run_command_keeps_success_when_cancellation_arrives_after_exit() {
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("git-success");
+        fs::write(&script, "#!/bin/sh\nprintf 'done'\n").unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let control = TestControl::new(true);
+        let output = run_command(&script, temp.path(), Vec::new(), Some(&control)).unwrap();
+
+        assert_eq!(output.stdout, "done");
+        assert_eq!(output.stderr, "");
+        assert!(
+            control.is_cancelled(),
+            "test precondition: cancel should flip after exit"
+        );
+        let pgids = control.pgids.lock().unwrap();
+        assert!(pgids.first().is_some_and(|pgid| pgid.is_some()));
+        assert_eq!(pgids.last().copied(), Some(None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_reports_mid_flight_cancellation() {
+        use std::time::Duration;
+
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("git-sleep");
+        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let control = std::sync::Arc::new(TestControl::new(false));
+        let cancel = std::sync::Arc::clone(&control);
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel.cancel();
+        });
+
+        let err =
+            run_command(&script, temp.path(), Vec::new(), Some(control.as_ref())).unwrap_err();
+        trigger.join().unwrap();
+
+        match err {
+            GitError::CommandFailed { stderr, .. } => assert!(stderr.contains("command cancelled")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let pgids = control.pgids.lock().unwrap();
+        assert!(pgids.first().is_some_and(|pgid| pgid.is_some()));
+        assert_eq!(pgids.last().copied(), Some(None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controlled_clone_kills_the_child_when_cancelled() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("git-sleep");
+        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let client = GitClient::with_programs(&script, &script);
+        let control = Arc::new(TestControl::new(false));
+        let cancel = Arc::clone(&control);
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel.cancel();
+        });
+        let started = Instant::now();
+        let err = client
+            .clone_repo_with_control(
+                "https://example.com/repo.git",
+                temp.path().join("target"),
+                control.as_ref(),
+            )
+            .unwrap_err();
+        trigger.join().unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancellation should not wait for the full child runtime"
+        );
+        match err {
+            GitError::CommandFailed { stderr, .. } => {
+                assert!(stderr.contains("command cancelled"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let pgids = control.pgids.lock().unwrap();
+        assert!(pgids.first().is_some_and(|pgid| pgid.is_some()));
+        assert_eq!(pgids.last().copied(), Some(None));
     }
 
     #[allow(dead_code)]

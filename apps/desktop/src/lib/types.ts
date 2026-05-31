@@ -33,6 +33,19 @@ export type Session = {
 
 export type AgentState = "running" | "needs-approval" | "completed" | "error";
 
+// Daemon Status — the daemon process's own liveness, distinct from this window's
+// socket link (CONTEXT.md, ADR 0009). Mirrors src-tauri's `DaemonStatus`.
+export type DaemonStatus = "starting" | "running" | "unreachable" | "failed";
+
+// Lifecycle of an async Job (CONTEXT.md, ADR 0008). Mirrors hitch-proto's
+// `JobStatus`.
+export type JobStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
 export type FileStatus =
   | "added"
   | "modified"
@@ -88,6 +101,47 @@ export type BranchSummary = {
 };
 
 export type Request = { type: string; [key: string]: unknown };
+
+// Shared allowlist accepted inside `start-job`. Keep this in lockstep with
+// hitch-proto's `JobRequest` so the desktop cannot advertise unsupported work.
+export type JobRequest =
+  | {
+      type: "clone-project";
+      remote_url: string;
+      destination: string;
+      name: string | null;
+    }
+  | {
+      type: "create-worktree";
+      project_id: Id;
+      branch: string;
+      base: string | null;
+      mode: "new-branch" | "existing-branch";
+    }
+  | { type: "list-draft-models"; provider: string }
+  | {
+      type: "generate-commit-draft";
+      worktree_id: Id;
+      settings: { provider: string; model: string | null } | null;
+    }
+  | {
+      type: "generate-pull-request-draft";
+      worktree_id: Id;
+      base: string | null;
+      settings: { provider: string; model: string | null } | null;
+    }
+  | { type: "push"; worktree_id: Id }
+  | { type: "pull"; worktree_id: Id }
+  | {
+      type: "create-pull-request";
+      worktree_id: Id;
+      title: string;
+      body: string | null;
+      base: string | null;
+      draft: boolean;
+    };
+
+export type StartJobRequest = { type: "start-job"; request: JobRequest };
 export type Response = { type: string; [key: string]: unknown };
 export type HitchEvent = { type: string; [key: string]: unknown };
 

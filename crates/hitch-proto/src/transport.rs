@@ -217,6 +217,7 @@ mod tests {
                 1,
                 Response::Hello {
                     protocol_version: PROTOCOL_VERSION,
+                    daemon_pid: 42,
                 },
             ))
             .unwrap();
@@ -240,6 +241,7 @@ mod tests {
                 1,
                 Response::Hello {
                     protocol_version: PROTOCOL_VERSION,
+                    daemon_pid: 42,
                 }
             )]
         );

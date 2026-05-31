@@ -7,12 +7,19 @@
 use std::path::PathBuf;
 
 use hitch_core::{
-    AgentState, Project, ProjectId, Session, SessionId, SessionParent, Worktree, WorktreeId,
+    AgentState, JobId, Project, ProjectId, Session, SessionId, SessionParent, Worktree, WorktreeId,
 };
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version for daemon/socket compatibility checks.
-pub const PROTOCOL_VERSION: u16 = 7;
+///
+/// v8 added the `Ping`/`Pong` heartbeat (ADR 0009) and the async **Job**
+/// messages — `StartJob`/`CancelJob`, `JobStarted`, and the `JobProgress`/
+/// `JobCompleted` events (ADR 0008). v9 extends `JobProgress` with optional
+/// job-kind metadata so reconnecting clients can rebuild the live Job store. v10
+/// adds the daemon pid to `Response::Hello` so a heartbeat-wedged daemon can be
+/// force-restarted by pid.
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -44,6 +51,51 @@ impl ControlMessage {
     pub fn event(event: Event) -> Self {
         Self::Event { event }
     }
+}
+
+/// Long-running daemon operations that may run as an async **Job** (ADR 0008).
+/// This is the exact allowlist accepted by [`Request::StartJob`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum JobRequest {
+    /// Clone a remote into `destination` and add it as a project.
+    CloneProject {
+        remote_url: String,
+        destination: PathBuf,
+        name: Option<String>,
+    },
+    /// Create a managed worktree on a new or existing branch.
+    CreateWorktree {
+        project_id: ProjectId,
+        branch: String,
+        base: Option<String>,
+        mode: WorktreeCreateMode,
+    },
+    /// List available Draft Generator models for a provider.
+    ListDraftModels { provider: DraftProvider },
+    /// Generate a commit draft from staged changes.
+    GenerateCommitDraft {
+        worktree_id: WorktreeId,
+        settings: Option<DraftGenerationSettings>,
+    },
+    /// Generate a pull-request draft from branch context relative to `base`.
+    GeneratePullRequestDraft {
+        worktree_id: WorktreeId,
+        base: Option<String>,
+        settings: Option<DraftGenerationSettings>,
+    },
+    /// Push the current branch using the system `git` CLI.
+    Push { worktree_id: WorktreeId },
+    /// Pull the current branch from its upstream using the system `git` CLI.
+    Pull { worktree_id: WorktreeId },
+    /// Create a GitHub PR through `gh`.
+    CreatePullRequest {
+        worktree_id: WorktreeId,
+        title: String,
+        body: Option<String>,
+        base: Option<String>,
+        draft: bool,
+    },
 }
 
 /// Client/hook commands accepted by the daemon.
@@ -185,6 +237,140 @@ pub enum Request {
         cwd: Option<PathBuf>,
         detail: Option<String>,
     },
+
+    /// Liveness heartbeat (ADR 0009). The daemon replies with [`Response::Pong`].
+    /// A responsive `Pong` is what makes the GUI's *running* status mean
+    /// *responsive*, not merely socket-open.
+    Ping,
+    /// Run a long-running request off the per-client request loop as a **Job**
+    /// (ADR 0008). The daemon replies immediately with [`Response::JobStarted`]
+    /// and later broadcasts [`Event::JobCompleted`] carrying the wrapped
+    /// request's final [`Response`]. Only [`JobRequest`] variants are accepted
+    /// here; fast git reads stay synchronous.
+    StartJob { request: JobRequest },
+    /// Cancel a running Job, signalling its worker to kill any git/agent child.
+    CancelJob { job_id: JobId },
+}
+
+impl From<JobRequest> for Request {
+    fn from(request: JobRequest) -> Self {
+        match request {
+            JobRequest::CloneProject {
+                remote_url,
+                destination,
+                name,
+            } => Request::CloneProject {
+                remote_url,
+                destination,
+                name,
+            },
+            JobRequest::CreateWorktree {
+                project_id,
+                branch,
+                base,
+                mode,
+            } => Request::CreateWorktree {
+                project_id,
+                branch,
+                base,
+                mode,
+            },
+            JobRequest::ListDraftModels { provider } => Request::ListDraftModels { provider },
+            JobRequest::GenerateCommitDraft {
+                worktree_id,
+                settings,
+            } => Request::GenerateCommitDraft {
+                worktree_id,
+                settings,
+            },
+            JobRequest::GeneratePullRequestDraft {
+                worktree_id,
+                base,
+                settings,
+            } => Request::GeneratePullRequestDraft {
+                worktree_id,
+                base,
+                settings,
+            },
+            JobRequest::Push { worktree_id } => Request::Push { worktree_id },
+            JobRequest::Pull { worktree_id } => Request::Pull { worktree_id },
+            JobRequest::CreatePullRequest {
+                worktree_id,
+                title,
+                body,
+                base,
+                draft,
+            } => Request::CreatePullRequest {
+                worktree_id,
+                title,
+                body,
+                base,
+                draft,
+            },
+        }
+    }
+}
+
+impl TryFrom<Request> for JobRequest {
+    type Error = Request;
+
+    fn try_from(request: Request) -> Result<Self, Self::Error> {
+        match request {
+            Request::CloneProject {
+                remote_url,
+                destination,
+                name,
+            } => Ok(JobRequest::CloneProject {
+                remote_url,
+                destination,
+                name,
+            }),
+            Request::CreateWorktree {
+                project_id,
+                branch,
+                base,
+                mode,
+            } => Ok(JobRequest::CreateWorktree {
+                project_id,
+                branch,
+                base,
+                mode,
+            }),
+            Request::ListDraftModels { provider } => Ok(JobRequest::ListDraftModels { provider }),
+            Request::GenerateCommitDraft {
+                worktree_id,
+                settings,
+            } => Ok(JobRequest::GenerateCommitDraft {
+                worktree_id,
+                settings,
+            }),
+            Request::GeneratePullRequestDraft {
+                worktree_id,
+                base,
+                settings,
+            } => Ok(JobRequest::GeneratePullRequestDraft {
+                worktree_id,
+                base,
+                settings,
+            }),
+            Request::Push { worktree_id } => Ok(JobRequest::Push { worktree_id }),
+            Request::Pull { worktree_id } => Ok(JobRequest::Pull { worktree_id }),
+            Request::CreatePullRequest {
+                worktree_id,
+                title,
+                body,
+                base,
+                draft,
+            } => Ok(JobRequest::CreatePullRequest {
+                worktree_id,
+                title,
+                body,
+                base,
+                draft,
+            }),
+            other => Err(other),
+        }
+    }
 }
 
 /// How a worktree branch should be selected when creating a worktree.
@@ -214,6 +400,7 @@ pub enum Response {
     /// Successful compatibility handshake.
     Hello {
         protocol_version: u16,
+        daemon_pid: u32,
     },
     /// Command succeeded and has no body.
     Ack,
@@ -251,10 +438,30 @@ pub enum Response {
         provider: DraftProvider,
         models: Vec<String>,
     },
+    /// Heartbeat reply to [`Request::Ping`] (ADR 0009).
+    Pong,
+    /// A Job was accepted and is now running off the request loop (ADR 0008).
+    /// The wrapped request's real [`Response`] arrives later inside
+    /// [`Event::JobCompleted`].
+    JobStarted {
+        job_id: JobId,
+    },
     /// Command failed. Kept in-band so clients can correlate by request id.
     Error {
         error: ProtocolError,
     },
+}
+
+/// Lifecycle of an async **Job** (`CONTEXT.md`). A Job is *queued*, then
+/// *running*, and finishes in exactly one terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum JobStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
 }
 
 /// Server-push notifications delivered by the daemon to clients.
@@ -301,6 +508,24 @@ pub enum Event {
     SessionCommand {
         session_id: SessionId,
         command: Option<String>,
+    },
+    /// A **Job** changed lifecycle state or emitted a progress note (ADR 0008).
+    /// Broadcast to every attached GUI; clients track it by `job_id`.
+    JobProgress {
+        job_id: JobId,
+        status: JobStatus,
+        /// Optional human-readable progress note (e.g. "Pushing…").
+        message: Option<String>,
+        /// Stable UI-facing job kind (e.g. `push`, `pr-draft`) when known.
+        kind: Option<String>,
+    },
+    /// A **Job** finished. The wrapped request's final [`Response`] rides inside
+    /// (`Response::Ack` / `PullRequestCreated` / `CommitDraft` / …, or
+    /// `Response::Error` on failure). The GUI resolves the awaiting caller from
+    /// this. Boxed because [`Response`] is large relative to the other variants.
+    JobCompleted {
+        job_id: JobId,
+        response: Box<Response>,
     },
 }
 
@@ -451,6 +676,16 @@ mod tests {
     }
 
     #[test]
+    fn job_request_variants_round_trip() {
+        let (project_id, worktree_id, _) = ids();
+        for request in sample_job_requests(project_id, worktree_id) {
+            let json = serde_json::to_string(&request).unwrap();
+            let back: JobRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(request, back, "failed to round-trip {json}");
+        }
+    }
+
+    #[test]
     fn response_variants_round_trip() {
         for response in sample_responses() {
             let json = serde_json::to_string(&response).unwrap();
@@ -532,6 +767,71 @@ mod tests {
         assert!(crate::MESSAGE_CATALOG.contains("Event:"));
         assert!(crate::MESSAGE_CATALOG.contains("session-output"));
         assert!(crate::MESSAGE_CATALOG.contains("worktree-dirty"));
+        // v8 heartbeat + Job families (ADR 0008/0009).
+        assert!(crate::MESSAGE_CATALOG.contains("ping"));
+        assert!(crate::MESSAGE_CATALOG.contains("start-job"));
+        assert!(crate::MESSAGE_CATALOG.contains("job-completed"));
+    }
+
+    #[test]
+    fn ping_pong_serialize_as_bare_tagged_variants() {
+        // The heartbeat carries no payload: a bare `{"type":"ping"}` /
+        // `{"type":"pong"}`. This is the contract the GUI's heartbeat thread
+        // round-trips on every interval (ADR 0009).
+        let ping: serde_json::Value = serde_json::to_value(Request::Ping).unwrap();
+        assert_eq!(ping["type"], "ping");
+        let pong: serde_json::Value = serde_json::to_value(Response::Pong).unwrap();
+        assert_eq!(pong["type"], "pong");
+    }
+
+    #[test]
+    fn job_messages_wrap_inner_request_and_response_as_contract() {
+        let (_, worktree_id, _) = ids();
+        let job_id = JobId::new();
+
+        // StartJob wraps only the supported JobRequest allowlist.
+        let start = Request::StartJob {
+            request: JobRequest::Push { worktree_id },
+        };
+        let value: serde_json::Value = serde_json::to_value(&start).unwrap();
+        assert_eq!(value["type"], "start-job");
+        assert_eq!(value["request"]["type"], "push");
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(start, back);
+
+        let unsupported = serde_json::json!({
+            "type": "start-job",
+            "request": {
+                "type": "git-status",
+                "worktree_id": worktree_id,
+            },
+        });
+        serde_json::from_value::<Request>(unsupported).unwrap_err();
+
+        // JobCompleted carries the wrapped request's real Response inside.
+        let completed = Event::JobCompleted {
+            job_id,
+            response: Box::new(Response::PullRequestCreated {
+                url: "https://example/pull/1".into(),
+            }),
+        };
+        let value: serde_json::Value = serde_json::to_value(&completed).unwrap();
+        assert_eq!(value["type"], "job-completed");
+        assert_eq!(value["response"]["type"], "pull-request-created");
+        let back: Event = serde_json::from_value(value).unwrap();
+        assert_eq!(completed, back);
+
+        // JobStatus stringifies kebab-case so the frontend store can match it,
+        // and reconnect snapshots can carry the original UI job kind.
+        let progress: serde_json::Value = serde_json::to_value(Event::JobProgress {
+            job_id,
+            status: JobStatus::Cancelled,
+            message: None,
+            kind: Some("push".into()),
+        })
+        .unwrap();
+        assert_eq!(progress["status"], "cancelled");
+        assert_eq!(progress["kind"], "push");
     }
 
     fn ids() -> (ProjectId, WorktreeId, SessionId) {
@@ -555,6 +855,49 @@ mod tests {
             branch: "feat/proto".into(),
             is_main: false,
         }
+    }
+
+    fn sample_job_requests(project_id: ProjectId, worktree_id: WorktreeId) -> Vec<JobRequest> {
+        vec![
+            JobRequest::CloneProject {
+                remote_url: "https://example.com/hitch.git".into(),
+                destination: "/Users/me/Code/hitch".into(),
+                name: Some("hitch".into()),
+            },
+            JobRequest::CreateWorktree {
+                project_id,
+                branch: "feat/proto".into(),
+                base: Some("main".into()),
+                mode: WorktreeCreateMode::NewBranch,
+            },
+            JobRequest::ListDraftModels {
+                provider: DraftProvider::Codex,
+            },
+            JobRequest::GenerateCommitDraft {
+                worktree_id,
+                settings: Some(DraftGenerationSettings {
+                    provider: DraftProvider::Claude,
+                    model: Some("sonnet".into()),
+                }),
+            },
+            JobRequest::GeneratePullRequestDraft {
+                worktree_id,
+                base: Some("main".into()),
+                settings: Some(DraftGenerationSettings {
+                    provider: DraftProvider::Codex,
+                    model: Some("gpt-5-codex".into()),
+                }),
+            },
+            JobRequest::Push { worktree_id },
+            JobRequest::Pull { worktree_id },
+            JobRequest::CreatePullRequest {
+                worktree_id,
+                title: "Add proto".into(),
+                body: Some("Body".into()),
+                base: Some("main".into()),
+                draft: true,
+            },
+        ]
     }
 
     fn sample_session(worktree_id: WorktreeId, session_id: SessionId) -> Session {
@@ -708,6 +1051,13 @@ mod tests {
                 cwd: Some("/repo".into()),
                 detail: Some("permission prompt".into()),
             },
+            Request::Ping,
+            Request::StartJob {
+                request: JobRequest::Push { worktree_id },
+            },
+            Request::CancelJob {
+                job_id: JobId::new(),
+            },
         ]
     }
 
@@ -719,6 +1069,7 @@ mod tests {
         vec![
             Response::Hello {
                 protocol_version: PROTOCOL_VERSION,
+                daemon_pid: 42,
             },
             Response::Ack,
             Response::Projects {
@@ -755,6 +1106,10 @@ mod tests {
             Response::DraftModels {
                 provider: DraftProvider::Codex,
                 models: vec!["gpt-5-codex".into(), "gpt-5".into()],
+            },
+            Response::Pong,
+            Response::JobStarted {
+                job_id: JobId::new(),
             },
             Response::Error {
                 error: ProtocolError::new(ErrorCode::Unavailable, "daemon busy").retryable(true),
@@ -798,6 +1153,16 @@ mod tests {
             Event::SessionCommand {
                 session_id,
                 command: None,
+            },
+            Event::JobProgress {
+                job_id: JobId::new(),
+                status: JobStatus::Running,
+                message: Some("Pushing…".into()),
+                kind: Some("push".into()),
+            },
+            Event::JobCompleted {
+                job_id: JobId::new(),
+                response: Box::new(Response::Ack),
             },
         ]
     }

@@ -1560,6 +1560,7 @@ version = "0.1.0"
 dependencies = [
  "hitch-core",
  "hitch-proto",
+ "libc",
  "objc2",
  "objc2-foundation",
  "serde",
@@ -1576,6 +1577,7 @@ version = "0.1.0"
 dependencies = [
  "git2",
  "hitch-core",
+ "libc",
  "tempfile",
 ]
 

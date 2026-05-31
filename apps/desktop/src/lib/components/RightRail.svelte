@@ -5,6 +5,8 @@
   // the selection + loads the diff text). Branch-level +/− stats live in the
   // tree; this panel focuses on file status and commit actions.
   import {
+    cancelJob,
+    cancellableJobForSelectedWorktree,
     commit,
     defaultBase,
     diffPath,
@@ -41,6 +43,8 @@
   const ahead = $derived($gitStatus?.ahead ?? 0);
   const behind = $derived($gitStatus?.behind ?? 0);
   const isDefaultBranch = $derived(Boolean($defaultBase && $gitStatus?.branch === $defaultBase));
+
+  const cancellableJob = $derived($cancellableJobForSelectedWorktree);
 
   let autoRunning = $state(false);
 
@@ -151,6 +155,15 @@
         <span class="from">from {$defaultBase}</span>
       {/if}
       <span class="branch-acts">
+        {#if cancellableJob}
+          <button
+            class="chip cancel"
+            title="Cancel the running operation"
+            onclick={() => void cancelJob(cancellableJob.id)}
+          >
+            Cancel
+          </button>
+        {/if}
         {#if files.length > 0}
           {#if $autoCommitPush}
             <button
@@ -331,6 +344,13 @@
   }
   .chip .ar.down {
     color: var(--warn);
+  }
+  :global(.chip.cancel) {
+    color: oklch(80% 0.08 25);
+    border-color: oklch(58% 0.14 25 / 0.4);
+  }
+  :global(.chip.cancel:hover) {
+    color: var(--err);
   }
   .branch-acts {
     margin-left: auto;

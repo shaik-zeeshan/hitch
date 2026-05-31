@@ -63,6 +63,13 @@ id_type! {
     SessionId
 }
 
+id_type! {
+    /// Identifies a long-running daemon **Job** (see `CONTEXT.md`). Jobs are
+    /// ephemeral and never persisted, but they still get an opaque random id so
+    /// the GUI can correlate `JobStarted` / `JobProgress` / `JobCompleted`.
+    JobId
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

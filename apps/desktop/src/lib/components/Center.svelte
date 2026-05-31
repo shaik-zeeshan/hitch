@@ -1,6 +1,8 @@
 <script lang="ts">
-  // Center column (mockup .center): connection banner, then either an empty
-  // prompt or the session tabs + live terminals for the active parent. Every
+  // Center column (mockup .center): the session tabs + live terminals for the
+  // active parent, or an empty state — no project, no worktree, no live session,
+  // or the daemon being unavailable (its status detail + restart live in the top
+  // nav; here we just stand in for the terminal it can't provide). Every
   // open session — across ALL parents, not just the active one — keeps a live
   // (warm) xterm: we render the keyed list off `$sessions` and toggle
   // VISIBILITY rather than mounting/unmounting per tab, diff, or worktree
@@ -39,15 +41,6 @@
 </script>
 
 <main class="center">
-  {#if $connection === "offline"}
-    <div class="banner offline">
-      {$error ?? "Daemon offline — sessions are detached."}
-      <button class="pill" onclick={() => void reconnect()}>Reconnect</button>
-    </div>
-  {:else if $connection === "connecting"}
-    <div class="banner connecting">Starting daemon…</div>
-  {/if}
-
   {#if $selectedParent}
     <SessionTabs parent={$selectedParent} />
   {/if}
@@ -61,13 +54,34 @@
   <div class="view">
     {#each $sessions as session (session.id)}
       {@const inActiveParent = sessionBelongsTo(session, $selectedParent)}
-      {@const visible = inActiveParent && session.id === $activeSessionId && !$diffActive}
+      {@const visible =
+        $connection === "ready" &&
+        inActiveParent &&
+        session.id === $activeSessionId &&
+        !$diffActive}
       <div class="slot" class:hidden={!visible}>
         <Terminal {session} active={visible} />
       </div>
     {/each}
 
-    {#if !$selectedProject}
+    {#if $connection !== "ready"}
+      <!-- The daemon owns every PTY, so without it there's nothing live to show.
+           Replace the terminal with a state that explains the situation and
+           offers a way back rather than leaving a stale, detached buffer up. -->
+      <div class="empty">
+        {#if $connection === "connecting"}
+          <h3>Starting daemon…</h3>
+          <p>Connecting to the Hitch daemon that owns your sessions.</p>
+        {:else}
+          <h3>Daemon offline</h3>
+          <p>
+            {$error ??
+              "The Hitch daemon isn't running. Sessions are detached, but their output is preserved and will reattach once it's back."}
+          </p>
+          <button class="action" onclick={() => void reconnect()}>Reconnect</button>
+        {/if}
+      </div>
+    {:else if !$selectedProject}
       <div class="empty">
         <h3>No project selected</h3>
         <p>Add a local repo or folder, then pick a worktree to open sessions.</p>
@@ -151,34 +165,22 @@
     font-family: var(--mono);
     color: var(--tx-md);
   }
-
-  .banner {
-    flex: none;
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    padding: 9px 14px;
-    font-size: 12px;
-  }
-  .banner.offline {
-    background: oklch(58% 0.14 25 / 0.14);
-    border-bottom: 1px solid oklch(58% 0.14 25 / 0.3);
-    color: oklch(86% 0.06 25);
-  }
-  .banner.connecting {
-    background: oklch(60% 0.08 265 / 0.12);
-    border-bottom: 1px solid var(--line);
-    color: var(--tx-md);
-  }
-  .banner .pill {
-    margin-left: auto;
-    padding: 4px 10px;
-    font-size: 11px;
+  .empty .action {
+    margin-top: 5px;
+    padding: 5px 12px;
+    font: inherit;
+    font-size: 11.5px;
     border-radius: var(--radius);
-    background: transparent;
+    border: 1px solid var(--line);
+    background: var(--bg-3);
+    color: var(--tx-md);
     cursor: pointer;
-    font-family: var(--ui);
-    border: 1px solid oklch(58% 0.14 25 / 0.45);
-    color: oklch(88% 0.05 25);
+    transition:
+      background var(--t-fast),
+      color var(--t-fast);
+  }
+  .empty .action:hover {
+    background: var(--bg-4);
+    color: var(--tx-hi);
   }
 </style>
