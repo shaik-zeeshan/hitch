@@ -256,6 +256,9 @@ struct HitchClientInner {
     /// Set while a recovery loop is in flight so a burst of disconnect signals
     /// (reader error + missed heartbeat) starts exactly one recovery.
     recovering: AtomicBool,
+    /// Set while the user-requested restart path intentionally drops the old
+    /// socket. EOF from that socket is expected and must not start auto-recovery.
+    suppress_recovery: AtomicBool,
     /// Daemon log path, computed once from `$HOME` to match the daemon writer.
     log_path: PathBuf,
 }
@@ -280,6 +283,7 @@ impl HitchClient {
             reason: Mutex::new(None),
             restart_guard: Mutex::new(CrashLoopGuard::new(CRASH_LOOP_MAX, CRASH_LOOP_WINDOW)),
             recovering: AtomicBool::new(false),
+            suppress_recovery: AtomicBool::new(false),
             log_path: daemon_log_path(),
         }))
     }
@@ -377,30 +381,79 @@ impl HitchClient {
             client_name: "hitch-desktop".into(),
             protocol_version: PROTOCOL_VERSION,
         };
-        let outcome = match self.send_request(app, hello.clone())? {
-            Response::Hello { .. } => Ok(()),
+        let outcome = match self.send_request(app, hello.clone()) {
+            Ok(Response::Hello { .. }) => Ok(()),
             // Any Hello error means the running daemon is incompatible — restart
             // regardless of error code (old daemons may serialize codes this
             // client can't parse).
-            Response::Error { error } => {
+            Ok(Response::Error { error }) => {
                 self.restart_daemon(
                     app,
                     format!("restarting incompatible daemon: {}", error.message),
                 )?;
-                match self.send_request(app, hello)? {
-                    Response::Hello { .. } => Ok(()),
-                    Response::Error { error } => Err(error.message),
-                    other => Err(format!(
+                match self.send_request(app, hello) {
+                    Ok(Response::Hello { .. }) => Ok(()),
+                    Ok(Response::Error { error }) => Err(error.message),
+                    Ok(other) => Err(format!(
                         "unexpected hello response after daemon restart: {other:?}"
                     )),
+                    Err(err) => Err(err),
                 }
             }
-            other => Err(format!("unexpected hello response: {other:?}")),
+            Ok(other) => Err(format!("unexpected hello response: {other:?}")),
+            Err(err) => Err(err),
         };
-        if outcome.is_ok() {
-            self.set_status(app, DaemonStatus::Running, None);
+        match outcome {
+            Ok(()) => {
+                self.set_status(app, DaemonStatus::Running, None);
+                Ok(())
+            }
+            Err(err) => {
+                if self.is_connected() {
+                    self.handle_connection_lost(app, &format!("daemon handshake failed: {err}"));
+                }
+                Err(err)
+            }
         }
-        outcome
+    }
+
+    fn handshake_after_restart(&self, app: &AppHandle) -> Result<(), String> {
+        match self.send_request(
+            app,
+            Request::Hello {
+                client_name: "hitch-desktop".into(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+        ) {
+            Ok(Response::Hello { .. }) => {
+                self.set_status(app, DaemonStatus::Running, None);
+                let _ = app.emit("hitch-reconnected", ());
+                Ok(())
+            }
+            Ok(Response::Error { error }) => {
+                let reason = format!("daemon hello failed after restart: {}", error.message);
+                self.mark_disconnected(app, reason.clone());
+                self.set_status(app, DaemonStatus::Unreachable, Some(reason.clone()));
+                Err(reason)
+            }
+            Ok(other) => {
+                let reason = format!("unexpected hello response after restart: {other:?}");
+                self.mark_disconnected(app, reason.clone());
+                self.set_status(app, DaemonStatus::Unreachable, Some(reason.clone()));
+                Err(reason)
+            }
+            Err(err) => {
+                let reason = format!("daemon hello failed after restart: {err}");
+                self.mark_disconnected(app, reason.clone());
+                self.set_status(app, DaemonStatus::Unreachable, Some(reason.clone()));
+                Err(reason)
+            }
+        }
+    }
+
+    fn restart_daemon_and_handshake(&self, app: &AppHandle, reason: String) -> Result<(), String> {
+        self.restart_daemon(app, reason)?;
+        self.handshake_after_restart(app)
     }
 
     fn attach_stream(&self, app: &AppHandle, stream: UnixStream) -> Result<(), String> {
@@ -456,21 +509,26 @@ impl HitchClient {
     }
 
     fn restart_daemon(&self, app: &AppHandle, reason: String) -> Result<(), String> {
-        self.request_daemon_shutdown();
-        self.mark_disconnected(app, reason);
-        self.set_status(app, DaemonStatus::Starting, None);
+        self.0.suppress_recovery.store(true, Ordering::SeqCst);
+        let result = (|| {
+            self.request_daemon_shutdown();
+            self.mark_disconnected(app, reason);
+            self.set_status(app, DaemonStatus::Starting, None);
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if UnixStream::connect(&self.0.socket_path).is_err() {
-                break;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if UnixStream::connect(&self.0.socket_path).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
             }
-            thread::sleep(Duration::from_millis(100));
-        }
 
-        self.spawn_daemon()?;
-        let stream = self.wait_for_daemon()?;
-        self.attach_stream(app, stream)
+            self.spawn_daemon()?;
+            let stream = self.wait_for_daemon()?;
+            self.attach_stream(app, stream)
+        })();
+        self.0.suppress_recovery.store(false, Ordering::SeqCst);
+        result
     }
 
     fn send_request(&self, app: &AppHandle, request: Request) -> Result<Response, String> {
@@ -616,6 +674,9 @@ impl HitchClient {
     /// auto-recovery (ADR 0009). The deliberate restart path (`restart_daemon`)
     /// does NOT route through here — it manages its own reconnect.
     fn handle_connection_lost(&self, app: &AppHandle, reason: &str) {
+        if self.0.suppress_recovery.load(Ordering::SeqCst) {
+            return;
+        }
         self.mark_disconnected(app, reason.to_string());
         // Socket-absent reads as `unreachable`; recovery refines this to
         // `starting` while retrying and `failed` if the crash-loop guard trips.
@@ -654,7 +715,12 @@ impl HitchClient {
         let mut delay = Duration::from_millis(300);
         let max_delay = Duration::from_secs(5);
         loop {
-            if self.is_connected() {
+            if self.is_connected()
+                && matches!(
+                    self.0.status.lock().map(|status| *status),
+                    Ok(DaemonStatus::Running)
+                )
+            {
                 return;
             }
             match self.connect_and_handshake(app) {
@@ -980,7 +1046,10 @@ fn get_daemon_log_tail(state: State<'_, HitchClient>, lines: Option<usize>) -> O
 /// Wraps the existing restart path so a wedged or failed daemon is recoverable
 /// without the terminal (ADR 0009).
 #[tauri::command]
-async fn restart_daemon_command(app: AppHandle, state: State<'_, HitchClient>) -> Result<(), String> {
+async fn restart_daemon_command(
+    app: AppHandle,
+    state: State<'_, HitchClient>,
+) -> Result<(), String> {
     let client = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         if let Ok(mut guard) = client.0.restart_guard.lock() {
@@ -988,24 +1057,7 @@ async fn restart_daemon_command(app: AppHandle, state: State<'_, HitchClient>) -
             // clear the budget so it always proceeds.
             guard.reset();
         }
-        client.restart_daemon(&app, "user requested daemon restart".to_string())?;
-        match client.send_request(
-            &app,
-            Request::Hello {
-                client_name: "hitch-desktop".into(),
-                protocol_version: PROTOCOL_VERSION,
-            },
-        )? {
-            Response::Hello { .. } => {}
-            Response::Error { error } => {
-                return Err(format!("daemon hello failed after restart: {}", error.message));
-            }
-            other => {
-                return Err(format!("unexpected hello response after restart: {other:?}"));
-            }
-        }
-        client.set_status(&app, DaemonStatus::Running, None);
-        let _ = app.emit("hitch-reconnected", ());
+        client.restart_daemon_and_handshake(&app, "user requested daemon restart".to_string())?;
         Ok::<(), String>(())
     })
     .await
@@ -1123,20 +1175,10 @@ fn handle_tray_menu_event(app: &AppHandle, event: MenuEvent) {
                 if let Ok(mut guard) = client.0.restart_guard.lock() {
                     guard.reset();
                 }
-                if client
-                    .restart_daemon(&app, "user requested daemon restart".to_string())
-                    .is_ok()
-                {
-                    let _ = client.send_request(
-                        &app,
-                        Request::Hello {
-                            client_name: "hitch-desktop".into(),
-                            protocol_version: PROTOCOL_VERSION,
-                        },
-                    );
-                    client.set_status(&app, DaemonStatus::Running, None);
-                    let _ = app.emit("hitch-reconnected", ());
-                }
+                let _ = client.restart_daemon_and_handshake(
+                    &app,
+                    "user requested daemon restart".to_string(),
+                );
             });
         }
         "quit" => {

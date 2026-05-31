@@ -28,6 +28,7 @@ import {
   daemonReason,
   daemonStatus,
   error,
+  isJobCancellable,
   jobs,
   runJob,
 } from "./daemon";
@@ -119,5 +120,39 @@ describe("job store: StartJob -> JobCompleted", () => {
     expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
       request: { type: "cancel-job", job_id: "j4" },
     });
+  });
+
+  it("only marks draft/model jobs as cancellable", () => {
+    expect(
+      isJobCancellable({ id: "j5", status: "running", message: null, kind: "commit-draft" }),
+    ).toBe(true);
+    expect(
+      isJobCancellable({ id: "j6", status: "running", message: null, kind: "pr-draft" }),
+    ).toBe(true);
+    expect(
+      isJobCancellable({ id: "j7", status: "running", message: null, kind: "push" }),
+    ).toBe(false);
+    expect(isJobCancellable({ id: "j8", status: "running", message: null, kind: null })).toBe(
+      false,
+    );
+  });
+
+  it("does not keep early completions for jobs started by another window", async () => {
+    completeJob("foreign", { type: "ack" });
+
+    invokeMock.mockResolvedValueOnce({ type: "job-started", job_id: "foreign" });
+    let settled = false;
+    const promise = runJob({ type: "push", worktree_id: "w1" }).then((response) => {
+      settled = true;
+      return response;
+    });
+    await flush();
+    await flush();
+
+    expect(settled).toBe(false);
+
+    completeJob("foreign", { type: "ack" });
+    await expect(promise).resolves.toMatchObject({ type: "ack" });
+    expect(settled).toBe(true);
   });
 });

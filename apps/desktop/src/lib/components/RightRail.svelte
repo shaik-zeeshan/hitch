@@ -15,6 +15,7 @@
     gitBusy,
     gitStatus,
     gitWorktreeId,
+    isJobCancellable,
     jobs,
     loadGitStatus,
     pull,
@@ -44,9 +45,11 @@
   const behind = $derived($gitStatus?.behind ?? 0);
   const isDefaultBranch = $derived(Boolean($defaultBase && $gitStatus?.branch === $defaultBase));
 
-  // The live git/draft Job, if any — surfaced as a Cancel affordance (ADR 0008).
-  const runningJob = $derived(
-    Object.values($jobs).find((j) => j.status === "running" || j.status === "queued") ?? null,
+  // Only draft/model Jobs register cancellable child process groups today.
+  const cancellableJob = $derived(
+    Object.values($jobs).find(
+      (j) => (j.status === "running" || j.status === "queued") && isJobCancellable(j),
+    ) ?? null,
   );
 
   let autoRunning = $state(false);
@@ -158,11 +161,11 @@
         <span class="from">from {$defaultBase}</span>
       {/if}
       <span class="branch-acts">
-        {#if runningJob}
+        {#if cancellableJob}
           <button
             class="chip cancel"
             title="Cancel the running operation"
-            onclick={() => void cancelJob(runningJob.id)}
+            onclick={() => void cancelJob(cancellableJob.id)}
           >
             Cancel
           </button>

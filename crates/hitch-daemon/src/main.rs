@@ -2224,21 +2224,16 @@ where
         guard.jobs.insert(job_id, Arc::clone(&control));
     }
 
-    // Reply immediately so the request loop is never blocked behind the work.
-    send_response(state, client_id, request_id, Response::JobStarted { job_id })?;
-    let _ = broadcast_event(
-        state,
-        Event::JobProgress {
-            job_id,
-            status: JobStatus::Running,
-            message: progress.map(str::to_string),
-        },
-    );
-
     let worker_state = Arc::clone(state);
-    let progress = progress.map(str::to_string);
+    let (start_tx, start_rx) = mpsc::channel();
     let spawn = thread::Builder::new().name(name.into()).spawn(move || {
-        let _ = progress; // kept for symmetry; running note already broadcast
+        if !start_rx.recv().unwrap_or(false) {
+            if let Ok(mut guard) = worker_state.lock() {
+                guard.jobs.remove(&job_id);
+            }
+            return;
+        }
+
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             work(&worker_state, &control)
         }));
@@ -2281,12 +2276,36 @@ where
         );
     });
 
-    if spawn.is_err() {
+    if let Err(err) = spawn {
         if let Ok(mut guard) = state.lock() {
             guard.jobs.remove(&job_id);
         }
-        return Err(internal(format!("failed to spawn {name}")));
+        return Err(internal(format!("failed to spawn {name}: {err}")));
     }
+
+    // Reply only after the worker thread exists; then release it after the
+    // running event so clients never observe completion before JobStarted.
+    if let Err(err) = send_response(
+        state,
+        client_id,
+        request_id,
+        Response::JobStarted { job_id },
+    ) {
+        if let Ok(mut guard) = state.lock() {
+            guard.jobs.remove(&job_id);
+        }
+        let _ = start_tx.send(false);
+        return Err(err);
+    }
+    let _ = broadcast_event(
+        state,
+        Event::JobProgress {
+            job_id,
+            status: JobStatus::Running,
+            message: progress.map(str::to_string),
+        },
+    );
+    let _ = start_tx.send(true);
     Ok(())
 }
 

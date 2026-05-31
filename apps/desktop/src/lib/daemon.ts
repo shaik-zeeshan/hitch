@@ -222,6 +222,12 @@ type JobPending = {
 };
 const jobPending = new Map<Id, JobPending>();
 const earlyCompletions = new Map<Id, Response>();
+const locallyStartedJobs = new Set<Id>();
+const cancellableJobKinds = new Set(["draft-models", "commit-draft", "pr-draft"]);
+
+export function isJobCancellable(job: Job | null | undefined): boolean {
+  return Boolean(job?.kind && cancellableJobKinds.has(job.kind));
+}
 
 export async function runJob<T extends Response>(
   request: Request,
@@ -232,6 +238,7 @@ export async function runJob<T extends Response>(
     request,
   });
   const jobId = started.job_id;
+  locallyStartedJobs.add(jobId);
   jobs.update((current) => ({
     ...current,
     [jobId]: { id: jobId, status: "running", message: null, kind },
@@ -240,6 +247,7 @@ export async function runJob<T extends Response>(
     const early = earlyCompletions.get(jobId);
     if (early) {
       earlyCompletions.delete(jobId);
+      locallyStartedJobs.delete(jobId);
       jobs.update((current) => {
         const next = { ...current };
         delete next[jobId];
@@ -275,6 +283,7 @@ export function applyJobProgress(
 // Resolve a Job from its `JobCompleted` event: the wrapped response rides inside.
 export function completeJob(jobId: Id, response: Response): void {
   const pending = jobPending.get(jobId);
+  const local = locallyStartedJobs.has(jobId);
   jobPending.delete(jobId);
   jobs.update((current) => {
     if (!(jobId in current)) return current;
@@ -283,9 +292,10 @@ export function completeJob(jobId: Id, response: Response): void {
     return next;
   });
   if (!pending) {
-    earlyCompletions.set(jobId, response);
+    if (local) earlyCompletions.set(jobId, response);
     return;
   }
+  locallyStartedJobs.delete(jobId);
   if (isError(response)) {
     pending.reject(new Error(response.error.message));
   } else {
@@ -302,6 +312,8 @@ function failAllJobs(reason: string): void {
     pending.reject(new Error(message));
   }
   jobPending.clear();
+  earlyCompletions.clear();
+  locallyStartedJobs.clear();
   jobs.set({});
 }
 
