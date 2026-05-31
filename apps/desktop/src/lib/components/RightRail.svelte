@@ -489,7 +489,7 @@
     align-items: center;
     gap: 7px;
     min-width: 0;
-    padding: 7px 10px 5px 12px;
+    padding: 7px 10px 9px 12px;
     font-size: 11px;
     color: var(--tx-md);
   }
