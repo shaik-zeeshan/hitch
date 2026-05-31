@@ -942,14 +942,23 @@ export async function loadProjectPrStatuses(
   projectPrInFlight.add(projectId);
   lastProjectPrFetch.set(projectId, now);
   // Stamp before awaiting: a project-wide response that started before a newer
-  // per-worktree `loadPrStatus` must not clobber that fresher status.
+  // per-worktree `loadPrStatus` must not clobber that fresher status. The same
+  // stamp gates the selected worktree's single `prInfo`, mirroring loadPrStatus.
   const freshnessSeq = ++prByWorktreeSeq;
+  const requestSeq = ++prRequestSeq;
   try {
     const response = await runJob<
       Response & { statuses: { worktree_id: Id; pr: PrInfo | null }[] }
     >({ type: "project-pr-statuses", project_id: projectId }, "pr-status");
+    const selectedId = get(gitWorktreeId);
     for (const status of response.statuses) {
       writePrByWorktree(status.worktree_id, status.pr ?? null, freshnessSeq);
+      // Keep the selected worktree's action state (Create vs Open PR) in step with
+      // its sidebar chip; both now flow from the same batched lookup. Gated like
+      // loadPrStatus so a slower batched response can't regress a newer result.
+      if (requestSeq === prRequestSeq && selectedId === status.worktree_id) {
+        prInfo.set(status.pr ?? null);
+      }
     }
   } catch {
     lastProjectPrFetch.delete(projectId);

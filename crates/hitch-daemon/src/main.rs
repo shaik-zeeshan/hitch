@@ -352,6 +352,14 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     // that returns no pid in the response). Best-effort: a missing pidfile only
     // costs the client its force-kill fast path, it does not break startup.
     write_pidfile(&config.socket_path);
+    // The setup that follows (`Store::open`, `restore_layout`, the accept loop)
+    // can early-return via `?`. Own the pidfile + socket with a guard so they are
+    // cleared on *every* exit path: otherwise a failed startup would leave a
+    // pidfile pointing at our now-dead pid, which the GUI could later SIGKILL once
+    // the OS reuses that pid. Normal shutdown cleanup runs before the guard drops.
+    let _daemon_files = DaemonFileGuard {
+        socket_path: config.socket_path.clone(),
+    };
 
     let shutdown = Arc::new(AtomicBool::new(false));
     // The dispatcher drains a single ordered channel of `DispatchMsg`. PTY reader
@@ -397,9 +405,22 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     cancel_active_jobs(&state);
     wait_for_jobs_to_finish(&state);
     kill_all_sessions(&state);
-    let _ = fs::remove_file(hitch_proto::transport::pidfile_path(&config.socket_path));
-    let _ = fs::remove_file(config.socket_path);
+    // Pidfile + socket are removed by `DaemonFileGuard` as it drops on return.
     Ok(())
+}
+
+/// Removes the daemon's pidfile and socket whenever `run_daemon` returns — by
+/// normal shutdown or by an early `?` during startup. Created right after the
+/// pidfile is written so no exit path can leak a stale pid (see `write_pidfile`).
+struct DaemonFileGuard {
+    socket_path: PathBuf,
+}
+
+impl Drop for DaemonFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(hitch_proto::transport::pidfile_path(&self.socket_path));
+        let _ = fs::remove_file(&self.socket_path);
+    }
 }
 
 /// Write our pid to the daemon's pidfile (see `transport::pidfile_path`). The
