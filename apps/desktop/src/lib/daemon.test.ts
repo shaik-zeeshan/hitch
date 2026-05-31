@@ -106,6 +106,28 @@ describe("job store: StartJob -> JobCompleted", () => {
     await expect(promise).rejects.toThrow("remote rejected");
   });
 
+  it("resolves completions that arrive before the StartJob continuation resumes", async () => {
+    let startJob!: (response: { type: string; job_id: string }) => void;
+    invokeMock.mockReturnValueOnce(
+      new Promise((resolve) => {
+        startJob = resolve;
+      }),
+    );
+
+    const promise = runJob<{ type: string; url: string }>(
+      { type: "create-pull-request", worktree_id: "w1" },
+      "create-pr",
+    );
+    startJob({ type: "job-started", job_id: "j-fast" });
+    completeJob("j-fast", {
+      type: "pull-request-created",
+      url: "https://x/pull/fast",
+    });
+
+    await expect(promise).resolves.toMatchObject({ url: "https://x/pull/fast" });
+    expect(get(jobs)["j-fast"]).toBeUndefined();
+  });
+
   it("reflects progress transitions, including cancellation", () => {
     applyJobProgress("j3", "running", "Pushing…");
     expect(get(jobs)["j3"]).toMatchObject({ status: "running", message: "Pushing…" });

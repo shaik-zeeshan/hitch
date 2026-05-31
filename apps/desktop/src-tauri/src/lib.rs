@@ -38,6 +38,7 @@ const OUTPUT_STAGING_CAPACITY: usize = 1024 * 1024;
 /// requests, so a tight timeout would false-positive under load.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
+const HEARTBEAT_LOST_REASON: &str = "daemon stopped responding to heartbeat";
 
 /// Crash-loop guard window + cap. If the GUI has to (re)spawn the daemon more
 /// than `CRASH_LOOP_MAX` times within `CRASH_LOOP_WINDOW`, it stops respawning
@@ -62,6 +63,12 @@ enum DaemonStatus {
     Unreachable,
     /// Spawn or startup errored; carries a reason sourced from the daemon log.
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryMode {
+    Reconnect,
+    RestartDaemon,
 }
 
 /// Status snapshot pushed to the webview on every transition (`hitch-status`)
@@ -101,9 +108,9 @@ impl CrashLoopGuard {
         self.attempts.len() <= self.max_attempts
     }
 
-    /// Clear the record so a user-initiated restart starts from a clean budget.
-    /// Only called from explicit user actions — auto-recovery relies on the
-    /// sliding window to expire old attempts naturally.
+    /// Clear the record so only consecutive startup failures trip the guard.
+    /// Called after a healthy handshake; explicit user restarts also clear it
+    /// before recording their requested spawn.
     fn reset(&mut self) {
         self.attempts.clear();
     }
@@ -121,6 +128,14 @@ fn read_log_tail(path: &Path, lines: usize) -> Option<String> {
     let all: Vec<&str> = trimmed.lines().collect();
     let start = all.len().saturating_sub(lines);
     Some(all[start..].join("\n"))
+}
+
+fn recovery_mode_for_loss(reason: &str) -> RecoveryMode {
+    if reason == HEARTBEAT_LOST_REASON {
+        RecoveryMode::RestartDaemon
+    } else {
+        RecoveryMode::Reconnect
+    }
 }
 
 /// Routes raw PTY bytes to the webview per session (ADR 0007).
@@ -329,6 +344,35 @@ impl HitchClient {
         read_log_tail(&self.0.log_path, 1)
     }
 
+    fn record_spawn_attempt(&self, app: &AppHandle) -> Result<(), String> {
+        let now = Instant::now();
+        let allowed = self
+            .0
+            .restart_guard
+            .lock()
+            .map(|mut guard| guard.allow(now))
+            .unwrap_or(true);
+        if allowed {
+            return Ok(());
+        }
+        let reason = self
+            .log_failure_reason()
+            .unwrap_or_else(|| "daemon failed to start repeatedly; stopped retrying".to_string());
+        self.set_status(app, DaemonStatus::Failed, Some(reason.clone()));
+        Err(reason)
+    }
+
+    fn reset_restart_guard(&self) {
+        if let Ok(mut guard) = self.0.restart_guard.lock() {
+            guard.reset();
+        }
+    }
+
+    fn mark_running(&self, app: &AppHandle) {
+        self.reset_restart_guard();
+        self.set_status(app, DaemonStatus::Running, None);
+    }
+
     fn connect(&self, app: &AppHandle) -> Result<(), String> {
         if self.is_connected() {
             return Ok(());
@@ -349,20 +393,7 @@ impl HitchClient {
                 // Socket absent: we must (re)spawn. Guard against a crash loop —
                 // a daemon that dies on startup (corrupt store, bind failure)
                 // must not be respawned forever (ADR 0009).
-                let now = Instant::now();
-                let allowed = self
-                    .0
-                    .restart_guard
-                    .lock()
-                    .map(|mut guard| guard.allow(now))
-                    .unwrap_or(true);
-                if !allowed {
-                    let reason = self.log_failure_reason().unwrap_or_else(|| {
-                        "daemon failed to start repeatedly; stopped retrying".to_string()
-                    });
-                    self.set_status(app, DaemonStatus::Failed, Some(reason.clone()));
-                    return Err(reason);
-                }
+                self.record_spawn_attempt(app)?;
                 self.set_status(app, DaemonStatus::Starting, None);
                 self.spawn_daemon()?;
                 self.wait_for_daemon()?
@@ -405,7 +436,7 @@ impl HitchClient {
         };
         match outcome {
             Ok(()) => {
-                self.set_status(app, DaemonStatus::Running, None);
+                self.mark_running(app);
                 Ok(())
             }
             Err(err) => {
@@ -426,7 +457,7 @@ impl HitchClient {
             },
         ) {
             Ok(Response::Hello { .. }) => {
-                self.set_status(app, DaemonStatus::Running, None);
+                self.mark_running(app);
                 let _ = app.emit("hitch-reconnected", ());
                 Ok(())
             }
@@ -501,7 +532,7 @@ impl HitchClient {
                     return;
                 }
                 if !matches!(pong, Ok(Response::Pong)) {
-                    client.handle_connection_lost(&app, "daemon stopped responding to heartbeat");
+                    client.handle_connection_lost(&app, HEARTBEAT_LOST_REASON);
                     return;
                 }
             })
@@ -513,6 +544,7 @@ impl HitchClient {
         let result = (|| {
             self.request_daemon_shutdown();
             self.mark_disconnected(app, reason);
+            self.record_spawn_attempt(app)?;
             self.set_status(app, DaemonStatus::Starting, None);
 
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -686,13 +718,13 @@ impl HitchClient {
             self.log_failure_reason()
                 .or_else(|| Some(reason.to_string())),
         );
-        self.begin_recovery(app);
+        self.begin_recovery(app, recovery_mode_for_loss(reason));
     }
 
     /// Start the auto-recovery loop unless one is already running. The
     /// `recovering` latch collapses a burst of disconnect signals (reader error
     /// arriving alongside a missed heartbeat) into a single recovery.
-    fn begin_recovery(&self, app: &AppHandle) {
+    fn begin_recovery(&self, app: &AppHandle, mode: RecoveryMode) {
         if self.0.recovering.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -701,17 +733,17 @@ impl HitchClient {
         thread::Builder::new()
             .name("hitch-daemon-recovery".into())
             .spawn(move || {
-                client.recovery_loop(&app);
+                client.recovery_loop(&app, mode);
                 client.0.recovering.store(false, Ordering::SeqCst);
             })
             .expect("failed to spawn daemon recovery thread");
     }
 
-    /// Reconnect with exponential backoff until the daemon is healthy again or
-    /// the crash-loop guard (enforced inside `connect`) gives up and sets
-    /// `failed`. On success the webview is told to re-snapshot; sessions replay
-    /// through the daemon's normal reconnect events (ADR 0007).
-    fn recovery_loop(&self, app: &AppHandle) {
+    /// Reconnect/restart with exponential backoff until the daemon is healthy
+    /// again or the crash-loop guard gives up and sets `failed`. On success the
+    /// webview is told to re-snapshot; sessions replay through the daemon's
+    /// normal reconnect events (ADR 0007).
+    fn recovery_loop(&self, app: &AppHandle, mode: RecoveryMode) {
         let mut delay = Duration::from_millis(300);
         let max_delay = Duration::from_secs(5);
         loop {
@@ -723,14 +755,22 @@ impl HitchClient {
             {
                 return;
             }
-            match self.connect_and_handshake(app) {
+            let result = match mode {
+                RecoveryMode::Reconnect => self.connect_and_handshake(app),
+                RecoveryMode::RestartDaemon => {
+                    self.restart_daemon_and_handshake(app, HEARTBEAT_LOST_REASON.to_string())
+                }
+            };
+            match result {
                 Ok(()) => {
-                    let _ = app.emit("hitch-reconnected", ());
+                    if mode == RecoveryMode::Reconnect {
+                        let _ = app.emit("hitch-reconnected", ());
+                    }
                     return;
                 }
                 Err(_) => {
-                    // `connect` sets `failed` when the crash-loop guard trips;
-                    // stop retrying then rather than thrash.
+                    // The spawn paths set `failed` when the crash-loop guard
+                    // trips; stop retrying then rather than thrash.
                     if matches!(
                         self.0.status.lock().map(|status| *status),
                         Ok(DaemonStatus::Failed)
@@ -1232,8 +1272,8 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_log_tail, tray_status_text, CrashLoopGuard, DaemonStatus, OutputRouter,
-        CRASH_LOOP_MAX,
+        read_log_tail, recovery_mode_for_loss, tray_status_text, CrashLoopGuard, DaemonStatus,
+        OutputRouter, RecoveryMode, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
     };
     use hitch_core::SessionId;
     use std::sync::{Arc, Mutex};
@@ -1482,6 +1522,38 @@ mod tests {
         assert!(!guard.allow(t0));
         guard.reset();
         assert!(guard.allow(t0));
+    }
+
+    #[test]
+    fn healthy_handshake_reset_breaks_startup_failure_sequence() {
+        let window = Duration::from_secs(60);
+        let mut guard = CrashLoopGuard::new(CRASH_LOOP_MAX, window);
+        let t0 = Instant::now();
+
+        for i in 0..CRASH_LOOP_MAX {
+            assert!(guard.allow(t0 + Duration::from_secs(i as u64)));
+        }
+
+        guard.reset();
+
+        for i in 0..CRASH_LOOP_MAX {
+            assert!(
+                guard.allow(t0 + Duration::from_secs((10 + i) as u64)),
+                "attempt {i} after a healthy handshake should start a fresh budget"
+            );
+        }
+    }
+
+    #[test]
+    fn heartbeat_timeout_uses_restart_recovery() {
+        assert_eq!(
+            recovery_mode_for_loss(HEARTBEAT_LOST_REASON),
+            RecoveryMode::RestartDaemon
+        );
+        assert_eq!(
+            recovery_mode_for_loss("daemon socket closed"),
+            RecoveryMode::Reconnect
+        );
     }
 }
 

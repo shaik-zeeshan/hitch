@@ -221,22 +221,58 @@ type JobPending = {
   reject: (error: Error) => void;
 };
 const jobPending = new Map<Id, JobPending>();
-const earlyCompletions = new Map<Id, Response>();
+const EARLY_COMPLETION_TTL_MS = 30_000;
+const EARLY_COMPLETION_MAX = 64;
+type EarlyCompletion = { response: Response; receivedAt: number };
+const earlyCompletions = new Map<Id, EarlyCompletion>();
 const locallyStartedJobs = new Set<Id>();
+let startingJobRequests = 0;
 const cancellableJobKinds = new Set(["draft-models", "commit-draft", "pr-draft"]);
 
 export function isJobCancellable(job: Job | null | undefined): boolean {
   return Boolean(job?.kind && cancellableJobKinds.has(job.kind));
 }
 
+function pruneEarlyCompletions(now = Date.now()): void {
+  for (const [jobId, completion] of earlyCompletions) {
+    if (now - completion.receivedAt > EARLY_COMPLETION_TTL_MS) {
+      earlyCompletions.delete(jobId);
+    }
+  }
+  while (earlyCompletions.size > EARLY_COMPLETION_MAX) {
+    const oldest = earlyCompletions.keys().next().value;
+    if (oldest === undefined) break;
+    earlyCompletions.delete(oldest);
+  }
+}
+
+function rememberEarlyCompletion(jobId: Id, response: Response): void {
+  earlyCompletions.set(jobId, { response, receivedAt: Date.now() });
+  pruneEarlyCompletions();
+}
+
+function takeEarlyCompletion(jobId: Id): Response | null {
+  pruneEarlyCompletions();
+  const early = earlyCompletions.get(jobId);
+  if (!early) return null;
+  earlyCompletions.delete(jobId);
+  return early.response;
+}
+
 export async function runJob<T extends Response>(
   request: Request,
   kind: string | null = null,
 ): Promise<T> {
-  const started = await daemonRequest<Response & { job_id: Id }>({
-    type: "start-job",
-    request,
-  });
+  startingJobRequests += 1;
+  let started: Response & { job_id: Id };
+  try {
+    started = await daemonRequest<Response & { job_id: Id }>({
+      type: "start-job",
+      request,
+    });
+  } finally {
+    startingJobRequests = Math.max(0, startingJobRequests - 1);
+  }
   const jobId = started.job_id;
   locallyStartedJobs.add(jobId);
   jobs.update((current) => ({
@@ -244,9 +280,8 @@ export async function runJob<T extends Response>(
     [jobId]: { id: jobId, status: "running", message: null, kind },
   }));
   return new Promise<T>((resolve, reject) => {
-    const early = earlyCompletions.get(jobId);
+    const early = takeEarlyCompletion(jobId);
     if (early) {
-      earlyCompletions.delete(jobId);
       locallyStartedJobs.delete(jobId);
       jobs.update((current) => {
         const next = { ...current };
@@ -292,7 +327,9 @@ export function completeJob(jobId: Id, response: Response): void {
     return next;
   });
   if (!pending) {
-    if (local) earlyCompletions.set(jobId, response);
+    if (local || startingJobRequests > 0) {
+      rememberEarlyCompletion(jobId, response);
+    }
     return;
   }
   locallyStartedJobs.delete(jobId);
