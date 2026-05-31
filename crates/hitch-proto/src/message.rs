@@ -19,8 +19,9 @@ use serde::{Deserialize, Serialize};
 /// job-kind metadata so reconnecting clients can rebuild the live Job store. v10
 /// adds the daemon pid to `Response::Hello` so a heartbeat-wedged daemon can be
 /// force-restarted by pid. v11 bumps the protocol for the extended
-/// `Response::PrStatus` wire shape.
-pub const PROTOCOL_VERSION: u16 = 11;
+/// `Response::PrStatus` wire shape. v12 moves PR status lookup to cancellable
+/// Jobs via `JobRequest::PrStatus`.
+pub const PROTOCOL_VERSION: u16 = 12;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -89,6 +90,8 @@ pub enum JobRequest {
     Push { worktree_id: WorktreeId },
     /// Pull the current branch from its upstream using the system `git` CLI.
     Pull { worktree_id: WorktreeId },
+    /// Look up the GitHub PR (if any) for a worktree's current branch via `gh`.
+    PrStatus { worktree_id: WorktreeId },
     /// Create a GitHub PR through `gh`.
     CreatePullRequest {
         worktree_id: WorktreeId,
@@ -176,8 +179,8 @@ pub enum Request {
 
     /// Read current git status for a worktree.
     GitStatus { worktree_id: WorktreeId },
-    /// Look up the GitHub PR (if any) for a worktree's current branch via `gh`.
-    /// On-demand (not polled): the daemon shells out to `gh pr view`.
+    /// Look up the GitHub PR (if any) for a worktree's current branch via a Job.
+    /// Kept as a compatibility request; dispatches through the async job path.
     PrStatus { worktree_id: WorktreeId },
     /// Read a file-level diff for a path in a worktree.
     GitDiff {
@@ -298,6 +301,7 @@ impl From<JobRequest> for Request {
             },
             JobRequest::Push { worktree_id } => Request::Push { worktree_id },
             JobRequest::Pull { worktree_id } => Request::Pull { worktree_id },
+            JobRequest::PrStatus { worktree_id } => Request::PrStatus { worktree_id },
             JobRequest::CreatePullRequest {
                 worktree_id,
                 title,
@@ -359,6 +363,7 @@ impl TryFrom<Request> for JobRequest {
             }),
             Request::Push { worktree_id } => Ok(JobRequest::Push { worktree_id }),
             Request::Pull { worktree_id } => Ok(JobRequest::Pull { worktree_id }),
+            Request::PrStatus { worktree_id } => Ok(JobRequest::PrStatus { worktree_id }),
             Request::CreatePullRequest {
                 worktree_id,
                 title,
@@ -872,6 +877,7 @@ mod tests {
             path: "/Users/me/.hitch/worktrees/hitch/feat-proto".into(),
             branch: "feat/proto".into(),
             is_main: false,
+            is_hitch_managed: true,
         }
     }
 
@@ -908,6 +914,7 @@ mod tests {
             },
             JobRequest::Push { worktree_id },
             JobRequest::Pull { worktree_id },
+            JobRequest::PrStatus { worktree_id },
             JobRequest::CreatePullRequest {
                 worktree_id,
                 title: "Add proto".into(),
@@ -1013,6 +1020,7 @@ mod tests {
                 rows: 40,
             },
             Request::GitStatus { worktree_id },
+            Request::PrStatus { worktree_id },
             Request::GitDiff {
                 worktree_id,
                 path: "src/lib.rs".into(),
@@ -1102,6 +1110,14 @@ mod tests {
             Response::SessionOpened { session },
             Response::GitStatus {
                 status: sample_status(worktree_id),
+            },
+            Response::PrStatus {
+                pr: Some(PrInfo {
+                    number: 1,
+                    url: "https://github.com/example/hitch/pull/1".into(),
+                    state: "OPEN".into(),
+                    draft: false,
+                }),
             },
             Response::FileDiff {
                 diff: sample_diff(worktree_id),

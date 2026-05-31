@@ -82,28 +82,28 @@
   // The headline action: the first applicable step in commit → pull → push →
   // create-PR → open-PR order. `null` run means nothing to do (e.g. clean +
   // synced on the default branch) and the button renders disabled.
-  type PrimaryAction = { label: string; run: (() => void) | null };
+  type PrimaryAction = { label: string; run: (() => void) | null; mutates: boolean };
   const primary = $derived<PrimaryAction>(
     hasChanges
       ? $autoCommitPush
-        ? { label: "Commit & Push", run: () => void handleAutoCommitPush() }
-        : { label: "Commit…", run: openCommit }
+        ? { label: "Commit & Push", run: () => void handleAutoCommitPush(), mutates: true }
+        : { label: "Commit…", run: openCommit, mutates: true }
       : behind > 0
-        ? { label: `Pull ↓${behind}`, run: () => void handleManualPull() }
+        ? { label: `Pull ↓${behind}`, run: () => void handleManualPull(), mutates: true }
         : ahead > 0
-          ? { label: `Push ↑${ahead}`, run: () => void handleManualPush() }
+          ? { label: `Push ↑${ahead}`, run: () => void handleManualPush(), mutates: true }
           : !onDefault && $gitWorktreeId && !openPr
-            ? { label: "Create PR", run: openCreatePr }
+            ? { label: "Create PR", run: openCreatePr, mutates: true }
             : openPr
-              ? { label: `Open PR #${openPr.number}`, run: () => void openExistingPr() }
-              : { label: "Up to date", run: null },
+              ? { label: `Open PR #${openPr.number}`, run: () => void openExistingPr(), mutates: false }
+              : { label: "Up to date", run: null, mutates: false },
   );
 
   // Per-step availability + the reason shown when a step is unavailable, so the
   // dropdown reads as a checklist of what this worktree can do right now.
   const pushReason = $derived(ahead > 0 ? "" : "Nothing to push");
   const pullReason = $derived(behind > 0 ? "" : "Up to date with remote");
-  const commitReason = $derived(hasChanges ? "" : "No changes to commit");
+  const commitReason = $derived(busy ? "Git operation in progress" : hasChanges ? "" : "No changes to commit");
   const createPrReason = $derived(
     busy ? "Git operation in progress" : onDefault ? "On the default branch" : !$gitWorktreeId ? "No worktree selected" : "",
   );
@@ -250,7 +250,7 @@
         <div class="splitbtn">
           <button
             class="split-main"
-            disabled={!primary.run || busy}
+            disabled={!primary.run || (busy && primary.mutates)}
             onclick={() => primary.run?.()}
           >
             {primary.label}
@@ -272,7 +272,7 @@
             </DropdownMenu.Trigger>
             <DropdownMenu.Portal>
               <DropdownMenu.Content class="menu act-menu" align="end" side="bottom" sideOffset={6}>
-                <DropdownMenu.Item class="mi" disabled={!hasChanges} title={commitReason} onSelect={openCommit}>
+                <DropdownMenu.Item class="mi" disabled={!hasChanges || busy} title={commitReason} onSelect={openCommit}>
                   <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
                     ><circle cx="8" cy="8" r="2.4" /><path d="M1.5 8h4.1M10.4 8h4.1" /></svg
                   >

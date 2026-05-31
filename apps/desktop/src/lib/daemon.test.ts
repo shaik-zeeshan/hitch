@@ -274,6 +274,7 @@ describe("job store: StartJob -> JobCompleted", () => {
           path: "/tmp/w-new",
           branch: "feat/demo",
           is_main: false,
+          is_hitch_managed: true,
         },
       ],
     });

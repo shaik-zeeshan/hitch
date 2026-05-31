@@ -425,31 +425,16 @@ impl GitClient {
     /// Create-PR, so a transient failure never blocks the flow. Only the JSON
     /// shape is trusted; malformed output also degrades to `None`.
     pub fn pr_status(&self, repo_path: impl AsRef<Path>) -> Result<Option<PrInfo>> {
-        let args = vec![
-            os("pr"),
-            os("view"),
-            os("--json"),
-            os("number,url,state,isDraft"),
-        ];
-        let output = match self.run_gh(repo_path.as_ref(), args) {
-            Ok(output) => output,
-            // gh exits non-zero when the branch has no PR (and on auth/network
-            // errors). Either way we have no PR to show.
-            Err(GitError::CommandFailed { .. }) => return Ok(None),
-            Err(err) => return Err(err),
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&output.stdout) else {
-            return Ok(None);
-        };
-        let (Some(number), Some(url)) = (value["number"].as_u64(), value["url"].as_str()) else {
-            return Ok(None);
-        };
-        Ok(Some(PrInfo {
-            number,
-            url: url.to_string(),
-            state: value["state"].as_str().unwrap_or_default().to_string(),
-            draft: value["isDraft"].as_bool().unwrap_or(false),
-        }))
+        pr_status_with_client(self, repo_path.as_ref(), None)
+    }
+
+    /// Look up PR status as a cancellable `gh pr view` child process.
+    pub fn pr_status_with_control(
+        &self,
+        repo_path: impl AsRef<Path>,
+        control: &dyn CommandControl,
+    ) -> Result<Option<PrInfo>> {
+        pr_status_with_client(self, repo_path.as_ref(), Some(control))
     }
 
     fn run_git(&self, cwd: &Path, args: Vec<OsString>) -> Result<CommandOutput> {
@@ -477,6 +462,47 @@ impl GitClient {
     ) -> Result<CommandOutput> {
         run_command(&self.gh, cwd, args, Some(control))
     }
+}
+
+fn pr_status_with_client(
+    client: &GitClient,
+    repo_path: &Path,
+    control: Option<&dyn CommandControl>,
+) -> Result<Option<PrInfo>> {
+    let args = vec![
+        os("pr"),
+        os("view"),
+        os("--json"),
+        os("number,url,state,isDraft"),
+    ];
+    let output = match control {
+        Some(control) => client.run_gh_with_control(repo_path, args, control),
+        None => client.run_gh(repo_path, args),
+    };
+    let output = match output {
+        Ok(output) => output,
+        Err(err @ GitError::CommandFailed { .. }) => {
+            if control.is_some_and(|control| control.is_cancelled()) {
+                return Err(err);
+            }
+            // gh exits non-zero when the branch has no PR (and on auth/network
+            // errors). Either way we have no PR to show.
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&output.stdout) else {
+        return Ok(None);
+    };
+    let (Some(number), Some(url)) = (value["number"].as_u64(), value["url"].as_str()) else {
+        return Ok(None);
+    };
+    Ok(Some(PrInfo {
+        number,
+        url: url.to_string(),
+        state: value["state"].as_str().unwrap_or_default().to_string(),
+        draft: value["isDraft"].as_bool().unwrap_or(false),
+    }))
 }
 
 /// A successful CLI command result.
@@ -1052,6 +1078,7 @@ fn create_worktree_with_client(
         target,
         request.branch.clone(),
         false,
+        true,
     ))
 }
 

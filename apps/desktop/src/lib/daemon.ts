@@ -245,6 +245,7 @@ const cancellableJobKinds = new Set([
   "push",
   "pull",
   "create-pr",
+  "pr-status",
   "draft-models",
   "commit-draft",
   "pr-draft",
@@ -850,10 +851,10 @@ export async function loadGitStatus(worktreeId: Id): Promise<GitStatus> {
 export async function loadPrStatus(worktreeId: Id): Promise<void> {
   const requestSeq = ++prRequestSeq;
   try {
-    const response = await daemonRequest<Response & { pr: PrInfo | null }>({
-      type: "pr-status",
-      worktree_id: worktreeId,
-    });
+    const response = await runJob<Response & { pr: PrInfo | null }>(
+      { type: "pr-status", worktree_id: worktreeId },
+      "pr-status",
+    );
     if (requestSeq === prRequestSeq && get(gitWorktreeId) === worktreeId) {
       prInfo.set(response.pr ?? null);
     }
@@ -1462,7 +1463,7 @@ export async function createPr(fields: PrFields): Promise<void> {
     );
     prUrl.set(response.url);
     // Refresh so the action menu flips from "Create PR" to "Open PR".
-    void loadPrStatus(worktreeId);
+    await loadPrStatus(worktreeId);
   } finally {
     gitBusy.set(false);
   }

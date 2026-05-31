@@ -74,13 +74,14 @@
   }
 
   // Clicking a project row selects it (for ⌘K context + the quick-add target)
-  // and toggles its worktree list. It MUST also clear the selected worktree so
-  // even re-clicking the SAME project row returns the UI to the project-level
-  // “choose a worktree” state instead of leaving the prior branch selected.
+  // and ensures its worktree list is visible. It MUST also clear the selected
+  // worktree so even re-clicking the SAME project row returns the UI to the
+  // project-level “choose a worktree” state instead of leaving the prior branch
+  // selected.
   function selectProject(p: Project) {
     selectedProjectId.set(p.id);
     selectedWorktreeId.set(null);
-    if (p.kind === "git-backed") toggleExpand(p);
+    if (p.kind === "git-backed") collapsed = { ...collapsed, [p.id]: false };
   }
 
   function selectWorktree(w: Worktree) {

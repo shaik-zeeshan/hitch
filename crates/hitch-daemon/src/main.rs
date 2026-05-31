@@ -997,10 +997,6 @@ fn handle_request<R: Read>(
             let status = git_status(state, worktree_id)?;
             send_response(state, client_id, request_id, Response::GitStatus { status })?;
         }
-        Request::PrStatus { worktree_id } => {
-            let pr = pr_status(state, worktree_id)?;
-            send_response(state, client_id, request_id, Response::PrStatus { pr })?;
-        }
         Request::GitDiff { worktree_id, path } => {
             let diff = git_diff(state, worktree_id, path)?;
             send_response(state, client_id, request_id, Response::FileDiff { diff })?;
@@ -1044,6 +1040,7 @@ fn handle_request<R: Read>(
         | Request::GeneratePullRequestDraft { .. }
         | Request::Push { .. }
         | Request::Pull { .. }
+        | Request::PrStatus { .. }
         | Request::CreatePullRequest { .. } => {
             let request = JobRequest::try_from(request)
                 .map_err(|_| internal("job-capable request rejected during dispatch"))?;
@@ -1146,7 +1143,8 @@ fn add_project_from_root(
         .unwrap_or_else(|| "Project".into());
     let project = Project::new(name, project_root.clone(), kind);
 
-    let main_worktree = branch.map(|branch| Worktree::new(project.id, project_root, branch, true));
+    let main_worktree =
+        branch.map(|branch| Worktree::new(project.id, project_root, branch, true, false));
     let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
     state.store.insert_project(&project).map_err(store_error)?;
     state.projects.insert(project.id, project.clone());
@@ -1191,12 +1189,6 @@ fn list_worktrees(
 /// given when it can't be resolved (e.g. it no longer exists on disk).
 fn canonical_or_self(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-/// Hitch only owns linked worktrees it created under the managed-root directory.
-/// Imported external worktrees stay visible but must never go through Hitch's
-/// destructive removal path.
-fn is_hitch_managed_worktree(path: &Path, managed_root: &Path) -> bool {
-    canonical_or_self(path).starts_with(canonical_or_self(managed_root))
 }
 
 /// Reconcile a git-backed project's stored worktrees against what git currently
@@ -1244,7 +1236,7 @@ fn reconcile_discovered_worktrees(state: &Arc<Mutex<DaemonState>>, project_id: P
         if existing_paths.contains(&path) {
             continue;
         }
-        let worktree = Worktree::new(project_id, path, found.branch, found.is_main);
+        let worktree = Worktree::new(project_id, path, found.branch, found.is_main, false);
         let Ok(mut state) = state.lock() else { return };
         if state.store.insert_worktree(&worktree).is_ok() {
             state.worktrees.insert(worktree.id, worktree);
@@ -1265,7 +1257,15 @@ fn prune_missing_worktree(state: &Arc<Mutex<DaemonState>>, worktree_id: Worktree
 
     for session_id in live_session_ids {
         match close_session(state, session_id, true) {
-            Ok(()) => {}
+            Ok(()) => {
+                let _ = broadcast_event(
+                    state,
+                    Event::SessionClosed {
+                        session_id,
+                        exit_code: None,
+                    },
+                );
+            }
             Err(err) if err.code == ErrorCode::NotFound => {}
             Err(_) => return,
         }
@@ -1521,7 +1521,7 @@ fn remove_worktree(
     delete_branch: bool,
     force: bool,
 ) -> Result<(), ProtocolError> {
-    let (project, worktree, managed_root, git, live_session_ids) = {
+    let (project, worktree, git, live_session_ids) = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
         let worktree = state
             .worktrees
@@ -1539,13 +1539,7 @@ fn remove_worktree(
             .filter(|session| session.session.parent == SessionParent::Worktree(worktree_id))
             .map(|session| session.session.id)
             .collect::<Vec<_>>();
-        (
-            project,
-            worktree,
-            state.config.managed_root.clone(),
-            state.git.clone(),
-            live_session_ids,
-        )
+        (project, worktree, state.git.clone(), live_session_ids)
     };
 
     if worktree.is_main {
@@ -1554,7 +1548,7 @@ fn remove_worktree(
             "main worktree cannot be removed by Hitch",
         ));
     }
-    if !is_hitch_managed_worktree(&worktree.path, &managed_root) {
+    if !worktree.is_hitch_managed {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
             "externally managed worktrees cannot be removed by Hitch",
@@ -1758,9 +1752,12 @@ fn git_status(
 fn pr_status(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
+    control: &JobControl,
 ) -> Result<Option<PrInfo>, ProtocolError> {
     let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
-    let pr = git.pr_status(&worktree.path).map_err(git_error)?;
+    let pr = git
+        .pr_status_with_control(&worktree.path, control)
+        .map_err(git_error)?;
     Ok(pr.map(|pr| PrInfo {
         number: pr.number,
         url: pr.url,
@@ -2583,6 +2580,18 @@ fn dispatch_job(
             Some("pull"),
             Some("Pulling…"),
             move |state, control| do_pull(state, worktree_id, control),
+        ),
+        JobRequest::PrStatus { worktree_id } => start_job(
+            "hitch-pr-status",
+            state,
+            client_id,
+            request_id,
+            Some("pr-status"),
+            None,
+            move |state, control| {
+                let pr = pr_status(state, worktree_id, control)?;
+                Ok(Response::PrStatus { pr })
+            },
         ),
         JobRequest::CreatePullRequest {
             worktree_id,
@@ -3505,8 +3514,8 @@ mod tests {
         )));
 
         let project = Project::new("hitch", &project_root, ProjectKind::GitBacked);
-        let main = Worktree::new(project.id, &project_root, "main", true);
-        let linked = Worktree::new(project.id, &linked_path, "feature/stale", false);
+        let main = Worktree::new(project.id, &project_root, "main", true, false);
+        let linked = Worktree::new(project.id, &linked_path, "feature/stale", false, true);
         let session = Session::new("shell", SessionParent::Worktree(linked.id), &linked_path);
         {
             let mut guard = state.lock().unwrap();
@@ -3554,7 +3563,7 @@ mod tests {
         let store_path = dir.join("state.db");
         let managed_root = dir.join("managed");
         let project_root = dir.join("repo");
-        let external_path = dir.join("external").join("feature");
+        let external_path = managed_root.join("external").join("feature");
         std::fs::create_dir_all(&managed_root).unwrap();
         std::fs::create_dir_all(&project_root).unwrap();
         std::fs::create_dir_all(&external_path).unwrap();
@@ -3574,7 +3583,7 @@ mod tests {
         )));
 
         let project = Project::new("hitch", &project_root, ProjectKind::GitBacked);
-        let worktree = Worktree::new(project.id, &external_path, "feature/external", false);
+        let worktree = Worktree::new(project.id, &external_path, "feature/external", false, false);
         {
             let mut guard = state.lock().unwrap();
             guard.store.insert_project(&project).unwrap();

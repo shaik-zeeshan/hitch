@@ -18,6 +18,7 @@ export type Worktree = {
   path: string;
   branch: string;
   is_main: boolean;
+  is_hitch_managed: boolean;
 };
 
 export type SessionParent =
@@ -145,6 +146,7 @@ export type JobRequest =
     }
   | { type: "push"; worktree_id: Id }
   | { type: "pull"; worktree_id: Id }
+  | { type: "pr-status"; worktree_id: Id }
   | {
       type: "create-pull-request";
       worktree_id: Id;
