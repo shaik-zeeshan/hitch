@@ -1466,7 +1466,15 @@ fn create_worktree(
         None => git.create_worktree(&project.root, &request),
     }
     .map_err(git_error)?;
-    install_agent_hooks_for_worktree_path(&project.root, &worktree.path, &hook_helper)?;
+    // Hook installation is best-effort: if it fails we still record the worktree
+    // so the checkout git just created never becomes an orphan that Hitch can't
+    // see (which would conflict with retries on the same branch/path). Agent-state
+    // tracking degrades until the config is fixed; reopening reinstalls hooks.
+    if let Err(err) =
+        install_agent_hooks_for_worktree_path(&project.root, &worktree.path, &hook_helper)
+    {
+        eprintln!("hitch-daemon: {}", err.message);
+    }
     let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
     state
         .store
@@ -1680,7 +1688,13 @@ fn open_session(
     pty_tx: &mpsc::Sender<PtyEvent>,
 ) -> Result<Session, ProtocolError> {
     if let SessionParent::Worktree(worktree_id) = parent {
-        install_agent_hooks_for_worktree_id(state, worktree_id)?;
+        // Hook installation is best-effort: a malformed or unwritable agent
+        // config (`.claude/settings.local.json`, `.codex/hooks.json`) must not
+        // block launching a plain terminal. Agent-state tracking simply degrades
+        // for this session until the config is fixed; reopening reinstalls hooks.
+        if let Err(err) = install_agent_hooks_for_worktree_id(state, worktree_id) {
+            eprintln!("hitch-daemon: {}", err.message);
+        }
     }
     let cwd = session_parent_cwd(state, parent)?;
     let session = Session::new(name, parent, cwd.clone());

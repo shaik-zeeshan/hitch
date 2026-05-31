@@ -323,7 +323,7 @@ fn runtime_agent_command(executable: &str, args: Option<&[String]>) -> Option<&'
         if path_basename_or_stem_eq(arg, "codex") {
             return Some("codex");
         }
-        if path_basename_or_stem_eq(arg, "claude") || arg_contains_ascii(arg, "claude-code") {
+        if path_basename_or_stem_eq(arg, "claude") || path_has_component(arg, "claude-code") {
             return Some("claude");
         }
     }
@@ -345,10 +345,17 @@ fn path_basename_or_stem_eq(path: &str, expected: &str) -> bool {
             .is_some_and(|stem| stem.eq_ignore_ascii_case(expected))
 }
 
-fn arg_contains_ascii(arg: &str, needle: &str) -> bool {
-    arg.as_bytes()
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+/// True when any path component of `arg` equals `expected` (case-insensitively).
+/// Recognizes an agent CLI by its package/bin directory (e.g.
+/// `.../@anthropic-ai/claude-code/cli.js`) without matching unrelated scripts
+/// that merely embed the name as a substring (e.g. `./scripts/claude-codegen.js`).
+fn path_has_component(arg: &str, expected: &str) -> bool {
+    std::path::Path::new(arg).components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|part| part.eq_ignore_ascii_case(expected))
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -559,6 +566,19 @@ mod tests {
     fn ordinary_node_commands_still_report_node() {
         assert_eq!(
             normalize_command_name("node", Some(&["node".into(), "server.js".into()])),
+            Some("node".into()),
+        );
+    }
+
+    #[test]
+    fn node_scripts_embedding_agent_names_still_report_node() {
+        // A script whose name merely contains "claude-code" as a substring must
+        // not be misreported as the Claude CLI.
+        assert_eq!(
+            normalize_command_name(
+                "node",
+                Some(&["node".into(), "./scripts/claude-codegen.js".into()]),
+            ),
             Some("node".into()),
         );
     }

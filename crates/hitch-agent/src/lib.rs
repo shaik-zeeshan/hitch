@@ -94,6 +94,9 @@ impl HookInstallOptions {
 pub struct HookInstallSummary {
     pub installed_configs: Vec<InstalledHookConfig>,
     pub local_exclude_updated: bool,
+    /// Whether a legacy Hitch-owned root `.gitignore` (written by pre-exclude
+    /// installs) was cleaned up during this run.
+    pub legacy_gitignore_removed: bool,
 }
 
 /// One local agent config touched by hook installation.
@@ -124,10 +127,51 @@ pub fn install_hooks(
 
     let local_exclude_updated = ensure_locally_excluded(worktree_path, &local_config_entries)?;
 
+    // Pre-exclude installs ignored these configs via a root `.gitignore` instead
+    // of `.git/info/exclude`. Now that we exclude locally, strip those legacy
+    // Hitch-owned entries so migrated worktrees don't keep (or depend on) the
+    // deprecated tracked file.
+    let legacy_gitignore_removed = remove_legacy_gitignore_entries(worktree_path)?;
+
     Ok(HookInstallSummary {
         installed_configs,
         local_exclude_updated,
+        legacy_gitignore_removed,
     })
+}
+
+/// Entries that pre-exclude installs appended to a root `.gitignore`.
+const LEGACY_GITIGNORE_ENTRIES: &[&str] =
+    &[".claude/settings.local.json", ".codex/config.local.json"];
+
+/// Remove Hitch's legacy `.gitignore` lines from `worktree_path`. Lines the user
+/// added are preserved; if stripping ours empties the file, the file is deleted
+/// (matching what a fresh exclude-based install leaves behind). Returns whether
+/// anything changed.
+fn remove_legacy_gitignore_entries(worktree_path: &Path) -> Result<bool, AgentHookError> {
+    let path = worktree_path.join(".gitignore");
+    let existing = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+
+    let retained = existing
+        .lines()
+        .filter(|line| !LEGACY_GITIGNORE_ENTRIES.contains(&line.trim()))
+        .collect::<Vec<_>>();
+    if retained.len() == existing.lines().count() {
+        return Ok(false);
+    }
+
+    if retained.iter().all(|line| line.trim().is_empty()) {
+        fs::remove_file(&path)?;
+    } else {
+        let mut updated = retained.join("\n");
+        updated.push('\n');
+        fs::write(&path, updated)?;
+    }
+    Ok(true)
 }
 
 fn install_claude_hooks(
@@ -668,6 +712,49 @@ mod tests {
         assert!(exclude.contains(".codex/hooks.json"));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_removes_legacy_hitch_owned_gitignore() {
+        let worktree = temp_dir("legacy-gitignore");
+        init_git_repo(&worktree);
+        // Simulate a pre-exclude install: Hitch's two lines are the whole file.
+        fs::write(
+            worktree.join(".gitignore"),
+            ".claude/settings.local.json\n.codex/config.local.json\n",
+        )
+        .unwrap();
+
+        let summary =
+            install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        assert!(summary.legacy_gitignore_removed);
+        assert!(!worktree.join(".gitignore").exists());
+        assert_git_status_clean(&worktree);
+
+        fs::remove_dir_all(worktree).unwrap();
+    }
+
+    #[test]
+    fn install_strips_only_legacy_lines_from_user_gitignore() {
+        let worktree = temp_dir("legacy-gitignore-mixed");
+        init_git_repo(&worktree);
+        fs::write(
+            worktree.join(".gitignore"),
+            "node_modules/\n.claude/settings.local.json\ntarget/\n.codex/config.local.json\n",
+        )
+        .unwrap();
+
+        let summary =
+            install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        assert!(summary.legacy_gitignore_removed);
+        let gitignore = fs::read_to_string(worktree.join(".gitignore")).unwrap();
+        assert_eq!(gitignore, "node_modules/\ntarget/\n");
+        assert!(!gitignore.contains(".claude/settings.local.json"));
+        assert!(!gitignore.contains(".codex/config.local.json"));
+
+        fs::remove_dir_all(worktree).unwrap();
     }
 
     #[test]

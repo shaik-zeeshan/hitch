@@ -167,6 +167,9 @@ function scheduleActiveCompletedTabDismissal(sessionId: Id): void {
     setTimeout(() => {
       completedTabTimers.delete(sessionId);
       if (get(activeSessionId) !== sessionId) return;
+      // The user may have opened the diff tab during the visible window; don't
+      // dismiss a badge the session tab is no longer showing.
+      if (get(diffActive)) return;
       if (get(agentStates)[sessionId] !== "completed") return;
       dismissSessionState(sessionId, "completed");
     }, COMPLETED_TAB_VISIBLE_MS),
@@ -674,7 +677,14 @@ export function applyHitchEvent(event: HitchEvent): void {
     if (sessionId) {
       agentStates.update((current) => ({ ...current, [sessionId]: state }));
       resetDismissedSessionState(sessionId);
-      if (state === "completed" && get(activeSessionId) === sessionId) {
+      // Only auto-dismiss when the session tab is the visible center view. If
+      // the diff tab is showing, the session is hidden behind it, so its
+      // completed badge must persist until the user actually reveals the tab.
+      if (
+        state === "completed" &&
+        get(activeSessionId) === sessionId &&
+        !get(diffActive)
+      ) {
         scheduleActiveCompletedTabDismissal(sessionId);
       } else {
         clearCompletedTabTimer(sessionId);
@@ -1658,9 +1668,23 @@ activeSessionId.subscribe(($id) => {
 // perceptible before dismissing it.
 activeSessionId.subscribe(($id) => {
   if (!$id) return;
+  // The diff tab can be the visible view while `activeSessionId` still points
+  // at a session behind it; don't treat that as a visit.
+  if (get(diffActive)) return;
   if (get(agentStates)[$id] !== "completed") return;
   clearCompletedTabTimer($id);
   dismissSessionState($id, "completed");
+});
+
+// Closing the diff reveals the active session tab again. If that session
+// completed while hidden behind the diff, the reveal is the acknowledgement.
+diffActive.subscribe(($active) => {
+  if ($active) return;
+  const id = get(activeSessionId);
+  if (!id) return;
+  if (get(agentStates)[id] !== "completed") return;
+  clearCompletedTabTimer(id);
+  dismissSessionState(id, "completed");
 });
 
 // Drop remembered ids for sessions that have closed.
