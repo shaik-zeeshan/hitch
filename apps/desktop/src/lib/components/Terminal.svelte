@@ -363,6 +363,15 @@
     // Ctrl+C stays SIGINT to the child. Returning false consumes the event;
     // true lets xterm/the child handle it as usual.
     term.attachCustomKeyEventHandler((e) => {
+      // Send Shift+Enter as a line feed (\n) rather than carriage return (\r),
+      // so terminal apps (e.g. Claude Code) can tell Enter (execute) apart from
+      // Shift+Enter (insert newline). Consume every event type for this combo so
+      // xterm doesn't also emit its default \r. xterm.js 6.1 may handle this
+      // natively; remove the workaround then.
+      if (e.shiftKey && e.key === "Enter") {
+        if (e.type === "keydown") sendInput(sessionId, "\n");
+        return false;
+      }
       if (e.type !== "keydown" || !e.metaKey) return true;
       if (e.key === "c") {
         // Copy only when there's a selection; otherwise let Cmd+C through.
