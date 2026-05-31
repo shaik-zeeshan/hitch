@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use hitch_core::{Project, Session, SessionId, SessionParent, Worktree};
 use hitch_proto::{
     encode_control_message, encode_pty_frame, CommitDraft, ControlMessage, ErrorCode, Event,
-    GitStatus, PullRequestDraft, Request, Response, PROTOCOL_VERSION,
+    GitStatus, JobRequest, PullRequestDraft, Request, Response, PROTOCOL_VERSION,
 };
 
 #[test]
@@ -470,7 +470,7 @@ fn stage_commit_push_and_create_pr_round_trip_over_socket() {
     // Push now runs as a Job (ADR 0008): JobStarted then JobCompleted{Ack}.
     match client.run_job(
         7,
-        Request::Push {
+        JobRequest::Push {
             worktree_id: worktree.id,
         },
     ) {
@@ -739,7 +739,7 @@ impl TestClient {
     ) -> PullRequestDraft {
         match self.run_job(
             id,
-            Request::GeneratePullRequestDraft {
+            JobRequest::GeneratePullRequestDraft {
                 worktree_id,
                 base,
                 settings: None,
@@ -761,7 +761,7 @@ impl TestClient {
     ) -> String {
         match self.run_job(
             id,
-            Request::CreatePullRequest {
+            JobRequest::CreatePullRequest {
                 worktree_id,
                 title: title.into(),
                 body: None,
@@ -832,10 +832,10 @@ impl TestClient {
         }
     }
 
-    /// Send a long-running request and block until its Job completes, returning
+    /// Send a `StartJob` wrapper and block until its Job completes, returning
     /// the wrapped response.
-    fn run_job(&mut self, id: u64, request: Request) -> Response {
-        self.send_request(id, request);
+    fn run_job(&mut self, id: u64, request: JobRequest) -> Response {
+        self.send_request(id, Request::StartJob { request });
         let job_id = self.read_job_started(id);
         self.read_job_completed(job_id)
     }

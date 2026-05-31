@@ -1289,7 +1289,7 @@ fn run_command(
 
     let stdout = String::from_utf8(join_pipe_reader(stdout_reader)?)?;
     let stderr = String::from_utf8(join_pipe_reader(stderr_reader)?)?;
-    if status.success() && !cancelled && !control.is_cancelled() {
+    if status.success() && !cancelled {
         Ok(CommandOutput { stdout, stderr })
     } else {
         Err(command_failed(
@@ -2032,30 +2032,68 @@ mod tests {
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
     }
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    };
+
+    struct TestControl {
+        cancelled: AtomicBool,
+        pgids: Mutex<Vec<Option<i32>>>,
+        cancel_on_clear: bool,
+    }
+
+    impl TestControl {
+        fn new(cancel_on_clear: bool) -> Self {
+            Self {
+                cancelled: AtomicBool::new(false),
+                pgids: Mutex::new(Vec::new()),
+                cancel_on_clear,
+            }
+        }
+
+        fn cancel(&self) {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl CommandControl for TestControl {
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+
+        fn set_child_pgid(&self, pgid: Option<i32>) {
+            self.pgids.lock().unwrap().push(pgid);
+            if self.cancel_on_clear && pgid.is_none() {
+                self.cancel();
+            }
+        }
+    }
+
+    #[test]
+    fn run_command_keeps_success_when_cancellation_arrives_after_exit() {
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("git-success");
+        fs::write(&script, "#!/bin/sh\nprintf 'done'\n").unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let control = TestControl::new(true);
+        let output = run_command(&script, temp.path(), Vec::new(), Some(&control)).unwrap();
+
+        assert_eq!(output.stdout, "done");
+        assert_eq!(output.stderr, "");
+        assert!(control.is_cancelled(), "test precondition: cancel should flip after exit");
+        let pgids = control.pgids.lock().unwrap();
+        assert!(pgids.first().is_some_and(|pgid| pgid.is_some()));
+        assert_eq!(pgids.last().copied(), Some(None));
+    }
 
     #[cfg(unix)]
     #[test]
-    fn controlled_clone_kills_the_child_when_cancelled() {
-        use std::sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc, Mutex,
-        };
-        use std::time::{Duration, Instant};
-
-        struct TestControl {
-            cancelled: AtomicBool,
-            pgids: Mutex<Vec<Option<i32>>>,
-        }
-
-        impl CommandControl for TestControl {
-            fn is_cancelled(&self) -> bool {
-                self.cancelled.load(Ordering::SeqCst)
-            }
-
-            fn set_child_pgid(&self, pgid: Option<i32>) {
-                self.pgids.lock().unwrap().push(pgid);
-            }
-        }
+    fn run_command_reports_mid_flight_cancellation() {
+        use std::time::Duration;
 
         let temp = TempDir::new().unwrap();
         let script = temp.path().join("git-sleep");
@@ -2064,17 +2102,44 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&script, permissions).unwrap();
 
-        let client = GitClient::with_programs(&script, &script);
-        let control = Arc::new(TestControl {
-            cancelled: AtomicBool::new(false),
-            pgids: Mutex::new(Vec::new()),
+        let control = std::sync::Arc::new(TestControl::new(false));
+        let cancel = std::sync::Arc::clone(&control);
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel.cancel();
         });
+
+        let err = run_command(&script, temp.path(), Vec::new(), Some(control.as_ref())).unwrap_err();
+        trigger.join().unwrap();
+
+        match err {
+            GitError::CommandFailed { stderr, .. } => assert!(stderr.contains("command cancelled")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let pgids = control.pgids.lock().unwrap();
+        assert!(pgids.first().is_some_and(|pgid| pgid.is_some()));
+        assert_eq!(pgids.last().copied(), Some(None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controlled_clone_kills_the_child_when_cancelled() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("git-sleep");
+        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let client = GitClient::with_programs(&script, &script);
+        let control = Arc::new(TestControl::new(false));
         let cancel = Arc::clone(&control);
         let trigger = thread::spawn(move || {
             thread::sleep(Duration::from_millis(100));
-            cancel.cancelled.store(true, Ordering::SeqCst);
+            cancel.cancel();
         });
-
         let started = Instant::now();
         let err = client
             .clone_repo_with_control(

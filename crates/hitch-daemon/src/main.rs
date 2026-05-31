@@ -31,8 +31,8 @@ use hitch_git::{
 use hitch_proto::{
     encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage,
     DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
-    JobStatus, ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode,
-    MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
+    JobRequest, JobStatus, ProtocolError, PullRequestDraft, Request, Response,
+    WorktreeCreateMode, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
 use hitch_pty::{
     ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY,
@@ -407,11 +407,10 @@ struct DaemonState {
     /// the dispatcher mutates this, so its borrows of `DaemonState` are brief and
     /// never overlap a client thread's mutation of the same field.
     broadcaster: OutputBroadcaster,
-    /// Live async **Jobs** keyed by id (ADR 0008). Each entry's [`JobControl`] is
-    /// shared with the Job worker thread so `CancelJob` can signal it and kill any
-    /// git/agent child. Ephemeral: never persisted, dropped when the worker
-    /// finishes, and gone entirely on daemon restart.
-    jobs: HashMap<JobId, Arc<JobControl>>,
+    /// Live async **Jobs** keyed by id (ADR 0008). Each entry keeps the shared
+    /// [`JobControl`] plus the UI metadata a late-attaching client needs to
+    /// rebuild its live Job store before later `JobCompleted` arrives.
+    jobs: HashMap<JobId, ActiveJob>,
 }
 
 impl DaemonState {
@@ -430,6 +429,12 @@ impl DaemonState {
             jobs: HashMap::new(),
         }
     }
+}
+
+struct ActiveJob {
+    control: Arc<JobControl>,
+    kind: Option<&'static str>,
+    message: Option<String>,
 }
 
 /// Shared control handle for one running **Job** (ADR 0008). The Job registry on
@@ -621,15 +626,22 @@ struct ClientSink {
     writer: Mutex<UnixStream>,
     /// Output readiness gate. `false` until the replay thread has delivered the
     /// full scrollback snapshot and drained any output buffered in `pending`.
-    /// The output broadcast path buffers into `pending` while the gate is closed
-    /// and writes directly once it is open. Non-output broadcasts ignore this
-    /// flag (ADR 0007).
+    /// and writes directly once it is open. Job events use their own gate below;
+    /// all other control-plane broadcasts ignore this one (ADR 0007).
     live: AtomicBool,
+    /// Job-event readiness gate. `false` until the reconnect replay has sent the
+    /// current running-job snapshot and drained any `JobProgress`/`JobCompleted`
+    /// events that raced with it.
+    jobs_live: AtomicBool,
     /// Output buffered while the gate is closed. The replay thread holds this
     /// lock while draining and writing the buffered bytes, then sets `live=true`
     /// before releasing — guaranteeing snapshot → pending → live order with no
     /// gap or duplication.
     pending: Mutex<Vec<(SessionId, Vec<u8>)>>,
+    /// Job events buffered while `jobs_live` is closed. The replay path drains
+    /// this under the lock before opening the gate, so late-attaching clients see
+    /// running-job snapshots before any raced completion/cancellation.
+    pending_job_events: Mutex<Vec<Event>>,
 }
 
 fn restore_layout(
@@ -692,7 +704,9 @@ fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &UnixStream) -> io::
         Arc::new(ClientSink {
             writer: Mutex::new(writer),
             live: AtomicBool::new(false),
+            jobs_live: AtomicBool::new(false),
             pending: Mutex::new(Vec::new()),
+            pending_job_events: Mutex::new(Vec::new()),
         }),
     );
     Ok(client_id)
@@ -841,6 +855,8 @@ fn handle_request<R: Read>(
             broadcast_event(state, Event::ProjectUpdated { project })?;
         }
         Request::CloneProject { .. } => {
+            let request = JobRequest::try_from(request)
+                .map_err(|_| internal("job-capable request rejected during dispatch"))?;
             dispatch_job(state, client_id, request_id, request)?;
         }
         Request::RemoveProject { project_id, force } => {
@@ -878,6 +894,8 @@ fn handle_request<R: Read>(
             )?;
         }
         Request::CreateWorktree { .. } => {
+            let request = JobRequest::try_from(request)
+                .map_err(|_| internal("job-capable request rejected during dispatch"))?;
             dispatch_job(state, client_id, request_id, request)?;
         }
         Request::RemoveWorktree {
@@ -1021,15 +1039,17 @@ fn handle_request<R: Read>(
         | Request::Push { .. }
         | Request::Pull { .. }
         | Request::CreatePullRequest { .. } => {
+            let request = JobRequest::try_from(request)
+                .map_err(|_| internal("job-capable request rejected during dispatch"))?;
             dispatch_job(state, client_id, request_id, request)?;
         }
         Request::StartJob { request } => {
-            dispatch_job(state, client_id, request_id, *request)?;
+            dispatch_job(state, client_id, request_id, request)?;
         }
         Request::CancelJob { job_id } => {
             let control = {
                 let guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
-                guard.jobs.get(&job_id).map(Arc::clone)
+                guard.jobs.get(&job_id).map(|job| Arc::clone(&job.control))
             };
             if let Some(control) = control {
                 control.cancel();
@@ -2106,9 +2126,9 @@ fn replay_sessions_to_client(
     state: &Arc<Mutex<DaemonState>>,
     client_id: u64,
 ) -> Result<(), ProtocolError> {
-    let replay_items = {
+    let (replay_items, jobs) = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
-        state
+        let replay_items = state
             .sessions
             .values()
             .map(|daemon_session| {
@@ -2119,7 +2139,13 @@ fn replay_sessions_to_client(
                 let command = daemon_session.pty.foreground_command();
                 (daemon_session.session.clone(), scrollback, command)
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let jobs = state
+            .jobs
+            .iter()
+            .map(|(job_id, job)| (*job_id, job.message.clone(), job.kind.map(str::to_string)))
+            .collect::<Vec<_>>();
+        (replay_items, jobs)
     };
 
     // Send control-plane messages (SessionOpened, SessionCommand) on the
@@ -2140,6 +2166,19 @@ fn replay_sessions_to_client(
             Event::SessionCommand {
                 session_id: session.id,
                 command: command.clone(),
+            },
+        )?;
+    }
+
+    for (job_id, message, kind) in &jobs {
+        send_event_to_client(
+            state,
+            client_id,
+            Event::JobProgress {
+                job_id: *job_id,
+                status: JobStatus::Running,
+                message: message.clone(),
+                kind: kind.clone(),
             },
         )?;
     }
@@ -2170,6 +2209,12 @@ fn replay_sessions_to_client(
                     let _ = write_output_to_sink(&sink, session_id, &bytes);
                 }
                 sink.live.store(true, Ordering::SeqCst);
+            }
+            if let Ok(mut pending_job_events) = sink.pending_job_events.lock() {
+                for event in pending_job_events.drain(..) {
+                    let _ = write_control_to_sink(&sink, &ControlMessage::event(event));
+                }
+                sink.jobs_live.store(true, Ordering::SeqCst);
             }
         }
         // Mirror the gate in the broadcaster so the unit-tested model stays consistent.
@@ -2202,6 +2247,7 @@ fn start_job<F>(
     state: &Arc<Mutex<DaemonState>>,
     client_id: u64,
     request_id: u64,
+    kind: Option<&'static str>,
     progress: Option<&str>,
     work: F,
 ) -> Result<(), ProtocolError>
@@ -2212,9 +2258,17 @@ where
 {
     let job_id = JobId::new();
     let control = Arc::new(JobControl::default());
+    let message = progress.map(str::to_string);
     {
         let mut guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
-        guard.jobs.insert(job_id, Arc::clone(&control));
+        guard.jobs.insert(
+            job_id,
+            ActiveJob {
+                control: Arc::clone(&control),
+                kind,
+                message: message.clone(),
+            },
+        );
     }
 
     let worker_state = Arc::clone(state);
@@ -2252,15 +2306,16 @@ where
             ),
             Err(error) => (JobStatus::Failed, Response::Error { error }),
         };
-        let _ = broadcast_event(
+        let _ = broadcast_job_event(
             &worker_state,
             Event::JobProgress {
                 job_id,
                 status,
                 message: None,
+                kind: None,
             },
         );
-        let _ = broadcast_event(
+        let _ = broadcast_job_event(
             &worker_state,
             Event::JobCompleted {
                 job_id,
@@ -2290,12 +2345,13 @@ where
         let _ = start_tx.send(false);
         return Err(err);
     }
-    let _ = broadcast_event(
+    let _ = broadcast_job_event(
         state,
         Event::JobProgress {
             job_id,
             status: JobStatus::Running,
-            message: progress.map(str::to_string),
+            message,
+            kind: kind.map(str::to_string),
         },
     );
     let _ = start_tx.send(true);
@@ -2310,10 +2366,10 @@ fn dispatch_job(
     state: &Arc<Mutex<DaemonState>>,
     client_id: u64,
     request_id: u64,
-    request: Request,
+    request: JobRequest,
 ) -> Result<(), ProtocolError> {
     match request {
-        Request::CloneProject {
+        JobRequest::CloneProject {
             remote_url,
             destination,
             name,
@@ -2322,6 +2378,7 @@ fn dispatch_job(
             state,
             client_id,
             request_id,
+            Some("clone"),
             Some("Cloning…"),
             move |state, control| {
                 let git = {
@@ -2336,7 +2393,7 @@ fn dispatch_job(
                 })
             },
         ),
-        Request::CreateWorktree {
+        JobRequest::CreateWorktree {
             project_id,
             branch,
             base,
@@ -2346,6 +2403,7 @@ fn dispatch_job(
             state,
             client_id,
             request_id,
+            Some("create-worktree"),
             Some("Creating worktree…"),
             move |state, control| {
                 let worktree = create_worktree(state, project_id, branch, base, mode, Some(control))?;
@@ -2360,23 +2418,25 @@ fn dispatch_job(
                 })
             },
         ),
-        Request::Push { worktree_id } => start_job(
+        JobRequest::Push { worktree_id } => start_job(
             "hitch-push",
             state,
             client_id,
             request_id,
+            Some("push"),
             Some("Pushing…"),
             move |state, control| do_push(state, worktree_id, control),
         ),
-        Request::Pull { worktree_id } => start_job(
+        JobRequest::Pull { worktree_id } => start_job(
             "hitch-pull",
             state,
             client_id,
             request_id,
+            Some("pull"),
             Some("Pulling…"),
             move |state, control| do_pull(state, worktree_id, control),
         ),
-        Request::CreatePullRequest {
+        JobRequest::CreatePullRequest {
             worktree_id,
             title,
             body,
@@ -2387,21 +2447,23 @@ fn dispatch_job(
             state,
             client_id,
             request_id,
+            Some("create-pr"),
             Some("Creating pull request…"),
             move |state, control| do_create_pr(state, worktree_id, title, body, base, draft, control),
         ),
-        Request::ListDraftModels { provider } => start_job(
+        JobRequest::ListDraftModels { provider } => start_job(
             "hitch-draft-models",
             state,
             client_id,
             request_id,
+            Some("draft-models"),
             None,
             move |state, control| {
                 let models = list_draft_models(state, provider, Some(control))?;
                 Ok(Response::DraftModels { provider, models })
             },
         ),
-        Request::GenerateCommitDraft {
+        JobRequest::GenerateCommitDraft {
             worktree_id,
             settings,
         } => start_job(
@@ -2409,13 +2471,14 @@ fn dispatch_job(
             state,
             client_id,
             request_id,
+            Some("commit-draft"),
             Some("Generating commit message…"),
             move |state, control| {
                 let draft = generate_commit_draft(state, worktree_id, settings, Some(control))?;
                 Ok(Response::CommitDraft { draft })
             },
         ),
-        Request::GeneratePullRequestDraft {
+        JobRequest::GeneratePullRequestDraft {
             worktree_id,
             base,
             settings,
@@ -2424,6 +2487,7 @@ fn dispatch_job(
             state,
             client_id,
             request_id,
+            Some("pr-draft"),
             Some("Generating PR description…"),
             move |state, control| {
                 let draft =
@@ -2431,10 +2495,6 @@ fn dispatch_job(
                 Ok(Response::PullRequestDraft { draft })
             },
         ),
-        _ => Err(ProtocolError::new(
-            ErrorCode::InvalidRequest,
-            "this request type cannot run as a Job",
-        )),
     }
 }
 
@@ -2557,6 +2617,48 @@ fn broadcast_event(state: &Arc<Mutex<DaemonState>>, event: Event) -> Result<(), 
     Ok(())
 }
 
+fn broadcast_job_event(state: &Arc<Mutex<DaemonState>>, event: Event) -> Result<(), ProtocolError> {
+    let clients = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        state
+            .clients
+            .iter()
+            .map(|(id, sink)| (*id, Arc::clone(sink)))
+            .collect::<Vec<_>>()
+    };
+
+    let mut dead = Vec::new();
+    for (id, sink) in clients {
+        let write_result = if sink.jobs_live.load(Ordering::SeqCst) {
+            write_control_to_sink(&sink, &ControlMessage::event(event.clone()))
+        } else {
+            let mut pending = sink
+                .pending_job_events
+                .lock()
+                .map_err(|_| internal("job replay buffer lock poisoned"))?;
+            if sink.jobs_live.load(Ordering::SeqCst) {
+                drop(pending);
+                write_control_to_sink(&sink, &ControlMessage::event(event.clone()))
+            } else {
+                pending.push(event.clone());
+                Ok(())
+            }
+        };
+        if write_result.is_err() {
+            dead.push(id);
+        }
+    }
+
+    if !dead.is_empty() {
+        if let Ok(mut state) = state.lock() {
+            for id in dead {
+                state.clients.remove(&id);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn broadcast_session_output(
     state: &Arc<Mutex<DaemonState>>,
     session_id: SessionId,
@@ -2567,8 +2669,9 @@ fn broadcast_session_output(
     // snapshot. While the gate is closed we buffer into `sink.pending` instead
     // of skipping, so bytes that arrive during the replay write window are not
     // lost. The replay thread drains `pending` and sets `live=true` under the
-    // pending lock, so ordering is: snapshot → pending → live. Control-plane
-    // broadcasts deliberately do NOT gate (see `broadcast_event`; ADR 0007).
+    // pending lock, so ordering is: snapshot → pending → live. Generic
+    // control-plane broadcasts still ignore this gate; job events use
+    // `broadcast_job_event`'s separate replay buffer.
     let clients = match state.lock() {
         Ok(state) => state
             .clients
@@ -2676,7 +2779,11 @@ fn write_output_to_sink(sink: &ClientSink, session_id: SessionId, bytes: &[u8]) 
 
 fn cancel_active_jobs(state: &Arc<Mutex<DaemonState>>) {
     let jobs = match state.lock() {
-        Ok(state) => state.jobs.values().cloned().collect::<Vec<_>>(),
+        Ok(state) => state
+            .jobs
+            .values()
+            .map(|job| Arc::clone(&job.control))
+            .collect::<Vec<_>>(),
         Err(_) => Vec::new(),
     };
     for control in jobs {
@@ -3045,7 +3152,14 @@ mod tests {
 
         let job_id = hitch_core::JobId::new();
         let control = Arc::new(super::JobControl::default());
-        state.lock().unwrap().jobs.insert(job_id, Arc::clone(&control));
+        state.lock().unwrap().jobs.insert(
+            job_id,
+            super::ActiveJob {
+                control: Arc::clone(&control),
+                kind: Some("push"),
+                message: Some("Pushing…".into()),
+            },
+        );
 
         let worker_state = Arc::clone(&state);
         let worker_control = Arc::clone(&control);

@@ -6,6 +6,7 @@
   // tree; this panel focuses on file status and commit actions.
   import {
     cancelJob,
+    cancellableJobForSelectedWorktree,
     commit,
     defaultBase,
     diffPath,
@@ -15,8 +16,6 @@
     gitBusy,
     gitStatus,
     gitWorktreeId,
-    isJobCancellable,
-    jobs,
     loadGitStatus,
     pull,
     push,
@@ -45,12 +44,7 @@
   const behind = $derived($gitStatus?.behind ?? 0);
   const isDefaultBranch = $derived(Boolean($defaultBase && $gitStatus?.branch === $defaultBase));
 
-  // Only draft/model Jobs register cancellable child process groups today.
-  const cancellableJob = $derived(
-    Object.values($jobs).find(
-      (j) => (j.status === "running" || j.status === "queued") && isJobCancellable(j),
-    ) ?? null,
-  );
+  const cancellableJob = $derived($cancellableJobForSelectedWorktree);
 
   let autoRunning = $state(false);
 

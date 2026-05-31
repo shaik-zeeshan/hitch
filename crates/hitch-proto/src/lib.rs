@@ -81,7 +81,7 @@ Request:
   install-agent-hooks(worktree_id)
   report-agent-state(agent, state, session_id?, cwd?, detail?)
   ping
-  start-job(request)
+  start-job(clone-project | create-worktree | list-draft-models | generate-commit-draft | generate-pull-request-draft | push | pull | create-pull-request)
   cancel-job(job_id)
 
 Response:

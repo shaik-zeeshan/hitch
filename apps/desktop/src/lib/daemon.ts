@@ -25,11 +25,13 @@ import {
   type HitchEvent,
   type Id,
   type JobStatus,
+  type JobRequest,
   type PrFields,
   type PullRequestDraft,
   type Project,
   type Request,
   type Response,
+  type StartJobRequest,
   type Session,
   type SessionParent,
   type Worktree,
@@ -54,8 +56,8 @@ export const daemonLogPath = writable<string | null>(null);
 
 // ---- Jobs (ADR 0008) ------------------------------------------------------
 //
-// Long-running daemon ops (push/pull/PR/drafts/worktree creation) run as Jobs:
-// the desktop sends `StartJob`, gets `JobStarted { job_id }`, and the real
+// Long-running daemon ops (clone/worktree creation, push/pull, PR, drafts)
+// run as Jobs: the desktop sends `StartJob`, gets `JobStarted { job_id }`, and
 // result arrives later in a `JobCompleted` event. This store mirrors live Jobs
 // by id for quiet progress; `runJob` (below) bridges the event flow back to a
 // Promise so callers keep their async API.
@@ -64,6 +66,7 @@ export type Job = {
   status: JobStatus;
   message: string | null;
   kind: string | null;
+  worktreeId: Id | null;
 };
 export const jobs = writable<Record<Id, Job>>({});
 
@@ -212,7 +215,7 @@ function toMessage(err: unknown): string {
 
 // ---- Job dispatch (ADR 0008) ----------------------------------------------
 //
-// `runJob` wraps a long-running request in `StartJob`, registers a pending
+// `runJob` wraps a job-capable request in `StartJob`, registers a pending
 // resolver keyed by the returned job id, and resolves/rejects it when the
 // matching `JobCompleted` event arrives (handled in the hitch-event listener).
 // Callers (push/pull/draft fns) keep an ordinary Promise API.
@@ -232,6 +235,25 @@ const cancellableJobKinds = new Set(["draft-models", "commit-draft", "pr-draft"]
 export function isJobCancellable(job: Job | null | undefined): boolean {
   return Boolean(job?.kind && cancellableJobKinds.has(job.kind));
 }
+
+function jobWorktreeId(request: JobRequest): Id | null {
+  return "worktree_id" in request ? request.worktree_id : null;
+}
+
+export const cancellableJobForSelectedWorktree = derived(
+  [jobs, gitWorktreeId],
+  ([$jobs, $worktreeId]) => {
+    if (!$worktreeId) return null;
+    return (
+      Object.values($jobs).find(
+        (job) =>
+          job.worktreeId === $worktreeId &&
+          (job.status === "running" || job.status === "queued") &&
+          isJobCancellable(job),
+      ) ?? null
+    );
+  },
+);
 
 function pruneEarlyCompletions(now = Date.now()): void {
   for (const [jobId, completion] of earlyCompletions) {
@@ -260,16 +282,14 @@ function takeEarlyCompletion(jobId: Id): Response | null {
 }
 
 export async function runJob<T extends Response>(
-  request: Request,
+  request: JobRequest,
   kind: string | null = null,
 ): Promise<T> {
   startingJobRequests += 1;
   let started: Response & { job_id: Id };
   try {
-    started = await daemonRequest<Response & { job_id: Id }>({
-      type: "start-job",
-      request,
-    });
+    const startRequest: StartJobRequest = { type: "start-job", request };
+    started = await daemonRequest<Response & { job_id: Id }>(startRequest);
   } finally {
     startingJobRequests = Math.max(0, startingJobRequests - 1);
   }
@@ -277,7 +297,7 @@ export async function runJob<T extends Response>(
   locallyStartedJobs.add(jobId);
   jobs.update((current) => ({
     ...current,
-    [jobId]: { id: jobId, status: "running", message: null, kind },
+    [jobId]: { id: jobId, status: "running", message: null, kind, worktreeId: jobWorktreeId(request) },
   }));
   return new Promise<T>((resolve, reject) => {
     const early = takeEarlyCompletion(jobId);
@@ -308,10 +328,17 @@ export function applyJobProgress(
   jobId: Id,
   status: JobStatus,
   message: string | null,
+  kind: string | null = null,
 ): void {
   jobs.update((current) => ({
     ...current,
-    [jobId]: { id: jobId, status, message, kind: current[jobId]?.kind ?? null },
+    [jobId]: {
+      id: jobId,
+      status,
+      message,
+      kind: kind ?? current[jobId]?.kind ?? null,
+      worktreeId: current[jobId]?.worktreeId ?? null,
+    },
   }));
 }
 
@@ -423,6 +450,14 @@ export async function refreshAll(): Promise<void> {
     ),
   );
 }
+async function refreshSnapshotAfterConnect(): Promise<void> {
+  try {
+    await refreshAll();
+  } catch (err) {
+    error.set(toMessage(err));
+  }
+}
+
 
 // ---- per-session PTY output (binary channel + bounded byte ring) ----------
 //
@@ -578,6 +613,7 @@ export async function initDaemon(): Promise<void> {
             event.job_id as Id,
             event.status as JobStatus,
             (event.message as string | null) ?? null,
+            (event.kind as string | null) ?? null,
           );
         }
         if (event.type === "job-completed") {
@@ -673,7 +709,7 @@ export async function initDaemon(): Promise<void> {
 
     await invoke("connect_daemon");
     applyDaemonStatus("running", null);
-    await refreshAll();
+    await refreshSnapshotAfterConnect();
   } catch (err) {
     applyDaemonStatus("failed", toMessage(err));
   }
@@ -714,7 +750,7 @@ export async function reconnect(): Promise<void> {
   try {
     await invoke("connect_daemon");
     applyDaemonStatus("running", null);
-    await refreshAll();
+    await refreshSnapshotAfterConnect();
   } catch (err) {
     applyDaemonStatus("failed", toMessage(err));
   }
@@ -727,7 +763,7 @@ export async function restartDaemon(): Promise<void> {
   try {
     await invoke("restart_daemon_command");
     applyDaemonStatus("running", null);
-    await refreshAll();
+    await refreshSnapshotAfterConnect();
   } catch (err) {
     applyDaemonStatus("failed", toMessage(err));
   }

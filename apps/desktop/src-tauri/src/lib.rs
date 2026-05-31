@@ -697,47 +697,60 @@ impl HitchClient {
             .expect("failed to spawn daemon reader thread");
     }
 
-    fn mark_disconnected(&self, app: &AppHandle, reason: String) {
+    fn clear_connection_state(&self, reason: &str, drop_writer: bool) {
         self.0.connected.store(false, Ordering::SeqCst);
-        if let Ok(mut writer) = self.0.writer.lock() {
-            *writer = None;
+        if drop_writer {
+            if let Ok(mut writer) = self.0.writer.lock() {
+                *writer = None;
+            }
         }
         if let Ok(mut sessions) = self.0.sessions.lock() {
             sessions.clear();
         }
-        self.refresh_tray(app);
 
         let error_response = Response::Error {
-            error: ProtocolError::new(ErrorCode::Unavailable, reason.clone()).retryable(true),
+            error: ProtocolError::new(ErrorCode::Unavailable, reason.to_string()).retryable(true),
         };
         if let Ok(mut pending) = self.0.pending.lock() {
             for (_, tx) in pending.drain() {
                 let _ = tx.send(error_response.clone());
             }
         }
+    }
 
+    fn mark_disconnected(&self, app: &AppHandle, reason: String) {
+        self.clear_connection_state(&reason, true);
+        self.refresh_tray(app);
         let _ = app.emit("hitch-disconnected", DisconnectedPayload { reason });
     }
 
     /// Handle an *unexpected* loss of the daemon link (reader EOF/error, missed
-    /// heartbeat, or a failed write). Tears the socket down, surfaces the loss as
-    /// a Daemon Status with a log-sourced reason, then kicks off bounded
-    /// auto-recovery (ADR 0009). The deliberate restart path (`restart_daemon`)
-    /// does NOT route through here — it manages its own reconnect.
+    /// heartbeat, or a failed write). Marks the connection unavailable, surfaces
+    /// the loss as a Daemon Status with a log-sourced reason, then kicks off
+    /// bounded auto-recovery (ADR 0009). The deliberate restart path
+    /// (`restart_daemon`) does NOT route through here — it manages its own reconnect.
     fn handle_connection_lost(&self, app: &AppHandle, reason: &str) {
         if self.0.suppress_recovery.load(Ordering::SeqCst) {
             return;
         }
-        self.mark_disconnected(app, reason.to_string());
+        let mode = recovery_mode_for_loss(reason);
+        let reason = reason.to_string();
+        self.clear_connection_state(&reason, mode != RecoveryMode::RestartDaemon);
+        self.refresh_tray(app);
+        let _ = app.emit(
+            "hitch-disconnected",
+            DisconnectedPayload {
+                reason: reason.clone(),
+            },
+        );
         // Socket-absent reads as `unreachable`; recovery refines this to
         // `starting` while retrying and `failed` if the crash-loop guard trips.
         self.set_status(
             app,
             DaemonStatus::Unreachable,
-            self.log_failure_reason()
-                .or_else(|| Some(reason.to_string())),
+            self.log_failure_reason().or_else(|| Some(reason.clone())),
         );
-        self.begin_recovery(app, recovery_mode_for_loss(reason));
+        self.begin_recovery(app, mode);
     }
 
     /// Start the auto-recovery loop unless one is already running. The
@@ -849,11 +862,9 @@ impl HitchClient {
     }
 
     /// Fire-and-forget a `ShutdownDaemon` request (full quit). We do not wait for
-    /// the Ack: the caller is about to exit the GUI process.
+    /// the Ack: the caller is about to exit the GUI process, and restart recovery
+    /// may still have a usable writer even after marking the connection unavailable.
     fn request_daemon_shutdown(&self) {
-        if !self.is_connected() {
-            return;
-        }
         let request_id = self.0.next_request_id.fetch_add(1, Ordering::SeqCst);
         let Ok(bytes) = encode_control_message(&ControlMessage::request(
             request_id,
@@ -1293,13 +1304,13 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_log_tail, recovery_mode_for_loss, tray_status_text, wait_for_socket_release,
-        CrashLoopGuard, DaemonStatus, OutputRouter, RecoveryMode, CRASH_LOOP_MAX,
-        HEARTBEAT_LOST_REASON,
+        read_control_message, read_log_tail, recovery_mode_for_loss, tray_status_text,
+        wait_for_socket_release, ControlMessage, CrashLoopGuard, DaemonStatus, HitchClient,
+        OutputRouter, RecoveryMode, Request, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
     };
     use hitch_core::SessionId;
     #[cfg(unix)]
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tauri::ipc::{Channel, InvokeResponseBody};
@@ -1606,6 +1617,33 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_recovery_preserves_writer_for_shutdown_request() {
+        let client = HitchClient::new();
+        let (writer, reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        client.0.connected.store(true, std::sync::atomic::Ordering::SeqCst);
+        *client.0.writer.lock().unwrap() = Some(writer);
+
+        client.clear_connection_state(HEARTBEAT_LOST_REASON, false);
+
+        assert!(!client.is_connected());
+        assert!(client.0.writer.lock().unwrap().is_some());
+
+        client.request_daemon_shutdown();
+
+        let mut reader = std::io::BufReader::new(reader);
+        let message = read_control_message(&mut reader).unwrap().unwrap();
+        assert_eq!(
+            message,
+            ControlMessage::request(1, Request::ShutdownDaemon)
+        );
     }
 }
 
