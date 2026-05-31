@@ -20,10 +20,10 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import {
+  activeSessionId,
   agentStateByProject,
   agentStateByWorktree,
   agentStates,
-  sessionAgents,
   applyDaemonStatus,
   applyHitchEvent,
   applyJobProgress,
@@ -33,6 +33,8 @@ import {
   connection,
   createWorktree,
   daemonReason,
+  dismissedWorktreeAgentStates,
+  dismissedSessionAgentStates,
   daemonStatus,
   disposeDaemon,
   error,
@@ -47,6 +49,7 @@ import {
   sessions,
   worktreeAgentStates,
   worktrees,
+  visibleAgentStates,
 } from "./daemon";
 
 // Flush the StartJob promise chain (runJob -> daemonRequest -> invoke) so the
@@ -62,12 +65,14 @@ beforeEach(() => {
   daemonStatus.set("starting");
   connection.set("connecting");
   selectedWorktreeId.set(null);
+  activeSessionId.set(null);
   projects.set([]);
   worktrees.set([]);
   sessions.set([]);
   agentStates.set({});
   worktreeAgentStates.set({});
-  sessionAgents.set({});
+  dismissedSessionAgentStates.set({});
+  dismissedWorktreeAgentStates.set({});
 });
 
 describe("daemon status mapping", () => {
@@ -145,7 +150,6 @@ describe("agent state propagation", () => {
       detail: null,
     } as any);
     expect(get(agentStates)).toEqual({ s1: "running" });
-    expect(get(sessionAgents)).toEqual({ s1: "claude-code" });
     expect(get(worktreeAgentStates)).toEqual({ w1: "running" });
     expect(get(agentStateByWorktree)).toEqual({ w1: "running" });
     expect(get(agentStateByProject)).toEqual({ p1: "running" });
@@ -163,6 +167,149 @@ describe("agent state propagation", () => {
       w2: "needs-approval",
     });
     expect(get(agentStateByProject)).toEqual({ p1: "needs-approval" });
+  });
+
+  it("hides non-running worktree rollup state once the user visits that worktree", () => {
+    projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
+    worktrees.set([
+      {
+        id: "w1",
+        project_id: "p1",
+        path: "/repo",
+        branch: "main",
+        is_main: true,
+        is_hitch_managed: false,
+      },
+      {
+        id: "w2",
+        project_id: "p1",
+        path: "/repo/.hitch/worktrees/feature",
+        branch: "feature",
+        is_main: false,
+        is_hitch_managed: true,
+      },
+    ]);
+    worktreeAgentStates.set({ w1: "completed" });
+    expect(get(agentStateByWorktree)).toEqual({ w1: "completed" });
+
+    selectedWorktreeId.set("w1");
+    expect(get(dismissedWorktreeAgentStates)).toEqual({ w1: "completed" });
+    expect(get(agentStateByWorktree)).toEqual({});
+    expect(get(agentStateByProject)).toEqual({});
+
+    selectedWorktreeId.set("w2");
+    expect(get(agentStateByWorktree)).toEqual({});
+
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: null,
+      worktree_id: "w1",
+      agent: "codex",
+      state: "completed",
+      detail: null,
+    } as any);
+    expect(get(agentStateByWorktree)).toEqual({ w1: "completed" });
+    expect(get(agentStateByProject)).toEqual({ p1: "completed" });
+
+    selectedWorktreeId.set("w1");
+    selectedWorktreeId.set("w2");
+    expect(get(agentStateByWorktree)).toEqual({});
+
+
+    worktreeAgentStates.set({ w1: "running" });
+    expect(get(agentStateByWorktree)).toEqual({ w1: "running" });
+    expect(get(agentStateByProject)).toEqual({ p1: "running" });
+
+  });
+  it("shows running worktree state again after leaving the active worktree", () => {
+    projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
+    worktrees.set([
+      {
+        id: "w1",
+        project_id: "p1",
+        path: "/repo",
+        branch: "main",
+        is_main: true,
+        is_hitch_managed: false,
+      },
+      {
+        id: "w2",
+        project_id: "p1",
+        path: "/repo/.hitch/worktrees/feature",
+        branch: "feature",
+        is_main: false,
+        is_hitch_managed: true,
+      },
+    ]);
+    worktreeAgentStates.set({ w1: "running" });
+
+    selectedWorktreeId.set("w1");
+    expect(get(dismissedWorktreeAgentStates)).toEqual({});
+    expect(get(agentStateByWorktree)).toEqual({});
+
+    selectedWorktreeId.set("w2");
+    expect(get(agentStateByWorktree)).toEqual({ w1: "running" });
+    expect(get(agentStateByProject)).toEqual({ p1: "running" });
+  });
+
+  it("dismisses a completed tab status when the user visits that tab", () => {
+    sessions.set([
+      { id: "s1", name: "codex", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
+      { id: "s2", name: "shell", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
+    ]);
+    activeSessionId.set("s2");
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: "s1",
+      worktree_id: null,
+      agent: "codex",
+      state: "completed",
+      detail: null,
+    } as any);
+    expect(get(visibleAgentStates)).toEqual({ s1: "completed" });
+
+    activeSessionId.set("s1");
+    expect(get(dismissedSessionAgentStates)).toEqual({ s1: "completed" });
+    expect(get(visibleAgentStates)).toEqual({});
+
+    activeSessionId.set("s2");
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: "s1",
+      worktree_id: null,
+      agent: "codex",
+      state: "completed",
+      detail: null,
+    } as any);
+    expect(get(visibleAgentStates)).toEqual({ s1: "completed" });
+  });
+
+  it("keeps active completed tab status visible briefly before dismissing it", () => {
+    vi.useFakeTimers();
+    try {
+      sessions.set([
+        { id: "s1", name: "codex", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
+      ]);
+      activeSessionId.set("s1");
+      applyHitchEvent({
+        type: "agent-state",
+        session_id: "s1",
+        worktree_id: null,
+        agent: "codex",
+        state: "completed",
+        detail: null,
+      } as any);
+      expect(get(visibleAgentStates)).toEqual({ s1: "completed" });
+
+      vi.advanceTimersByTime(2_499);
+      expect(get(visibleAgentStates)).toEqual({ s1: "completed" });
+
+      vi.advanceTimersByTime(1);
+      expect(get(dismissedSessionAgentStates)).toEqual({ s1: "completed" });
+      expect(get(visibleAgentStates)).toEqual({});
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

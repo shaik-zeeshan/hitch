@@ -1,23 +1,22 @@
 <script lang="ts">
   // Session tabs (mockup .tabs). One tab per session in the active parent, then
   // — when a changed file is open — a divider and the diff tab as a peer.
-  // Each tab leads with an icon from hook-reported Agent identity when present
-  // (Claude / Codex / shell), titles hook-reported agent sessions with their
-  // product name, and — for agent sessions — trails a coloured state word
+  // Each tab leads with an icon from the active foreground command when present
+  // (Claude / Codex / shell), titles active agent sessions with their product
+  // name, and trails the hook-reported state word when present
   // (the runtag). × closes, and the trailing + opens a dropdown to spawn
   // Claude / Codex / a plain shell in the active parent.
   import { ContextMenu, DropdownMenu } from "bits-ui";
   import {
     activeSession,
     activeSessionId,
-    agentStates,
+    visibleAgentStates,
     closeDiff,
     closeSession,
     diffActive,
     diffPath,
     openSession,
     sessionCommands,
-    sessionAgents,
     visibleSessions,
   } from "../daemon";
   import { AGENT_LABEL, type Session, type SessionParent } from "../types";
@@ -36,11 +35,10 @@
 
 <div class="tabs" role="tablist">
   {#each $visibleSessions as session (session.id)}
-    {@const state = $agentStates[session.id]}
+    {@const state = $visibleAgentStates[session.id]}
     {@const command = $sessionCommands[session.id]}
-    {@const agent = $sessionAgents[session.id]}
-    {@const title = sessionTabTitle(session.name, command, agent)}
-    {@const kind = sessionTabKind(agent)}
+    {@const title = sessionTabTitle(session.name, command)}
+    {@const kind = sessionTabKind(session.name, command)}
     {@const active = !$diffActive && session.id === $activeSession?.id}
     <ContextMenu.Root>
       <ContextMenu.Trigger>

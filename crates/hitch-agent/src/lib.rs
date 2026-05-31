@@ -145,7 +145,12 @@ fn install_claude_hooks(
             "StopFailure": [claude_hook_entry(helper_path, "stop-failure", AgentState::Error)]
         }
     });
-    merge_json_file(&path, overlay)?;
+    merge_json_file(
+        &path,
+        overlay,
+        AgentKind::ClaudeCode,
+        &["SessionStart", "SessionEnd"],
+    )?;
     installed_configs.push(InstalledHookConfig {
         agent: AgentKind::ClaudeCode,
         path,
@@ -166,7 +171,7 @@ fn install_codex_hooks(
             "Stop": [codex_hook_entry(helper_path, "stop", AgentState::Completed)]
         }
     });
-    merge_json_file(&path, overlay)?;
+    merge_json_file(&path, overlay, AgentKind::Codex, &["SessionStart"])?;
     installed_configs.push(InstalledHookConfig {
         agent: AgentKind::Codex,
         path,
@@ -230,7 +235,12 @@ fn state_arg(state: AgentState) -> &'static str {
     }
 }
 
-fn merge_json_file(path: &Path, overlay: Value) -> Result<(), AgentHookError> {
+fn merge_json_file(
+    path: &Path,
+    overlay: Value,
+    agent: AgentKind,
+    obsolete_events: &[&str],
+) -> Result<(), AgentHookError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -255,9 +265,53 @@ fn merge_json_file(path: &Path, overlay: Value) -> Result<(), AgentHookError> {
     }
 
     merge_preserving_existing(&mut base, overlay);
+    prune_obsolete_hitch_hooks(&mut base, agent, obsolete_events);
     let rendered = serde_json::to_string_pretty(&base)?;
     fs::write(path, format!("{rendered}\n"))?;
     Ok(())
+}
+
+fn prune_obsolete_hitch_hooks(base: &mut Value, agent: AgentKind, obsolete_events: &[&str]) {
+    let Some(hooks) = base.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return;
+    };
+
+    for event in obsolete_events {
+        let remove_event = {
+            let Some(groups) = hooks.get_mut(*event).and_then(Value::as_array_mut) else {
+                continue;
+            };
+
+            for group in groups.iter_mut() {
+                let Some(commands) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                commands.retain(|hook| !is_hitch_hook_command(hook, agent));
+            }
+            groups.retain(|group| {
+                group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .map_or(true, |commands| !commands.is_empty())
+            });
+            groups.is_empty()
+        };
+        if remove_event {
+            hooks.remove(*event);
+        }
+    }
+}
+
+fn is_hitch_hook_command(hook: &Value, agent: AgentKind) -> bool {
+    let agent_flag = match agent {
+        AgentKind::ClaudeCode => "--agent claude-code",
+        AgentKind::Codex => "--agent codex",
+    };
+    hook.get("type").and_then(Value::as_str) == Some("command")
+        && hook
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| command.contains("hitch-hook") && command.contains(agent_flag))
 }
 
 fn merge_preserving_existing(base: &mut Value, overlay: Value) {
@@ -463,8 +517,18 @@ mod tests {
             worktree.join(".claude/settings.local.json"),
             r#"{
   "permissions": {"allow": ["Bash(git status)"]},
-  "hooks": {"Notification": [{"matcher":"user", "hooks": []}]}
+  "hooks": {
+    "Notification": [{"matcher":"user", "hooks": []}],
+    "SessionStart": [{"matcher":"startup", "hooks": [{"type":"command","command":"/opt/hitch/hitch-hook --agent claude-code --event session-start --state running"}]}],
+    "SessionEnd": [{"matcher":"other", "hooks": [{"type":"command","command":"/opt/hitch/hitch-hook --agent claude-code --event session-end --state completed"}]}]
+  }
 }"#,
+        )
+        .unwrap();
+        fs::create_dir_all(worktree.join(".codex")).unwrap();
+        fs::write(
+            worktree.join(".codex/hooks.json"),
+            r#"{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"/opt/hitch/hitch-hook --agent codex --event session-start --state running"}]}]}}"#,
         )
         .unwrap();
 
@@ -489,6 +553,8 @@ mod tests {
             value.to_string().contains("--agent claude-code")
                 && value.to_string().contains("--state needs-approval")
         }));
+        assert!(config["hooks"]["SessionStart"].is_null());
+        assert!(config["hooks"]["SessionEnd"].is_null());
 
         let codex: Value =
             serde_json::from_str(&fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap())
@@ -500,6 +566,7 @@ mod tests {
                 && value.to_string().contains("user-prompt-submit")
                 && value.to_string().contains("--state running")
         }));
+        assert!(codex["hooks"]["SessionStart"].is_null());
 
         assert!(!worktree.join(".gitignore").exists());
 
