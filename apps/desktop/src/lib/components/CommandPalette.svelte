@@ -97,12 +97,12 @@
                     keywords={[w.branch, projectName(w.project_id)]}
                     onSelect={() => run(() => jumpWorktree(w))}
                   >
-                    <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                      ><circle cx="4" cy="4" r="1.8" /><circle cx="4" cy="12" r="1.8" /><circle
+                    <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
+                      ><circle cx="4" cy="3.5" r="1.6" /><circle cx="4" cy="12.5" r="1.6" /><circle
                         cx="12"
-                        cy="6"
-                        r="1.8"
-                      /><path d="M4 5.8v4.4M5.7 4.5h5.3M11 7.7c0 1.5-1.4 2.4-3.2 2.4H5.8" /></svg
+                        cy="5"
+                        r="1.6"
+                      /><path d="M4 5.1v5.8M12 6.6C12 9.8 8.8 11 4.6 11" /></svg
                     >
                     <span class="pi-label"
                       ><span class="mono">{w.branch}</span> <span class="ctx">· {projectName(w.project_id)}</span
@@ -161,12 +161,12 @@
                     value="create pull request pr"
                     onSelect={() => run(() => createPrOpen.set(true))}
                   >
-                    <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                      ><circle cx="4" cy="4" r="1.8" /><circle cx="4" cy="12" r="1.8" /><circle
+                    <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
+                      ><circle cx="4" cy="3.5" r="1.6" /><circle cx="4" cy="12.5" r="1.6" /><circle
                         cx="12"
-                        cy="6"
-                        r="1.8"
-                      /><path d="M4 5.8v4.4M5.7 4.5h5.3M11 7.7c0 1.5-1.4 2.4-3.2 2.4H5.8" /></svg
+                        cy="5"
+                        r="1.6"
+                      /><path d="M4 5.1v5.8M12 6.6C12 9.8 8.8 11 4.6 11" /></svg
                     >
                     <span class="pi-label">Create pull request…</span>
                   </Command.Item>
@@ -196,9 +196,9 @@
                   value="clone remote repository git project"
                   onSelect={() => run(() => cloneProjectOpen.set(true))}
                 >
-                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                    ><circle cx="4" cy="4" r="1.8" /><circle cx="4" cy="12" r="1.8" /><circle cx="12" cy="6" r="1.8" /><path
-                      d="M4 5.8v4.4M5.7 4.5c3 0 4.6 0 5.3 0M11 7.7c0 1.5-1.4 2.4-3.2 2.4H5.8"
+                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
+                    ><circle cx="4" cy="3.5" r="1.6" /><circle cx="4" cy="12.5" r="1.6" /><circle cx="12" cy="5" r="1.6" /><path
+                      d="M4 5.1v5.8M12 6.6C12 9.8 8.8 11 4.6 11"
                     /></svg
                   >
                   <span class="pi-label">Clone remote repository…</span>

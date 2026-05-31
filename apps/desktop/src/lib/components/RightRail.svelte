@@ -215,9 +215,9 @@
 
   {#if $gitStatus}
     <div class="ch-branch">
-      <svg class="branch-ico" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="var(--tx-lo)" stroke-width="1.3"
-        ><circle cx="4" cy="4" r="1.8" /><circle cx="4" cy="12" r="1.8" /><circle cx="12" cy="6" r="1.8" /><path
-          d="M4 5.8v4.4M5.7 4.5c3 0 4.6 0 5.3 0M11 7.7c0 1.5-1.4 2.4-3.2 2.4H5.8"
+      <svg class="branch-ico" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="var(--tx-lo)" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
+        ><circle cx="4" cy="3.5" r="1.6" /><circle cx="4" cy="12.5" r="1.6" /><circle cx="12" cy="5" r="1.6" /><path
+          d="M4 5.1v5.8M12 6.6C12 9.8 8.8 11 4.6 11"
         /></svg
       >
       <span class="b" title={$gitStatus.branch}>{$gitStatus.branch}</span>
