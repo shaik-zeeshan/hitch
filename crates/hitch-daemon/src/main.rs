@@ -826,22 +826,8 @@ fn handle_request<R: Read>(
             )?;
             broadcast_event(state, Event::ProjectUpdated { project })?;
         }
-        Request::CloneProject {
-            remote_url,
-            destination,
-            name,
-        } => {
-            let root = clone_project(&remote_url, &destination, name.as_deref())?;
-            let project = add_project_from_root(state, &root, name.as_deref())?;
-            send_response(
-                state,
-                client_id,
-                request_id,
-                Response::Projects {
-                    projects: vec![project.clone()],
-                },
-            )?;
-            broadcast_event(state, Event::ProjectUpdated { project })?;
+        Request::CloneProject { .. } => {
+            dispatch_job(state, client_id, request_id, request)?;
         }
         Request::RemoveProject { project_id, force } => {
             let closed_session_ids = remove_project(state, project_id, force)?;
@@ -2217,9 +2203,11 @@ fn replay_sessions_to_client(
 ///
 /// The worker receives the shared [`JobControl`] so it can register a cancellable
 /// child (the Draft Generator's provider tree) and check `is_cancelled()`. A
-/// cancelled Job reports `Cancelled` and an `Unavailable` error response,
-/// regardless of what `work` returned. The Job is removed from the registry the
-/// moment `work` returns, so a racing `CancelJob` after completion is a no-op.
+/// cancelled Job reports `Cancelled` only when `work` also failed — if the work
+/// already succeeded before the cancel flag was set, the successful response is
+/// preserved. The Job is removed from the registry the moment `work` returns, so
+/// a racing `CancelJob` after completion is a no-op. Worker panics are caught and
+/// reported as failed completions so the frontend promise never hangs.
 ///
 /// This generalizes the former `spawn_response_task`: instead of replying once by
 /// request id, completion travels the broadcast bus keyed by job id, so every
@@ -2259,24 +2247,30 @@ where
     let progress = progress.map(str::to_string);
     let spawn = thread::Builder::new().name(name.into()).spawn(move || {
         let _ = progress; // kept for symmetry; running note already broadcast
-        let result = work(&worker_state, &control);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            work(&worker_state, &control)
+        }));
+        let result = match result {
+            Ok(inner) => inner,
+            Err(_) => Err(ProtocolError::new(
+                ErrorCode::Internal,
+                "job worker panicked",
+            )),
+        };
         // Drop the registry entry first so a late CancelJob can't match this id.
         if let Ok(mut guard) = worker_state.lock() {
             guard.jobs.remove(&job_id);
         }
-        let (status, response) = if control.is_cancelled() {
-            (
+        let (status, response) = match result {
+            Ok(response) => (JobStatus::Succeeded, response),
+            Err(_) if control.is_cancelled() => (
                 JobStatus::Cancelled,
                 Response::Error {
                     error: ProtocolError::new(ErrorCode::Unavailable, "job cancelled")
                         .retryable(true),
                 },
-            )
-        } else {
-            match result {
-                Ok(response) => (JobStatus::Succeeded, response),
-                Err(error) => (JobStatus::Failed, Response::Error { error }),
-            }
+            ),
+            Err(error) => (JobStatus::Failed, Response::Error { error }),
         };
         let _ = broadcast_event(
             &worker_state,
@@ -2315,6 +2309,25 @@ fn dispatch_job(
     request: Request,
 ) -> Result<(), ProtocolError> {
     match request {
+        Request::CloneProject {
+            remote_url,
+            destination,
+            name,
+        } => start_job(
+            "hitch-clone",
+            state,
+            client_id,
+            request_id,
+            Some("Cloning…"),
+            move |state, _| {
+                let root = clone_project(&remote_url, &destination, name.as_deref())?;
+                let project = add_project_from_root(state, &root, name.as_deref())?;
+                let _ = broadcast_event(state, Event::ProjectUpdated { project: project.clone() });
+                Ok(Response::Projects {
+                    projects: vec![project],
+                })
+            },
+        ),
         Request::Push { worktree_id } => start_job(
             "hitch-push",
             state,

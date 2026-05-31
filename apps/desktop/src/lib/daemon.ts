@@ -221,6 +221,7 @@ type JobPending = {
   reject: (error: Error) => void;
 };
 const jobPending = new Map<Id, JobPending>();
+const earlyCompletions = new Map<Id, Response>();
 
 export async function runJob<T extends Response>(
   request: Request,
@@ -236,6 +237,21 @@ export async function runJob<T extends Response>(
     [jobId]: { id: jobId, status: "running", message: null, kind },
   }));
   return new Promise<T>((resolve, reject) => {
+    const early = earlyCompletions.get(jobId);
+    if (early) {
+      earlyCompletions.delete(jobId);
+      jobs.update((current) => {
+        const next = { ...current };
+        delete next[jobId];
+        return next;
+      });
+      if (isError(early)) {
+        reject(new Error(early.error.message));
+      } else {
+        resolve(early as T);
+      }
+      return;
+    }
     jobPending.set(jobId, {
       resolve: (response) => resolve(response as T),
       reject,
@@ -266,7 +282,10 @@ export function completeJob(jobId: Id, response: Response): void {
     delete next[jobId];
     return next;
   });
-  if (!pending) return;
+  if (!pending) {
+    earlyCompletions.set(jobId, response);
+    return;
+  }
   if (isError(response)) {
     pending.reject(new Error(response.error.message));
   } else {
@@ -795,12 +814,15 @@ export async function cloneProject(
   destination: string,
   name: string | null = null,
 ): Promise<void> {
-  await daemonRequest({
-    type: "clone-project",
-    remote_url: remoteUrl.trim(),
-    destination: destination.trim(),
-    name: name?.trim() || null,
-  });
+  await runJob(
+    {
+      type: "clone-project",
+      remote_url: remoteUrl.trim(),
+      destination: destination.trim(),
+      name: name?.trim() || null,
+    },
+    "clone",
+  );
   await refreshAll();
 }
 

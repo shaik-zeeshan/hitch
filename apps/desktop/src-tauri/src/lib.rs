@@ -101,8 +101,9 @@ impl CrashLoopGuard {
         self.attempts.len() <= self.max_attempts
     }
 
-    /// Clear the record after a healthy attach so a later, unrelated crash starts
-    /// from a clean budget.
+    /// Clear the record so a user-initiated restart starts from a clean budget.
+    /// Only called from explicit user actions — auto-recovery relies on the
+    /// sliding window to expire old attempts naturally.
     fn reset(&mut self) {
         self.attempts.clear();
     }
@@ -397,9 +398,6 @@ impl HitchClient {
             other => Err(format!("unexpected hello response: {other:?}")),
         };
         if outcome.is_ok() {
-            if let Ok(mut guard) = self.0.restart_guard.lock() {
-                guard.reset();
-            }
             self.set_status(app, DaemonStatus::Running, None);
         }
         outcome
@@ -991,13 +989,21 @@ async fn restart_daemon_command(app: AppHandle, state: State<'_, HitchClient>) -
             guard.reset();
         }
         client.restart_daemon(&app, "user requested daemon restart".to_string())?;
-        client.send_request(
+        match client.send_request(
             &app,
             Request::Hello {
                 client_name: "hitch-desktop".into(),
                 protocol_version: PROTOCOL_VERSION,
             },
-        )?;
+        )? {
+            Response::Hello { .. } => {}
+            Response::Error { error } => {
+                return Err(format!("daemon hello failed after restart: {}", error.message));
+            }
+            other => {
+                return Err(format!("unexpected hello response after restart: {other:?}"));
+            }
+        }
         client.set_status(&app, DaemonStatus::Running, None);
         let _ = app.emit("hitch-reconnected", ());
         Ok::<(), String>(())
