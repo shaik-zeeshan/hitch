@@ -32,7 +32,7 @@ use hitch_proto::{
     encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage,
     DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
     JobRequest, JobStatus, PrInfo, ProtocolError, PullRequestDraft, Request, Response,
-    WorktreeCreateMode, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
+    WorktreeCreateMode, WorktreePr, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
 use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY};
 use hitch_store::Store;
@@ -347,6 +347,11 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
 
     let listener = UnixListener::bind(&config.socket_path)?;
     listener.set_nonblocking(true)?;
+    // Record our pid beside the socket so the GUI can force-kill us even when it
+    // never completed a `Hello` handshake (e.g. a protocol mismatch — the path
+    // that returns no pid in the response). Best-effort: a missing pidfile only
+    // costs the client its force-kill fast path, it does not break startup.
+    write_pidfile(&config.socket_path);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     // The dispatcher drains a single ordered channel of `DispatchMsg`. PTY reader
@@ -392,8 +397,26 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     cancel_active_jobs(&state);
     wait_for_jobs_to_finish(&state);
     kill_all_sessions(&state);
+    let _ = fs::remove_file(hitch_proto::transport::pidfile_path(&config.socket_path));
     let _ = fs::remove_file(config.socket_path);
     Ok(())
+}
+
+/// Write our pid to the daemon's pidfile (see `transport::pidfile_path`). The
+/// pidfile is the GUI's only handle on a daemon it could not handshake with, so
+/// a stale entry from a crashed daemon must never linger: `truncate` overwrites
+/// any prior pid, and the bind that precedes this call guarantees we are the
+/// sole owner of this socket path.
+fn write_pidfile(socket_path: &Path) {
+    let path = hitch_proto::transport::pidfile_path(socket_path);
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+    {
+        let _ = write!(file, "{}", std::process::id());
+    }
 }
 
 struct DaemonState {
@@ -1041,6 +1064,7 @@ fn handle_request<R: Read>(
         | Request::Push { .. }
         | Request::Pull { .. }
         | Request::PrStatus { .. }
+        | Request::ProjectPrStatuses { .. }
         | Request::CreatePullRequest { .. } => {
             let request = JobRequest::try_from(request)
                 .map_err(|_| internal("job-capable request rejected during dispatch"))?;
@@ -1764,6 +1788,54 @@ fn pr_status(
         state: pr.state,
         draft: pr.draft,
     }))
+}
+
+fn project_pr_statuses(
+    state: &Arc<Mutex<DaemonState>>,
+    project_id: ProjectId,
+    control: &JobControl,
+) -> Result<Vec<WorktreePr>, ProtocolError> {
+    let worktrees = list_worktrees(state, project_id)?;
+    if worktrees.is_empty() {
+        return Ok(Vec::new());
+    }
+    // All worktrees of a project share the repo + remote, so one `gh pr list` in
+    // any of them covers them all. Prefer the main worktree as a stable cwd.
+    let repo_path = worktrees
+        .iter()
+        .find(|w| w.is_main)
+        .unwrap_or(&worktrees[0])
+        .path
+        .clone();
+    let git = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        state.git.clone()
+    };
+    let prs = git
+        .pr_list_with_control(&repo_path, control)
+        .map_err(git_error)?;
+    Ok(worktrees
+        .into_iter()
+        .map(|worktree| WorktreePr {
+            pr: best_pr_for_branch(&prs, &worktree.branch),
+            worktree_id: worktree.id,
+        })
+        .collect())
+}
+
+/// Pick the PR that best represents a branch when `gh pr list` returned more
+/// than one for it: an open PR wins over a closed/merged one, and among equals
+/// the highest number (most recent) wins. Returns the proto `PrInfo`.
+fn best_pr_for_branch(prs: &[(String, hitch_git::PrInfo)], branch: &str) -> Option<PrInfo> {
+    prs.iter()
+        .filter(|(head, _)| head == branch)
+        .max_by_key(|(_, pr)| (pr.state.eq_ignore_ascii_case("OPEN"), pr.number))
+        .map(|(_, pr)| PrInfo {
+            number: pr.number,
+            url: pr.url.clone(),
+            state: pr.state.clone(),
+            draft: pr.draft,
+        })
 }
 
 fn git_diff(
@@ -2593,6 +2665,18 @@ fn dispatch_job(
                 Ok(Response::PrStatus { pr })
             },
         ),
+        JobRequest::ProjectPrStatuses { project_id } => start_job(
+            "hitch-project-pr-statuses",
+            state,
+            client_id,
+            request_id,
+            Some("pr-status"),
+            None,
+            move |state, control| {
+                let statuses = project_pr_statuses(state, project_id, control)?;
+                Ok(Response::ProjectPrStatuses { statuses })
+            },
+        ),
         JobRequest::CreatePullRequest {
             worktree_id,
             title,
@@ -3040,8 +3124,41 @@ fn poisoned(name: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::OutputBroadcaster;
+    use super::{best_pr_for_branch, OutputBroadcaster};
     use hitch_core::SessionId;
+
+    fn git_pr(number: u64, state: &str) -> hitch_git::PrInfo {
+        hitch_git::PrInfo {
+            number,
+            url: format!("https://example.test/pr/{number}"),
+            state: state.to_string(),
+            draft: false,
+        }
+    }
+
+    #[test]
+    fn best_pr_for_branch_matches_by_branch_and_prefers_open_then_newest() {
+        let prs = vec![
+            ("feature".to_string(), git_pr(1, "MERGED")),
+            ("feature".to_string(), git_pr(7, "OPEN")),
+            ("feature".to_string(), git_pr(9, "CLOSED")),
+            ("other".to_string(), git_pr(20, "OPEN")),
+        ];
+        // Open wins over a higher-numbered closed/merged PR on the same branch.
+        assert_eq!(best_pr_for_branch(&prs, "feature").unwrap().number, 7);
+        // A branch with no PR yields None rather than borrowing another's.
+        assert!(best_pr_for_branch(&prs, "missing").is_none());
+    }
+
+    #[test]
+    fn best_pr_for_branch_falls_back_to_newest_when_none_open() {
+        let prs = vec![
+            ("topic".to_string(), git_pr(3, "MERGED")),
+            ("topic".to_string(), git_pr(11, "CLOSED")),
+        ];
+        // No open PR: the most recent (highest number) represents the branch.
+        assert_eq!(best_pr_for_branch(&prs, "topic").unwrap().number, 11);
+    }
 
     // A test harness that mirrors the dispatcher thread's single-threaded
     // serialization: the only legal operations are `record_output` (the

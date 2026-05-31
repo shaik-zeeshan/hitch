@@ -20,8 +20,10 @@ use serde::{Deserialize, Serialize};
 /// adds the daemon pid to `Response::Hello` so a heartbeat-wedged daemon can be
 /// force-restarted by pid. v11 bumps the protocol for the extended
 /// `Response::PrStatus` wire shape. v12 moves PR status lookup to cancellable
-/// Jobs via `JobRequest::PrStatus`.
-pub const PROTOCOL_VERSION: u16 = 12;
+/// Jobs via `JobRequest::PrStatus`. v13 adds the batched
+/// `JobRequest::ProjectPrStatuses` so the sidebar can populate every worktree's
+/// PR chip from one `gh pr list` per project instead of one lookup per visit.
+pub const PROTOCOL_VERSION: u16 = 13;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -92,6 +94,10 @@ pub enum JobRequest {
     Pull { worktree_id: WorktreeId },
     /// Look up the GitHub PR (if any) for a worktree's current branch via `gh`.
     PrStatus { worktree_id: WorktreeId },
+    /// Look up the PR for *every* worktree in a project in one `gh pr list`,
+    /// mapped back to each worktree by branch. Lets the sidebar show PR chips
+    /// for all worktrees without a per-worktree lookup.
+    ProjectPrStatuses { project_id: ProjectId },
     /// Create a GitHub PR through `gh`.
     CreatePullRequest {
         worktree_id: WorktreeId,
@@ -182,6 +188,8 @@ pub enum Request {
     /// Look up the GitHub PR (if any) for a worktree's current branch via a Job.
     /// Kept as a compatibility request; dispatches through the async job path.
     PrStatus { worktree_id: WorktreeId },
+    /// Look up the PR for every worktree in a project via a Job (batched).
+    ProjectPrStatuses { project_id: ProjectId },
     /// Read a file-level diff for a path in a worktree.
     GitDiff {
         worktree_id: WorktreeId,
@@ -302,6 +310,9 @@ impl From<JobRequest> for Request {
             JobRequest::Push { worktree_id } => Request::Push { worktree_id },
             JobRequest::Pull { worktree_id } => Request::Pull { worktree_id },
             JobRequest::PrStatus { worktree_id } => Request::PrStatus { worktree_id },
+            JobRequest::ProjectPrStatuses { project_id } => {
+                Request::ProjectPrStatuses { project_id }
+            }
             JobRequest::CreatePullRequest {
                 worktree_id,
                 title,
@@ -364,6 +375,9 @@ impl TryFrom<Request> for JobRequest {
             Request::Push { worktree_id } => Ok(JobRequest::Push { worktree_id }),
             Request::Pull { worktree_id } => Ok(JobRequest::Pull { worktree_id }),
             Request::PrStatus { worktree_id } => Ok(JobRequest::PrStatus { worktree_id }),
+            Request::ProjectPrStatuses { project_id } => {
+                Ok(JobRequest::ProjectPrStatuses { project_id })
+            }
             Request::CreatePullRequest {
                 worktree_id,
                 title,
@@ -434,6 +448,11 @@ pub enum Response {
     PrStatus {
         /// `None` when the branch has no PR (or `gh` could not determine one).
         pr: Option<PrInfo>,
+    },
+    /// PR per worktree for a whole project (reply to `ProjectPrStatuses`). A
+    /// worktree with no matching PR carries `pr: None`.
+    ProjectPrStatuses {
+        statuses: Vec<WorktreePr>,
     },
     FileDiff {
         diff: FileDiff,
@@ -572,6 +591,14 @@ pub struct PrInfo {
     /// `gh`'s PR state, e.g. `OPEN`, `CLOSED`, `MERGED`.
     pub state: String,
     pub draft: bool,
+}
+
+/// A worktree paired with the PR (if any) for its branch — one entry per
+/// worktree in a [`Response::ProjectPrStatuses`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreePr {
+    pub worktree_id: WorktreeId,
+    pub pr: Option<PrInfo>,
 }
 
 /// One changed path in a worktree.

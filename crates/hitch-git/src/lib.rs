@@ -437,6 +437,18 @@ impl GitClient {
         pr_status_with_client(self, repo_path.as_ref(), Some(control))
     }
 
+    /// List the repo's PRs in one cancellable `gh pr list`, each paired with its
+    /// head branch so the caller can map them to worktrees. Returns `(branch,
+    /// PrInfo)` pairs; a branch may appear more than once (e.g. an old merged PR
+    /// and a new open one), so the caller picks which matters.
+    pub fn pr_list_with_control(
+        &self,
+        repo_path: impl AsRef<Path>,
+        control: &dyn CommandControl,
+    ) -> Result<Vec<(String, PrInfo)>> {
+        pr_list_with_client(self, repo_path.as_ref(), Some(control))
+    }
+
     fn run_git(&self, cwd: &Path, args: Vec<OsString>) -> Result<CommandOutput> {
         run_command(&self.git, cwd, args, None)
     }
@@ -503,6 +515,68 @@ fn pr_status_with_client(
         state: value["state"].as_str().unwrap_or_default().to_string(),
         draft: value["isDraft"].as_bool().unwrap_or(false),
     }))
+}
+
+/// Cap on PRs pulled per `gh pr list`. We only keep PRs whose head branch
+/// matches a live worktree, so this just bounds the work for repos with long PR
+/// histories; active worktree branches sit among the most-recent PRs.
+const PR_LIST_LIMIT: &str = "100";
+
+fn pr_list_with_client(
+    client: &GitClient,
+    repo_path: &Path,
+    control: Option<&dyn CommandControl>,
+) -> Result<Vec<(String, PrInfo)>> {
+    // `--state all` so a worktree whose PR has already merged still shows a chip;
+    // `headRefName` is the branch we map back to each worktree.
+    let args = vec![
+        os("pr"),
+        os("list"),
+        os("--state"),
+        os("all"),
+        os("--limit"),
+        os(PR_LIST_LIMIT),
+        os("--json"),
+        os("number,url,state,isDraft,headRefName"),
+    ];
+    let output = match control {
+        Some(control) => client.run_gh_with_control(repo_path, args, control),
+        None => client.run_gh(repo_path, args),
+    };
+    let output = match output {
+        Ok(output) => output,
+        Err(err @ GitError::CommandFailed { .. }) => {
+            if control.is_some_and(|control| control.is_cancelled()) {
+                return Err(err);
+            }
+            // No repo / no auth / no network — nothing to show, like pr_status.
+            return Ok(Vec::new());
+        }
+        Err(err) => return Err(err),
+    };
+    let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(&output.stdout) else {
+        return Ok(Vec::new());
+    };
+    let mut prs = Vec::with_capacity(values.len());
+    for value in values {
+        let (Some(number), Some(url), Some(head)) = (
+            value["number"].as_u64(),
+            value["url"].as_str(),
+            value["headRefName"].as_str(),
+        ) else {
+            continue;
+        };
+        prs.push((
+            head.to_string(),
+            PrInfo {
+                number,
+                url: url.to_string(),
+                state: value["state"].as_str().unwrap_or_default().to_string(),
+                draft: value["isDraft"].as_bool().unwrap_or(false),
+            },
+        ));
+    }
+    Ok(prs)
 }
 
 /// A successful CLI command result.

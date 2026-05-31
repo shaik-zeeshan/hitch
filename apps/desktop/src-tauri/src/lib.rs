@@ -42,6 +42,15 @@ const HEARTBEAT_LOST_REASON: &str = "daemon stopped responding to heartbeat";
 const DAEMON_RESPONSE_TIMEOUT_REASON: &str = "timed out waiting for daemon response";
 const HANDSHAKE_FAILURE_PREFIX: &str = "daemon handshake failed: ";
 const DAEMON_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// Restart-reason prefix marking a daemon the handshake found incompatible or
+/// otherwise un-handshakeable. `should_force_kill_daemon` keys off this to
+/// SIGKILL rather than negotiate a graceful shutdown.
+const INCOMPATIBLE_DAEMON_PREFIX: &str = "restarting incompatible daemon";
+/// How many times `connect_and_handshake` will restart-and-retry before giving
+/// up. One retry is too brittle — a slow unbind or socket race on the first
+/// restart would surface as a failure — but the crash-loop guard still backstops
+/// a daemon that is genuinely unable to come up compatible.
+const MAX_HANDSHAKE_ATTEMPTS: usize = 3;
 
 /// Crash-loop guard window + cap. If the GUI has to (re)spawn the daemon more
 /// than `CRASH_LOOP_MAX` times within `CRASH_LOOP_WINDOW`, it stops respawning
@@ -147,7 +156,31 @@ fn is_handshake_timeout(reason: &str) -> bool {
         .is_some_and(|inner| inner == DAEMON_RESPONSE_TIMEOUT_REASON)
 }
 fn should_force_kill_daemon(reason: &str) -> bool {
-    reason == HEARTBEAT_LOST_REASON
+    // A wedged daemon (missed heartbeat) and an incompatible one are both
+    // untrustworthy to shut themselves down on request — an incompatible daemon
+    // may not even parse our ShutdownDaemon message. SIGKILL by pid instead of
+    // asking nicely and waiting on a graceful unbind that may never come.
+    reason == HEARTBEAT_LOST_REASON || reason.starts_with(INCOMPATIBLE_DAEMON_PREFIX)
+}
+
+/// Render a failed `Hello` exchange into a human reason for the daemon status.
+/// Every branch maps to the same outcome — force-restart — so this is purely the
+/// message; collapsing them here keeps `connect_and_handshake` to one match arm.
+fn describe_handshake_failure(outcome: &Result<Response, String>) -> String {
+    match outcome {
+        Ok(Response::Error { error }) => error.message.clone(),
+        Ok(other) => format!("unexpected hello response: {other:?}"),
+        Err(err) => err.clone(),
+    }
+}
+
+/// Read the daemon's pid from the pidfile it writes beside the socket. This is
+/// the only handle on a daemon we could not complete a `Hello` with (a protocol
+/// mismatch returns no pid), so it's what makes force-killing such a daemon
+/// possible. Returns `None` if the file is absent or unparsable.
+fn read_daemon_pidfile(socket_path: &Path) -> Option<u32> {
+    let path = hitch_proto::transport::pidfile_path(socket_path);
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 fn wait_for_socket_release(path: &Path, timeout: Duration) -> Result<(), String> {
@@ -382,11 +415,16 @@ impl HitchClient {
     }
 
     fn force_kill_daemon(&self) -> Result<(), String> {
+        // Prefer the pid from the last successful Hello; fall back to the daemon's
+        // pidfile. The fallback is what lets us force-kill a daemon we never
+        // handshook with — exactly the protocol-mismatch case, where the daemon
+        // rejects Hello and so reports no pid in its response.
         let daemon_pid = self
             .0
             .daemon_pid
             .lock()
             .map_err(|_| "daemon pid lock poisoned".to_string())?
+            .or_else(|| read_daemon_pidfile(&self.0.socket_path))
             .ok_or_else(|| "cannot force-restart daemon: daemon pid is unknown".to_string())?;
         #[cfg(unix)]
         unsafe {
@@ -469,56 +507,50 @@ impl HitchClient {
         self.attach_stream(app, stream)
     }
 
-    /// Connect (spawning if needed) and complete the `Hello` handshake, restarting
-    /// a protocol-incompatible daemon once. On success the Daemon Status becomes
-    /// `running` and the crash-loop budget resets. Shared by the `connect_daemon`
-    /// command and the auto-recovery loop so both diagnose failures identically.
+    /// Connect (spawning if needed) and complete the `Hello` handshake,
+    /// force-restarting an un-handshakeable daemon and retrying up to
+    /// `MAX_HANDSHAKE_ATTEMPTS`. On success the Daemon Status becomes `running`
+    /// and the crash-loop budget resets. Shared by the `connect_daemon` command
+    /// and the auto-recovery loop so both diagnose failures identically.
+    ///
+    /// The key invariant: *any* non-`Hello` outcome — a protocol-rejection
+    /// `Error`, an unexpected variant, a response this client can't even
+    /// deserialize, or a transport error — is treated as "the running daemon is
+    /// incompatible or wedged" and triggers a force-restart. A response we cannot
+    /// parse is itself proof of incompatibility, so it must take the restart path
+    /// rather than leak to the caller (the previous `Ok(Response::Error)`-only
+    /// branch let parse and transport errors surface as a bare mismatch).
     fn connect_and_handshake(&self, app: &AppHandle) -> Result<(), String> {
-        self.connect(app)?;
         let hello = Request::Hello {
             client_name: "hitch-desktop".into(),
             protocol_version: PROTOCOL_VERSION,
         };
-        let outcome = match self.send_request(app, hello.clone()) {
-            Ok(Response::Hello { daemon_pid, .. }) => {
-                self.set_daemon_pid(Some(daemon_pid));
-                Ok(())
-            }
-            // Any Hello error means the running daemon is incompatible — restart
-            // regardless of error code (old daemons may serialize codes this
-            // client can't parse).
-            Ok(Response::Error { error }) => {
-                self.restart_daemon(
-                    app,
-                    format!("restarting incompatible daemon: {}", error.message),
-                )?;
-                match self.send_request(app, hello) {
-                    Ok(Response::Hello { daemon_pid, .. }) => {
-                        self.set_daemon_pid(Some(daemon_pid));
-                        Ok(())
+        let mut last_err = String::new();
+        for attempt in 0..MAX_HANDSHAKE_ATTEMPTS {
+            self.connect(app)?;
+            match self.send_request(app, hello.clone()) {
+                Ok(Response::Hello { daemon_pid, .. }) => {
+                    self.set_daemon_pid(Some(daemon_pid));
+                    self.mark_running(app);
+                    return Ok(());
+                }
+                other => {
+                    last_err = describe_handshake_failure(&other);
+                    // Don't burn the final attempt on a restart we won't retry.
+                    if attempt + 1 == MAX_HANDSHAKE_ATTEMPTS {
+                        break;
                     }
-                    Ok(Response::Error { error }) => Err(error.message),
-                    Ok(other) => Err(format!(
-                        "unexpected hello response after daemon restart: {other:?}"
-                    )),
-                    Err(err) => Err(err),
+                    self.restart_daemon(
+                        app,
+                        format!("{INCOMPATIBLE_DAEMON_PREFIX}: {last_err}"),
+                    )?;
                 }
-            }
-            Ok(other) => Err(format!("unexpected hello response: {other:?}")),
-            Err(err) => Err(err),
-        };
-        match outcome {
-            Ok(()) => {
-                self.mark_running(app);
-                Ok(())
-            }
-            Err(err) => {
-                if self.is_connected() {
-                    self.handle_connection_lost(app, &format!("daemon handshake failed: {err}"));
-                }
-                Err(err)
             }
         }
+        if self.is_connected() {
+            self.handle_connection_lost(app, &format!("daemon handshake failed: {last_err}"));
+        }
+        Err(last_err)
     }
 
     fn handshake_after_restart(&self, app: &AppHandle) -> Result<(), String> {
@@ -616,18 +648,24 @@ impl HitchClient {
     fn restart_daemon(&self, app: &AppHandle, reason: String) -> Result<(), String> {
         self.0.suppress_recovery.store(true, Ordering::SeqCst);
         let result = (|| {
+            // Always ask first: ShutdownDaemon is a stable unit message even an
+            // older/incompatible daemon understands, so it's the one teardown that
+            // works across protocol versions.
             self.request_daemon_shutdown();
             let force_kill = should_force_kill_daemon(&reason);
             self.mark_disconnected(app, reason.clone());
-            if force_kill {
-                self.force_kill_daemon()?;
-            }
             self.record_spawn_attempt(app)?;
             self.set_status(app, DaemonStatus::Starting, None);
 
-            if !force_kill {
-                wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)?;
+            // For a wedged or incompatible daemon, SIGKILL by pid is the fast path
+            // — but it's best-effort: a daemon predating the pidfile (the very
+            // stale-daemon-across-an-upgrade case) reports no pid, so we must not
+            // hard-fail on it. In every case we then wait for the socket to be
+            // released so we never spawn a second daemon over a live one.
+            if force_kill {
+                let _ = self.force_kill_daemon();
             }
+            wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)?;
 
             self.spawn_daemon()?;
             let stream = self.wait_for_daemon()?;
@@ -1362,9 +1400,10 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_control_message, read_log_tail, recovery_mode_for_loss, should_force_kill_daemon,
-        tray_status_text, wait_for_socket_release, ControlMessage, CrashLoopGuard, DaemonStatus,
-        HitchClient, OutputRouter, RecoveryMode, Request, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
+        describe_handshake_failure, read_control_message, read_log_tail, recovery_mode_for_loss,
+        should_force_kill_daemon, tray_status_text, wait_for_socket_release, ControlMessage,
+        CrashLoopGuard, DaemonStatus, ErrorCode, HitchClient, OutputRouter, ProtocolError,
+        RecoveryMode, Request, Response, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
     };
     use hitch_core::SessionId;
     #[cfg(unix)]
@@ -1658,6 +1697,31 @@ mod tests {
             RecoveryMode::Reconnect
         );
         assert!(!should_force_kill_daemon("daemon socket closed"));
+        // An incompatible daemon can't be trusted to shut itself down, so the
+        // restart path force-kills it rather than waiting on a graceful unbind.
+        assert!(should_force_kill_daemon(
+            "restarting incompatible daemon: client protocol 13 != daemon protocol 12"
+        ));
+    }
+
+    #[test]
+    fn handshake_failure_message_covers_every_non_hello_outcome() {
+        // A protocol-rejection Error surfaces the daemon's own message.
+        assert_eq!(
+            describe_handshake_failure(&Ok(Response::Error {
+                error: ProtocolError::new(ErrorCode::UnsupportedProtocol, "bad version"),
+            })),
+            "bad version"
+        );
+        // A transport/parse error (the case that used to leak past recovery)
+        // still yields a reason, so it takes the restart path like the rest.
+        assert_eq!(
+            describe_handshake_failure(&Err("connection reset".to_string())),
+            "connection reset"
+        );
+        // An unexpected variant is described rather than silently dropped.
+        assert!(describe_handshake_failure(&Ok(Response::Ack))
+            .starts_with("unexpected hello response"));
     }
 
     #[cfg(unix)]

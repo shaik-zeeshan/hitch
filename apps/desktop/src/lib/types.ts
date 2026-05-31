@@ -147,6 +147,7 @@ export type JobRequest =
   | { type: "push"; worktree_id: Id }
   | { type: "pull"; worktree_id: Id }
   | { type: "pr-status"; worktree_id: Id }
+  | { type: "project-pr-statuses"; project_id: Id }
   | {
       type: "create-pull-request";
       worktree_id: Id;

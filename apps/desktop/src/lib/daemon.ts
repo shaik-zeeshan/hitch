@@ -103,6 +103,12 @@ export const prUrl = writable<string | null>(null);
 // use `openPrInfo` when the action state machine needs an actually-open PR.
 export const prInfo = writable<PrInfo | null>(null);
 export const openPrInfo = derived(prInfo, ($pr) => (isOpenPr($pr) ? $pr : null));
+// PR-per-worktree, so the sidebar can show a PR chip on each branch without each
+// row firing its own lookup. Populated as a side effect of `loadPrStatus` (which
+// already runs on worktree switch + after git ops), so a chip appears once a
+// worktree's status has been fetched at least once. A missing key = not yet
+// known (no chip); an explicit `null` = checked, no PR.
+export const prByWorktree = writable<Record<Id, PrInfo | null>>({});
 
 const diffCache = new Map<string, string>();
 let diffRequestSeq = 0;
@@ -110,8 +116,15 @@ let statusRequestSeq = 0;
 let prRequestSeq = 0;
 let statusPollTimer: ReturnType<typeof setInterval> | null = null;
 let statusPollInFlight = false;
+let prPollTimer: ReturnType<typeof setInterval> | null = null;
+let prFocusHandler: (() => void) | null = null;
 
 const STATUS_POLL_MS = 1_000;
+// PR state changes on GitHub (e.g. draft → ready) are external, so poll for them
+// while connected. `gh pr list` is network-priced and PR state rarely flips, so
+// a slow cadence is plenty; a window-focus refresh covers the "I just changed it
+// in the browser and switched back" case without waiting for the next tick.
+const PR_POLL_MS = 30_000;
 
 // ---- derived stores -------------------------------------------------------
 
@@ -436,6 +449,15 @@ export async function refreshAll(): Promise<void> {
   const allWorktrees = worktreeLists.flat();
   worktrees.set(allWorktrees);
 
+  // Populate every worktree's PR chip in the background — one batched lookup per
+  // project, throttled internally. Not awaited: a slow `gh` must not hold up the
+  // rest of the snapshot (sessions, dirty state).
+  for (const project of projectResponse.projects) {
+    if (project.kind === "git-backed") {
+      void loadProjectPrStatuses(project.id);
+    }
+  }
+
   const sessionResponse = await daemonRequest<Response & { sessions: Session[] }>({
     type: "list-sessions",
     parent: null,
@@ -742,6 +764,7 @@ export function applyDaemonStatus(status: DaemonStatus, reason: string | null): 
   if (status === "running") {
     connection.set("ready");
     error.set(null);
+    startPrStatusPolling();
   } else if (status === "starting") {
     connection.set("connecting");
   } else {
@@ -749,6 +772,7 @@ export function applyDaemonStatus(status: DaemonStatus, reason: string | null): 
     connection.set("offline");
     if (reason) error.set(reason);
     failAllJobs(reason ?? status);
+    stopPrStatusPolling();
   }
 }
 
@@ -756,6 +780,7 @@ export function disposeDaemon(): void {
   unlisteners.forEach((unlisten) => unlisten());
   unlisteners = [];
   stopGitStatusPolling();
+  stopPrStatusPolling();
   booted = false;
 }
 
@@ -854,6 +879,10 @@ export async function loadPrStatus(worktreeId: Id): Promise<void> {
       { type: "pr-status", worktree_id: worktreeId },
       "pr-status",
     );
+    // The result is authoritative for `worktreeId` regardless of which worktree
+    // is selected now, so always feed the per-worktree map; only the selected
+    // worktree's single `prInfo` is gated by the seq/selection guard.
+    prByWorktree.update((map) => ({ ...map, [worktreeId]: response.pr ?? null }));
     if (requestSeq === prRequestSeq && get(gitWorktreeId) === worktreeId) {
       prInfo.set(response.pr ?? null);
     }
@@ -861,6 +890,42 @@ export async function loadPrStatus(worktreeId: Id): Promise<void> {
     if (requestSeq === prRequestSeq && get(gitWorktreeId) === worktreeId) {
       prInfo.set(null);
     }
+  }
+}
+
+// PR status is one `gh pr list` per project, so it's network-priced; refreshAll
+// can fire often (after every git op), so throttle per project. `gh pr list`
+// rarely changes faster than this between refreshes, and a worktree switch still
+// fetches its own fresh status via loadPrStatus.
+const PR_STATUS_MIN_INTERVAL_MS = 20_000;
+const lastProjectPrFetch = new Map<Id, number>();
+
+// Populate the PR chip for EVERY worktree of a project from a single batched
+// lookup, so chips appear without visiting each worktree. Best-effort and
+// fire-and-forget from refreshAll; a failure just clears the throttle so the
+// next refresh can retry sooner.
+export async function loadProjectPrStatuses(
+  projectId: Id,
+  options: { force?: boolean } = {},
+): Promise<void> {
+  const now = Date.now();
+  if (!options.force && now - (lastProjectPrFetch.get(projectId) ?? 0) < PR_STATUS_MIN_INTERVAL_MS) {
+    return;
+  }
+  lastProjectPrFetch.set(projectId, now);
+  try {
+    const response = await runJob<
+      Response & { statuses: { worktree_id: Id; pr: PrInfo | null }[] }
+    >({ type: "project-pr-statuses", project_id: projectId }, "pr-status");
+    prByWorktree.update((map) => {
+      const next = { ...map };
+      for (const status of response.statuses) {
+        next[status.worktree_id] = status.pr ?? null;
+      }
+      return next;
+    });
+  } catch {
+    lastProjectPrFetch.delete(projectId);
   }
 }
 
@@ -884,6 +949,36 @@ function pollSelectedGitStatus(worktreeId: Id): void {
 function startGitStatusPolling(worktreeId: Id): void {
   stopGitStatusPolling();
   statusPollTimer = setInterval(() => pollSelectedGitStatus(worktreeId), STATUS_POLL_MS);
+}
+
+// Refresh PR chips for every git-backed project. The periodic poll forces past
+// the refreshAll throttle (it is itself paced by PR_POLL_MS); the focus refresh
+// does not, so rapid window switching can't hammer `gh`.
+function pollAllProjectPrStatuses(options: { force?: boolean } = {}): void {
+  if (get(connection) !== "ready") return;
+  for (const project of get(projects)) {
+    if (project.kind === "git-backed") {
+      void loadProjectPrStatuses(project.id, options);
+    }
+  }
+}
+
+function startPrStatusPolling(): void {
+  stopPrStatusPolling();
+  prPollTimer = setInterval(() => pollAllProjectPrStatuses({ force: true }), PR_POLL_MS);
+  if (typeof window !== "undefined" && !prFocusHandler) {
+    prFocusHandler = () => pollAllProjectPrStatuses();
+    window.addEventListener("focus", prFocusHandler);
+  }
+}
+
+function stopPrStatusPolling(): void {
+  if (prPollTimer) clearInterval(prPollTimer);
+  prPollTimer = null;
+  if (typeof window !== "undefined" && prFocusHandler) {
+    window.removeEventListener("focus", prFocusHandler);
+    prFocusHandler = null;
+  }
 }
 
 function statusAfterStage(status: FileStatus): FileStatus {

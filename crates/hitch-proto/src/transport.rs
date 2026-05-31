@@ -57,6 +57,18 @@ pub fn default_socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("hitch{}-{}.sock", instance_infix(), current_uid()))
 }
 
+/// Path to the daemon's pidfile, derived from its socket path.
+///
+/// The daemon writes its pid here when it binds the socket and removes it on a
+/// clean shutdown. This is the one place the daemon's pid is discoverable
+/// *without* a successful `Hello` handshake — so a client that connects to a
+/// protocol-incompatible daemon (which never returns a pid) can still SIGKILL it
+/// and respawn a compatible one. Both sides derive the path from the socket path
+/// through this single helper so they can never drift onto different files.
+pub fn pidfile_path(socket_path: &Path) -> PathBuf {
+    socket_path.with_extension("pid")
+}
+
 /// Blocking client connection to the daemon socket.
 #[derive(Debug)]
 pub struct UnixSocketClient {
