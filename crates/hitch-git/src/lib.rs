@@ -437,16 +437,18 @@ impl GitClient {
         pr_status_with_client(self, repo_path.as_ref(), Some(control))
     }
 
-    /// List the repo's PRs in one cancellable `gh pr list`, each paired with its
-    /// head branch so the caller can map them to worktrees. Returns `(branch,
-    /// PrInfo)` pairs; a branch may appear more than once (e.g. an old merged PR
-    /// and a new open one), so the caller picks which matters.
-    pub fn pr_list_with_control(
+    /// Look up the current user's PRs for a specific set of head branches in one
+    /// cancellable `gh pr list`. Each returned PR is paired with its head branch
+    /// so the caller can map them back to worktrees; a branch may appear more than
+    /// once (e.g. an old merged PR and a newer open one), so the caller picks which
+    /// wins. See [`pr_list_for_branches_with_client`] for why the search is scoped.
+    pub fn pr_list_for_branches_with_control(
         &self,
         repo_path: impl AsRef<Path>,
+        branches: &[String],
         control: &dyn CommandControl,
     ) -> Result<Vec<(String, PrInfo)>> {
-        pr_list_with_client(self, repo_path.as_ref(), Some(control))
+        pr_list_for_branches_with_client(self, repo_path.as_ref(), branches, Some(control))
     }
 
     fn run_git(&self, cwd: &Path, args: Vec<OsString>) -> Result<CommandOutput> {
@@ -517,16 +519,43 @@ fn pr_status_with_client(
     }))
 }
 
-/// Cap on PRs pulled per `gh pr list`. We only keep PRs whose head branch
-/// matches a live worktree, so this just bounds the work for repos with long PR
-/// histories; active worktree branches sit among the most-recent PRs.
-const PR_LIST_LIMIT: &str = "100";
+/// Build the `gh pr list --search` query that scopes a batched PR lookup to the
+/// current user's PRs whose head is one of `branches`. GitHub search ANDs distinct
+/// qualifiers and ORs repeated ones, so this reads as
+/// `author:@me AND (head:b1 OR head:b2 OR …)`. `author:@me` is what keeps the
+/// result to PRs we own — without it a worktree branch with a common name (`main`,
+/// `patch-1`) would pull every fork's same-named PR and could bury (and, under the
+/// limit, truncate away) our own. Blank branch names (e.g. a detached worktree)
+/// contribute no `head:` term. Valid git branch names contain no spaces or `:`,
+/// so they need no quoting in the search expression.
+fn pr_branch_search(branches: &[String]) -> String {
+    let mut search = String::from("author:@me");
+    for branch in branches {
+        if branch.is_empty() {
+            continue;
+        }
+        search.push_str(" head:");
+        search.push_str(branch);
+    }
+    search
+}
 
-fn pr_list_with_client(
+fn pr_list_for_branches_with_client(
     client: &GitClient,
     repo_path: &Path,
+    branches: &[String],
     control: Option<&dyn CommandControl>,
 ) -> Result<Vec<(String, PrInfo)>> {
+    let search = pr_branch_search(branches);
+    // No real branches to look up — `author:@me` alone would match every PR we
+    // ever opened, which we don't want, so bail before spending a `gh` call.
+    if !search.contains("head:") {
+        return Ok(Vec::new());
+    }
+    // The search already constrains the result to our PRs on the requested
+    // branches (≈ one per branch), so this limit is just headroom — generous
+    // enough that an old+new PR on every branch still fits without truncation.
+    let limit = branches.len().saturating_mul(4).clamp(30, 500).to_string();
     // `--state all` so a worktree whose PR has already merged still shows a chip;
     // `headRefName` is the branch we map back to each worktree.
     let args = vec![
@@ -534,8 +563,10 @@ fn pr_list_with_client(
         os("list"),
         os("--state"),
         os("all"),
+        os("--search"),
+        os(&search),
         os("--limit"),
-        os(PR_LIST_LIMIT),
+        os(&limit),
         os("--json"),
         os("number,url,state,isDraft,headRefName"),
     ];
@@ -1662,6 +1693,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use tempfile::TempDir;
+
+    #[test]
+    fn pr_branch_search_ands_author_with_ored_heads_and_skips_blanks() {
+        // Distinct qualifiers AND, repeated `head:` OR: "mine AND (b1 OR b2)".
+        assert_eq!(
+            pr_branch_search(&["feature".into(), "fix/bug".into()]),
+            "author:@me head:feature head:fix/bug"
+        );
+        // A detached worktree contributes no head term; `author:@me` alone is not
+        // a branch lookup, so callers treat a head-less query as "nothing to ask".
+        let only_blank = pr_branch_search(&[String::new()]);
+        assert_eq!(only_blank, "author:@me");
+        assert!(!only_blank.contains("head:"));
+    }
 
     #[test]
     fn status_and_diff_cover_clean_modified_staged_and_untracked() {

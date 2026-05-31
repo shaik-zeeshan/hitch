@@ -1799,8 +1799,8 @@ fn project_pr_statuses(
     if worktrees.is_empty() {
         return Ok(Vec::new());
     }
-    // All worktrees of a project share the repo + remote, so one `gh pr list` in
-    // any of them covers them all. Prefer the main worktree as a stable cwd.
+    // All worktrees of a project share the repo + remote, so one `gh pr list`
+    // covers them all. Prefer the main worktree as a stable cwd.
     let repo_path = worktrees
         .iter()
         .find(|w| w.is_main)
@@ -1811,8 +1811,12 @@ fn project_pr_statuses(
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
         state.git.clone()
     };
+    // Scope the lookup to exactly our worktree branches (+ `author:@me`) so a long
+    // PR history can't truncate our branches out of the result and a same-named
+    // fork PR from another contributor can't attach to a worktree (owner-aware).
+    let branches: Vec<String> = worktrees.iter().map(|w| w.branch.clone()).collect();
     let prs = git
-        .pr_list_with_control(&repo_path, control)
+        .pr_list_for_branches_with_control(&repo_path, &branches, control)
         .map_err(git_error)?;
     Ok(worktrees
         .into_iter()
@@ -1823,9 +1827,9 @@ fn project_pr_statuses(
         .collect())
 }
 
-/// Pick the PR that best represents a branch when `gh pr list` returned more
-/// than one for it: an open PR wins over a closed/merged one, and among equals
-/// the highest number (most recent) wins. Returns the proto `PrInfo`.
+/// Pick the PR that best represents a branch when the batched lookup returned
+/// more than one for it: an open PR wins over a closed/merged one, and among
+/// equals the highest number (most recent) wins. Returns the proto `PrInfo`.
 fn best_pr_for_branch(prs: &[(String, hitch_git::PrInfo)], branch: &str) -> Option<PrInfo> {
     prs.iter()
         .filter(|(head, _)| head == branch)

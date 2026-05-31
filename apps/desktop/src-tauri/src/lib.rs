@@ -416,9 +416,12 @@ impl HitchClient {
 
     fn force_kill_daemon(&self) -> Result<(), String> {
         // Prefer the pid from the last successful Hello; fall back to the daemon's
-        // pidfile. The fallback is what lets us force-kill a daemon we never
-        // handshook with — exactly the protocol-mismatch case, where the daemon
-        // rejects Hello and so reports no pid in its response.
+        // pidfile. We reach here via `restart_daemon`, which marks the connection
+        // disconnected first — and disconnecting clears the cached pid — so in the
+        // protocol-mismatch / never-handshook case the cached pid is `None` and the
+        // pidfile (which the live daemon always writes on startup) identifies the
+        // daemon actually holding the socket. The cached pid only wins on the rare
+        // path where we still hold a live handshake, and then it matches the pidfile.
         let daemon_pid = self
             .0
             .daemon_pid
@@ -792,6 +795,15 @@ impl HitchClient {
 
     fn clear_connection_state(&self, reason: &str, drop_writer: bool) {
         self.0.connected.store(false, Ordering::SeqCst);
+        // The cached pid is only meaningful while we're handshook with that exact
+        // daemon. Once disconnected it's stale — a daemon swapped underneath us
+        // (upgrade, crash+respawn) leaves an incompatible daemon at the socket
+        // whose pid lives only in the pidfile. Clearing here means `force_kill_daemon`
+        // falls through to the pidfile for the protocol-mismatch case instead of
+        // SIGKILLing a stale/reused pid while the real daemon keeps the socket.
+        if let Ok(mut slot) = self.0.daemon_pid.lock() {
+            *slot = None;
+        }
         if drop_writer {
             if let Ok(mut writer) = self.0.writer.lock() {
                 *writer = None;

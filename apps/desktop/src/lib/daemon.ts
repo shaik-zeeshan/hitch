@@ -110,6 +110,20 @@ export const openPrInfo = derived(prInfo, ($pr) => (isOpenPr($pr) ? $pr : null))
 // known (no chip); an explicit `null` = checked, no PR.
 export const prByWorktree = writable<Record<Id, PrInfo | null>>({});
 
+// Monotonic freshness clock shared by every path that writes `prByWorktree`
+// (per-worktree `loadPrStatus` and the batched `loadProjectPrStatuses`). Each
+// request stamps a seq at start; an entry is only overwritten by a seq at least
+// as new as the one last applied to it, so a slow project-wide response can't
+// regress a worktree whose per-worktree status was refreshed more recently
+// (e.g. right after creating a PR).
+let prByWorktreeSeq = 0;
+const prByWorktreeApplied = new Map<Id, number>();
+function writePrByWorktree(worktreeId: Id, pr: PrInfo | null, seq: number): void {
+  if (seq < (prByWorktreeApplied.get(worktreeId) ?? 0)) return;
+  prByWorktreeApplied.set(worktreeId, seq);
+  prByWorktree.update((map) => ({ ...map, [worktreeId]: pr }));
+}
+
 const diffCache = new Map<string, string>();
 let diffRequestSeq = 0;
 let statusRequestSeq = 0;
@@ -121,10 +135,12 @@ let prFocusHandler: (() => void) | null = null;
 
 const STATUS_POLL_MS = 1_000;
 // PR state changes on GitHub (e.g. draft → ready) are external, so poll for them
-// while connected. `gh pr list` is network-priced and PR state rarely flips, so
-// a slow cadence is plenty; a window-focus refresh covers the "I just changed it
-// in the browser and switched back" case without waiting for the next tick.
-const PR_POLL_MS = 30_000;
+// while connected. `gh pr list` is network-priced and PR state rarely flips, and
+// any change *we* cause is refreshed immediately by the post-git-op and focus
+// paths — so the periodic poll only needs to catch external changes, where a few
+// minutes of latency is fine. We also skip it while the window is hidden (the
+// focus refresh catches up on return), so a backgrounded app spawns no `gh`.
+const PR_POLL_MS = 180_000;
 
 // ---- derived stores -------------------------------------------------------
 
@@ -874,6 +890,7 @@ export async function loadGitStatus(worktreeId: Id): Promise<GitStatus> {
 // the UI falls back to offering Create-PR rather than getting stuck.
 export async function loadPrStatus(worktreeId: Id): Promise<void> {
   const requestSeq = ++prRequestSeq;
+  const freshnessSeq = ++prByWorktreeSeq;
   try {
     const response = await runJob<Response & { pr: PrInfo | null }>(
       { type: "pr-status", worktree_id: worktreeId },
@@ -882,7 +899,7 @@ export async function loadPrStatus(worktreeId: Id): Promise<void> {
     // The result is authoritative for `worktreeId` regardless of which worktree
     // is selected now, so always feed the per-worktree map; only the selected
     // worktree's single `prInfo` is gated by the seq/selection guard.
-    prByWorktree.update((map) => ({ ...map, [worktreeId]: response.pr ?? null }));
+    writePrByWorktree(worktreeId, response.pr ?? null, freshnessSeq);
     if (requestSeq === prRequestSeq && get(gitWorktreeId) === worktreeId) {
       prInfo.set(response.pr ?? null);
     }
@@ -899,6 +916,11 @@ export async function loadPrStatus(worktreeId: Id): Promise<void> {
 // fetches its own fresh status via loadPrStatus.
 const PR_STATUS_MIN_INTERVAL_MS = 20_000;
 const lastProjectPrFetch = new Map<Id, number>();
+// Projects with a `project-pr-statuses` job still pending. `runJob` has no
+// timeout, so a hung/slow `gh pr list` keeps its promise open indefinitely; the
+// forced periodic poll bypasses the throttle, so without this guard every tick
+// would start another daemon job and another `gh` process for the same repo.
+const projectPrInFlight = new Set<Id>();
 
 // Populate the PR chip for EVERY worktree of a project from a single batched
 // lookup, so chips appear without visiting each worktree. Best-effort and
@@ -912,20 +934,27 @@ export async function loadProjectPrStatuses(
   if (!options.force && now - (lastProjectPrFetch.get(projectId) ?? 0) < PR_STATUS_MIN_INTERVAL_MS) {
     return;
   }
+  // A previous lookup for this project is still pending (slow/hung `gh`). Forced
+  // polls bypass the throttle, so without this we'd keep stacking jobs.
+  if (projectPrInFlight.has(projectId)) {
+    return;
+  }
+  projectPrInFlight.add(projectId);
   lastProjectPrFetch.set(projectId, now);
+  // Stamp before awaiting: a project-wide response that started before a newer
+  // per-worktree `loadPrStatus` must not clobber that fresher status.
+  const freshnessSeq = ++prByWorktreeSeq;
   try {
     const response = await runJob<
       Response & { statuses: { worktree_id: Id; pr: PrInfo | null }[] }
     >({ type: "project-pr-statuses", project_id: projectId }, "pr-status");
-    prByWorktree.update((map) => {
-      const next = { ...map };
-      for (const status of response.statuses) {
-        next[status.worktree_id] = status.pr ?? null;
-      }
-      return next;
-    });
+    for (const status of response.statuses) {
+      writePrByWorktree(status.worktree_id, status.pr ?? null, freshnessSeq);
+    }
   } catch {
     lastProjectPrFetch.delete(projectId);
+  } finally {
+    projectPrInFlight.delete(projectId);
   }
 }
 
@@ -965,7 +994,12 @@ function pollAllProjectPrStatuses(options: { force?: boolean } = {}): void {
 
 function startPrStatusPolling(): void {
   stopPrStatusPolling();
-  prPollTimer = setInterval(() => pollAllProjectPrStatuses({ force: true }), PR_POLL_MS);
+  prPollTimer = setInterval(() => {
+    // Don't poll a backgrounded app: the focus refresh below catches us up the
+    // moment the user returns, so a hidden window spawns no `gh` processes.
+    if (typeof document !== "undefined" && document.hidden) return;
+    pollAllProjectPrStatuses({ force: true });
+  }, PR_POLL_MS);
   if (typeof window !== "undefined" && !prFocusHandler) {
     prFocusHandler = () => pollAllProjectPrStatuses();
     window.addEventListener("focus", prFocusHandler);
