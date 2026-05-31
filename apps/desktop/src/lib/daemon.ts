@@ -29,6 +29,7 @@ import {
   type JobRequest,
   type PrFields,
   type PrInfo,
+  isOpenPr,
   type PullRequestDraft,
   type Project,
   type Request,
@@ -98,9 +99,10 @@ export const diffActive = writable<boolean>(false);
 export const gitBusy = writable<boolean>(false);
 export const prUrl = writable<string | null>(null);
 // The PR (if any) GitHub has for the selected worktree's branch. `null` = none
-// known (or not yet checked). Fetched on-demand — on worktree switch and after
-// commit/push/create-PR — never polled, since each check shells out to `gh`.
+// known (or not yet checked). This preserves closed/merged metadata for display;
+// use `openPrInfo` when the action state machine needs an actually-open PR.
 export const prInfo = writable<PrInfo | null>(null);
+export const openPrInfo = derived(prInfo, ($pr) => (isOpenPr($pr) ? $pr : null));
 
 const diffCache = new Map<string, string>();
 let diffRequestSeq = 0;
@@ -932,9 +934,9 @@ export async function addProject(root: string): Promise<void> {
 }
 
 // Open the native folder picker and add the chosen directory as a project.
-// The picker IS the local add-project flow (no intermediate text-field dialog):
-// the daemon detects git vs plain on its own. Cancelling is a silent no-op;
-// failures surface in the `error` store like the other fire-and-forget actions.
+// This stays the primary local add-project flow; the separate dialog fallback
+// handles manual path entry when the picker is unavailable or unsuitable.
+// Cancelling is a silent no-op; failures surface in the `error` store.
 export async function pickAndAddProject(): Promise<void> {
   try {
     const picked = await open({
@@ -1443,21 +1445,27 @@ export async function pull(): Promise<void> {
 // Throws on failure so the dialog can surface the error inline (mirrors App.tsx).
 export async function createPr(fields: PrFields): Promise<void> {
   const worktreeId = get(gitWorktreeId);
-  if (!worktreeId) return;
-  const response = await runJob<Response & { url: string }>(
-    {
-      type: "create-pull-request",
-      worktree_id: worktreeId,
-      title: fields.title,
-      body: fields.body,
-      base: fields.base,
-      draft: fields.draft,
-    },
-    "create-pr",
-  );
-  prUrl.set(response.url);
-  // Refresh so the action menu flips from "Create PR" to "Open PR".
-  void loadPrStatus(worktreeId);
+  if (!worktreeId) throw new Error("Select a git worktree first.");
+  if (get(gitBusy)) throw new Error("Wait for the current git operation to finish.");
+  gitBusy.set(true);
+  try {
+    const response = await runJob<Response & { url: string }>(
+      {
+        type: "create-pull-request",
+        worktree_id: worktreeId,
+        title: fields.title,
+        body: fields.body,
+        base: fields.base,
+        draft: fields.draft,
+      },
+      "create-pr",
+    );
+    prUrl.set(response.url);
+    // Refresh so the action menu flips from "Create PR" to "Open PR".
+    void loadPrStatus(worktreeId);
+  } finally {
+    gitBusy.set(false);
+  }
 }
 
 // ---- selection fix-up + cleanup (run once, here, as subscriptions) --------

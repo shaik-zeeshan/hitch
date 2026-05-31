@@ -20,6 +20,7 @@
     gitWorktreeId,
     loadGitStatus,
     loadPrStatus,
+    openPrInfo,
     prInfo,
     pull,
     push,
@@ -59,6 +60,7 @@
   // does the *next* meaningful step; the dropdown exposes each step directly,
   // greyed out (with a reason) when it doesn't apply to the current status.
   const pr = $derived($prInfo);
+  const openPr = $derived($openPrInfo);
   const hasChanges = $derived(files.length > 0);
   const onDefault = $derived(isDefaultBranch);
   const busy = $derived($gitBusy || autoRunning);
@@ -67,9 +69,13 @@
     commitOpen.set(true);
   }
   function openCreatePr() {
+    if (busy || !$gitWorktreeId) return;
     createPrOpen.set(true);
   }
-  async function openPr() {
+  async function openExistingPr() {
+    if (openPr) await openUrl(openPr.url);
+  }
+  async function openDisplayedPr() {
     if (pr) await openUrl(pr.url);
   }
 
@@ -86,10 +92,10 @@
         ? { label: `Pull ↓${behind}`, run: () => void handleManualPull() }
         : ahead > 0
           ? { label: `Push ↑${ahead}`, run: () => void handleManualPush() }
-          : !onDefault && $gitWorktreeId && !pr
+          : !onDefault && $gitWorktreeId && !openPr
             ? { label: "Create PR", run: openCreatePr }
-            : pr
-              ? { label: `Open PR #${pr.number}`, run: () => void openPr() }
+            : openPr
+              ? { label: `Open PR #${openPr.number}`, run: () => void openExistingPr() }
               : { label: "Up to date", run: null },
   );
 
@@ -99,7 +105,7 @@
   const pullReason = $derived(behind > 0 ? "" : "Up to date with remote");
   const commitReason = $derived(hasChanges ? "" : "No changes to commit");
   const createPrReason = $derived(
-    onDefault ? "On the default branch" : !$gitWorktreeId ? "No worktree selected" : "",
+    busy ? "Git operation in progress" : onDefault ? "On the default branch" : !$gitWorktreeId ? "No worktree selected" : "",
   );
 
   function shortError(err: unknown): string {
@@ -225,9 +231,9 @@
           title="{pr.draft ? 'Draft' : pr.state} pull request #{pr.number} — open on GitHub"
           onclick={(e) => {
             e.preventDefault();
-            void openPr();
-          }}>#{pr.number}</a
-        >
+            void openDisplayedPr();
+          }}
+        >#{pr.number}</a>
       {/if}
     </div>
 
@@ -307,14 +313,14 @@
                   Pull <span class="mi-k">↓{behind}</span>
                 </DropdownMenu.Item>
                 <DropdownMenu.Separator class="m-sep" />
-                {#if pr}
-                  <DropdownMenu.Item class="mi" onSelect={() => void openPr()}>
+                {#if openPr}
+                  <DropdownMenu.Item class="mi" onSelect={() => void openExistingPr()}>
                     <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
                       ><circle cx="4" cy="4" r="1.8" /><circle cx="4" cy="12" r="1.8" /><circle cx="12" cy="12" r="1.8" /><path
                         d="M4 5.8v4.4M12 5.5v4.7M12 5.5c0-2-1.6-2.5-3.2-2.5H6"
                       /></svg
                     >
-                    Open PR #{pr.number} <span class="mi-k">↗</span>
+                    Open PR #{openPr.number} <span class="mi-k">↗</span>
                   </DropdownMenu.Item>
                 {:else}
                   <DropdownMenu.Item
@@ -323,6 +329,7 @@
                     title={createPrReason}
                     onSelect={openCreatePr}
                   >
+
                     <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"
                       ><path d="M8 4v8M4 8h8" /></svg
                     >

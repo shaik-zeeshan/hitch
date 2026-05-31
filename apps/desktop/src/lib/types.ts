@@ -78,13 +78,18 @@ export type FileDiff = {
   diff: string;
 };
 
-// An existing GitHub PR for a worktree's current branch (from `gh pr view`).
+// A GitHub PR for a worktree's current branch, as returned by `gh pr view`.
+// GitHub may return an open, closed, or merged PR for the branch; only an open
+// PR is terminal for the desktop's Create-PR action.
 export type PrInfo = {
   number: number;
   url: string;
-  state: string;
+  state: "OPEN" | "CLOSED" | "MERGED";
   draft: boolean;
 };
+export function isOpenPr(pr: PrInfo | null | undefined): pr is PrInfo {
+  return pr?.state === "OPEN";
+}
 
 export type PrFields = {
   title: string;

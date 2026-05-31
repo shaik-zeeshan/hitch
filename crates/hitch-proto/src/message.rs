@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 /// `JobCompleted` events (ADR 0008). v9 extends `JobProgress` with optional
 /// job-kind metadata so reconnecting clients can rebuild the live Job store. v10
 /// adds the daemon pid to `Response::Hello` so a heartbeat-wedged daemon can be
-/// force-restarted by pid.
-pub const PROTOCOL_VERSION: u16 = 10;
+/// force-restarted by pid. v11 bumps the protocol for the extended
+/// `Response::PrStatus` wire shape.
+pub const PROTOCOL_VERSION: u16 = 11;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;

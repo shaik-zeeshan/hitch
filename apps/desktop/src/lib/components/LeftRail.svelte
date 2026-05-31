@@ -4,14 +4,14 @@
   // nav, not here, so the rail opens straight onto the tree.
   //
   // "Add project" is a split control: the primary click opens the native folder
-  // picker directly (the common case — add a local repo/folder), and the
-  // chevron opens a small menu offering the same plus "Clone remote…". No
-  // intermediate text-field dialog for local folders.
+  // picker directly (the common case — add a local repo/folder). The chevron
+  // menu keeps that fast path, adds an explicit manual local-path fallback, and
+  // leaves remote clone in its own dialog.
   import { goto } from "$app/navigation";
   import { DropdownMenu } from "bits-ui";
   import ProjectTree from "./ProjectTree.svelte";
   import { pickAndAddProject } from "../daemon";
-  import { cloneProjectOpen } from "../overlays";
+  import { addProjectOpen, cloneProjectOpen } from "../overlays";
 
   let { collapsed = false }: { collapsed?: boolean } = $props();
 </script>
@@ -46,6 +46,12 @@
                 ><path d="M1.5 4.5a2 2 0 0 1 2-2h3l1.5 1.6h4.5a2 2 0 0 1 2 2v5.4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z" /></svg
               >
               Add local folder…
+            </DropdownMenu.Item>
+            <DropdownMenu.Item class="mi" onSelect={() => addProjectOpen.set(true)}>
+              <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                ><path d="M2.5 3.5h11v9h-11z" /><path d="M4.5 6.25h7M4.5 8h5M4.5 9.75h4" /></svg
+              >
+              Enter local path…
             </DropdownMenu.Item>
             <DropdownMenu.Item class="mi" onSelect={() => cloneProjectOpen.set(true)}>
               <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"

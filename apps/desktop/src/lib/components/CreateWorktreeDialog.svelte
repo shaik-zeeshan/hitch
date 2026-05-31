@@ -38,6 +38,9 @@
     const n = Math.floor(Math.random() * 90) + 10;
     return `${pick(ADJECTIVES)}-${pick(NOUNS)}-${n}`;
   }
+  function localBranchNameForRemote(name: string): string {
+    return name.split("/").slice(1).join("/") || name;
+  }
 
   let query = $state("");
   let base = $state("");
@@ -51,7 +54,10 @@
   const q = $derived(query.trim());
   const ql = $derived(q.toLowerCase());
   const localBranches = $derived(branches.filter((b) => !b.is_remote));
-  const remoteBranches = $derived(branches.filter((b) => b.is_remote));
+  const localBranchNames = $derived(new Set(localBranches.map((b) => b.name)));
+  const remoteBranches = $derived(
+    branches.filter((b) => b.is_remote && !localBranchNames.has(localBranchNameForRemote(b.name))),
+  );
   const localMatches = $derived(
     q ? localBranches.filter((b) => b.name.toLowerCase().includes(ql)) : localBranches,
   );
@@ -60,7 +66,7 @@
   );
   // Hide the create row only when the text is already an exact local branch
   // (creating a duplicate would fail; picking that branch checks it out).
-  const exactLocal = $derived(localBranches.some((b) => b.name === q));
+  const exactLocal = $derived(localBranchNames.has(q));
   const createName = $derived(q || generatedPlaceholder);
 
   const rows = $derived.by<Row[]>(() => {
@@ -68,7 +74,7 @@
     if (!exactLocal) out.push({ kind: "create", key: "create", name: createName });
     for (const b of localMatches) out.push({ kind: "existing", key: `l:${b.name}`, name: b.name });
     for (const b of remoteMatches) {
-      const localName = b.name.split("/").slice(1).join("/") || b.name;
+      const localName = localBranchNameForRemote(b.name);
       out.push({ kind: "remote", key: `r:${b.name}`, name: b.name, localName });
     }
     return out;

@@ -25,6 +25,7 @@
   import { disposeDaemon, initDaemon } from "$lib/daemon";
   import { commandOpen } from "$lib/overlays";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
+  import AddProjectDialog from "$lib/components/AddProjectDialog.svelte";
   import CloneProjectDialog from "$lib/components/CloneProjectDialog.svelte";
   import CreateWorktreeDialog from "$lib/components/CreateWorktreeDialog.svelte";
   import RemoveProjectDialog from "$lib/components/RemoveProjectDialog.svelte";
@@ -109,6 +110,7 @@
 <div class="wk-keepalive" aria-hidden="true" style="opacity:{hbOpacity}"></div>
 
 <CommandPalette />
+<AddProjectDialog />
 <CloneProjectDialog />
 <CreateWorktreeDialog />
 <RemoveProjectDialog />

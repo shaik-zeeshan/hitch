@@ -1193,6 +1193,12 @@ fn list_worktrees(
 fn canonical_or_self(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
+/// Hitch only owns linked worktrees it created under the managed-root directory.
+/// Imported external worktrees stay visible but must never go through Hitch's
+/// destructive removal path.
+fn is_hitch_managed_worktree(path: &Path, managed_root: &Path) -> bool {
+    canonical_or_self(path).starts_with(canonical_or_self(managed_root))
+}
 
 /// Register any on-disk git worktrees the store doesn't yet know about for a
 /// git-backed project. Matches existing worktrees by canonical path so the main
@@ -1481,7 +1487,7 @@ fn remove_worktree(
     delete_branch: bool,
     force: bool,
 ) -> Result<(), ProtocolError> {
-    let (project, worktree, git, live_session_ids) = {
+    let (project, worktree, managed_root, git, live_session_ids) = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
         let worktree = state
             .worktrees
@@ -1499,13 +1505,25 @@ fn remove_worktree(
             .filter(|session| session.session.parent == SessionParent::Worktree(worktree_id))
             .map(|session| session.session.id)
             .collect::<Vec<_>>();
-        (project, worktree, state.git.clone(), live_session_ids)
+        (
+            project,
+            worktree,
+            state.config.managed_root.clone(),
+            state.git.clone(),
+            live_session_ids,
+        )
     };
 
     if worktree.is_main {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
             "main worktree cannot be removed by Hitch",
+        ));
+    }
+    if !is_hitch_managed_worktree(&worktree.path, &managed_root) {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "externally managed worktrees cannot be removed by Hitch",
         ));
     }
     if !force && !live_session_ids.is_empty() {
@@ -3368,6 +3386,63 @@ mod tests {
 
         assert!(observed_cancel.load(Ordering::SeqCst));
         assert!(state.lock().unwrap().jobs.is_empty());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn remove_worktree_rejects_externally_managed_paths() {
+        use hitch_core::{Project, ProjectKind, Worktree};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-external-remove-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("state.db");
+        let managed_root = dir.join("managed");
+        let project_root = dir.join("repo");
+        let external_path = dir.join("external").join("feature");
+        std::fs::create_dir_all(&managed_root).unwrap();
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(&external_path).unwrap();
+
+        let config = super::DaemonConfig {
+            socket_path: dir.join("daemon.sock"),
+            store_path: store_path.clone(),
+            managed_root: managed_root.clone(),
+            hook_helper: dir.join("hook"),
+            git: PathBuf::from("git"),
+            gh: PathBuf::from("gh"),
+            draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+        };
+        let store = hitch_store::Store::open(&store_path).unwrap();
+        let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
+            store, config,
+        )));
+
+        let project = Project::new("hitch", &project_root, ProjectKind::GitBacked);
+        let worktree = Worktree::new(project.id, &external_path, "feature/external", false);
+        {
+            let mut guard = state.lock().unwrap();
+            guard.store.insert_project(&project).unwrap();
+            guard.store.insert_worktree(&worktree).unwrap();
+            guard.projects.insert(project.id, project.clone());
+            guard.worktrees.insert(worktree.id, worktree.clone());
+        }
+
+        let err = super::remove_worktree(&state, worktree.id, false, false).unwrap_err();
+        assert_eq!(err.code, super::ErrorCode::InvalidRequest);
+        assert_eq!(
+            err.message,
+            "externally managed worktrees cannot be removed by Hitch"
+        );
+        assert!(external_path.exists(), "external worktree path must be untouched");
+        assert!(state.lock().unwrap().worktrees.contains_key(&worktree.id));
 
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
