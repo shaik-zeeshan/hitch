@@ -18,6 +18,7 @@ export type Worktree = {
   path: string;
   branch: string;
   is_main: boolean;
+  is_hitch_managed: boolean;
 };
 
 export type SessionParent =
@@ -78,6 +79,19 @@ export type FileDiff = {
   diff: string;
 };
 
+// A GitHub PR for a worktree's current branch, as returned by `gh pr view`.
+// GitHub may return an open, closed, or merged PR for the branch; only an open
+// PR is terminal for the desktop's Create-PR action.
+export type PrInfo = {
+  number: number;
+  url: string;
+  state: "OPEN" | "CLOSED" | "MERGED";
+  draft: boolean;
+};
+export function isOpenPr(pr: PrInfo | null | undefined): pr is PrInfo {
+  return pr?.state === "OPEN";
+}
+
 export type PrFields = {
   title: string;
   body: string | null;
@@ -132,6 +146,7 @@ export type JobRequest =
     }
   | { type: "push"; worktree_id: Id }
   | { type: "pull"; worktree_id: Id }
+  | { type: "pr-status"; worktree_id: Id }
   | {
       type: "create-pull-request";
       worktree_id: Id;
@@ -165,12 +180,14 @@ export function statusGlyphClass(status: FileStatus): string {
   return glyph === "M" || glyph === "A" || glyph === "D" ? glyph : "U";
 }
 
-// Agent state is rendered as a WORD in a reserved hue (never a bare symbol), so
-// it survives grayscale and color blindness. `cls` matches the mockup's
-// .status.{run,approval,done,error} classes.
+// Agent state renders as a human-language WORD inside a tinted pill, in a
+// reserved hue (never a bare symbol), so it survives grayscale and color
+// blindness. `cls` matches the .pill.{run,approval,done,error} classes. The
+// labels are phrased for a person glancing at a branch they're NOT in: "what is
+// that agent doing?" — working / awaiting input / completed.
 export const AGENT_LABEL: Record<AgentState, { label: string; cls: string }> = {
-  running: { label: "running", cls: "run" },
-  "needs-approval": { label: "needs approval", cls: "approval" },
+  running: { label: "working", cls: "run" },
+  "needs-approval": { label: "awaiting input", cls: "approval" },
   completed: { label: "completed", cls: "done" },
   error: { label: "error", cls: "error" },
 };

@@ -112,6 +112,25 @@ impl GitRepository {
     pub fn current_branch(&self) -> Result<String> {
         current_branch(&self.root)
     }
+
+    /// List every working tree git knows about for this repository: the main
+    /// worktree plus each linked worktree on disk. Used to import worktrees a
+    /// project already has (created outside Hitch) so they auto-appear.
+    pub fn worktrees(&self) -> Result<Vec<DiscoveredWorktree>> {
+        discover_worktrees(&self.root)
+    }
+}
+
+/// A working tree git reports for a repository — the main checkout or a linked
+/// worktree — with the branch it currently has checked out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredWorktree {
+    /// Absolute path to the working tree on disk.
+    pub path: PathBuf,
+    /// The branch checked out there (falls back to the worktree name if detached).
+    pub branch: String,
+    /// True for the repository's main worktree (the original checkout).
+    pub is_main: bool,
 }
 
 /// Paths and executables used for write-side commands.
@@ -399,6 +418,25 @@ impl GitClient {
         create_pr_with_client(self, repo_path.as_ref(), request, Some(control))
     }
 
+    /// Look up the PR (if any) GitHub associates with the worktree's current
+    /// branch via `gh pr view`. Returns `Ok(None)` when there is no PR for the
+    /// branch (or when `gh` can't determine one — unauthenticated, no remote,
+    /// offline): callers treat "unknown" the same as "none" and keep offering
+    /// Create-PR, so a transient failure never blocks the flow. Only the JSON
+    /// shape is trusted; malformed output also degrades to `None`.
+    pub fn pr_status(&self, repo_path: impl AsRef<Path>) -> Result<Option<PrInfo>> {
+        pr_status_with_client(self, repo_path.as_ref(), None)
+    }
+
+    /// Look up PR status as a cancellable `gh pr view` child process.
+    pub fn pr_status_with_control(
+        &self,
+        repo_path: impl AsRef<Path>,
+        control: &dyn CommandControl,
+    ) -> Result<Option<PrInfo>> {
+        pr_status_with_client(self, repo_path.as_ref(), Some(control))
+    }
+
     fn run_git(&self, cwd: &Path, args: Vec<OsString>) -> Result<CommandOutput> {
         run_command(&self.git, cwd, args, None)
     }
@@ -424,6 +462,47 @@ impl GitClient {
     ) -> Result<CommandOutput> {
         run_command(&self.gh, cwd, args, Some(control))
     }
+}
+
+fn pr_status_with_client(
+    client: &GitClient,
+    repo_path: &Path,
+    control: Option<&dyn CommandControl>,
+) -> Result<Option<PrInfo>> {
+    let args = vec![
+        os("pr"),
+        os("view"),
+        os("--json"),
+        os("number,url,state,isDraft"),
+    ];
+    let output = match control {
+        Some(control) => client.run_gh_with_control(repo_path, args, control),
+        None => client.run_gh(repo_path, args),
+    };
+    let output = match output {
+        Ok(output) => output,
+        Err(err @ GitError::CommandFailed { .. }) => {
+            if control.is_some_and(|control| control.is_cancelled()) {
+                return Err(err);
+            }
+            // gh exits non-zero when the branch has no PR (and on auth/network
+            // errors). Either way we have no PR to show.
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&output.stdout) else {
+        return Ok(None);
+    };
+    let (Some(number), Some(url)) = (value["number"].as_u64(), value["url"].as_str()) else {
+        return Ok(None);
+    };
+    Ok(Some(PrInfo {
+        number,
+        url: url.to_string(),
+        state: value["state"].as_str().unwrap_or_default().to_string(),
+        draft: value["isDraft"].as_bool().unwrap_or(false),
+    }))
 }
 
 /// A successful CLI command result.
@@ -560,6 +639,16 @@ pub struct CreatePrRequest {
     pub head: Option<String>,
     /// Remote to push to when the branch has no upstream or is ahead. Defaults to `origin`.
     pub remote: Option<String>,
+    pub draft: bool,
+}
+
+/// An existing GitHub pull request for the current branch, as reported by `gh`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrInfo {
+    pub number: u64,
+    pub url: String,
+    /// `gh`'s PR state, e.g. `OPEN`, `CLOSED`, `MERGED`.
+    pub state: String,
     pub draft: bool,
 }
 
@@ -903,6 +992,46 @@ pub fn current_branch(repo_path: impl AsRef<Path>) -> Result<String> {
     current_branch_from_repo(&repo)
 }
 
+/// List the main worktree plus every linked worktree git tracks for a repo.
+///
+/// Linked worktrees whose directory no longer exists on disk (stale/prunable
+/// entries) are skipped so callers only see worktrees they can actually open.
+pub fn discover_worktrees(repo_path: impl AsRef<Path>) -> Result<Vec<DiscoveredWorktree>> {
+    let repo = Repository::discover(repo_path.as_ref())?;
+    let main_root = repo
+        .workdir()
+        .ok_or(GitError::BareRepository)?
+        .to_path_buf();
+
+    let mut out = vec![DiscoveredWorktree {
+        branch: current_branch_from_repo(&repo).unwrap_or_else(|_| "HEAD".into()),
+        path: main_root,
+        is_main: true,
+    }];
+
+    for name in repo.worktrees()?.iter().flatten() {
+        let Ok(worktree) = repo.find_worktree(name) else {
+            continue;
+        };
+        let path = worktree.path().to_path_buf();
+        // Skip linked worktrees whose directory is gone (prunable but not pruned).
+        if !path.is_dir() {
+            continue;
+        }
+        let branch = Repository::open(&path)
+            .ok()
+            .and_then(|wt_repo| current_branch_from_repo(&wt_repo).ok())
+            .unwrap_or_else(|| name.to_string());
+        out.push(DiscoveredWorktree {
+            path,
+            branch,
+            is_main: false,
+        });
+    }
+
+    Ok(out)
+}
+
 /// Build the managed worktree path Hitch owns for a project branch.
 pub fn managed_worktree_path(
     managed_root: impl AsRef<Path>,
@@ -949,6 +1078,7 @@ fn create_worktree_with_client(
         target,
         request.branch.clone(),
         false,
+        true,
     ))
 }
 
@@ -1870,6 +2000,50 @@ mod tests {
         };
         let err = client.create_worktree(fixture.path(), &second).unwrap_err();
         assert!(matches!(err, GitError::CommandFailed { .. }));
+    }
+
+    #[test]
+    fn discover_worktrees_reports_main_plus_created_linked_worktrees() {
+        let fixture = RepoFixture::new();
+        let managed = TempDir::new().unwrap();
+        let client = GitClient::default();
+
+        // Only the main worktree exists at first.
+        let initial = discover_worktrees(fixture.path()).unwrap();
+        assert_eq!(initial.len(), 1);
+        assert!(initial[0].is_main);
+        assert_eq!(
+            canonical_or_self(&initial[0].path),
+            canonical_or_self(fixture.path())
+        );
+
+        // Create a linked worktree on a fresh branch.
+        let request = CreateWorktreeRequest {
+            project_id: ProjectId::new(),
+            project_name: "hitch".into(),
+            managed_root: managed.path().into(),
+            branch: "feature/discover".into(),
+            checkout: WorktreeCheckout::NewBranch,
+            base: Some("main".into()),
+        };
+        let created = client.create_worktree(fixture.path(), &request).unwrap();
+
+        // Discovery now reports both, with the linked worktree's branch.
+        let found = discover_worktrees(fixture.path()).unwrap();
+        assert_eq!(found.len(), 2, "found {found:?}");
+        let linked = found
+            .iter()
+            .find(|w| !w.is_main)
+            .expect("linked worktree discovered");
+        assert_eq!(linked.branch, "feature/discover");
+        assert_eq!(
+            canonical_or_self(&linked.path),
+            canonical_or_self(&created.path)
+        );
+    }
+
+    fn canonical_or_self(path: &Path) -> PathBuf {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
     }
 
     #[test]

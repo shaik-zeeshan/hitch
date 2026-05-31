@@ -10,8 +10,13 @@ import type { Project, Worktree } from "./types";
 // ⌘K command palette.
 export const commandOpen = writable(false);
 
-// Add-project dialog (local folder / clone remote).
+// Local add-project fallback dialog. The primary flow still goes straight to
+// the native folder picker (`pickAndAddProject`); this store is the explicit
+// manual path-entry fallback for when the picker is unavailable or unsuitable.
 export const addProjectOpen = writable(false);
+
+// Clone-remote dialog. Remote clone stays separate from local add-project.
+export const cloneProjectOpen = writable(false);
 
 // Create-worktree dialog, scoped to the project it creates under (null = closed).
 export const createWorktreeFor = writable<Project | null>(null);

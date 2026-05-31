@@ -73,8 +73,14 @@
     collapsed = { ...collapsed, [p.id]: !collapsed[p.id] };
   }
 
+  // Clicking a project row selects it (for ⌘K context + the quick-add target)
+  // and ensures its worktree list is visible. It MUST also clear the selected
+  // worktree so even re-clicking the SAME project row returns the UI to the
+  // project-level “choose a worktree” state instead of leaving the prior branch
+  // selected.
   function selectProject(p: Project) {
     selectedProjectId.set(p.id);
+    selectedWorktreeId.set(null);
     if (p.kind === "git-backed") collapsed = { ...collapsed, [p.id]: false };
   }
 
@@ -134,9 +140,9 @@
             {/if}
 
             {#if project.kind === "git-backed"}
-              <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                ><circle cx="4" cy="4" r="1.8" /><circle cx="4" cy="12" r="1.8" /><circle cx="12" cy="6" r="1.8" /><path
-                  d="M4 5.8v4.4M5.7 4.5c3 0 4.6 0 5.3 0M11 7.7c0 1.5-1.4 2.4-3.2 2.4H5.8"
+              <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
+                ><circle cx="4" cy="3.5" r="1.6" /><circle cx="4" cy="12.5" r="1.6" /><circle cx="12" cy="5" r="1.6" /><path
+                  d="M4 5.1v5.8M12 6.6C12 9.8 8.8 11 4.6 11"
                 /></svg
               >
             {:else}
@@ -147,25 +153,27 @@
 
             <span class="lbl">{project.name}</span>
 
-            {#if !expanded && status}
-              <span class="status {AGENT_LABEL[status].cls}">{AGENT_LABEL[status].label}</span>
-            {/if}
+            <span class="right">
+              {#if !expanded && status}
+                <span class="pill rollup {AGENT_LABEL[status].cls}">{AGENT_LABEL[status].label}</span>
+              {/if}
 
-            {#if project.kind === "git-backed"}
-              <button
-                class="quick-add"
-                aria-label={`New worktree in ${project.name}`}
-                title={`New worktree in ${project.name}`}
-                onclick={(e) => {
-                  e.stopPropagation();
-                  createWorktreeFor.set(project);
-                }}
-              >
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
-                  ><path d="M8 3.5v9M3.5 8h9" /></svg
+              {#if project.kind === "git-backed"}
+                <button
+                  class="quick-add"
+                  aria-label={`New worktree in ${project.name}`}
+                  title={`New worktree in ${project.name}`}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    createWorktreeFor.set(project);
+                  }}
                 >
-              </button>
-            {/if}
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                    ><path d="M8 3.5v9M3.5 8h9" /></svg
+                  >
+                </button>
+              {/if}
+            </span>
           </div>
         {/snippet}
       </ContextMenu.Trigger>
@@ -218,18 +226,37 @@
         {#each worktreesFor(project.id) as worktree (worktree.id)}
           {@const wtStatus = $agentStateByWorktree[worktree.id]}
           {@const lineStat = $worktreeLineStats[worktree.id]}
+          {@const isActive = worktree.id === $selectedWorktreeId}
+          {@const hasLoc = !!lineStat && (lineStat.additions > 0 || lineStat.deletions > 0)}
           <ContextMenu.Root>
             <ContextMenu.Trigger>
               {#snippet child({ props })}
                 <button
                   {...props}
                   class="row wt-row"
-                  class:sel={worktree.id === $selectedWorktreeId}
+                  class:sel={isActive}
                   onclick={() => selectWorktree(worktree)}
                 >
-                  <span class="branch-main">
-                    <span class="lbl br-name">{worktree.branch}</span>
-                    {#if lineStat && (lineStat.additions > 0 || lineStat.deletions > 0)}
+                  <span class="lbl br-name">{worktree.branch}</span>
+                  <!-- One thing on the right, by rule: the worktree you're IN
+                       shows its own +/− line stat (status is redundant — you can
+                       see the agent live in the main pane); every OTHER worktree
+                       shows its agent-state pill so you can triage at a glance.
+                       An idle-but-dirty branch still surfaces its line stat. -->
+                  <span class="right">
+                    {#if isActive}
+                      {#if hasLoc && lineStat}
+                        <span
+                          class="diffstat"
+                          title={`${lineStat.additions} additions, ${lineStat.deletions} deletions`}
+                        >
+                          {#if lineStat.additions > 0}<span class="add">{lineStat.additions}+</span>{/if}
+                          {#if lineStat.deletions > 0}<span class="del">{lineStat.deletions}-</span>{/if}
+                        </span>
+                      {/if}
+                    {:else if wtStatus}
+                      <span class="pill {AGENT_LABEL[wtStatus].cls}">{AGENT_LABEL[wtStatus].label}</span>
+                    {:else if hasLoc && lineStat}
                       <span
                         class="diffstat"
                         title={`${lineStat.additions} additions, ${lineStat.deletions} deletions`}
@@ -239,12 +266,6 @@
                       </span>
                     {/if}
                   </span>
-                  {#if wtStatus}
-                    <span class="meta-r">
-                      <span class="status {AGENT_LABEL[wtStatus].cls}">{AGENT_LABEL[wtStatus].label}</span>
-                    </span>
-                  {/if}
-                  {#if worktree.is_main}<span class="wt-main">main</span>{/if}
                 </button>
               {/snippet}
             </ContextMenu.Trigger>
@@ -281,15 +302,17 @@
                   >
                   Copy path
                 </ContextMenu.Item>
-                <ContextMenu.Separator class="m-sep" />
-                <ContextMenu.Item class="mi danger" onSelect={() => removeWorktreeTarget.set(worktree)}>
-                  <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                    ><path
-                      d="M3 4.5h10M6 4.5V3.2a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V4.5M4.5 4.5l.6 8a1 1 0 0 0 1 1h3.8a1 1 0 0 0 1-1l.6-8"
-                    /></svg
-                  >
-                  Remove worktree…
-                </ContextMenu.Item>
+                {#if worktree.is_hitch_managed && !worktree.is_main}
+                  <ContextMenu.Separator class="m-sep" />
+                  <ContextMenu.Item class="mi danger" onSelect={() => removeWorktreeTarget.set(worktree)}>
+                    <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                      ><path
+                        d="M3 4.5h10M6 4.5V3.2a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V4.5M4.5 4.5l.6 8a1 1 0 0 0 1 1h3.8a1 1 0 0 0 1-1l.6-8"
+                      /></svg
+                    >
+                    Remove worktree…
+                  </ContextMenu.Item>
+                {/if}
               </ContextMenu.Content>
             </ContextMenu.Portal>
           </ContextMenu.Root>
@@ -326,9 +349,14 @@
     align-items: center;
     gap: 7px;
     width: 100%;
+    /* Never let a long branch/project name push the icons or status word out of
+       the rail — the flexible label is the only part that shrinks + ellipsizes. */
+    min-width: 0;
+    overflow: hidden;
     text-align: left;
     font: inherit;
-    padding: 6px 8px;
+    /* denser than the old 6px rows so more branches fit at a glance */
+    padding: 4px 8px;
     border-radius: var(--radius);
     color: var(--tx-md);
     cursor: pointer;
@@ -392,19 +420,16 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .branch-main {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    align-items: baseline;
-    gap: 7px;
-  }
-  .branch-main .lbl {
-    flex: 0 1 auto;
-  }
   .row .br-name {
     font-family: var(--mono);
     font-size: 11.5px;
+  }
+  /* the single right-hand slot: holds exactly one of pill / diffstat */
+  .right {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    flex: none;
   }
   .diffstat {
     display: inline-flex;
@@ -421,12 +446,6 @@
   .diffstat .del {
     color: var(--err);
   }
-  .wt-main {
-    font-size: 10px;
-    color: var(--tx-lo);
-    font-family: var(--mono);
-    flex: none;
-  }
 
   /* project rows read as group headers */
   .tree > .row .lbl {
@@ -438,7 +457,7 @@
 
   .worktrees {
     display: grid;
-    gap: 2px;
+    gap: 1px;
   }
   /* tree hierarchy: one quiet vertical hairline under the caret, no ticks */
   .tree .worktrees {
@@ -459,35 +478,37 @@
     padding-left: 6px;
   }
 
-  /* status as a WORD, in a reserved hue */
-  .status {
-    font-size: 10px;
+  /* agent state as a human-language word inside a tinted pill, reserved hue */
+  .pill {
+    font-size: 9.5px;
     font-weight: 600;
     letter-spacing: 0.2px;
     flex: none;
     white-space: nowrap;
+    padding: 1.5px 7px;
+    border-radius: 999px;
   }
-  .status.run {
+  .pill.run {
     color: var(--run);
+    background: oklch(78% 0.1 195 / 0.15);
   }
-  .status.approval {
+  .pill.approval {
     color: var(--warn);
+    background: oklch(81% 0.13 75 / 0.16);
   }
-  .status.done {
+  .pill.done {
     color: var(--ok);
+    background: oklch(77% 0.12 150 / 0.14);
   }
-  .status.error {
+  .pill.error {
     color: var(--err);
-  }
-  .meta-r {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    flex: none;
+    background: oklch(68% 0.17 25 / 0.16);
   }
 
   /* per-project quick-add: a "+" on the project row that creates a worktree
-     under it directly. Always visible, brightening on its own hover. */
+     under it directly. Hidden at rest so the resting row stays quiet; revealed
+     on row hover/focus. On a collapsed project it shares the slot with the
+     rolled-up pill, which steps aside when the "+" appears. */
   .row .quick-add {
     width: 18px;
     height: 18px;
@@ -500,16 +521,29 @@
     color: var(--tx-lo);
     cursor: pointer;
     flex: none;
+    opacity: 0;
+    pointer-events: none;
     transition:
       background var(--t-fast),
-      color var(--t-fast);
+      color var(--t-fast),
+      opacity var(--t-fast);
   }
   .row .quick-add svg {
     width: 12px;
     height: 12px;
   }
+  .row:hover .quick-add,
+  .row:focus-within .quick-add {
+    opacity: 1;
+    pointer-events: auto;
+  }
   .row .quick-add:hover {
     background: var(--bg-4);
     color: var(--ac-bright);
+  }
+  /* rolled-up pill yields to the "+" when the row is hovered/focused */
+  .row:hover .pill.rollup,
+  .row:focus-within .pill.rollup {
+    display: none;
   }
 </style>

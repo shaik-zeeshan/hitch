@@ -9,6 +9,7 @@
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import { derived, get, writable } from "svelte/store";
 import { ByteRing } from "./byteRing";
 import {
@@ -27,6 +28,8 @@ import {
   type JobStatus,
   type JobRequest,
   type PrFields,
+  type PrInfo,
+  isOpenPr,
   type PullRequestDraft,
   type Project,
   type Request,
@@ -95,10 +98,16 @@ export const diffText = writable<string | null>(null);
 export const diffActive = writable<boolean>(false);
 export const gitBusy = writable<boolean>(false);
 export const prUrl = writable<string | null>(null);
+// The PR (if any) GitHub has for the selected worktree's branch. `null` = none
+// known (or not yet checked). This preserves closed/merged metadata for display;
+// use `openPrInfo` when the action state machine needs an actually-open PR.
+export const prInfo = writable<PrInfo | null>(null);
+export const openPrInfo = derived(prInfo, ($pr) => (isOpenPr($pr) ? $pr : null));
 
 const diffCache = new Map<string, string>();
 let diffRequestSeq = 0;
 let statusRequestSeq = 0;
+let prRequestSeq = 0;
 let statusPollTimer: ReturnType<typeof setInterval> | null = null;
 let statusPollInFlight = false;
 
@@ -834,6 +843,27 @@ export async function loadGitStatus(worktreeId: Id): Promise<GitStatus> {
   return response.status;
 }
 
+// Fetch the PR for a worktree's branch and store it. On-demand only (worktree
+// switch + after git ops). A seq guard drops a slow response once the selected
+// worktree has moved on, mirroring loadGitStatus. Failures clear to `null` so
+// the UI falls back to offering Create-PR rather than getting stuck.
+export async function loadPrStatus(worktreeId: Id): Promise<void> {
+  const requestSeq = ++prRequestSeq;
+  try {
+    const response = await runJob<Response & { pr: PrInfo | null }>(
+      { type: "pr-status", worktree_id: worktreeId },
+      "pr-status",
+    );
+    if (requestSeq === prRequestSeq && get(gitWorktreeId) === worktreeId) {
+      prInfo.set(response.pr ?? null);
+    }
+  } catch {
+    if (requestSeq === prRequestSeq && get(gitWorktreeId) === worktreeId) {
+      prInfo.set(null);
+    }
+  }
+}
+
 function stopGitStatusPolling(): void {
   if (statusPollTimer) clearInterval(statusPollTimer);
   statusPollTimer = null;
@@ -901,6 +931,24 @@ export async function addProject(root: string): Promise<void> {
   if (!trimmed) return;
   await daemonRequest({ type: "add-project", root: trimmed });
   await refreshAll();
+}
+
+// Open the native folder picker and add the chosen directory as a project.
+// This stays the primary local add-project flow; the separate dialog fallback
+// handles manual path entry when the picker is unavailable or unsuitable.
+// Cancelling is a silent no-op; failures surface in the `error` store.
+export async function pickAndAddProject(): Promise<void> {
+  try {
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      title: "Add a project folder",
+    });
+    if (typeof picked !== "string") return;
+    await addProject(picked);
+  } catch (err) {
+    error.set(toMessage(err));
+  }
 }
 
 export async function cloneProject(
@@ -1397,19 +1445,27 @@ export async function pull(): Promise<void> {
 // Throws on failure so the dialog can surface the error inline (mirrors App.tsx).
 export async function createPr(fields: PrFields): Promise<void> {
   const worktreeId = get(gitWorktreeId);
-  if (!worktreeId) return;
-  const response = await runJob<Response & { url: string }>(
-    {
-      type: "create-pull-request",
-      worktree_id: worktreeId,
-      title: fields.title,
-      body: fields.body,
-      base: fields.base,
-      draft: fields.draft,
-    },
-    "create-pr",
-  );
-  prUrl.set(response.url);
+  if (!worktreeId) throw new Error("Select a git worktree first.");
+  if (get(gitBusy)) throw new Error("Wait for the current git operation to finish.");
+  gitBusy.set(true);
+  try {
+    const response = await runJob<Response & { url: string }>(
+      {
+        type: "create-pull-request",
+        worktree_id: worktreeId,
+        title: fields.title,
+        body: fields.body,
+        base: fields.base,
+        draft: fields.draft,
+      },
+      "create-pr",
+    );
+    prUrl.set(response.url);
+    // Refresh so the action menu flips from "Create PR" to "Open PR".
+    await loadPrStatus(worktreeId);
+  } finally {
+    gitBusy.set(false);
+  }
 }
 
 // ---- selection fix-up + cleanup (run once, here, as subscriptions) --------
@@ -1421,20 +1477,22 @@ projects.subscribe(($projects) => {
   }
 });
 
-// Keep the selected worktree valid for the selected project: plain projects
-// have none; git projects fall back to main (or the first) when the current
-// selection no longer belongs to the project.
+// Keep the selected worktree valid for the selected project, but never auto-
+// pick one. Plain projects have no worktrees; switching git projects (or
+// removing the selected worktree) invalidates the current selection — in both
+// cases we clear it to null rather than jumping into `main`. Clicking a project
+// then expands it and shows the "choose a worktree" state; the user picks the
+// worktree explicitly, so `main` is no longer special on selection.
 derived([selectedProject, projectWorktrees], (v) => v).subscribe(
   ([$project, $worktrees]) => {
     const selected = get(selectedWorktreeId);
+    if (selected === null) return;
     if ($project?.kind === "plain") {
-      if (selected !== null) selectedWorktreeId.set(null);
+      selectedWorktreeId.set(null);
       return;
     }
     if ($project && !$worktrees.some((w) => w.id === selected)) {
-      selectedWorktreeId.set(
-        $worktrees.find((w) => w.is_main)?.id ?? $worktrees[0]?.id ?? null,
-      );
+      selectedWorktreeId.set(null);
     }
   },
 );
@@ -1519,9 +1577,11 @@ gitWorktreeId.subscribe(($id) => {
   gitStatus.set(null);
   closeDiff();
   prUrl.set(null);
+  prInfo.set(null);
   stopGitStatusPolling();
   if ($id) {
     void loadGitStatus($id).catch((err) => error.set(toMessage(err)));
+    void loadPrStatus($id);
     startGitStatusPolling($id);
   }
 });

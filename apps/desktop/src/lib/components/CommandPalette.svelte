@@ -2,17 +2,19 @@
   // ⌘K command palette (mockup #cmdk-modal). A bits-ui Dialog (focus trap,
   // escape, overlay) hosting a bits-ui Command (fuzzy filter + arrow nav).
   // "Jump to" lists every worktree and live session; "Actions" are one-shot
-  // triggers — opening a dialog (new worktree, add project, create PR) or
-  // firing a session. Selecting any item closes the palette first, then runs.
+  // triggers — opening a dialog (new worktree, local-path fallback, create PR,
+  // clone) or firing a session. Selecting any item closes the palette first.
   import { Command, Dialog } from "bits-ui";
   import {
     activeSessionId,
     agentStateByWorktree,
     defaultBase,
     diffActive,
+    gitBusy,
     gitStatus,
     gitWorktreeId,
     openSession,
+    pickAndAddProject,
     projects,
     selectedParent,
     selectedProject,
@@ -21,7 +23,7 @@
     sessions,
     worktrees,
   } from "../daemon";
-  import { addProjectOpen, commandOpen, createPrOpen, createWorktreeFor } from "../overlays";
+  import { addProjectOpen, cloneProjectOpen, commandOpen, createPrOpen, createWorktreeFor } from "../overlays";
   import { AGENT_LABEL, type Session, type Worktree } from "../types";
 
   const projectName = (id: string) => $projects.find((p) => p.id === id)?.name ?? "";
@@ -33,7 +35,7 @@
       ? $selectedProject
       : ($projects.find((p) => p.kind === "git-backed") ?? null),
   );
-  const canCreatePr = $derived(Boolean($gitWorktreeId && (!$defaultBase || $gitStatus?.branch !== $defaultBase)));
+  const canCreatePr = $derived(Boolean($gitWorktreeId && !$gitBusy && (!$defaultBase || $gitStatus?.branch !== $defaultBase)));
 
   function run(action: () => void) {
     commandOpen.set(false);
@@ -95,12 +97,12 @@
                     keywords={[w.branch, projectName(w.project_id)]}
                     onSelect={() => run(() => jumpWorktree(w))}
                   >
-                    <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                      ><circle cx="4" cy="4" r="1.8" /><circle cx="4" cy="12" r="1.8" /><circle
+                    <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
+                      ><circle cx="4" cy="3.5" r="1.6" /><circle cx="4" cy="12.5" r="1.6" /><circle
                         cx="12"
-                        cy="6"
-                        r="1.8"
-                      /><path d="M4 5.8v4.4M5.7 4.5h5.3M11 7.7c0 1.5-1.4 2.4-3.2 2.4H5.8" /></svg
+                        cy="5"
+                        r="1.6"
+                      /><path d="M4 5.1v5.8M12 6.6C12 9.8 8.8 11 4.6 11" /></svg
                     >
                     <span class="pi-label"
                       ><span class="mono">{w.branch}</span> <span class="ctx">· {projectName(w.project_id)}</span
@@ -159,25 +161,47 @@
                     value="create pull request pr"
                     onSelect={() => run(() => createPrOpen.set(true))}
                   >
-                    <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                      ><circle cx="4" cy="4" r="1.8" /><circle cx="4" cy="12" r="1.8" /><circle
+                    <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
+                      ><circle cx="4" cy="3.5" r="1.6" /><circle cx="4" cy="12.5" r="1.6" /><circle
                         cx="12"
-                        cy="6"
-                        r="1.8"
-                      /><path d="M4 5.8v4.4M5.7 4.5h5.3M11 7.7c0 1.5-1.4 2.4-3.2 2.4H5.8" /></svg
+                        cy="5"
+                        r="1.6"
+                      /><path d="M4 5.1v5.8M12 6.6C12 9.8 8.8 11 4.6 11" /></svg
                     >
                     <span class="pi-label">Create pull request…</span>
                   </Command.Item>
                 {/if}
                 <Command.Item
                   class="p-item"
-                  value="add project local clone"
+                  value="add project local folder open"
+                  onSelect={() => run(() => void pickAndAddProject())}
+                >
+                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                    ><path d="M1.5 4.5a2 2 0 0 1 2-2h3l1.5 1.6h4.5a2 2 0 0 1 2 2v5.4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z" /></svg
+                  >
+                  <span class="pi-label">Add local project…</span>
+                </Command.Item>
+                <Command.Item
+                  class="p-item"
+                  value="add project local path paste manual"
                   onSelect={() => run(() => addProjectOpen.set(true))}
                 >
-                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"
-                    ><line x1="8" y1="3" x2="8" y2="13" /><line x1="3" y1="8" x2="13" y2="8" /></svg
+                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                    ><path d="M2.5 3.5h11v9h-11z" /><path d="M4.5 6.25h7M4.5 8h5M4.5 9.75h4" /></svg
                   >
-                  <span class="pi-label">Add project…</span>
+                  <span class="pi-label">Add local project by path…</span>
+                </Command.Item>
+                <Command.Item
+                  class="p-item"
+                  value="clone remote repository git project"
+                  onSelect={() => run(() => cloneProjectOpen.set(true))}
+                >
+                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
+                    ><circle cx="4" cy="3.5" r="1.6" /><circle cx="4" cy="12.5" r="1.6" /><circle cx="12" cy="5" r="1.6" /><path
+                      d="M4 5.1v5.8M12 6.6C12 9.8 8.8 11 4.6 11"
+                    /></svg
+                  >
+                  <span class="pi-label">Clone remote repository…</span>
                 </Command.Item>
               </Command.GroupItems>
             </Command.Group>

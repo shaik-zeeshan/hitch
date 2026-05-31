@@ -4,10 +4,16 @@
   // call createPr, which throws on failure so the error surfaces inline. On
   // success the daemon's PR url lands in the prUrl store and we show it.
   import { Dialog } from "bits-ui";
-  import { createPr, defaultBase, generatePullRequestDraft, gitStatus, prUrl } from "../daemon";
+  import { createPr, defaultBase, generatePullRequestDraft, gitBusy, gitStatus, gitWorktreeId, prUrl } from "../daemon";
   import { createPrOpen } from "../overlays";
 
-  let { disabled = false, triggerClass = "btn grow" }: { disabled?: boolean; triggerClass?: string } = $props();
+  // `triggerless`: mount the dialog without its own trigger button, so another
+  // surface (the Changes-panel action menu) can open it via the createPrOpen store.
+  let {
+    disabled = false,
+    triggerClass = "btn grow",
+    triggerless = false,
+  }: { disabled?: boolean; triggerClass?: string; triggerless?: boolean } = $props();
 
   let title = $state("");
   let body = $state("");
@@ -16,6 +22,13 @@
   let submitting = $state(false);
   let generating = $state(false);
   let errMsg = $state<string | null>(null);
+  const gateMessage = $derived(
+    !$gitWorktreeId
+      ? "Select a git worktree before creating a pull request."
+      : $gitBusy
+        ? "Wait for the current git operation to finish before creating a pull request."
+        : null,
+  );
 
   // Bumped on each open-reset so an in-flight draft request that resolves after
   // the dialog was closed and reopened can detect it's stale and skip clobbering
@@ -48,6 +61,10 @@
   }
 
   async function generate() {
+    if (gateMessage) {
+      errMsg = gateMessage;
+      return;
+    }
     const targetBase = base.trim() || $defaultBase || "";
     if (!targetBase) {
       errMsg = "Enter a base branch before generating a PR draft.";
@@ -73,6 +90,10 @@
 
   async function submit() {
     const t = title.trim();
+    if (gateMessage) {
+      errMsg = gateMessage;
+      return;
+    }
     if (!t || submitting) return;
     submitting = true;
     errMsg = null;
@@ -93,7 +114,9 @@
 </script>
 
 <Dialog.Root bind:open={$createPrOpen}>
-  <Dialog.Trigger class={triggerClass} {disabled}>Create PR…</Dialog.Trigger>
+  {#if !triggerless}
+    <Dialog.Trigger class={triggerClass} disabled={disabled || Boolean(gateMessage)}>Create PR…</Dialog.Trigger>
+  {/if}
   <Dialog.Portal>
     <Dialog.Overlay class="modal-back" />
     <Dialog.Content class="modal" aria-describedby={undefined}>
@@ -118,7 +141,7 @@
       {:else}
         <div class="m-body">
           <div class="draft-actions">
-            <button class="btn" disabled={generating || submitting} onclick={() => void generate()}>
+            <button class="btn" disabled={Boolean(gateMessage) || generating || submitting} onclick={() => void generate()}>
               {generating ? "Generating…" : title || body ? "Regenerate" : "Generate"}
             </button>
           </div>
@@ -139,13 +162,14 @@
             <span class="check" class:on={draft} aria-hidden="true">✓</span>
             <span class="lab">Create as draft</span>
           </button>
+          {#if gateMessage}<p class="m-error">{gateMessage}</p>{/if}
           {#if errMsg}<p class="m-error">{errMsg}</p>{/if}
         </div>
         <div class="m-foot">
           <Dialog.Close class="btn">Cancel</Dialog.Close>
           <button
             class="btn primary"
-            disabled={!title.trim() || submitting}
+            disabled={Boolean(gateMessage) || !title.trim() || submitting}
             onclick={() => void submit()}
           >
             {submitting ? "Creating…" : "Create pull request"}

@@ -1,18 +1,26 @@
 <script lang="ts">
-  // Create-worktree dialog (mockup #wt-modal). Opened from the "+" on a
-  // project row and the ⌘K palette via the createWorktreeFor store (the
-  // project it creates under). New-branch vs existing-branch picks the daemon's
-  // WorktreeCreateMode; the base field only applies to a new branch. Throws on
-  // failure surface inline; success dismisses and optionally opens a shell.
+  // Create-worktree dialog. Opened from the "+" on a project row and the ⌘K
+  // palette via the createWorktreeFor store (the project it creates under).
+  //
+  // There is no "new branch / existing branch" mode toggle. A single search
+  // field drives a palette-style list: the top row always offers to CREATE a
+  // branch named after what you typed (off the chosen base), and below it the
+  // project's existing local branches (check one out) and remote branches
+  // (create a local branch tracking it) filter as you type. Hitch infers the
+  // git operation from which row you pick — you never name the distinction.
+  // Throws surface inline; success dismisses and optionally opens a shell.
   import { Dialog, Select } from "bits-ui";
   import { createWorktree, defaultBase, listBranches, openSession } from "../daemon";
   import { createWorktreeFor } from "../overlays";
+  import { localBranchNameForRemote, remoteBranchChoices } from "../branchChoices";
   import type { BranchSummary } from "../types";
 
   const project = $derived($createWorktreeFor);
 
-  let branch = $state("");
-  let mode = $state<"new-branch" | "existing-branch">("new-branch");
+  type Row =
+    | { kind: "create"; key: string; name: string }
+    | { kind: "existing"; key: string; name: string }
+    | { kind: "remote"; key: string; name: string; localName: string };
 
   const ADJECTIVES = [
     "sunny", "calm", "brave", "fuzzy", "swift", "quiet", "bold", "silly",
@@ -31,36 +39,83 @@
     const n = Math.floor(Math.random() * 90) + 10;
     return `${pick(ADJECTIVES)}-${pick(NOUNS)}-${n}`;
   }
+
+  let query = $state("");
   let base = $state("");
   let openShell = $state(true);
   let submitting = $state(false);
   let errMsg = $state<string | null>(null);
   let branches = $state<BranchSummary[]>([]);
   let generatedPlaceholder = $state(generateBranchName());
+  let activeIndex = $state(0);
 
+  const q = $derived(query.trim());
+  const ql = $derived(q.toLowerCase());
   const localBranches = $derived(branches.filter((b) => !b.is_remote));
+  const localBranchNames = $derived(new Set(localBranches.map((b) => b.name)));
+  const remoteBranches = $derived(remoteBranchChoices(branches));
+  const localMatches = $derived(
+    q ? localBranches.filter((b) => b.name.toLowerCase().includes(ql)) : localBranches,
+  );
+  const remoteMatches = $derived(
+    q ? remoteBranches.filter((b) => b.name.toLowerCase().includes(ql)) : remoteBranches,
+  );
+  // Hide the create row only when the text is already an exact local branch
+  // (creating a duplicate would fail; picking that branch checks it out).
+  const exactLocal = $derived(localBranchNames.has(q));
+  const createName = $derived(q || generatedPlaceholder);
+
+  const rows = $derived.by<Row[]>(() => {
+    const out: Row[] = [];
+    if (!exactLocal) out.push({ kind: "create", key: "create", name: createName });
+    for (const b of localMatches) out.push({ kind: "existing", key: `l:${b.name}`, name: b.name });
+    for (const b of remoteMatches) {
+      const localName = localBranchNameForRemote(b.name);
+      out.push({ kind: "remote", key: `r:${b.name}`, name: b.name, localName });
+    }
+    return out;
+  });
+
   const allBranches = $derived(branches);
+  const activeRow = $derived(rows[activeIndex] ?? null);
+  const primaryLabel = $derived(
+    submitting
+      ? "Creating…"
+      : activeRow?.kind === "existing"
+        ? "Check out branch"
+        : activeRow?.kind === "remote"
+          ? "Create from remote"
+          : "Create branch",
+  );
+
+  // Typing always re-aims the selection at the top (the create row), so Enter
+  // creates exactly what you typed without an extra keystroke.
+  $effect(() => {
+    query;
+    activeIndex = 0;
+  });
+  // Keep the cursor in range as the list shrinks.
+  $effect(() => {
+    if (activeIndex >= rows.length) activeIndex = Math.max(0, rows.length - 1);
+  });
 
   // Reset the form and fetch branches when a project first opens the dialog.
   let openedFor = $state<string | null>(null);
   $effect(() => {
     if (project && project.id !== openedFor) {
       openedFor = project.id;
-      branch = "";
+      query = "";
       generatedPlaceholder = generateBranchName();
-      mode = "new-branch";
       base = $defaultBase ?? "";
       openShell = true;
       submitting = false;
       errMsg = null;
       branches = [];
+      activeIndex = 0;
       listBranches(project.id).then((b) => {
         branches = b;
         if (!base && b.length > 0) {
           base = $defaultBase ?? b.find((x) => !x.is_remote)?.name ?? b[0].name;
-        }
-        if (mode === "existing-branch" && !branch && localBranches.length > 0) {
-          branch = localBranches[0].name;
         }
       });
     } else if (!project) {
@@ -68,30 +123,47 @@
     }
   });
 
-  // When switching to existing-branch, default-select the first local branch.
-  $effect(() => {
-    if (mode === "existing-branch" && !branch && localBranches.length > 0) {
-      branch = localBranches[0].name;
-    }
-  });
-
   function onOpenChange(next: boolean) {
     if (!next) createWorktreeFor.set(null);
   }
 
-  async function submit() {
+  function onKey(event: KeyboardEvent) {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      activeIndex = Math.min(activeIndex + 1, rows.length - 1);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      activeIndex = Math.max(activeIndex - 1, 0);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      if (activeRow) void submit(activeRow);
+    }
+  }
+
+  async function submit(row: Row) {
     const p = project;
-    const name = branch.trim() || (mode === "new-branch" ? generatedPlaceholder : "");
-    if (!p || !name || submitting) return;
+    if (!p || submitting) return;
+    let branchName: string;
+    let baseRef: string | null;
+    let mode: "new-branch" | "existing-branch";
+    if (row.kind === "existing") {
+      branchName = row.name;
+      baseRef = null;
+      mode = "existing-branch";
+    } else if (row.kind === "remote") {
+      branchName = row.localName;
+      baseRef = row.name;
+      mode = "new-branch";
+    } else {
+      branchName = row.name.trim();
+      baseRef = base.trim() || null;
+      mode = "new-branch";
+    }
+    if (!branchName) return;
     submitting = true;
     errMsg = null;
     try {
-      const created = await createWorktree(
-        p.id,
-        name,
-        mode === "new-branch" ? base.trim() || null : null,
-        mode,
-      );
+      const created = await createWorktree(p.id, branchName, baseRef, mode);
       if (created && openShell) {
         await openSession({ kind: "worktree", id: created.id }, "shell", null);
       }
@@ -114,19 +186,80 @@
       </div>
       <div class="m-body">
         <div class="field">
-          <span>Branch name</span>
-          {#if mode === "existing-branch" && localBranches.length > 0}
-            <Select.Root type="single" bind:value={branch}>
-              <Select.Trigger class="select-trigger base" aria-label="Branch name">
-                <Select.Value placeholder="Select a branch" />
+          <span>Search or name a branch</span>
+          <div class="wt-search">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+              ><circle cx="7" cy="7" r="4.5" /><line x1="10.5" y1="10.5" x2="14" y2="14" /></svg
+            >
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+              bind:value={query}
+              placeholder={generatedPlaceholder}
+              autofocus
+              spellcheck="false"
+              autocomplete="off"
+              onkeydown={onKey}
+            />
+          </div>
+        </div>
+
+        <div class="wt-list" role="listbox" tabindex="-1" aria-label="Branches">
+          {#each rows as row, i (row.key)}
+            <button
+              type="button"
+              class="wt-row"
+              class:active={i === activeIndex}
+              role="option"
+              aria-selected={i === activeIndex}
+              onmousemove={() => (activeIndex = i)}
+              onclick={() => void submit(row)}
+            >
+              {#if row.kind === "create"}
+                <svg class="wt-ico create" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
+                  ><path d="M8 3.5v9M3.5 8h9" /></svg
+                >
+                <span class="wt-lab">Create branch <span class="mono">{row.name}</span></span>
+                <span class="wt-hint">from {base || $defaultBase || "base"}</span>
+              {:else if row.kind === "existing"}
+                <svg class="wt-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
+                  ><circle cx="4" cy="3.5" r="1.6" /><circle cx="4" cy="12.5" r="1.6" /><circle cx="12" cy="5" r="1.6" /><path
+                    d="M4 5.1v5.8M12 6.6C12 9.8 8.8 11 4.6 11"
+                  /></svg
+                >
+                <span class="wt-lab"><span class="mono">{row.name}</span></span>
+                <span class="wt-hint">check out</span>
+              {:else}
+                <svg class="wt-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                  ><path d="M8 13V5M4.5 8.5 8 5l3.5 3.5M3 3.5h10" /></svg
+                >
+                <span class="wt-lab"><span class="mono">{row.name}</span></span>
+                <span class="wt-hint">new local branch</span>
+              {/if}
+            </button>
+          {/each}
+          {#if rows.length === 0}
+            <p class="wt-empty">No branches yet — type a name to create one.</p>
+          {/if}
+        </div>
+
+        <div class="field">
+          <span>Base for new branch</span>
+          {#if allBranches.length > 0}
+            <Select.Root type="single" bind:value={base}>
+              <Select.Trigger class="select-trigger base" aria-label="Base branch">
+                <Select.Value placeholder={$defaultBase ?? "main"} />
                 <span class="select-chev" aria-hidden="true">⌄</span>
               </Select.Trigger>
               <Select.Portal>
                 <Select.Content class="select-content" sideOffset={6}>
                   <Select.Viewport>
-                    {#each localBranches as b}
-                      <Select.Item class="select-item" value={b.name} label={b.name}>
-                        {b.name}
+                    {#each allBranches as b}
+                      <Select.Item
+                        class="select-item"
+                        value={b.name}
+                        label={b.is_remote ? `↑ ${b.name}` : b.name}
+                      >
+                        {#if b.is_remote}<span class="remote-badge">↑</span>{/if}{b.name}
                       </Select.Item>
                     {/each}
                   </Select.Viewport>
@@ -134,59 +267,10 @@
               </Select.Portal>
             </Select.Root>
           {:else}
-            <!-- svelte-ignore a11y_autofocus -->
-            <input
-              class="base"
-              bind:value={branch}
-              placeholder={generatedPlaceholder}
-              autofocus={mode === "new-branch"}
-              onkeydown={(e) => e.key === "Enter" && void submit()}
-            />
+            <input class="base" bind:value={base} placeholder={$defaultBase ?? "main"} />
           {/if}
         </div>
-        <div class="field">
-          <span>Create from</span>
-          <div class="seg">
-            <button type="button" class:on={mode === "new-branch"} onclick={() => (mode = "new-branch")}
-              >New branch</button
-            >
-            <button
-              type="button"
-              class:on={mode === "existing-branch"}
-              onclick={() => (mode = "existing-branch")}>Existing branch</button
-            >
-          </div>
-        </div>
-        {#if mode === "new-branch"}
-          <div class="field">
-            <span>Base branch</span>
-            {#if allBranches.length > 0}
-              <Select.Root type="single" bind:value={base}>
-                <Select.Trigger class="select-trigger base" aria-label="Base branch">
-                  <Select.Value placeholder={$defaultBase ?? "main"} />
-                  <span class="select-chev" aria-hidden="true">⌄</span>
-                </Select.Trigger>
-                <Select.Portal>
-                  <Select.Content class="select-content" sideOffset={6}>
-                    <Select.Viewport>
-                      {#each allBranches as b}
-                        <Select.Item
-                          class="select-item"
-                          value={b.name}
-                          label={b.is_remote ? `↑ ${b.name}` : b.name}
-                        >
-                          {#if b.is_remote}<span class="remote-badge">↑</span>{/if}{b.name}
-                        </Select.Item>
-                      {/each}
-                    </Select.Viewport>
-                  </Select.Content>
-                </Select.Portal>
-              </Select.Root>
-            {:else}
-              <input class="base" bind:value={base} placeholder={$defaultBase ?? "main"} />
-            {/if}
-          </div>
-        {/if}
+
         <button type="button" class="field-row" onclick={() => (openShell = !openShell)}>
           <span class="check" class:on={openShell} aria-hidden="true">✓</span>
           <span class="lab">Open a shell session in it now</span>
@@ -195,8 +279,12 @@
       </div>
       <div class="m-foot">
         <Dialog.Close class="btn">Cancel</Dialog.Close>
-        <button class="btn primary" disabled={(mode === "existing-branch" && !branch.trim()) || submitting} onclick={() => void submit()}>
-          {submitting ? "Creating…" : "Create worktree"}
+        <button
+          class="btn primary"
+          disabled={!activeRow || submitting}
+          onclick={() => activeRow && void submit(activeRow)}
+        >
+          {primaryLabel}
         </button>
       </div>
     </Dialog.Content>
@@ -208,5 +296,107 @@
     color: var(--tx-lo);
     margin-right: 5px;
     font-size: 10px;
+  }
+
+  /* Search field — borrows the palette input feel inside the dialog. */
+  .wt-search {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    background: var(--bg-0);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 0 10px;
+    transition: border-color var(--t-fast);
+  }
+  .wt-search:focus-within {
+    border-color: var(--ac);
+  }
+  .wt-search svg {
+    width: 14px;
+    height: 14px;
+    color: var(--tx-lo);
+    flex: none;
+  }
+  .wt-search input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: 0;
+    outline: 0;
+    color: var(--tx-hi);
+    font: inherit;
+    font-size: 12.5px;
+    padding: 8px 0;
+  }
+  .wt-search input::placeholder {
+    color: var(--tx-lo);
+  }
+
+  /* Results list — a permanent panel in the dialog body, not a popover. */
+  .wt-list {
+    max-height: 188px;
+    overflow-y: auto;
+    background: var(--bg-0);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 4px;
+    display: grid;
+    gap: 1px;
+  }
+  .wt-row {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    text-align: left;
+    font: inherit;
+    padding: 7px 8px;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--tx-md);
+    cursor: pointer;
+    min-width: 0;
+  }
+  .wt-row.active {
+    background: var(--ac-wash);
+    color: var(--tx-hi);
+  }
+  .wt-ico {
+    width: 15px;
+    height: 15px;
+    color: var(--tx-lo);
+    flex: none;
+  }
+  .wt-ico.create {
+    color: var(--ac-bright);
+  }
+  .wt-row.active .wt-ico {
+    color: var(--ac-bright);
+  }
+  .wt-lab {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+  }
+  .wt-lab .mono {
+    font-family: var(--mono);
+    font-size: 11.5px;
+  }
+  .wt-hint {
+    flex: none;
+    font-size: 10px;
+    color: var(--tx-lo);
+    white-space: nowrap;
+  }
+  .wt-empty {
+    padding: 14px 10px;
+    text-align: center;
+    font-size: 11.5px;
+    color: var(--tx-lo);
   }
 </style>

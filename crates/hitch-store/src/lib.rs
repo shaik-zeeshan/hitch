@@ -14,7 +14,7 @@ use hitch_core::{
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 const PROJECT_KIND_GIT_BACKED: &str = "git-backed";
 const PROJECT_KIND_PLAIN: &str = "plain";
 const SESSION_PARENT_WORKTREE: &str = "worktree";
@@ -82,7 +82,8 @@ impl Store {
                     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                     path TEXT NOT NULL,
                     branch TEXT NOT NULL,
-                    is_main INTEGER NOT NULL CHECK (is_main IN (0, 1))
+                    is_main INTEGER NOT NULL CHECK (is_main IN (0, 1)),
+                    is_hitch_managed INTEGER NOT NULL CHECK (is_hitch_managed IN (0, 1))
                 );
 
                 CREATE INDEX worktrees_project_id_idx ON worktrees(project_id);
@@ -98,11 +99,25 @@ impl Store {
 
                 CREATE INDEX sessions_parent_idx ON sessions(parent_kind, parent_id);
 
-                PRAGMA user_version = 1;
+                PRAGMA user_version = 2;
                 "#,
             )?;
         }
 
+        if version == 1 {
+            self.conn.execute_batch(
+                r#"
+                ALTER TABLE worktrees
+                    ADD COLUMN is_hitch_managed INTEGER NOT NULL DEFAULT 0 CHECK (is_hitch_managed IN (0, 1));
+
+                UPDATE worktrees
+                    SET is_hitch_managed = 1
+                    WHERE is_main = 0;
+
+                PRAGMA user_version = 2;
+                "#,
+            )?;
+        }
         Ok(())
     }
 
@@ -193,13 +208,14 @@ impl Store {
     /// Insert a worktree. The referenced project must already exist.
     pub fn insert_worktree(&self, worktree: &Worktree) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO worktrees (id, project_id, path, branch, is_main) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO worktrees (id, project_id, path, branch, is_main, is_hitch_managed) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id_to_string(worktree.id.as_uuid()),
                 id_to_string(worktree.project_id.as_uuid()),
                 path_to_string(&worktree.path),
                 worktree.branch,
                 bool_to_i64(worktree.is_main),
+                bool_to_i64(worktree.is_hitch_managed),
             ],
         )?;
         Ok(())
@@ -208,13 +224,14 @@ impl Store {
     /// Replace all mutable fields of an existing worktree.
     pub fn update_worktree(&self, worktree: &Worktree) -> Result<()> {
         let rows = self.conn.execute(
-            "UPDATE worktrees SET project_id = ?2, path = ?3, branch = ?4, is_main = ?5 WHERE id = ?1",
+            "UPDATE worktrees SET project_id = ?2, path = ?3, branch = ?4, is_main = ?5, is_hitch_managed = ?6 WHERE id = ?1",
             params![
                 id_to_string(worktree.id.as_uuid()),
                 id_to_string(worktree.project_id.as_uuid()),
                 path_to_string(&worktree.path),
                 worktree.branch,
                 bool_to_i64(worktree.is_main),
+                bool_to_i64(worktree.is_hitch_managed),
             ],
         )?;
         ensure_changed(rows, EntityKind::Worktree)
@@ -237,7 +254,7 @@ impl Store {
     pub fn get_worktree(&self, worktree_id: WorktreeId) -> Result<Option<Worktree>> {
         self.conn
             .query_row(
-                "SELECT id, project_id, path, branch, is_main FROM worktrees WHERE id = ?1",
+                "SELECT id, project_id, path, branch, is_main, is_hitch_managed FROM worktrees WHERE id = ?1",
                 params![id_to_string(worktree_id.as_uuid())],
                 map_worktree,
             )
@@ -248,7 +265,7 @@ impl Store {
     /// List worktrees for one project in stable display order.
     pub fn list_worktrees(&self, project_id: ProjectId) -> Result<Vec<Worktree>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, path, branch, is_main FROM worktrees WHERE project_id = ?1 ORDER BY is_main DESC, branch, id",
+            "SELECT id, project_id, path, branch, is_main, is_hitch_managed FROM worktrees WHERE project_id = ?1 ORDER BY is_main DESC, branch, id",
         )?;
         let worktrees = stmt
             .query_map(params![id_to_string(project_id.as_uuid())], map_worktree)?
@@ -368,7 +385,7 @@ impl Store {
 
     fn list_all_worktrees(&self) -> Result<Vec<Worktree>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, path, branch, is_main FROM worktrees ORDER BY project_id, is_main DESC, branch, id",
+            "SELECT id, project_id, path, branch, is_main, is_hitch_managed FROM worktrees ORDER BY project_id, is_main DESC, branch, id",
         )?;
         let worktrees = stmt
             .query_map([], map_worktree)?
@@ -494,6 +511,7 @@ fn map_worktree(row: &rusqlite::Row<'_>) -> rusqlite::Result<Worktree> {
     let path: String = row.get(2)?;
     let branch = row.get(3)?;
     let is_main: i64 = row.get(4)?;
+    let is_hitch_managed: i64 = row.get(5)?;
     Ok(Worktree {
         id: parse_uuid(&id)
             .map(WorktreeId::from)
@@ -504,6 +522,7 @@ fn map_worktree(row: &rusqlite::Row<'_>) -> rusqlite::Result<Worktree> {
         path: PathBuf::from(path),
         branch,
         is_main: is_main != 0,
+        is_hitch_managed: is_hitch_managed != 0,
     })
 }
 
@@ -605,6 +624,88 @@ mod tests {
     }
 
     #[test]
+    fn migrates_v1_main_as_unmanaged_and_linked_worktrees_as_hitch_managed() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE projects (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                root TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('git-backed', 'plain'))
+            );
+
+            CREATE TABLE worktrees (
+                id TEXT PRIMARY KEY NOT NULL,
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                is_main INTEGER NOT NULL CHECK (is_main IN (0, 1))
+            );
+
+            CREATE INDEX worktrees_project_id_idx ON worktrees(project_id);
+
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                parent_kind TEXT NOT NULL CHECK (parent_kind IN ('worktree', 'project')),
+                parent_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                scrollback BLOB NOT NULL DEFAULT X''
+            );
+
+            CREATE INDEX sessions_parent_idx ON sessions(parent_kind, parent_id);
+            PRAGMA user_version = 1;
+            "#,
+        )
+        .unwrap();
+
+        let project_id = ProjectId::new();
+        let main_id = WorktreeId::new();
+        let linked_id = WorktreeId::new();
+        conn.execute(
+            "INSERT INTO projects (id, name, root, kind) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                id_to_string(project_id.as_uuid()),
+                "hitch",
+                "/tmp/hitch",
+                PROJECT_KIND_GIT_BACKED
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO worktrees (id, project_id, path, branch, is_main) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id_to_string(main_id.as_uuid()),
+                id_to_string(project_id.as_uuid()),
+                "/tmp/hitch",
+                "main",
+                1
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO worktrees (id, project_id, path, branch, is_main) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id_to_string(linked_id.as_uuid()),
+                id_to_string(project_id.as_uuid()),
+                "/tmp/hitch-linked",
+                "feature",
+                0
+            ],
+        )
+        .unwrap();
+
+        let store = Store::from_connection(conn).unwrap();
+        let main = store.get_worktree(main_id).unwrap().unwrap();
+        let linked = store.get_worktree(linked_id).unwrap().unwrap();
+        assert!(main.is_main);
+        assert!(!main.is_hitch_managed);
+        assert!(!linked.is_main);
+        assert!(linked.is_hitch_managed);
+    }
+
+    #[test]
     fn rejects_database_from_newer_schema_version() {
         let path = temp_db_path("future-schema");
         {
@@ -642,6 +743,7 @@ mod tests {
             "/Users/me/.hitch/worktrees/hitch/main",
             "main",
             true,
+            false,
         );
         store.insert_worktree(&worktree).unwrap();
         assert_eq!(
@@ -711,7 +813,7 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let project = Project::new("hitch", "/tmp/hitch", ProjectKind::GitBacked);
         store.insert_project(&project).unwrap();
-        let worktree = Worktree::new(project.id, "/tmp/hitch-main", "main", true);
+        let worktree = Worktree::new(project.id, "/tmp/hitch-main", "main", true, false);
         store.insert_worktree(&worktree).unwrap();
         let project_session = Session::new(
             "project-shell",
@@ -742,6 +844,7 @@ mod tests {
             "/Users/me/.hitch/worktrees/hitch/feature",
             "feature",
             false,
+            true,
         );
         let session = Session::new(
             "agent",
