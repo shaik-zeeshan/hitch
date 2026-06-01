@@ -1247,12 +1247,26 @@ fn list_worktrees(
             .map_err(store_error)?
     };
 
-    worktrees
-        .into_iter()
-        .map(|worktree| {
-            refresh_worktree_branch_from_disk(state, worktree).map(|(worktree, _)| worktree)
-        })
-        .collect()
+    let mut refreshed = Vec::with_capacity(worktrees.len());
+    for worktree in worktrees {
+        // Reconciliation is the single place an external branch change is
+        // picked up and persisted. Broadcast it here so every attached GUI sees
+        // the new branch, not just the one that later selects this worktree:
+        // otherwise a background project-pr-statuses refresh updates the PR chip
+        // by worktree id while the stale branch name lingers beside it. Mirrors
+        // the single-worktree `refreshed_worktree_context` path.
+        let (worktree, branch_changed) = refresh_worktree_branch_from_disk(state, worktree)?;
+        if branch_changed {
+            broadcast_event(
+                state,
+                Event::WorktreeUpdated {
+                    worktree: worktree.clone(),
+                },
+            )?;
+        }
+        refreshed.push(worktree);
+    }
+    Ok(refreshed)
 }
 
 /// Canonicalize a path for identity comparison, falling back to the path as
@@ -3719,6 +3733,153 @@ mod tests {
         assert!(!guard.worktrees.contains_key(&linked.id));
 
         drop(guard);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn list_worktrees_broadcasts_external_branch_change() {
+        use hitch_core::{Project, ProjectKind, Worktree};
+        use hitch_proto::{ControlLineDecoder, ControlMessage, Event};
+        use std::io::Read as _;
+        use std::os::unix::net::UnixStream;
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        fn run(command: &mut Command, what: &str) {
+            let status = command.status().unwrap();
+            assert!(status.success(), "{what} failed with {status}");
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-branch-broadcast-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("state.db");
+        let managed_root = dir.join("managed");
+        let project_root = dir.join("repo");
+        std::fs::create_dir_all(&managed_root).unwrap();
+
+        let mut git = Command::new("git");
+        git.arg("init").arg(&project_root);
+        run(&mut git, "git init");
+
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["config", "user.email", "hitch@example.com"]);
+        run(&mut git, "git config user.email");
+
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["config", "user.name", "Hitch Tests"]);
+        run(&mut git, "git config user.name");
+
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["branch", "-M", "main"]);
+        run(&mut git, "git branch -M main");
+
+        std::fs::write(project_root.join("README.md"), "hello\n").unwrap();
+
+        let mut git = Command::new("git");
+        git.arg("-C").arg(&project_root).args(["add", "README.md"]);
+        run(&mut git, "git add README.md");
+
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["commit", "-m", "initial"]);
+        run(&mut git, "git commit");
+
+        let config = super::DaemonConfig {
+            socket_path: dir.join("daemon.sock"),
+            store_path: store_path.clone(),
+            managed_root,
+            hook_helper: dir.join("hook"),
+            git: PathBuf::from("git"),
+            gh: PathBuf::from("gh"),
+            draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+        };
+        let store = hitch_store::Store::open(&store_path).unwrap();
+        let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(store, config)));
+
+        let project = Project::new("hitch", &project_root, ProjectKind::GitBacked);
+        let main = Worktree::new(project.id, &project_root, "main", true, false);
+        {
+            let mut guard = state.lock().unwrap();
+            guard.store.insert_project(&project).unwrap();
+            guard.store.insert_worktree(&main).unwrap();
+            guard.projects.insert(project.id, project.clone());
+            guard.worktrees.insert(main.id, main.clone());
+        }
+
+        // Register a client sink so the broadcast has a destination we can read
+        // back off the wire.
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let sink = Arc::new(super::ClientSink {
+            writer: Mutex::new(writer),
+            live: AtomicBool::new(true),
+            jobs_live: AtomicBool::new(true),
+            pending: Mutex::new(Vec::new()),
+            pending_job_events: Mutex::new(Vec::new()),
+        });
+        {
+            let mut guard = state.lock().unwrap();
+            guard.clients.insert(1, sink);
+        }
+
+        // Switch the worktree's branch outside Hitch, the way a manual checkout
+        // or an agent would.
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["checkout", "-b", "feature/new"]);
+        run(&mut git, "git checkout -b feature/new");
+
+        let listed = super::list_worktrees(&state, project.id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].branch, "feature/new");
+
+        // The external branch change must reach attached GUIs as a
+        // WorktreeUpdated event — not be persisted silently — so a concurrent
+        // PR refresh can't leave a fresh PR chip beside a stale branch name.
+        let mut reader = reader;
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut decoder = ControlLineDecoder::new();
+        let mut buf = [0u8; 8192];
+        let event = loop {
+            let n = reader.read(&mut buf).expect("read worktree-updated broadcast");
+            assert!(n > 0, "client sink closed before delivering the event");
+            if let Some(event) =
+                decoder
+                    .push(&buf[..n])
+                    .unwrap()
+                    .into_iter()
+                    .find_map(|message| match message {
+                        ControlMessage::Event { event } => Some(event),
+                        _ => None,
+                    })
+            {
+                break event;
+            }
+        };
+        match event {
+            Event::WorktreeUpdated { worktree } => {
+                assert_eq!(worktree.id, main.id);
+                assert_eq!(worktree.branch, "feature/new");
+            }
+            other => panic!("expected WorktreeUpdated event, got {other:?}"),
+        }
+
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }
