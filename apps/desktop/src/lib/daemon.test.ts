@@ -40,6 +40,7 @@ import {
   daemonStatus,
   disposeDaemon,
   error,
+  fetchRemote,
   initDaemon,
   isJobCancellable,
   jobs,
@@ -590,6 +591,28 @@ describe("job store: StartJob -> JobCompleted", () => {
     await expect(promise).rejects.toThrow("remote rejected");
   });
 
+  it("routes fetch through StartJob for the requested worktree", async () => {
+    invokeMock.mockResolvedValueOnce({ type: "job-started", job_id: "j-fetch" });
+
+    const promise = fetchRemote("w-fetch");
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: { type: "fetch", worktree_id: "w-fetch" },
+      },
+    });
+    expect(get(jobs)["j-fetch"]).toMatchObject({
+      status: "running",
+      kind: "fetch",
+      worktreeId: "w-fetch",
+    });
+
+    completeJob("j-fetch", { type: "ack" });
+    await expect(promise).resolves.toBeUndefined();
+  });
+
   it("rebuilds a replayed running job so its later completion is applied", () => {
     applyJobProgress("j-reattach", "running", "Pushing…", "push");
 
@@ -785,6 +808,15 @@ describe("job store: StartJob -> JobCompleted", () => {
         status: "running",
         message: null,
         kind: "push",
+        worktreeId: "w1",
+      }),
+    ).toBe(true);
+    expect(
+      isJobCancellable({
+        id: "j-fetch",
+        status: "running",
+        message: null,
+        kind: "fetch",
         worktreeId: "w1",
       }),
     ).toBe(true);

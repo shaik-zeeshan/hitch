@@ -15,6 +15,7 @@
     discardAllFiles,
     discardFile,
     generateCommitDraft,
+    fetchRemote,
     gitBusy,
     gitStatus,
     gitWorktreeId,
@@ -169,6 +170,20 @@
     }
   }
 
+  async function handleRefresh() {
+    if ($gitBusy || !$gitWorktreeId) return;
+    const worktreeId = $gitWorktreeId;
+    const id = toast.loading("Fetching…");
+    try {
+      await fetchRemote(worktreeId);
+      await loadGitStatus(worktreeId);
+      void loadPrStatus(worktreeId);
+      toast.success("Fetched", { id });
+    } catch (err) {
+      toast.error(shortError(err), { id });
+    }
+  }
+
   function confirmDiscardAll() {
     if (files.length === 0 || $gitBusy) return;
     if (window.confirm(`Discard all ${files.length} changed file${files.length === 1 ? "" : "s"}?`)) {
@@ -190,14 +205,10 @@
     <span class="grow"></span>
     <button
       class="iconbtn"
-      title="Refresh"
-      aria-label="Refresh status"
-      disabled={!$gitWorktreeId}
-      onclick={() => {
-        if (!$gitWorktreeId) return;
-        void loadGitStatus($gitWorktreeId);
-        void loadPrStatus($gitWorktreeId);
-      }}
+      title="Fetch remote and refresh status"
+      aria-label="Fetch remote and refresh status"
+      disabled={!$gitWorktreeId || $gitBusy}
+      onclick={() => void handleRefresh()}
     >
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
         ><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5V5h-2.5" /></svg

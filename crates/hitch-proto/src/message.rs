@@ -1037,6 +1037,7 @@ mod tests {
                 }),
             },
             JobRequest::Push { worktree_id },
+            JobRequest::Fetch { worktree_id },
             JobRequest::Pull { worktree_id },
             JobRequest::PrStatus { worktree_id },
             JobRequest::CreatePullRequest {

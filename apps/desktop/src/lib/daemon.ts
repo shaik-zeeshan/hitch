@@ -397,6 +397,7 @@ const cancellableJobKinds = new Set([
   "clone",
   "create-worktree",
   "push",
+  "fetch",
   "pull",
   "create-pr",
   "draft-models",
@@ -1773,6 +1774,20 @@ export async function push(worktreeId: Id | null = get(gitWorktreeId)): Promise<
   try {
     error.set(null);
     await runJob({ type: "push", worktree_id: worktreeId }, "push");
+  } catch (err) {
+    error.set(toMessage(err));
+    throw err;
+  } finally {
+    gitBusy.set(false);
+  }
+}
+
+export async function fetchRemote(worktreeId: Id | null = get(gitWorktreeId)): Promise<void> {
+  if (!worktreeId) return;
+  gitBusy.set(true);
+  try {
+    error.set(null);
+    await runJob({ type: "fetch", worktree_id: worktreeId }, "fetch");
   } catch (err) {
     error.set(toMessage(err));
     throw err;
