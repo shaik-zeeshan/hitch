@@ -103,7 +103,7 @@ impl HookArgs {
         let mut agent = None;
         let mut event = None;
         let mut state = None;
-        let mut session_id = std::env::var(SESSION_ID_ENV)
+        let session_id = std::env::var(SESSION_ID_ENV)
             .ok()
             .map(|value| parse_session_id(&value))
             .transpose()?;
@@ -119,10 +119,11 @@ impl HookArgs {
                 "--event" => event = Some(required_value(&mut iter, "--event")?),
                 "--state" => state = Some(parse_state(&required_value(&mut iter, "--state")?)?),
                 "--session-id" => {
-                    session_id = Some(parse_session_id(&required_value(
-                        &mut iter,
-                        "--session-id",
-                    )?)?)
+                    let _ = required_value(&mut iter, "--session-id")?;
+                    return Err(HookError::Usage(format!(
+                        "--session-id is not accepted; set {SESSION_ID_ENV} in the hook environment\n{}",
+                        usage()
+                    )));
                 }
                 "--cwd" => cwd = Some(PathBuf::from(required_value(&mut iter, "--cwd")?)),
                 "--detail" => detail = Some(required_value(&mut iter, "--detail")?),
@@ -301,7 +302,7 @@ where
 }
 
 fn usage() -> String {
-    "usage: hitch-hook --agent <claude-code|codex> [--event NAME] [--state running|needs-approval|waiting|error|none] [--socket PATH] [--session-id UUID] [--cwd PATH] [--detail TEXT]".into()
+    "usage: hitch-hook --agent <claude-code|codex> [--event NAME] [--state running|needs-approval|waiting|error|none] [--socket PATH] [--cwd PATH] [--detail TEXT]".into()
 }
 
 #[derive(Debug)]
@@ -343,10 +344,12 @@ mod tests {
     use hitch_proto::{ControlMessage, Request};
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static SOCKET_NONCE: AtomicU64 = AtomicU64::new(0);
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
     #[test]
     fn explicit_state_args_parse() {
         let args = HookArgs::parse([
@@ -425,6 +428,84 @@ mod tests {
             cwd_from_payload(payload),
             Some(PathBuf::from("/repo/from-payload"))
         );
+    }
+
+    #[test]
+    fn session_id_cli_argument_is_rejected() {
+        let _env = cleared_session_env();
+        let err = HookArgs::parse([
+            "--agent",
+            "claude-code",
+            "--state",
+            "running",
+            "--session-id",
+            "11111111-1111-4111-8111-111111111111",
+        ])
+        .unwrap_err();
+
+        assert!(err.to_string().contains("--session-id is not accepted"));
+    }
+
+    #[test]
+    fn session_id_resolves_from_env() {
+        let _env = session_env("22222222-2222-4222-8222-222222222222");
+        let args = HookArgs::parse(["--agent", "claude-code", "--state", "running"]).unwrap();
+
+        assert_eq!(
+            args.session_id,
+            Some(parse_session_id("22222222-2222-4222-8222-222222222222").unwrap())
+        );
+    }
+
+    #[test]
+    fn sends_env_session_id_and_windows_cwd_to_socket() {
+        let _env = session_env("33333333-3333-4333-8333-333333333333");
+        let socket = test_socket_path();
+        let listener = DaemonListener::bind(&socket).unwrap();
+        let socket_for_client = socket.clone();
+        let windows_cwd = r"C:\Users\agent\repo\worktree";
+
+        let server = thread::spawn(move || {
+            let mut stream = listener.accept().unwrap();
+            let messages = stream.read_control_messages().unwrap();
+            assert_eq!(messages.len(), 1);
+            messages.into_iter().next().unwrap()
+        });
+
+        let mut stdin = Cursor::new(r#"{"message":"permission requested"}"#.as_bytes());
+        real_main(
+            [
+                "--agent".to_string(),
+                "codex".to_string(),
+                "--event".to_string(),
+                "permission-request".to_string(),
+                "--socket".to_string(),
+                socket_for_client.display().to_string(),
+                "--cwd".to_string(),
+                windows_cwd.to_string(),
+            ],
+            &mut stdin,
+        )
+        .unwrap();
+
+        let message = server.join().unwrap();
+        let ControlMessage::Request { request, .. } = message else {
+            panic!("expected request");
+        };
+        let Request::ReportAgentState {
+            session_id, cwd, ..
+        } = request
+        else {
+            panic!("expected report-agent-state");
+        };
+        assert_eq!(
+            session_id,
+            Some(parse_session_id("33333333-3333-4333-8333-333333333333").unwrap())
+        );
+        assert_eq!(cwd, Some(PathBuf::from(windows_cwd)));
+
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(socket);
     }
 
     #[test]
@@ -558,6 +639,39 @@ mod tests {
         .unwrap();
     }
 
+    struct SessionEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for SessionEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(SESSION_ID_ENV, value),
+                None => std::env::remove_var(SESSION_ID_ENV),
+            }
+        }
+    }
+
+    fn session_env(value: &str) -> SessionEnvGuard {
+        let guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os(SESSION_ID_ENV);
+        std::env::set_var(SESSION_ID_ENV, value);
+        SessionEnvGuard {
+            _lock: guard,
+            previous,
+        }
+    }
+
+    fn cleared_session_env() -> SessionEnvGuard {
+        let guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os(SESSION_ID_ENV);
+        std::env::remove_var(SESSION_ID_ENV);
+        SessionEnvGuard {
+            _lock: guard,
+            previous,
+        }
+    }
     fn test_socket_path() -> PathBuf {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

@@ -16,7 +16,7 @@ use hitch_proto::{
     encode_control_message, encode_pty_frame, CommitDraft, DraftProvider, Event, FileDiff,
     GitStatus, JobRequest, JobStatus, PullRequestDraft, WorktreeCreateMode,
 };
-use hitch_proto::{ControlMessage, ErrorCode, Request, Response, PROTOCOL_VERSION};
+use hitch_proto::{ControlMessage, ErrorCode, KnownAgent, Request, Response, PROTOCOL_VERSION};
 
 #[test]
 fn daemon_transport_answers_hello_ping_and_shutdown() {
@@ -87,6 +87,121 @@ fn windows_default_shell_session_accepts_input_resize_and_kills_descendants() {
         !orphan_marker.exists(),
         "closing a Windows PTY session left a shell descendant running"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_agent_state_reports_store_broadcast_replay_and_clear_by_session_id() {
+    let socket = test_socket_path("windows-agent-state");
+    let project_root = std::env::temp_dir().join(format!(
+        "hitch daemon windows agent state {}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&project_root).unwrap();
+    init_git_repo(&project_root);
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &project_root);
+    let worktree = client
+        .list_worktrees(3, project.id)
+        .into_iter()
+        .find(|worktree| worktree.path == project_root)
+        .expect("main worktree");
+    let session = client.open_default_session(4, SessionParent::Worktree(worktree.id));
+
+    let claude = std::fs::read_to_string(project_root.join(".claude/settings.local.json")).unwrap();
+    assert!(
+        claude.contains("hitch-hook.exe") || claude.contains("hitch-hook"),
+        "Claude config should contain hook helper command: {claude}"
+    );
+    let codex = std::fs::read_to_string(project_root.join(".codex/hooks.json")).unwrap();
+    assert!(
+        codex.contains("--state running") && codex.contains("--agent codex"),
+        "Codex config should contain explicit Hitch state hooks: {codex}"
+    );
+
+    let nested_cwd = project_root.join("nested dir").join("from hook");
+    std::fs::create_dir_all(&nested_cwd).unwrap();
+    drop(client);
+
+    let mut reporter = TestClient::connect(&socket);
+    reporter.hello(5);
+    reporter.read_session_opened_with_agent_state(
+        session.id,
+        None,
+        None,
+        None,
+        Duration::from_secs(5),
+    );
+    reporter.read_session_command(session.id, Duration::from_secs(5));
+
+    reporter.send_request(
+        6,
+        Request::ReportAgentState {
+            agent: KnownAgent::Codex,
+            state: Some(hitch_core::AgentState::Running),
+            session_id: Some(session.id),
+            cwd: Some(nested_cwd.clone()),
+            detail: Some("working from Windows cwd".into()),
+        },
+    );
+    let event = reporter.read_agent_state_event(Duration::from_secs(5));
+    assert_eq!(
+        event,
+        Event::AgentState {
+            session_id: Some(session.id),
+            worktree_id: Some(worktree.id),
+            agent: KnownAgent::Codex,
+            state: Some(hitch_core::AgentState::Running),
+            detail: Some("working from Windows cwd".into()),
+        }
+    );
+    reporter.read_ack(6);
+
+    {
+        let mut reattached = TestClient::connect(&socket);
+        reattached.hello(7);
+        reattached.read_session_opened_with_agent_state(
+            session.id,
+            Some(KnownAgent::Codex),
+            Some(hitch_core::AgentState::Running),
+            Some("working from Windows cwd"),
+            Duration::from_secs(5),
+        );
+        reattached.read_session_command(session.id, Duration::from_secs(5));
+    }
+
+    reporter.send_request(
+        8,
+        Request::ReportAgentState {
+            agent: KnownAgent::Codex,
+            state: None,
+            session_id: Some(session.id),
+            cwd: Some(nested_cwd),
+            detail: None,
+        },
+    );
+    let cleared = reporter.read_agent_state_event(Duration::from_secs(5));
+    assert_eq!(
+        cleared,
+        Event::AgentState {
+            session_id: Some(session.id),
+            worktree_id: Some(worktree.id),
+            agent: KnownAgent::Codex,
+            state: None,
+            detail: None,
+        }
+    );
+    reporter.read_ack(8);
+
+    reporter.shutdown(9);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(project_root);
 }
 
 #[cfg(windows)]
@@ -1395,6 +1510,100 @@ impl TestClient {
             }
         }
         panic!("timed out waiting for ack to request {id}");
+    }
+
+    fn report_agent_state(
+        &mut self,
+        id: u64,
+        agent: KnownAgent,
+        state: Option<hitch_core::AgentState>,
+        session_id: Option<SessionId>,
+        cwd: Option<PathBuf>,
+        detail: Option<String>,
+    ) {
+        self.ack(
+            id,
+            Request::ReportAgentState {
+                agent,
+                state,
+                session_id,
+                cwd,
+                detail,
+            },
+        );
+    }
+
+    fn read_agent_state_event(&mut self, timeout: Duration) -> Event {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Event {
+                    event: event @ Event::AgentState { .. },
+                }) => return event,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("daemon error while waiting for agent-state event: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for agent-state event");
+    }
+
+    fn read_session_opened_with_agent_state(
+        &mut self,
+        session_id: SessionId,
+        expected_agent: Option<KnownAgent>,
+        expected_state: Option<hitch_core::AgentState>,
+        expected_detail: Option<&str>,
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::SessionOpened {
+                            session,
+                            agent,
+                            agent_state,
+                            agent_detail,
+                        },
+                }) if session.id == session_id => {
+                    assert_eq!(agent, expected_agent);
+                    assert_eq!(agent_state, expected_state);
+                    assert_eq!(agent_detail.as_deref(), expected_detail);
+                    return;
+                }
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("daemon error while waiting for replayed session state: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for replayed agent state on session {session_id}");
+    }
+
+    fn read_session_command(&mut self, session_id: SessionId, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::SessionCommand {
+                            session_id: command_session_id,
+                            ..
+                        },
+                }) if command_session_id == session_id => return,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("daemon error while waiting for replayed session command: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for replayed session command on session {session_id}");
     }
 
     // ---- Job helpers (ADR 0008) ------------------------------------------

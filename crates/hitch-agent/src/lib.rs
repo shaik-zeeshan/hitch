@@ -355,11 +355,12 @@ fn hook_command(
     event: &str,
     state: Option<AgentState>,
 ) -> String {
+    let style = command_arg_style_for_path(helper_path);
     let mut command = format!(
         "{} --agent {} --event {}",
-        shell_quote(&helper_path.to_string_lossy()),
+        platform_command_arg(&helper_path.to_string_lossy(), style),
         agent.id(),
-        shell_quote(event)
+        platform_command_arg(event, style)
     );
     if let Some(state) = state {
         command.push_str(" --state ");
@@ -600,8 +601,87 @@ fn normalize_helper_path(path: &Path) -> Result<PathBuf, AgentHookError> {
     }
 }
 
-fn shell_quote(value: &str) -> String {
+fn command_arg_style_for_path(path: &Path) -> CommandArgStyle {
+    if is_windows_absolute_path(&path.to_string_lossy()) {
+        CommandArgStyle::Windows
+    } else {
+        command_arg_style()
+    }
+}
+
+fn is_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.starts_with(br"\\")
+        || (bytes.len() >= 3
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/')
+            && bytes[0].is_ascii_alphabetic())
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandArgStyle {
+    Posix,
+    Windows,
+}
+
+#[cfg(windows)]
+fn command_arg_style() -> CommandArgStyle {
+    CommandArgStyle::Windows
+}
+
+#[cfg(not(windows))]
+fn command_arg_style() -> CommandArgStyle {
+    CommandArgStyle::Posix
+}
+
+fn platform_command_arg(value: &str, style: CommandArgStyle) -> String {
+    match style {
+        CommandArgStyle::Posix => posix_command_arg(value),
+        CommandArgStyle::Windows => windows_command_arg(value),
+    }
+}
+
+fn posix_command_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn windows_command_arg(value: &str) -> String {
+    if value.is_empty()
+        || value
+            .bytes()
+            .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'"'))
+    {
+        let mut quoted = String::with_capacity(value.len() + 2);
+        quoted.push('"');
+        let mut backslashes = 0;
+        for ch in value.chars() {
+            match ch {
+                '\\' => backslashes += 1,
+                '"' => {
+                    for _ in 0..(backslashes * 2 + 1) {
+                        quoted.push('\\');
+                    }
+                    quoted.push('"');
+                    backslashes = 0;
+                }
+                _ => {
+                    for _ in 0..backslashes {
+                        quoted.push('\\');
+                    }
+                    backslashes = 0;
+                    quoted.push(ch);
+                }
+            }
+        }
+        for _ in 0..(backslashes * 2) {
+            quoted.push('\\');
+        }
+        quoted.push('"');
+        quoted
+    } else {
+        value.to_owned()
+    }
 }
 
 /// Hook installation/parsing error.
@@ -678,6 +758,44 @@ mod tests {
         assert_eq!(ids, vec!["claude-code", "codex"]);
         assert_eq!(registry()[0].executable, "claude");
         assert_eq!(registry()[1].executable, "codex");
+    }
+
+    #[test]
+    fn claude_hook_command_quotes_windows_helper_path_and_keeps_explicit_state() {
+        let helper = Path::new(r"C:\Program Files\Hitch Tools\hitch-hook.exe");
+
+        let entry = claude_hook_entry(helper, "notification", AgentState::NeedsApproval);
+        let command = entry["hooks"][0]["command"].as_str().unwrap();
+
+        assert_eq!(
+            command,
+            r#""C:\Program Files\Hitch Tools\hitch-hook.exe" --agent claude-code --event notification --state needs-approval"#
+        );
+    }
+
+    #[test]
+    fn codex_hook_command_quotes_windows_helper_path_and_keeps_explicit_state() {
+        let helper = Path::new(r"C:\Program Files\Hitch Tools\hitch-hook.exe");
+
+        let entry = codex_hook_entry(helper, "user-prompt-submit", AgentState::Running);
+        let command = entry["hooks"][0]["command"].as_str().unwrap();
+
+        assert_eq!(
+            command,
+            r#""C:\Program Files\Hitch Tools\hitch-hook.exe" --agent codex --event user-prompt-submit --state running"#
+        );
+    }
+
+    #[test]
+    fn posix_command_arguments_keep_single_quote_escaping() {
+        assert_eq!(
+            platform_command_arg("/opt/Hitch Tools/hitch-hook", CommandArgStyle::Posix),
+            "'/opt/Hitch Tools/hitch-hook'"
+        );
+        assert_eq!(
+            platform_command_arg("can't-stop", CommandArgStyle::Posix),
+            "'can'\\''t-stop'"
+        );
     }
 
     #[test]
