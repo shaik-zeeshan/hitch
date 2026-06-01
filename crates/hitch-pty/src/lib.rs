@@ -664,11 +664,7 @@ mod tests {
         let session_id = SessionId::new();
         let pty = ManagedPty::spawn(
             PtySpawnConfig::new(session_id, std::env::current_dir().unwrap())
-                .command(Some(vec![
-                    "/bin/sh".into(),
-                    "-c".into(),
-                    "sleep 5".into(),
-                ]))
+                .command(Some(vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()]))
                 .scrollback_capacity(1024),
             tx,
         )

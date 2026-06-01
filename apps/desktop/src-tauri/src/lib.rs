@@ -1569,9 +1569,10 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 mod tests {
     use super::{
         describe_handshake_failure, read_control_message, read_log_tail, read_pty_payload,
-        recovery_mode_for_loss, should_force_kill_daemon, tray_status_text, wait_for_socket_release,
-        ControlMessage, CrashLoopGuard, DaemonStatus, ErrorCode, HitchClient, OutputRouter,
-        ProtocolError, RecoveryMode, Request, Response, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
+        recovery_mode_for_loss, should_force_kill_daemon, tray_status_text,
+        wait_for_socket_release, ControlMessage, CrashLoopGuard, DaemonStatus, ErrorCode,
+        HitchClient, OutputRouter, ProtocolError, RecoveryMode, Request, Response, CRASH_LOOP_MAX,
+        HEARTBEAT_LOST_REASON,
     };
     use hitch_core::SessionId;
     #[cfg(unix)]

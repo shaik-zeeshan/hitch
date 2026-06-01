@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 /// Jobs via `JobRequest::PrStatus`. v13 adds the batched
 /// `JobRequest::ProjectPrStatuses` so the sidebar can populate every worktree's
 /// PR chip from one `gh pr list` per project instead of one lookup per visit.
-pub const PROTOCOL_VERSION: u16 = 13;
+/// v14 adds `Request::RepaintSession` so the GUI can ask the daemon to force a
+/// child-process repaint after activation or resize.
+pub const PROTOCOL_VERSION: u16 = 14;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -814,6 +816,16 @@ mod tests {
 
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
+    }
+
+    #[test]
+    fn protocol_version_tracks_repaint_session_wire_contract() {
+        let (_, _, session_id) = ids();
+        let request = Request::RepaintSession { session_id };
+        let value: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["type"], "repaint-session");
+        assert_eq!(value["session_id"], session_id.to_string());
+        assert_eq!(PROTOCOL_VERSION, 14);
     }
 
     #[test]
