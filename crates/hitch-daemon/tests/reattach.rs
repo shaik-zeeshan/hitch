@@ -890,7 +890,7 @@ impl TestClient {
             match self.read_packet() {
                 Packet::Control(ControlMessage::Response {
                     id: response_id,
-                    response: Response::SessionOpened { session },
+                    response: Response::SessionOpened { session, .. },
                 }) if response_id == id => return session,
                 Packet::Control(ControlMessage::Response {
                     response: Response::Error { error },

@@ -29,15 +29,21 @@ A known AI coding CLI that Hitch has integration for (e.g. Claude Code, Codex) �
 _Avoid_: Harness, Assistant.
 
 **Agent State**:
-The current status of an Agent running in a Session, reported by the agent's own hook system (Claude Code lifecycle hooks, Codex lifecycle hooks) over a local channel — not inferred from terminal output. Values: *running*, *needs-approval*, *completed*, *error*. A Session not running a known Agent has no Agent State.
-_Avoid_: Status (too generic).
+The current status of an Agent running in a Session, reported by the agent's own hook system (Claude Code lifecycle hooks, Codex lifecycle hooks) over a local channel — not inferred from terminal output. Values:
+- *running* — the Agent is actively working.
+- *needs-approval* — the Agent is **blocked mid-turn** on a permission gate; it cannot proceed without the user. The urgent "your turn".
+- *waiting* — the Agent finished its turn and is **idle at its prompt**, content to wait; the ball is in the user's court. The soft "your turn". (Surfaced to a person glancing at a branch as *"your turn"*.)
+- *error* — the Agent stopped because of a failure.
+
+A Session not running a known Agent has **no** Agent State (`None`). This absence is also how Hitch models an Agent that has **exited** — when the Agent process leaves the Session's foreground (the user quit `claude`/`codex`, or it died), the Agent State clears to `None` rather than lingering on a stale value or becoming a distinct terminal status. There is no *completed* state: an interactive Agent in a PTY never "completes", it goes *waiting* until re-prompted or it exits to `None`.
+_Avoid_: Status (too generic), Completed/Done (an interactive Agent does not terminate into a state — it idles to *waiting* or exits to `None`), Idle (resolved as *waiting*).
 
 **Agent Registry**:
 Hitch's built-in set of known Agents (Claude Code, Codex to start), each with a code-level integration describing its launch command and hook mechanism. Adding an Agent is a contained code change, not user config. Commands outside the registry still run as plain Sessions, just without Agent State.
 _Avoid_: Plugins, Providers.
 
 **Hook helper**:
-A small `hitch` CLI invoked by an Agent's installed hook; it reports the Agent's state to the **Daemon**'s local socket. Hitch installs the hook by merging it into a per-Worktree, gitignored agent-local config (e.g. `.claude/settings.local.json`, `.codex/hooks.json`) without overwriting the user's own keys.
+A small `hitch` CLI invoked by an Agent's installed hook; it reports the Agent's state to the **Daemon**'s local socket, which **owns** the current value (see ADR 0011). Hitch installs the hook by merging it into a per-Worktree, gitignored agent-local config (e.g. `.claude/settings.local.json`, `.codex/hooks.json`) without overwriting the user's own keys. Every installed hook carries an explicit state; the helper never infers state from payload text. It resolves to a Session by `HITCH_SESSION_ID` (injected into every PTY) only — a report that cannot be resolved is logged and dropped, never smeared onto a Worktree.
 _Avoid_: Notifier, Bridge.
 
 **Job**:
@@ -55,7 +61,7 @@ _Avoid_: Agent harness, Agent.
 - A plain-folder **Project** owns no worktrees and exposes no git operations.
 - A **Worktree** is checked out on exactly one branch; a branch maps to at most one **Worktree**.
 - A **Session** runs in exactly one Worktree (git-backed) or one plain-folder Project root.
-- A **Session** running a known **Agent** has an **Agent State**; other Sessions do not.
+- A **Session** running a known **Agent** has an **Agent State**; other Sessions do not. The **Daemon** owns the current value per Session and replays it on attach; a **Worktree**/**Project** row badge is a *derived* rollup of its Sessions' states, prioritised *needs-approval > error > waiting > running*.
 - Hitch enables Agent State by writing the agent's hook config into the Worktree it manages.
 - A **Draft Generator** runs outside Sessions and does not produce **Agent State**.
 - A **Job** is owned by the **Daemon**, runs off the request loop, and reports its lifecycle via events; the GUI observes Jobs but never owns them. Fast git reads are not Jobs.
@@ -65,3 +71,6 @@ _Avoid_: Agent harness, Agent.
 
 - "Tracked task" — there is no Task entity. A Session running an Agent is the closest thing; its "tracking" is just its Agent State, surfaced in the tree/tab. Typing `claude` in any Session reports state because the hook lives in the worktree config, not in how the Session was launched.
 - "Agent harness" — resolved as **Draft Generator** for this feature; **Agent** remains reserved for known CLIs running in Sessions.
+- "completed" / "done" — removed (ADR 0011). An interactive Agent does not terminate into a state: a finished turn is *waiting*, an exited Agent is `None`.
+- "your turn" is two distinct states: *needs-approval* (blocking gate, sticky until resolved) vs *waiting* (idle prompt, dismiss-on-seen).
+- **Known gap:** Codex exposes no failure hook, so the *error* Agent State is never shown for Codex (a crash clears to `None`); accepted for now (ADR 0011).

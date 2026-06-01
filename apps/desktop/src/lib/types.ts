@@ -32,7 +32,7 @@ export type Session = {
   cwd: string;
 };
 
-export type AgentState = "running" | "needs-approval" | "completed" | "error";
+export type AgentState = "running" | "needs-approval" | "waiting" | "error";
 export type KnownAgent = "claude-code" | "codex";
 
 
@@ -192,24 +192,24 @@ export function statusGlyphClass(status: FileStatus): string {
 
 // Agent state renders as a human-language WORD inside a tinted pill, in a
 // reserved hue (never a bare symbol), so it survives grayscale and color
-// blindness. `cls` matches the .pill.{run,approval,done,error} classes. The
+// blindness. `cls` matches the .pill.{run,approval,wait,error} classes. The
 // labels are phrased for a person glancing at a branch they're NOT in: "what is
-// that agent doing?" — working / awaiting input / completed.
+// that agent doing?" — working / awaiting input / your turn.
 export const AGENT_LABEL: Record<AgentState, { label: string; cls: string }> = {
   running: { label: "working", cls: "run" },
   "needs-approval": { label: "awaiting input", cls: "approval" },
-  completed: { label: "completed", cls: "done" },
+  waiting: { label: "your turn", cls: "wait" },
   error: { label: "error", cls: "error" },
 };
 
 // When a worktree (or project) holds several agent sessions, the row shows the
 // one that most needs attention: a blocked approval outranks an error, which
-// outranks an in-progress run, which outranks a finished one.
+// outranks a turn waiting on the user, which outranks an in-progress run.
 export const AGENT_PRIORITY: AgentState[] = [
   "needs-approval",
   "error",
+  "waiting",
   "running",
-  "completed",
 ];
 
 export function aggregateAgentState(

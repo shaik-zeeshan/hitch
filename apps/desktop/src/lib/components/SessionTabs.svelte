@@ -244,7 +244,7 @@
   .runtag.approval {
     color: var(--warn);
   }
-  .runtag.done {
+  .runtag.wait {
     color: var(--ok);
   }
   .runtag.error {

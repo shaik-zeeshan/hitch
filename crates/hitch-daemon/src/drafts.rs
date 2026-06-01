@@ -384,7 +384,7 @@ fn run_provider_command(
         // installed agent hooks (`.claude/settings.local.json`). The provider
         // would fire those hooks, and `hitch-hook` would resolve them by cwd to
         // whatever live shell session shares the worktree — flipping it to
-        // running/completed. This env var tells the hook helper to stay silent
+        // running/waiting. This env var tells the hook helper to stay silent
         // for this process tree, so commit/PR drafts never disturb sessions.
         .env(hitch_proto::SUPPRESS_AGENT_HOOKS_ENV, "1");
 

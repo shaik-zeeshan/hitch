@@ -580,7 +580,7 @@
     color: var(--warn);
     background: oklch(81% 0.13 75 / 0.16);
   }
-  .pill.done {
+  .pill.wait {
     color: var(--ok);
     background: oklch(77% 0.12 150 / 0.14);
   }

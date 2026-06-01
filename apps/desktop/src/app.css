@@ -6,7 +6,7 @@
    Accent (iris 265) = selection/focus/primary + the "dirty" dot.
    State is shown as a WORD (label) in a reserved hue, never a bare
    symbol, so it survives grayscale + color blindness:
-     running (teal) · needs approval (amber) · completed (green) · error (red)
+     running (teal) · needs approval (amber) · waiting (green) · error (red)
 
    Colors and fonts live under Tailwind v4 namespaces (--color-*, --font-*)
    so they also generate `bg-*`/`text-*`/`border-*`/`font-*` utilities.
@@ -488,7 +488,7 @@
   .palette .status.approval {
     color: var(--warn);
   }
-  .palette .status.done {
+  .palette .status.wait {
     color: var(--ok);
   }
   .palette .status.error {
