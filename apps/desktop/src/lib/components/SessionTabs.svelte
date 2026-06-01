@@ -1,16 +1,16 @@
 <script lang="ts">
   // Session tabs (mockup .tabs). One tab per session in the active parent, then
   // — when a changed file is open — a divider and the diff tab as a peer.
-  // Each tab leads with an icon picked from the session's live foreground
-  // command (Claude / Codex / shell), titles itself with that command, and —
-  // for agent sessions — trails a coloured state word (the runtag). × closes,
-  // and the trailing + opens a dropdown to spawn Claude / Codex / a plain shell
-  // in the active parent.
+  // Each tab leads with an icon from the active foreground command when present
+  // (Claude / Codex / shell), titles active agent sessions with their product
+  // name, and trails the hook-reported state word when present
+  // (the runtag). × closes, and the trailing + opens a dropdown to spawn
+  // Claude / Codex / a plain shell in the active parent.
   import { ContextMenu, DropdownMenu } from "bits-ui";
   import {
     activeSession,
     activeSessionId,
-    agentStates,
+    visibleAgentStates,
     closeDiff,
     closeSession,
     diffActive,
@@ -20,19 +20,12 @@
     visibleSessions,
   } from "../daemon";
   import { AGENT_LABEL, type Session, type SessionParent } from "../types";
+  import { sessionTabKind, sessionTabTitle } from "../sessionDisplay";
 
   let { parent }: { parent: SessionParent } = $props();
 
   const diffName = $derived($diffPath?.split("/").pop() ?? "diff");
 
-  // Pick the leading icon from the live command, falling back to the session
-  // name until the daemon reports (or when the command is unknown).
-  function tabKind(cmd: string | null | undefined, name: string): "claude" | "codex" | "shell" {
-    const v = (cmd ?? name).toLowerCase();
-    if (v === "claude") return "claude";
-    if (v === "codex") return "codex";
-    return "shell";
-  }
 
   function select(session: Session) {
     diffActive.set(false);
@@ -42,10 +35,10 @@
 
 <div class="tabs" role="tablist">
   {#each $visibleSessions as session (session.id)}
-    {@const state = $agentStates[session.id]}
+    {@const state = $visibleAgentStates[session.id]}
     {@const command = $sessionCommands[session.id]}
-    {@const title = command ?? session.name}
-    {@const kind = tabKind(command, session.name)}
+    {@const title = sessionTabTitle(session.name, command)}
+    {@const kind = sessionTabKind(session.name, command)}
     {@const active = !$diffActive && session.id === $activeSession?.id}
     <ContextMenu.Root>
       <ContextMenu.Trigger>

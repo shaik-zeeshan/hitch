@@ -10,7 +10,7 @@ const targetTriple = process.env.CARGO_BUILD_TARGET || hostTriple();
 const explicitTarget = Boolean(process.env.CARGO_BUILD_TARGET);
 const isWindowsTarget = targetTriple.includes("windows");
 
-const cargoArgs = ["build", "-p", "hitch-daemon", "--release"];
+const cargoArgs = ["build", "-p", "hitch-daemon", "-p", "hitch-hook", "--release"];
 if (explicitTarget) {
   cargoArgs.push("--target", targetTriple);
 }
@@ -26,22 +26,26 @@ if (build.status !== 0) {
   process.exit(build.status ?? 1);
 }
 
-const exe = isWindowsTarget ? "hitch-daemon.exe" : "hitch-daemon";
-const source = resolve(
-  workspaceRoot,
-  "target",
-  ...(explicitTarget ? [targetTriple] : []),
-  "release",
-  exe,
-);
-const sidecarName = `hitch-daemon-${targetTriple}${isWindowsTarget ? ".exe" : ""}`;
+const binaries = ["hitch-daemon", "hitch-hook"];
 const destinationDir = resolve(desktopRoot, "src-tauri/binaries");
-const destination = resolve(destinationDir, sidecarName);
-
 mkdirSync(destinationDir, { recursive: true });
-copyFileSync(source, destination);
-chmodSync(destination, statSync(source).mode & 0o777);
-console.log(`Prepared daemon sidecar: ${destination}`);
+
+for (const binary of binaries) {
+  const exe = isWindowsTarget ? `${binary}.exe` : binary;
+  const source = resolve(
+    workspaceRoot,
+    "target",
+    ...(explicitTarget ? [targetTriple] : []),
+    "release",
+    exe,
+  );
+  const sidecarName = `${binary}-${targetTriple}${isWindowsTarget ? ".exe" : ""}`;
+  const destination = resolve(destinationDir, sidecarName);
+
+  copyFileSync(source, destination);
+  chmodSync(destination, statSync(source).mode & 0o777);
+  console.log(`Prepared sidecar: ${destination}`);
+}
 
 function hostTriple() {
   switch (`${process.platform}:${process.arch}`) {

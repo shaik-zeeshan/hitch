@@ -20,7 +20,12 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import {
+  activeSessionId,
+  agentStateByProject,
+  agentStateByWorktree,
+  agentStates,
   applyDaemonStatus,
+  applyHitchEvent,
   applyJobProgress,
   cancellableJobForSelectedWorktree,
   cancelJob,
@@ -28,6 +33,8 @@ import {
   connection,
   createWorktree,
   daemonReason,
+  dismissedWorktreeAgentStates,
+  dismissedSessionAgentStates,
   daemonStatus,
   disposeDaemon,
   error,
@@ -38,10 +45,15 @@ import {
   loadProjectPrStatuses,
   prByWorktree,
   prInfo,
+  projects,
   reconnect,
   restartDaemon,
   runJob,
   selectedWorktreeId,
+  sessions,
+  worktreeAgentStates,
+  worktrees,
+  visibleAgentStates,
 } from "./daemon";
 
 // Flush the StartJob promise chain (runJob -> daemonRequest -> invoke) so the
@@ -57,6 +69,14 @@ beforeEach(() => {
   daemonStatus.set("starting");
   connection.set("connecting");
   selectedWorktreeId.set(null);
+  activeSessionId.set(null);
+  projects.set([]);
+  worktrees.set([]);
+  sessions.set([]);
+  agentStates.set({});
+  worktreeAgentStates.set({});
+  dismissedSessionAgentStates.set({});
+  dismissedWorktreeAgentStates.set({});
 });
 
 describe("daemon status mapping", () => {
@@ -81,6 +101,7 @@ describe("daemon status mapping", () => {
     expect(get(connection)).toBe("offline");
   });
 
+
   it("fails in-flight jobs when the daemon becomes unreachable", async () => {
     invokeMock.mockResolvedValueOnce({ type: "job-started", job_id: "j-lost" });
     const pending = runJob({ type: "push", worktree_id: "w1" });
@@ -91,6 +112,259 @@ describe("daemon status mapping", () => {
     applyDaemonStatus("unreachable", "socket closed");
     await expect(pending).rejects.toThrow(/daemon restarted/);
     expect(get(jobs)).toEqual({});
+  });
+});
+
+describe("agent state propagation", () => {
+  it("rolls hook reports up from session and worktree events", () => {
+    projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
+    worktrees.set([
+      {
+        id: "w1",
+        project_id: "p1",
+        path: "/repo",
+        branch: "main",
+        is_main: true,
+        is_hitch_managed: false,
+      },
+      {
+        id: "w2",
+        project_id: "p1",
+        path: "/repo/.hitch/worktrees/feature",
+        branch: "feature",
+        is_main: false,
+        is_hitch_managed: true,
+      },
+    ]);
+    sessions.set([
+      {
+        id: "s1",
+        name: "claude",
+        parent: { kind: "worktree", id: "w1" },
+        cwd: "/repo",
+      },
+    ]);
+
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: "s1",
+      worktree_id: "w1",
+      agent: "claude-code",
+      state: "running",
+      detail: null,
+    } as any);
+    expect(get(agentStates)).toEqual({ s1: "running" });
+    expect(get(worktreeAgentStates)).toEqual({ w1: "running" });
+    expect(get(agentStateByWorktree)).toEqual({ w1: "running" });
+    expect(get(agentStateByProject)).toEqual({ p1: "running" });
+
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: null,
+      worktree_id: "w2",
+      agent: "codex",
+      state: "needs-approval",
+      detail: "permission requested",
+    } as any);
+    expect(get(agentStateByWorktree)).toEqual({
+      w1: "running",
+      w2: "needs-approval",
+    });
+    expect(get(agentStateByProject)).toEqual({ p1: "needs-approval" });
+  });
+
+  it("hides non-running worktree rollup state once the user visits that worktree", () => {
+    projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
+    worktrees.set([
+      {
+        id: "w1",
+        project_id: "p1",
+        path: "/repo",
+        branch: "main",
+        is_main: true,
+        is_hitch_managed: false,
+      },
+      {
+        id: "w2",
+        project_id: "p1",
+        path: "/repo/.hitch/worktrees/feature",
+        branch: "feature",
+        is_main: false,
+        is_hitch_managed: true,
+      },
+    ]);
+    worktreeAgentStates.set({ w1: "completed" });
+    expect(get(agentStateByWorktree)).toEqual({ w1: "completed" });
+
+    selectedWorktreeId.set("w1");
+    expect(get(dismissedWorktreeAgentStates)).toEqual({ w1: "completed" });
+    expect(get(agentStateByWorktree)).toEqual({});
+    expect(get(agentStateByProject)).toEqual({});
+
+    selectedWorktreeId.set("w2");
+    expect(get(agentStateByWorktree)).toEqual({});
+
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: null,
+      worktree_id: "w1",
+      agent: "codex",
+      state: "completed",
+      detail: null,
+    } as any);
+    expect(get(agentStateByWorktree)).toEqual({ w1: "completed" });
+    expect(get(agentStateByProject)).toEqual({ p1: "completed" });
+
+    selectedWorktreeId.set("w1");
+    selectedWorktreeId.set("w2");
+    expect(get(agentStateByWorktree)).toEqual({});
+
+
+    worktreeAgentStates.set({ w1: "running" });
+    expect(get(agentStateByWorktree)).toEqual({ w1: "running" });
+    expect(get(agentStateByProject)).toEqual({ p1: "running" });
+
+  });
+  it("shows running worktree state again after leaving the active worktree", () => {
+    projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
+    worktrees.set([
+      {
+        id: "w1",
+        project_id: "p1",
+        path: "/repo",
+        branch: "main",
+        is_main: true,
+        is_hitch_managed: false,
+      },
+      {
+        id: "w2",
+        project_id: "p1",
+        path: "/repo/.hitch/worktrees/feature",
+        branch: "feature",
+        is_main: false,
+        is_hitch_managed: true,
+      },
+    ]);
+    worktreeAgentStates.set({ w1: "running" });
+
+    selectedWorktreeId.set("w1");
+    expect(get(dismissedWorktreeAgentStates)).toEqual({});
+    expect(get(agentStateByWorktree)).toEqual({});
+
+    selectedWorktreeId.set("w2");
+    expect(get(agentStateByWorktree)).toEqual({ w1: "running" });
+    expect(get(agentStateByProject)).toEqual({ p1: "running" });
+  });
+
+  it("dismisses a completed tab status when the user visits that tab", () => {
+    sessions.set([
+      { id: "s1", name: "codex", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
+      { id: "s2", name: "shell", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
+    ]);
+    activeSessionId.set("s2");
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: "s1",
+      worktree_id: null,
+      agent: "codex",
+      state: "completed",
+      detail: null,
+    } as any);
+    expect(get(visibleAgentStates)).toEqual({ s1: "completed" });
+
+    activeSessionId.set("s1");
+    expect(get(dismissedSessionAgentStates)).toEqual({ s1: "completed" });
+    expect(get(visibleAgentStates)).toEqual({});
+
+    activeSessionId.set("s2");
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: "s1",
+      worktree_id: null,
+      agent: "codex",
+      state: "completed",
+      detail: null,
+    } as any);
+    expect(get(visibleAgentStates)).toEqual({ s1: "completed" });
+  });
+
+  it("keeps active completed tab status visible briefly before dismissing it", () => {
+    vi.useFakeTimers();
+    try {
+      sessions.set([
+        { id: "s1", name: "codex", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
+      ]);
+      activeSessionId.set("s1");
+      applyHitchEvent({
+        type: "agent-state",
+        session_id: "s1",
+        worktree_id: null,
+        agent: "codex",
+        state: "completed",
+        detail: null,
+      } as any);
+      expect(get(visibleAgentStates)).toEqual({ s1: "completed" });
+
+      vi.advanceTimersByTime(2_499);
+      expect(get(visibleAgentStates)).toEqual({ s1: "completed" });
+
+      vi.advanceTimersByTime(1);
+      expect(get(dismissedSessionAgentStates)).toEqual({ s1: "completed" });
+      expect(get(visibleAgentStates)).toEqual({});
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears worktree hook state when the last session for it closes", () => {
+    worktrees.set([
+      {
+        id: "w1",
+        project_id: "p1",
+        path: "/repo",
+        branch: "main",
+        is_main: true,
+        is_hitch_managed: false,
+      },
+    ]);
+    sessions.set([
+      { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+    ]);
+    // Agent reported running, then the tab is closed before a Stop hook fires.
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: "s1",
+      worktree_id: "w1",
+      agent: "claude-code",
+      state: "running",
+      detail: null,
+    } as any);
+    expect(get(worktreeAgentStates)).toEqual({ w1: "running" });
+
+    applyHitchEvent({ type: "session-closed", session_id: "s1", exit_code: null } as any);
+    expect(get(worktreeAgentStates)).toEqual({});
+    expect(get(agentStateByWorktree)).toEqual({});
+  });
+
+  it("keeps worktree hook state while another session for it stays open", () => {
+    worktrees.set([
+      {
+        id: "w1",
+        project_id: "p1",
+        path: "/repo",
+        branch: "main",
+        is_main: true,
+        is_hitch_managed: false,
+      },
+    ]);
+    sessions.set([
+      { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+      { id: "s2", name: "shell", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+    ]);
+    worktreeAgentStates.set({ w1: "running" });
+
+    applyHitchEvent({ type: "session-closed", session_id: "s1", exit_code: null } as any);
+    expect(get(worktreeAgentStates)).toEqual({ w1: "running" });
   });
 });
 

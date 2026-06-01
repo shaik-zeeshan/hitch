@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.hitch.desktop",
   "build": {
-    "beforeDevCommand": "cargo build -p hitch-daemon && bun run dev",
+    "beforeDevCommand": "cargo build -p hitch-daemon -p hitch-hook && bun run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "bun run prepare-daemon-sidecar && bun run build",
     "frontendDist": "../build"
@@ -29,7 +29,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/hitch-daemon"],
+    "externalBin": ["binaries/hitch-daemon", "binaries/hitch-hook"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

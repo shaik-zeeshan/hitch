@@ -17,3 +17,7 @@ pub use ids::{JobId, ProjectId, SessionId, WorktreeId};
 pub use project::{Project, ProjectKind};
 pub use session::{Session, SessionParent};
 pub use worktree::Worktree;
+
+/// Environment variable Hitch sets in every PTY session so agent hooks launched
+/// from that shell can report state against the correct Hitch session tab.
+pub const SESSION_ID_ENV: &str = "HITCH_SESSION_ID";

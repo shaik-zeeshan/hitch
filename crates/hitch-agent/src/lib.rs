@@ -9,6 +9,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use hitch_core::AgentState;
 use serde_json::{json, Map, Value};
@@ -65,7 +66,7 @@ const REGISTRY: &[AgentDescriptor] = &[
         display_name: "Codex",
         executable: "codex",
         default_args: CODEX_ARGS,
-        local_config_path: ".codex/config.local.json",
+        local_config_path: ".codex/hooks.json",
     },
 ];
 
@@ -79,13 +80,25 @@ pub fn registry() -> &'static [AgentDescriptor] {
 pub struct HookInstallOptions {
     /// Absolute path to the `hitch-hook` helper binary written into agent config.
     pub helper_path: PathBuf,
+    /// Path to the `git` binary used to detect whether a legacy `.gitignore` is
+    /// tracked before cleaning it up. Defaults to `git` on `PATH`; the daemon
+    /// overrides it with its configured `--git` path via [`Self::with_git`].
+    pub git_path: PathBuf,
 }
 
 impl HookInstallOptions {
     pub fn new(helper_path: impl Into<PathBuf>) -> Self {
         Self {
             helper_path: helper_path.into(),
+            git_path: PathBuf::from("git"),
         }
+    }
+
+    /// Override the `git` binary used for tracked-file detection.
+    #[must_use]
+    pub fn with_git(mut self, git_path: impl Into<PathBuf>) -> Self {
+        self.git_path = git_path.into();
+        self
     }
 }
 
@@ -93,7 +106,10 @@ impl HookInstallOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookInstallSummary {
     pub installed_configs: Vec<InstalledHookConfig>,
-    pub gitignore_updated: bool,
+    pub local_exclude_updated: bool,
+    /// Whether a legacy Hitch-owned root `.gitignore` (written by pre-exclude
+    /// installs) was cleaned up during this run.
+    pub legacy_gitignore_removed: bool,
 }
 
 /// One local agent config touched by hook installation.
@@ -116,20 +132,99 @@ pub fn install_hooks(
     let helper_path = normalize_helper_path(&options.helper_path)?;
 
     let mut installed_configs = Vec::new();
-    let mut gitignore_entries = Vec::new();
+    // `.codex/config.local.json` is the obsolete pre-`hooks.json` Codex config.
+    // It's still excluded so worktrees migrated from a pre-exclude install (which
+    // ignored it via the now-removed root `.gitignore`) don't expose that orphan
+    // file as dirty once `remove_legacy_gitignore_entries` strips the old line.
+    let local_config_entries = [
+        ".claude/settings.local.json",
+        ".codex/hooks.json",
+        ".codex/config.local.json",
+    ];
 
     install_claude_hooks(worktree_path, &helper_path, &mut installed_configs)?;
-    gitignore_entries.push(".claude/settings.local.json");
 
     install_codex_hooks(worktree_path, &helper_path, &mut installed_configs)?;
-    gitignore_entries.push(".codex/config.local.json");
 
-    let gitignore_updated = ensure_gitignored(worktree_path, &gitignore_entries)?;
+    let local_exclude_updated = ensure_locally_excluded(worktree_path, &local_config_entries)?;
+
+    // Pre-exclude installs ignored these configs via a root `.gitignore` instead
+    // of `.git/info/exclude`. Now that we exclude locally, strip those legacy
+    // Hitch-owned entries so migrated worktrees don't keep (or depend on) the
+    // deprecated tracked file.
+    let legacy_gitignore_removed =
+        remove_legacy_gitignore_entries(worktree_path, &options.git_path)?;
 
     Ok(HookInstallSummary {
         installed_configs,
-        gitignore_updated,
+        local_exclude_updated,
+        legacy_gitignore_removed,
     })
+}
+
+/// Entries that pre-exclude installs appended to a root `.gitignore`.
+const LEGACY_GITIGNORE_ENTRIES: &[&str] =
+    &[".claude/settings.local.json", ".codex/config.local.json"];
+
+/// Remove Hitch's legacy `.gitignore` lines from `worktree_path`. Lines the user
+/// added are preserved; if stripping ours empties the file, the file is deleted
+/// (matching what a fresh exclude-based install leaves behind). Returns whether
+/// anything changed.
+///
+/// Only Hitch's own untracked droppings are touched: a `.gitignore` the user has
+/// committed is left entirely alone, since deleting or rewriting a tracked file
+/// would dirty the repo and discard ignore rules the user owns.
+fn remove_legacy_gitignore_entries(
+    worktree_path: &Path,
+    git_path: &Path,
+) -> Result<bool, AgentHookError> {
+    let path = worktree_path.join(".gitignore");
+    let existing = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+
+    if gitignore_is_tracked(worktree_path, git_path) {
+        return Ok(false);
+    }
+
+    let retained = existing
+        .lines()
+        .filter(|line| !LEGACY_GITIGNORE_ENTRIES.contains(&line.trim()))
+        .collect::<Vec<_>>();
+    if retained.len() == existing.lines().count() {
+        return Ok(false);
+    }
+
+    if retained.iter().all(|line| line.trim().is_empty()) {
+        fs::remove_file(&path)?;
+    } else {
+        let mut updated = retained.join("\n");
+        updated.push('\n');
+        fs::write(&path, updated)?;
+    }
+    Ok(true)
+}
+
+/// Whether `.gitignore` is tracked by git in `worktree_path`. Returns `true` when
+/// git reports the file as tracked, and — conservatively — also when git cannot
+/// be run at all (a missing or misconfigured binary), so a tracked `.gitignore`
+/// is never mutated just because we failed to ask. A successful `git` run that
+/// reports the file as untracked (including a non-repository directory, where the
+/// command exits non-zero) yields `false`, letting the legacy cleanup proceed in
+/// the common untracked case.
+fn gitignore_is_tracked(worktree_path: &Path, git_path: &Path) -> bool {
+    Command::new(git_path)
+        .current_dir(worktree_path)
+        .args(["ls-files", "--error-unmatch", "--", ".gitignore"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        // Could not even spawn git: assume tracked so we don't risk rewriting a
+        // file the user owns.
+        .map_or(true, |status| status.success())
 }
 
 fn install_claude_hooks(
@@ -141,11 +236,18 @@ fn install_claude_hooks(
     let overlay = json!({
         "hooks": {
             "UserPromptSubmit": [claude_hook_entry(helper_path, "user-prompt-submit", AgentState::Running)],
-            "Notification": [claude_hook_entry(helper_path, "notification", AgentState::NeedsApproval)],
-            "Stop": [claude_hook_entry(helper_path, "stop", AgentState::Completed)]
+            "PermissionRequest": [claude_hook_entry(helper_path, "permission-request", AgentState::NeedsApproval)],
+            "Notification": [claude_hook_entry_with_matcher(helper_path, "permission_prompt", "notification", AgentState::NeedsApproval)],
+            "Stop": [claude_hook_entry(helper_path, "stop", AgentState::Completed)],
+            "StopFailure": [claude_hook_entry(helper_path, "stop-failure", AgentState::Error)]
         }
     });
-    merge_json_file(&path, overlay)?;
+    merge_json_file(
+        &path,
+        overlay,
+        AgentKind::ClaudeCode,
+        &["SessionStart", "SessionEnd"],
+    )?;
     installed_configs.push(InstalledHookConfig {
         agent: AgentKind::ClaudeCode,
         path,
@@ -158,11 +260,15 @@ fn install_codex_hooks(
     helper_path: &Path,
     installed_configs: &mut Vec<InstalledHookConfig>,
 ) -> Result<(), AgentHookError> {
-    let path = worktree_path.join(".codex/config.local.json");
+    let path = worktree_path.join(".codex/hooks.json");
     let overlay = json!({
-        "notify": [hook_command(helper_path, AgentKind::Codex, "notify", None)]
+        "hooks": {
+            "UserPromptSubmit": [codex_hook_entry(helper_path, "user-prompt-submit", AgentState::Running)],
+            "PermissionRequest": [codex_hook_entry(helper_path, "permission-request", AgentState::NeedsApproval)],
+            "Stop": [codex_hook_entry(helper_path, "stop", AgentState::Completed)]
+        }
     });
-    merge_json_file(&path, overlay)?;
+    merge_json_file(&path, overlay, AgentKind::Codex, &["SessionStart"])?;
     installed_configs.push(InstalledHookConfig {
         agent: AgentKind::Codex,
         path,
@@ -170,9 +276,27 @@ fn install_codex_hooks(
     Ok(())
 }
 
-fn claude_hook_entry(helper_path: &Path, event: &str, state: AgentState) -> Value {
+fn codex_hook_entry(helper_path: &Path, event: &str, state: AgentState) -> Value {
     json!({
         "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": hook_command(helper_path, AgentKind::Codex, event, Some(state))
+        }]
+    })
+}
+fn claude_hook_entry(helper_path: &Path, event: &str, state: AgentState) -> Value {
+    claude_hook_entry_with_matcher(helper_path, "", event, state)
+}
+
+fn claude_hook_entry_with_matcher(
+    helper_path: &Path,
+    matcher: &str,
+    event: &str,
+    state: AgentState,
+) -> Value {
+    json!({
+        "matcher": matcher,
         "hooks": [{
             "type": "command",
             "command": hook_command(helper_path, AgentKind::ClaudeCode, event, Some(state))
@@ -208,7 +332,12 @@ fn state_arg(state: AgentState) -> &'static str {
     }
 }
 
-fn merge_json_file(path: &Path, overlay: Value) -> Result<(), AgentHookError> {
+fn merge_json_file(
+    path: &Path,
+    overlay: Value,
+    agent: AgentKind,
+    obsolete_events: &[&str],
+) -> Result<(), AgentHookError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -233,9 +362,53 @@ fn merge_json_file(path: &Path, overlay: Value) -> Result<(), AgentHookError> {
     }
 
     merge_preserving_existing(&mut base, overlay);
+    prune_obsolete_hitch_hooks(&mut base, agent, obsolete_events);
     let rendered = serde_json::to_string_pretty(&base)?;
     fs::write(path, format!("{rendered}\n"))?;
     Ok(())
+}
+
+fn prune_obsolete_hitch_hooks(base: &mut Value, agent: AgentKind, obsolete_events: &[&str]) {
+    let Some(hooks) = base.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return;
+    };
+
+    for event in obsolete_events {
+        let remove_event = {
+            let Some(groups) = hooks.get_mut(*event).and_then(Value::as_array_mut) else {
+                continue;
+            };
+
+            for group in groups.iter_mut() {
+                let Some(commands) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                commands.retain(|hook| !is_hitch_hook_command(hook, agent));
+            }
+            groups.retain(|group| {
+                group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .map_or(true, |commands| !commands.is_empty())
+            });
+            groups.is_empty()
+        };
+        if remove_event {
+            hooks.remove(*event);
+        }
+    }
+}
+
+fn is_hitch_hook_command(hook: &Value, agent: AgentKind) -> bool {
+    let agent_flag = match agent {
+        AgentKind::ClaudeCode => "--agent claude-code",
+        AgentKind::Codex => "--agent codex",
+    };
+    hook.get("type").and_then(Value::as_str) == Some("command")
+        && hook
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| command.contains("hitch-hook") && command.contains(agent_flag))
 }
 
 fn merge_preserving_existing(base: &mut Value, overlay: Value) {
@@ -271,8 +444,16 @@ fn merge_preserving_existing(base: &mut Value, overlay: Value) {
     }
 }
 
-fn ensure_gitignored(worktree_path: &Path, entries: &[&str]) -> Result<bool, AgentHookError> {
-    let path = worktree_path.join(".gitignore");
+fn ensure_locally_excluded(worktree_path: &Path, entries: &[&str]) -> Result<bool, AgentHookError> {
+    // Git reads `info/exclude` from the *common* git dir shared by every linked
+    // worktree, not from a linked worktree's per-worktree gitdir, so excludes
+    // must be written there or they are silently ignored.
+    let Some(git_dir) = resolve_common_git_dir(worktree_path)? else {
+        return Ok(false);
+    };
+    let info_dir = git_dir.join("info");
+    fs::create_dir_all(&info_dir)?;
+    let path = info_dir.join("exclude");
     let existing = match fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
@@ -282,7 +463,7 @@ fn ensure_gitignored(worktree_path: &Path, entries: &[&str]) -> Result<bool, Age
     let existing_lines = existing
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect::<Vec<_>>();
     let missing = entries
         .iter()
@@ -304,6 +485,70 @@ fn ensure_gitignored(worktree_path: &Path, entries: &[&str]) -> Result<bool, Age
     }
     fs::write(path, updated)?;
     Ok(true)
+}
+
+/// Resolve the *common* git directory for `worktree_path`.
+///
+/// Git applies `$GIT_DIR/info/exclude` from the common git dir, which is shared
+/// by the main worktree and every linked worktree — not from a linked worktree's
+/// per-worktree gitdir (`<repo>/.git/worktrees/<name>`). A linked worktree's
+/// gitdir contains a `commondir` file pointing at that shared dir; for the main
+/// worktree the resolved gitdir already is the common dir.
+fn resolve_common_git_dir(worktree_path: &Path) -> Result<Option<PathBuf>, AgentHookError> {
+    let Some(git_dir) = resolve_git_dir(worktree_path)? else {
+        return Ok(None);
+    };
+    let common = match fs::read_to_string(git_dir.join("commondir")) {
+        Ok(contents) => {
+            let trimmed = contents.trim();
+            let candidate = Path::new(trimmed);
+            if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                // A relative `commondir` is resolved against the gitdir. The
+                // embedded `..` segments are left for the OS to resolve at I/O
+                // time; we only ever join `info/exclude` onto this path.
+                git_dir.join(trimmed)
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => git_dir,
+        Err(err) => return Err(err.into()),
+    };
+    Ok(Some(common))
+}
+
+fn resolve_git_dir(worktree_path: &Path) -> Result<Option<PathBuf>, AgentHookError> {
+    let dot_git = worktree_path.join(".git");
+    match fs::metadata(&dot_git) {
+        Ok(metadata) if metadata.is_dir() => Ok(Some(dot_git)),
+        Ok(_) => resolve_git_dir_file(worktree_path, &dot_git).map(Some),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn resolve_git_dir_file(worktree_path: &Path, dot_git: &Path) -> Result<PathBuf, AgentHookError> {
+    let contents = fs::read_to_string(dot_git)?;
+    let raw_path = contents
+        .trim()
+        .strip_prefix("gitdir:")
+        .ok_or_else(|| AgentHookError::InvalidGitDirFile {
+            path: dot_git.into(),
+            message: "missing gitdir prefix".into(),
+        })?
+        .trim();
+    if raw_path.is_empty() {
+        return Err(AgentHookError::InvalidGitDirFile {
+            path: dot_git.into(),
+            message: "empty gitdir path".into(),
+        });
+    }
+    let git_dir = PathBuf::from(raw_path);
+    if git_dir.is_absolute() {
+        Ok(git_dir)
+    } else {
+        Ok(worktree_path.join(git_dir))
+    }
 }
 
 fn normalize_helper_path(path: &Path) -> Result<PathBuf, AgentHookError> {
@@ -331,6 +576,10 @@ pub enum AgentHookError {
         path: PathBuf,
         message: String,
     },
+    InvalidGitDirFile {
+        path: PathBuf,
+        message: String,
+    },
 }
 
 impl fmt::Display for AgentHookError {
@@ -344,6 +593,9 @@ impl fmt::Display for AgentHookError {
             Self::InvalidConfigShape { path, message } => {
                 write!(f, "invalid config shape in {}: {message}", path.display())
             }
+            Self::InvalidGitDirFile { path, message } => {
+                write!(f, "invalid gitdir file {}: {message}", path.display())
+            }
         }
     }
 }
@@ -354,7 +606,7 @@ impl std::error::Error for AgentHookError {
             Self::Io(err) => Some(err),
             Self::Serde(err) => Some(err),
             Self::InvalidJson { source, .. } => Some(source),
-            Self::InvalidConfigShape { .. } => None,
+            Self::InvalidConfigShape { .. } | Self::InvalidGitDirFile { .. } => None,
         }
     }
 }
@@ -395,15 +647,25 @@ mod tests {
             worktree.join(".claude/settings.local.json"),
             r#"{
   "permissions": {"allow": ["Bash(git status)"]},
-  "hooks": {"Notification": [{"matcher":"user", "hooks": []}]}
+  "hooks": {
+    "Notification": [{"matcher":"user", "hooks": []}],
+    "SessionStart": [{"matcher":"startup", "hooks": [{"type":"command","command":"/opt/hitch/hitch-hook --agent claude-code --event session-start --state running"}]}],
+    "SessionEnd": [{"matcher":"other", "hooks": [{"type":"command","command":"/opt/hitch/hitch-hook --agent claude-code --event session-end --state completed"}]}]
+  }
 }"#,
+        )
+        .unwrap();
+        fs::create_dir_all(worktree.join(".codex")).unwrap();
+        fs::write(
+            worktree.join(".codex/hooks.json"),
+            r#"{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"/opt/hitch/hitch-hook --agent codex --event session-start --state running"}]}]}}"#,
         )
         .unwrap();
 
         let summary =
             install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
 
-        assert!(summary.gitignore_updated);
+        assert!(!summary.local_exclude_updated);
         assert_eq!(summary.installed_configs.len(), 2);
 
         let config: Value = serde_json::from_str(
@@ -421,10 +683,22 @@ mod tests {
             value.to_string().contains("--agent claude-code")
                 && value.to_string().contains("--state needs-approval")
         }));
+        assert!(config["hooks"]["SessionStart"].is_null());
+        assert!(config["hooks"]["SessionEnd"].is_null());
 
-        let gitignore = fs::read_to_string(worktree.join(".gitignore")).unwrap();
-        assert!(gitignore.contains(".claude/settings.local.json"));
-        assert!(gitignore.contains(".codex/config.local.json"));
+        let codex: Value =
+            serde_json::from_str(&fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap())
+                .unwrap();
+        let prompt_hooks = codex["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert!(prompt_hooks.iter().any(|value| {
+            value.to_string().contains("--agent codex")
+                && value.to_string().contains("--event")
+                && value.to_string().contains("user-prompt-submit")
+                && value.to_string().contains("--state running")
+        }));
+        assert!(codex["hooks"]["SessionStart"].is_null());
+
+        assert!(!worktree.join(".gitignore").exists());
 
         fs::remove_dir_all(worktree).unwrap();
     }
@@ -432,28 +706,235 @@ mod tests {
     #[test]
     fn install_is_idempotent() {
         let worktree = temp_dir("idempotent");
-        install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+        init_git_repo(&worktree);
+        let first =
+            install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+        assert!(first.local_exclude_updated);
         let first_claude =
             fs::read_to_string(worktree.join(".claude/settings.local.json")).unwrap();
-        let first_codex = fs::read_to_string(worktree.join(".codex/config.local.json")).unwrap();
-        let first_gitignore = fs::read_to_string(worktree.join(".gitignore")).unwrap();
+        let first_codex = fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap();
+        let first_exclude = fs::read_to_string(worktree.join(".git/info/exclude")).unwrap();
 
         let second =
             install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
 
-        assert!(!second.gitignore_updated);
+        assert!(!second.local_exclude_updated);
         assert_eq!(
             fs::read_to_string(worktree.join(".claude/settings.local.json")).unwrap(),
             first_claude
         );
         assert_eq!(
-            fs::read_to_string(worktree.join(".codex/config.local.json")).unwrap(),
+            fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap(),
             first_codex
         );
         assert_eq!(
-            fs::read_to_string(worktree.join(".gitignore")).unwrap(),
-            first_gitignore
+            fs::read_to_string(worktree.join(".git/info/exclude")).unwrap(),
+            first_exclude
         );
+
+        fs::remove_dir_all(worktree).unwrap();
+    }
+
+    #[test]
+    fn install_updates_local_exclude_in_git_directory() {
+        let worktree = temp_dir("exclude");
+        init_git_repo(&worktree);
+
+        let summary =
+            install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        assert!(summary.local_exclude_updated);
+        assert!(!worktree.join(".gitignore").exists());
+        let exclude = fs::read_to_string(worktree.join(".git/info/exclude")).unwrap();
+        assert!(exclude.contains(".claude/settings.local.json"));
+        assert!(exclude.contains(".codex/hooks.json"));
+        assert_git_status_clean(&worktree);
+
+        fs::remove_dir_all(worktree).unwrap();
+    }
+
+    #[test]
+    fn install_resolves_relative_linked_worktree_gitdir() {
+        let root = temp_dir("linked-relative-root");
+        let worktree = root.join("linked");
+        let git_dir = root.join("main/.git/worktrees/linked");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(git_dir.join("info")).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            "gitdir: ../main/.git/worktrees/linked\n",
+        )
+        .unwrap();
+
+        let summary =
+            install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        assert!(summary.local_exclude_updated);
+        let exclude = fs::read_to_string(git_dir.join("info/exclude")).unwrap();
+        assert!(exclude.contains(".claude/settings.local.json"));
+        assert!(exclude.contains(".codex/hooks.json"));
+        assert!(!worktree.join(".gitignore").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_resolves_absolute_linked_worktree_gitdir() {
+        let root = temp_dir("linked-absolute-root");
+        let worktree = root.join("linked");
+        let git_dir = root.join("main/.git/worktrees/linked");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(git_dir.join("info")).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+
+        install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        let exclude = fs::read_to_string(git_dir.join("info/exclude")).unwrap();
+        assert!(exclude.contains(".claude/settings.local.json"));
+        assert!(exclude.contains(".codex/hooks.json"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_excludes_are_honored_in_real_linked_worktree() {
+        // The real bug: Git reads `info/exclude` from the common git dir, so an
+        // exclude written into a linked worktree's per-worktree gitdir is silently
+        // ignored and the worktree shows the hook configs as untracked. Drive real
+        // `git` end-to-end to prove the installed excludes actually hide them.
+        let root = temp_dir("real-linked");
+        let main = root.join("main");
+        fs::create_dir_all(&main).unwrap();
+        // `init_git_repo` already configures a user and lands an initial commit,
+        // so the repo is ready for `git worktree add`.
+        init_git_repo(&main);
+
+        let feature = root.join("feature");
+        git(&main, ["worktree", "add", "--quiet", feature.to_str().unwrap()]);
+
+        let summary =
+            install_hooks(&feature, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+        assert!(summary.local_exclude_updated);
+
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&feature)
+            .output()
+            .expect("git status");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            !stdout.contains(".claude/settings.local.json"),
+            "claude config should be excluded, got: {stdout}"
+        );
+        assert!(
+            !stdout.contains(".codex/hooks.json"),
+            "codex config should be excluded, got: {stdout}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_removes_legacy_hitch_owned_gitignore() {
+        let worktree = temp_dir("legacy-gitignore");
+        init_git_repo(&worktree);
+        // Simulate a pre-exclude install: Hitch's two lines are the whole file.
+        fs::write(
+            worktree.join(".gitignore"),
+            ".claude/settings.local.json\n.codex/config.local.json\n",
+        )
+        .unwrap();
+
+        let summary =
+            install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        assert!(summary.legacy_gitignore_removed);
+        assert!(!worktree.join(".gitignore").exists());
+        assert_git_status_clean(&worktree);
+
+        fs::remove_dir_all(worktree).unwrap();
+    }
+
+    #[test]
+    fn install_strips_only_legacy_lines_from_user_gitignore() {
+        let worktree = temp_dir("legacy-gitignore-mixed");
+        init_git_repo(&worktree);
+        fs::write(
+            worktree.join(".gitignore"),
+            "node_modules/\n.claude/settings.local.json\ntarget/\n.codex/config.local.json\n",
+        )
+        .unwrap();
+
+        let summary =
+            install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        assert!(summary.legacy_gitignore_removed);
+        let gitignore = fs::read_to_string(worktree.join(".gitignore")).unwrap();
+        assert_eq!(gitignore, "node_modules/\ntarget/\n");
+        assert!(!gitignore.contains(".claude/settings.local.json"));
+        assert!(!gitignore.contains(".codex/config.local.json"));
+
+        fs::remove_dir_all(worktree).unwrap();
+    }
+
+    #[test]
+    fn install_preserves_tracked_legacy_gitignore() {
+        let worktree = temp_dir("tracked-legacy-gitignore");
+        init_git_repo(&worktree);
+        // A user-committed `.gitignore` that happens to hold only the legacy
+        // lines must not be deleted: that would dirty the repo with a tracked
+        // deletion and discard rules the user owns.
+        fs::write(
+            worktree.join(".gitignore"),
+            ".claude/settings.local.json\n.codex/config.local.json\n",
+        )
+        .unwrap();
+        git(&worktree, ["add", ".gitignore"]);
+        git(&worktree, ["commit", "-m", "track gitignore"]);
+
+        let summary =
+            install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        assert!(!summary.legacy_gitignore_removed);
+        assert!(worktree.join(".gitignore").exists());
+        let gitignore = fs::read_to_string(worktree.join(".gitignore")).unwrap();
+        assert!(gitignore.contains(".claude/settings.local.json"));
+        assert!(gitignore.contains(".codex/config.local.json"));
+        // The tracked file is untouched and the agent configs are locally
+        // excluded, so the worktree stays clean.
+        assert_git_status_clean(&worktree);
+
+        fs::remove_dir_all(worktree).unwrap();
+    }
+
+    #[test]
+    fn migrated_worktree_keeps_legacy_codex_config_excluded() {
+        let worktree = temp_dir("legacy-codex-config");
+        init_git_repo(&worktree);
+        // Pre-exclude state: legacy `.gitignore` plus the orphaned Codex config
+        // that the old install left behind on disk.
+        fs::write(
+            worktree.join(".gitignore"),
+            ".claude/settings.local.json\n.codex/config.local.json\n",
+        )
+        .unwrap();
+        fs::create_dir_all(worktree.join(".codex")).unwrap();
+        fs::write(worktree.join(".codex/config.local.json"), "{}\n").unwrap();
+
+        let summary =
+            install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        assert!(summary.legacy_gitignore_removed);
+        assert!(!worktree.join(".gitignore").exists());
+        let exclude = fs::read_to_string(worktree.join(".git/info/exclude")).unwrap();
+        assert!(exclude.contains(".codex/config.local.json"));
+        // Removing the legacy `.gitignore` line must not expose the orphaned
+        // config: the local exclude keeps the repo clean.
+        assert_git_status_clean(&worktree);
 
         fs::remove_dir_all(worktree).unwrap();
     }
@@ -469,6 +950,46 @@ mod tests {
         assert!(matches!(err, AgentHookError::InvalidConfigShape { .. }));
 
         fs::remove_dir_all(worktree).unwrap();
+    }
+
+    fn init_git_repo(path: &Path) {
+        git(path, ["init", "--initial-branch=main"]);
+        git(path, ["config", "user.name", "Hitch Test"]);
+        git(path, ["config", "user.email", "hitch@example.test"]);
+        fs::write(path.join("tracked.txt"), "initial\n").unwrap();
+        git(path, ["add", "tracked.txt"]);
+        git(path, ["commit", "-m", "initial"]);
+    }
+
+    fn assert_git_status_clean(path: &Path) {
+        let output = std::process::Command::new("git")
+            .current_dir(path)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "git status was dirty: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    fn git<const N: usize>(cwd: &Path, args: [&str; N]) {
+        let output = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn temp_dir(name: &str) -> PathBuf {
