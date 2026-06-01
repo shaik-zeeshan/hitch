@@ -53,6 +53,7 @@ import {
   prByWorktree,
   gitStatus,
   prInfo,
+  prUrl,
   projects,
   refreshAll,
   push,
@@ -60,6 +61,7 @@ import {
   restartDaemon,
   runJob,
   selectedWorktreeId,
+  sessionCommands,
   sessions,
   worktrees,
   visibleAgentStates,
@@ -91,6 +93,10 @@ beforeEach(() => {
   worktreeLineStats.set({});
   gitStatus.set(null);
   diffPath.set(null);
+  prByWorktree.set({});
+  prInfo.set(null);
+  prUrl.set(null);
+  sessionCommands.set({});
   diffText.set(null);
   diffActive.set(false);
 });
@@ -1025,6 +1031,124 @@ describe("Windows project paths", () => {
     expect(requests).toEqual([{ type: "git-diff", worktree_id: worktree.id, path: filePath }]);
     expect(get(diffPath)).toBe(filePath);
     expect(get(diffText)).toBe("diff --git");
+  });
+
+  it("creates a Windows managed worktree through a job and reflects the daemon worktree event", async () => {
+    const managedBranch = "feature/windows/worktree-safe-dir";
+    const managedWorktree = {
+      id: "worktree-managed-win",
+      project_id: project.id,
+      path: String.raw`C:\Users\Ada Lovelace\AppData\Local\Hitch\worktrees\repo-with-spaces\feature-windows-worktree-safe-dir`,
+      branch: managedBranch,
+      is_main: false,
+      is_hitch_managed: true,
+    } as const;
+    const requests: unknown[] = [];
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; request?: unknown } }) => {
+        requests.push(request);
+        if (request.type === "start-job") return { type: "job-started", job_id: "j-create-win" };
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    projects.set([project]);
+    worktrees.set([worktree]);
+
+    const promise = createWorktree(project.id, ` ${managedBranch} `, "main", "new-branch");
+    await flush();
+
+    expect(requests).toEqual([
+      {
+        type: "start-job",
+        request: {
+          type: "create-worktree",
+          project_id: project.id,
+          branch: managedBranch,
+          base: "main",
+          mode: "new-branch",
+        },
+      },
+    ]);
+
+    applyHitchEvent({ type: "worktree-updated", worktree: managedWorktree });
+    expect(get(worktrees).map((item) => item.path)).toContain(managedWorktree.path);
+
+    completeJob("j-create-win", { type: "worktrees", worktrees: [managedWorktree] });
+    await expect(promise).resolves.toMatchObject({
+      id: managedWorktree.id,
+      branch: managedBranch,
+      path: managedWorktree.path,
+    });
+    expect(get(selectedWorktreeId)).toBe(managedWorktree.id);
+    expect(get(worktrees).filter((item) => item.id === managedWorktree.id)).toHaveLength(1);
+  });
+
+  it("removes a Windows managed worktree event from the tree and clears worktree-scoped frontend state", () => {
+    const removed = {
+      id: "worktree-remove-win",
+      project_id: project.id,
+      path: String.raw`C:\Users\Ada Lovelace\AppData\Local\Hitch\worktrees\repo-with-spaces\bugfix-win-safe-dir`,
+      branch: "bugfix/windows/worktree-safe-dir",
+      is_main: false,
+      is_hitch_managed: true,
+    } as const;
+    projects.set([project]);
+    worktrees.set([worktree, removed]);
+    sessions.set([
+      { id: "session-remove", name: "claude", parent: { kind: "worktree", id: removed.id }, cwd: removed.path },
+      { id: "session-keep", name: "shell", parent: { kind: "worktree", id: worktree.id }, cwd: worktree.path },
+    ]);
+    selectedWorktreeId.set(removed.id);
+    activeSessionId.set("session-remove");
+    agentStates.set({ "session-remove": "waiting", "session-keep": "running" });
+    dismissedSessionAgentStates.set({ "session-remove": "waiting" });
+    dismissedWorktreeAgentStates.set({ [removed.id]: "waiting" });
+    sessionCommands.set({ "session-remove": "claude", "session-keep": "pwsh" });
+    dirtyWorktrees.set({ [removed.id]: true, [worktree.id]: false });
+    worktreeLineStats.set({
+      [removed.id]: { additions: 9, deletions: 4 },
+      [worktree.id]: { additions: 0, deletions: 0 },
+    });
+    gitStatus.set({
+      worktree_id: removed.id,
+      branch: removed.branch,
+      dirty: true,
+      ahead: 0,
+      behind: 0,
+      additions: 9,
+      deletions: 4,
+      files: [{ path: filePath, status: "modified", staged: false }],
+    });
+    diffPath.set(filePath);
+    diffText.set("diff --git a/file b/file");
+    diffActive.set(true);
+    prByWorktree.set({
+      [removed.id]: { number: 7, url: "https://example.test/pr/7", state: "OPEN", draft: false },
+    });
+    prInfo.set({ number: 7, url: "https://example.test/pr/7", state: "OPEN", draft: false });
+    prUrl.set("https://example.test/pr/7");
+
+    applyHitchEvent({ type: "worktree-removed", worktree_id: removed.id });
+
+    expect(get(worktrees).map((item) => item.id)).toEqual([worktree.id]);
+    expect(get(sessions).map((item) => item.id)).toEqual(["session-keep"]);
+    expect(get(selectedWorktreeId)).toBeNull();
+    expect(get(activeSessionId)).toBeNull();
+    expect(get(gitStatus)).toBeNull();
+    expect(get(diffPath)).toBeNull();
+    expect(get(diffText)).toBeNull();
+    expect(get(diffActive)).toBe(false);
+    expect(get(dirtyWorktrees)).toEqual({ [worktree.id]: false });
+    expect(get(worktreeLineStats)).toEqual({ [worktree.id]: { additions: 0, deletions: 0 } });
+    expect(get(prByWorktree)).toEqual({});
+    expect(get(prInfo)).toBeNull();
+    expect(get(prUrl)).toBeNull();
+    expect(get(agentStates)).toEqual({ "session-keep": "running" });
+    expect(get(dismissedSessionAgentStates)).toEqual({});
+    expect(get(dismissedWorktreeAgentStates)).toEqual({});
+    expect(get(sessionCommands)).toEqual({ "session-keep": "pwsh" });
+    expect(get(agentStateByWorktree)).toEqual({ [worktree.id]: "running" });
   });
 });
 

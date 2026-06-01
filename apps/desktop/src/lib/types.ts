@@ -169,7 +169,8 @@ export type JobRequest =
 
 export type StartJobRequest = { type: "start-job"; request: JobRequest };
 export type Response = { type: string; [key: string]: unknown };
-export type HitchEvent = { type: string; [key: string]: unknown };
+export type WorktreeRemovedEvent = { type: "worktree-removed"; worktree_id: Id };
+export type HitchEvent = WorktreeRemovedEvent | { type: string; [key: string]: unknown };
 
 // ---- display maps ---------------------------------------------------------
 

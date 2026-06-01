@@ -1802,8 +1802,10 @@ fn worktree_state(status: Status) -> FileState {
     }
 }
 
+const MAX_SAFE_PATH_COMPONENT_PREFIX_CHARS: usize = 96;
+
 fn safe_path_component(value: &str) -> String {
-    let sanitized: String = value
+    let mut sanitized: String = value
         .chars()
         .map(|ch| match ch {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
@@ -1812,10 +1814,77 @@ fn safe_path_component(value: &str) -> String {
         })
         .collect();
 
-    match sanitized.trim_matches(['.', ' ']) {
-        "" => "_".to_string(),
-        trimmed => trimmed.to_string(),
+    let trimmed = sanitized.trim_matches(['.', ' ']);
+    if trimmed.is_empty() {
+        sanitized.clear();
+        sanitized.push('_');
+    } else if trimmed.len() != sanitized.len() {
+        sanitized = trimmed.to_string();
     }
+
+    if sanitized.chars().count() > MAX_SAFE_PATH_COMPONENT_PREFIX_CHARS {
+        sanitized = sanitized
+            .chars()
+            .take(MAX_SAFE_PATH_COMPONENT_PREFIX_CHARS)
+            .collect();
+        let trimmed = sanitized.trim_matches(['.', ' ']);
+        if trimmed.is_empty() {
+            sanitized.clear();
+            sanitized.push('_');
+        } else if trimmed.len() != sanitized.len() {
+            sanitized = trimmed.to_string();
+        }
+    }
+
+    if is_windows_reserved_device_name(&sanitized) {
+        sanitized.insert(0, '_');
+    }
+
+    format!("{sanitized}-{:016x}", stable_path_hash(value))
+}
+
+fn is_windows_reserved_device_name(value: &str) -> bool {
+    let stem = value
+        .split_once('.')
+        .map_or(value, |(stem, _)| stem)
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+fn stable_path_hash(value: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 fn os(value: impl AsRef<OsStr>) -> OsString {
@@ -2631,12 +2700,91 @@ mod tests {
 
     #[test]
     fn managed_path_sanitizes_project_and_branch_components() {
+        let path = managed_worktree_path("/tmp/root", "my/project", "feature/test");
+        let components = path
+            .strip_prefix("/tmp/root")
+            .unwrap()
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
         assert_eq!(
-            managed_worktree_path("/tmp/root", "my/project", "feature/test")
-                .strip_prefix("/tmp/root")
-                .unwrap(),
-            Path::new("my_project/feature_test")
+            components,
+            [
+                "my_project-ab25a1fcafb8fb99",
+                "feature_test-05b3fea2f0a81a1e"
+            ]
         );
+    }
+
+    #[test]
+    fn managed_path_components_are_windows_safe_and_collision_resistant() {
+        let branch_a = safe_path_component(r#"feature/a:bad*name? " <x>|"#);
+        assert_eq!(branch_a, "feature_a_bad_name_ _ _x__-2d0df6d4ab28ba66");
+
+        let branch_b = safe_path_component("feature\\a:bad*name? \" <x>|");
+        assert_eq!(branch_b, "feature_a_bad_name_ _ _x__-c2fc782d233557a7");
+        assert_ne!(branch_a, branch_b);
+
+        for value in [
+            "CON",
+            "prn",
+            "AUX.",
+            "nul ",
+            "COM1",
+            "LPT9.txt",
+            "...",
+            "   ",
+            "\u{0000}\u{001f}",
+        ] {
+            let component = safe_path_component(value);
+            assert_windows_safe_component(&component);
+        }
+
+        let long = safe_path_component(&format!("{}.", "a".repeat(300)));
+        assert_windows_safe_component(&long);
+        assert_eq!(
+            long.chars().count(),
+            MAX_SAFE_PATH_COMPONENT_PREFIX_CHARS + 17
+        );
+    }
+
+    fn assert_windows_safe_component(component: &str) {
+        assert!(!component.is_empty());
+        assert!(!component.ends_with(['.', ' ']));
+        assert!(!component.chars().any(|ch| matches!(
+            ch,
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+        ) || ch.is_control()));
+
+        let stem = component
+            .split_once('.')
+            .map_or(component, |(stem, _)| stem)
+            .to_ascii_uppercase();
+        assert!(!matches!(
+            stem.as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        ));
     }
 
     struct RepoFixture {

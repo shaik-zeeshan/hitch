@@ -29,7 +29,7 @@ use hitch_core::{
 };
 use hitch_git::{
     staged_diff, CommandControl, CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState,
-    GitClient, GitRepository, RemoveWorktreeRequest, StatusEntry, WorktreeCheckout,
+    GitClient, GitRepository, StatusEntry, WorktreeCheckout,
 };
 use hitch_proto::{
     encode_control_message, encode_pty_frame,
@@ -1010,8 +1010,18 @@ fn handle_request<R: Read>(
             delete_branch,
             force,
         } => {
-            remove_worktree(state, worktree_id, delete_branch, force)?;
+            let closed_session_ids = remove_worktree(state, worktree_id, delete_branch, force)?;
             send_response(state, client_id, request_id, Response::Ack)?;
+            for session_id in closed_session_ids {
+                broadcast_event(
+                    state,
+                    Event::SessionClosed {
+                        session_id,
+                        exit_code: None,
+                    },
+                )?;
+            }
+            broadcast_event(state, Event::WorktreeRemoved { worktree_id })?;
         }
         Request::ListSessions { parent } => {
             let sessions = {
@@ -1506,9 +1516,11 @@ fn prune_missing_worktree(state: &Arc<Mutex<DaemonState>>, worktree_id: Worktree
         }
     }
 
-    let Ok(mut state) = state.lock() else { return };
-    if state.store.delete_worktree(worktree_id).is_ok() {
-        state.worktrees.remove(&worktree_id);
+    let Ok(mut guard) = state.lock() else { return };
+    if guard.store.delete_worktree(worktree_id).is_ok() {
+        guard.worktrees.remove(&worktree_id);
+        drop(guard);
+        let _ = broadcast_event(state, Event::WorktreeRemoved { worktree_id });
     }
 }
 
@@ -1769,8 +1781,8 @@ fn remove_worktree(
     worktree_id: WorktreeId,
     delete_branch: bool,
     force: bool,
-) -> Result<(), ProtocolError> {
-    let (project, worktree, git, live_session_ids) = {
+) -> Result<Vec<SessionId>, ProtocolError> {
+    let (project, worktree, git_path, live_session_ids) = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
         let worktree = state
             .worktrees
@@ -1788,7 +1800,12 @@ fn remove_worktree(
             .filter(|session| session.session.parent == SessionParent::Worktree(worktree_id))
             .map(|session| session.session.id)
             .collect::<Vec<_>>();
-        (project, worktree, state.git.clone(), live_session_ids)
+        (
+            project,
+            worktree,
+            state.config.git.clone(),
+            live_session_ids,
+        )
     };
 
     if worktree.is_main {
@@ -1821,33 +1838,65 @@ fn remove_worktree(
         ));
     }
 
+    let mut closed_session_ids = Vec::new();
     for session_id in live_session_ids {
         match close_session(state, session_id, true) {
-            Ok(()) => {}
+            Ok(()) => closed_session_ids.push(session_id),
             // Tolerate a session that vanished on its own (PTY-exit dispatcher)
             // or was closed by another client; a force-removal must continue.
             Err(err) if err.code == ErrorCode::NotFound => {}
             Err(err) => return Err(err),
         }
     }
-
-    git.remove_worktree(
-        &project.root,
-        &RemoveWorktreeRequest {
-            path: worktree.path,
-            force,
-            delete_branch: delete_branch.then_some(worktree.branch),
-        },
-    )
-    .map_err(git_error)?;
-
     let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    let racing_ids = state
+        .sessions
+        .values()
+        .filter(|session| session.session.parent == SessionParent::Worktree(worktree_id))
+        .map(|session| session.session.id)
+        .collect::<Vec<_>>();
+    if !force && !racing_ids.is_empty() {
+        return Err(ProtocolError::new(
+            ErrorCode::LiveSessions,
+            "worktree has live sessions; retry with force to kill them",
+        ));
+    }
+    let orphans = racing_ids
+        .into_iter()
+        .filter_map(|id| state.sessions.remove(&id).map(|session| (id, session)))
+        .collect::<Vec<_>>();
+    for (session_id, _) in &orphans {
+        state
+            .store
+            .delete_session(*session_id)
+            .map_err(store_error)?;
+    }
+    for (_, session) in &orphans {
+        let _ = session.pty.kill();
+    }
+    if force && (!closed_session_ids.is_empty() || !orphans.is_empty()) {
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    remove_git_worktree_bounded(
+        &git_path,
+        &project.root,
+        &worktree.path,
+        force,
+        delete_branch.then_some(worktree.branch.as_str()),
+    )?;
+
     state
         .store
         .delete_worktree(worktree_id)
         .map_err(store_error)?;
     state.worktrees.remove(&worktree_id);
-    Ok(())
+    drop(state);
+
+    for (session_id, _) in orphans {
+        closed_session_ids.push(session_id);
+    }
+    Ok(closed_session_ids)
 }
 
 fn open_session(
@@ -1902,6 +1951,217 @@ fn open_session(
         },
     );
     Ok(session)
+}
+
+fn remove_git_worktree_bounded(
+    git_path: &Path,
+    repo_root: &Path,
+    worktree_path: &Path,
+    force: bool,
+    delete_branch: Option<&str>,
+) -> Result<(), ProtocolError> {
+    if let Some(branch) = delete_branch {
+        ensure_branch_merged_for_delete(git_path, repo_root, branch)?;
+    }
+
+    if force {
+        remove_worktree_dir_after_forced_session_close(worktree_path)?;
+        run_git_with_timeout(
+            git_path,
+            repo_root,
+            [OsArg::Borrowed("worktree"), OsArg::Borrowed("prune")],
+            Duration::from_secs(5),
+        )?;
+    } else {
+        let args = [
+            OsArg::Borrowed("worktree"),
+            OsArg::Borrowed("remove"),
+            OsArg::Owned(worktree_path.as_os_str().to_string_lossy().into_owned()),
+        ];
+        match run_git_with_timeout(git_path, repo_root, args, Duration::from_secs(10)) {
+            Ok(()) => {}
+            Err(err)
+                if !worktree_path.exists() && err.message.contains("is not a working tree") => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    if let Some(branch) = delete_branch {
+        run_git_with_timeout(
+            git_path,
+            repo_root,
+            [
+                OsArg::Borrowed("branch"),
+                OsArg::Borrowed("-d"),
+                OsArg::Borrowed(branch),
+            ],
+            Duration::from_secs(5),
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_branch_merged_for_delete(
+    git_path: &Path,
+    repo_root: &Path,
+    branch: &str,
+) -> Result<(), ProtocolError> {
+    let merged = run_git_status_with_timeout(
+        git_path,
+        repo_root,
+        [
+            OsArg::Borrowed("merge-base"),
+            OsArg::Borrowed("--is-ancestor"),
+            OsArg::Borrowed(branch),
+            OsArg::Borrowed("HEAD"),
+        ],
+        Duration::from_secs(5),
+    )?;
+    if merged {
+        Ok(())
+    } else {
+        Err(ProtocolError::new(
+            ErrorCode::GitFailed,
+            format!("branch {branch:?} is not merged into HEAD"),
+        ))
+    }
+}
+
+fn remove_worktree_dir_after_forced_session_close(
+    worktree_path: &Path,
+) -> Result<(), ProtocolError> {
+    let mut last_error = None;
+    for attempt in 0..50 {
+        match fs::remove_dir_all(worktree_path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) if attempt < 49 => {
+                last_error = Some(err);
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => {
+                last_error = Some(err);
+                break;
+            }
+        }
+    }
+    Err(ProtocolError::new(
+        ErrorCode::GitFailed,
+        format!(
+            "failed to remove worktree directory {} after closing sessions: {}",
+            worktree_path.display(),
+            last_error
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "timed out".to_string())
+        ),
+    ))
+}
+
+enum OsArg<'a> {
+    Borrowed(&'a str),
+    Owned(String),
+}
+
+fn run_git_status_with_timeout<'a, I>(
+    git_path: &Path,
+    repo_root: &Path,
+    args: I,
+    timeout: Duration,
+) -> Result<bool, ProtocolError>
+where
+    I: IntoIterator<Item = OsArg<'a>>,
+{
+    let mut command = Command::new(git_path);
+    command.current_dir(repo_root).stdin(Stdio::null());
+    for arg in args {
+        match arg {
+            OsArg::Borrowed(arg) => {
+                command.arg(arg);
+            }
+            OsArg::Owned(arg) => {
+                command.arg(arg);
+            }
+        };
+    }
+    let mut child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| ProtocolError::new(ErrorCode::GitFailed, err.to_string()))?;
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| ProtocolError::new(ErrorCode::GitFailed, err.to_string()))?
+        {
+            return Ok(status.success());
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ProtocolError::new(
+                ErrorCode::GitFailed,
+                "git branch merge check timed out",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn run_git_with_timeout<'a, I>(
+    git_path: &Path,
+    repo_root: &Path,
+    args: I,
+    timeout: Duration,
+) -> Result<(), ProtocolError>
+where
+    I: IntoIterator<Item = OsArg<'a>>,
+{
+    let mut command = Command::new(git_path);
+    command.current_dir(repo_root).stdin(Stdio::null());
+    for arg in args {
+        match arg {
+            OsArg::Borrowed(arg) => {
+                command.arg(arg);
+            }
+            OsArg::Owned(arg) => {
+                command.arg(arg);
+            }
+        };
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| ProtocolError::new(ErrorCode::GitFailed, err.to_string()))?;
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| ProtocolError::new(ErrorCode::GitFailed, err.to_string()))?
+        {
+            let output = child
+                .wait_with_output()
+                .map_err(|err| ProtocolError::new(ErrorCode::GitFailed, err.to_string()))?;
+            if status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ProtocolError::new(
+                ErrorCode::GitFailed,
+                format!("git failed: {stderr}"),
+            ));
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ProtocolError::new(
+                ErrorCode::GitFailed,
+                "git worktree remove timed out waiting for the worktree path to become removable",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn close_session(

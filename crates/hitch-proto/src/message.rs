@@ -28,7 +28,9 @@ use serde::{Deserialize, Serialize};
 /// v15 adds `Request::RepaintSession` so the GUI can ask the daemon to force a
 /// child-process repaint after activation or resize. v16 adds fetch as an
 /// explicit Job so remote refs can be refreshed without blocking the request loop.
-pub const PROTOCOL_VERSION: u16 = 16;
+/// v17 adds `Event::WorktreeRemoved` so peers can drop daemon-owned removed
+/// worktrees without waiting for a full tree refresh.
+pub const PROTOCOL_VERSION: u16 = 17;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -549,6 +551,9 @@ pub enum Event {
     WorktreeUpdated {
         worktree: Worktree,
     },
+    WorktreeRemoved {
+        worktree_id: WorktreeId,
+    },
     ProjectUpdated {
         project: Project,
     },
@@ -898,13 +903,21 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_tracks_repaint_session_wire_contract() {
-        let (_, _, session_id) = ids();
+    fn protocol_version_tracks_worktree_removed_wire_contract() {
+        let (_, worktree_id, session_id) = ids();
         let request = Request::RepaintSession { session_id };
         let value: serde_json::Value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["type"], "repaint-session");
         assert_eq!(value["session_id"], session_id.to_string());
-        assert_eq!(PROTOCOL_VERSION, 16);
+
+        let event = Event::WorktreeRemoved { worktree_id };
+        let value: serde_json::Value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "worktree-removed");
+        assert_eq!(value["worktree_id"], worktree_id.to_string());
+        let back: Event = serde_json::from_value(value).unwrap();
+        assert_eq!(event, back);
+
+        assert_eq!(PROTOCOL_VERSION, 17);
     }
 
     #[test]
@@ -1315,6 +1328,7 @@ mod tests {
                 dirty: true,
             },
             Event::WorktreeUpdated { worktree },
+            Event::WorktreeRemoved { worktree_id },
             Event::ProjectUpdated { project },
             Event::ProjectRemoved { project_id },
             Event::SessionCommand {

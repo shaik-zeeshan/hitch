@@ -569,6 +569,46 @@ function upsert<T extends { id: Id }>(items: T[], item: T): T[] {
     : [...items, item];
 }
 
+function omitKey<T>(record: Record<Id, T>, id: Id): Record<Id, T> {
+  if (!(id in record)) return record;
+  const next = { ...record };
+  delete next[id];
+  return next;
+}
+
+function removeWorktreeLocal(worktreeId: Id): void {
+  const removedSessionIds = get(sessions)
+    .filter((session) => session.parent.kind === "worktree" && session.parent.id === worktreeId)
+    .map((session) => session.id);
+  for (const sessionId of removedSessionIds) {
+    clearDismissibleTabTimer(sessionId);
+    closeSessionOutput(sessionId);
+  }
+
+  sessions.update((items) =>
+    items.filter((session) => session.parent.kind !== "worktree" || session.parent.id !== worktreeId),
+  );
+  worktrees.update((items) => items.filter((worktree) => worktree.id !== worktreeId));
+  dirtyWorktrees.update((current) => omitKey(current, worktreeId));
+  worktreeLineStats.update((current) => omitKey(current, worktreeId));
+  dismissedWorktreeAgentStates.update((current) => omitKey(current, worktreeId));
+  prByWorktree.update((current) => omitKey(current, worktreeId));
+  prByWorktreeApplied.delete(worktreeId);
+  prByWorktreeStarted.delete(worktreeId);
+  const diffCachePrefix = `${worktreeId}\0`;
+  for (const key of diffCache.keys()) {
+    if (key.startsWith(diffCachePrefix)) diffCache.delete(key);
+  }
+
+  if (get(gitStatus)?.worktree_id === worktreeId) gitStatus.set(null);
+  if (get(gitWorktreeId) === worktreeId) {
+    selectedWorktreeId.set(null);
+    prInfo.set(null);
+    prUrl.set(null);
+    closeDiff();
+  }
+}
+
 // ---- snapshot / refresh ---------------------------------------------------
 
 export async function refreshAll(): Promise<void> {
@@ -749,6 +789,9 @@ export function applyHitchEvent(event: HitchEvent): void {
   }
   if (event.type === "worktree-updated") {
     worktrees.update((items) => upsert(items, event.worktree as Worktree));
+  }
+  if (event.type === "worktree-removed") {
+    removeWorktreeLocal(event.worktree_id as Id);
   }
   if (event.type === "worktree-dirty") {
     const worktreeId = event.worktree_id as Id;
@@ -1330,8 +1373,10 @@ export async function createWorktree(
     "create-worktree",
   );
   const created = response.worktrees[0] ?? null;
-  if (created) selectedWorktreeId.set(created.id);
-  await refreshAll();
+  if (created) {
+    worktrees.update((items) => upsert(items, created));
+    selectedWorktreeId.set(created.id);
+  }
   return created;
 }
 
@@ -1350,8 +1395,7 @@ export async function removeWorktree(
     delete_branch: deleteBranch,
     force,
   });
-  if (get(selectedWorktreeId) === worktreeId) selectedWorktreeId.set(null);
-  await refreshAll();
+  removeWorktreeLocal(worktreeId);
 }
 
 // Last grid an active Terminal successfully fitted to, in cols/rows. Used to

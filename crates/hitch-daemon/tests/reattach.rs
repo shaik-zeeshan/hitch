@@ -11,14 +11,12 @@ use hitch_core::SESSION_ID_ENV;
 #[cfg(any(unix, windows))]
 use hitch_core::{Project, Session, SessionId, SessionParent, Worktree};
 use hitch_proto::transport::{connect_daemon, DaemonStream};
-#[cfg(unix)]
-use hitch_proto::ErrorCode;
 #[cfg(any(unix, windows))]
 use hitch_proto::{
     encode_control_message, encode_pty_frame, CommitDraft, Event, FileDiff, GitStatus, JobRequest,
-    PullRequestDraft,
+    PullRequestDraft, WorktreeCreateMode,
 };
-use hitch_proto::{ControlMessage, Request, Response, PROTOCOL_VERSION};
+use hitch_proto::{ControlMessage, ErrorCode, Request, Response, PROTOCOL_VERSION};
 
 #[test]
 fn daemon_transport_answers_hello_ping_and_shutdown() {
@@ -313,6 +311,75 @@ fn git_project_with_spaces_persists_statuses_diffs_and_dirty_events() {
 
     reconnected.shutdown(10);
     wait_for_process_exit(&mut second, Duration::from_secs(3));
+    let _ = std::fs::remove_file(store);
+    let _ = std::fs::remove_dir_all(managed_root);
+    let _ = std::fs::remove_dir_all(repo_parent);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn forced_remove_managed_worktree_closes_sessions_and_clears_state() {
+    let socket = test_socket_path("worktree-remove");
+    let store = test_file_path("worktree remove store", "sqlite");
+    let managed_root = test_dir_path("worktree remove managed");
+    let repo_parent = test_dir_path("worktree remove parent");
+    let repo = repo_parent.join("repo with spaces");
+    init_git_repo(&repo);
+
+    let mut daemon = spawn_daemon_full(&socket, &store, &managed_root, None);
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let mut peer = TestClient::connect(&socket);
+    peer.hello(2);
+
+    let project = client.add_project(3, &repo);
+    let branch = "feature/windows/cleanup";
+    let worktree = client.create_worktree(4, project.id, branch);
+    assert!(worktree.is_hitch_managed);
+    assert_eq!(worktree.branch, branch);
+    assert!(worktree.path.starts_with(&managed_root));
+    assert!(git_worktree_paths(&repo)
+        .iter()
+        .any(|path| same_path(path, &worktree.path)));
+
+    #[cfg(unix)]
+    let session = Some(client.open_default_session(5, SessionParent::Worktree(worktree.id)));
+    #[cfg(windows)]
+    let session: Option<Session> = None;
+    client.ack(
+        6,
+        Request::RemoveWorktree {
+            worktree_id: worktree.id,
+            delete_branch: false,
+            force: true,
+        },
+    );
+
+    if let Some(session) = session {
+        peer.read_session_closed(session.id, Duration::from_secs(5));
+    }
+    peer.read_worktree_removed(worktree.id, Duration::from_secs(5));
+    assert!(
+        !worktree.path.exists(),
+        "removed worktree path still exists"
+    );
+    assert!(
+        !git_worktree_paths(&repo)
+            .iter()
+            .any(|path| same_path(path, &worktree.path)),
+        "git still reports removed worktree {:?}",
+        git_worktree_paths(&repo)
+    );
+    client.expect_error(
+        7,
+        Request::GitStatus {
+            worktree_id: worktree.id,
+        },
+        ErrorCode::NotFound,
+    );
+
+    client.shutdown(9);
+    wait_for_process_exit(&mut daemon, Duration::from_secs(3));
     let _ = std::fs::remove_file(store);
     let _ = std::fs::remove_dir_all(managed_root);
     let _ = std::fs::remove_dir_all(repo_parent);
@@ -958,6 +1025,62 @@ impl TestClient {
         }
     }
 
+    fn create_worktree(
+        &mut self,
+        id: u64,
+        project_id: hitch_core::ProjectId,
+        branch: &str,
+    ) -> Worktree {
+        self.send_request(
+            id,
+            Request::StartJob {
+                request: JobRequest::CreateWorktree {
+                    project_id,
+                    branch: branch.into(),
+                    base: None,
+                    mode: WorktreeCreateMode::NewBranch,
+                },
+            },
+        );
+        let _ = self.read_job_started(id);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut request_id = id + 1_000;
+        while Instant::now() < deadline {
+            self.send_request(request_id, Request::ListWorktrees { project_id });
+            loop {
+                match self.read_packet_until(deadline) {
+                    Packet::Control(ControlMessage::Response {
+                        id: response_id,
+                        response: Response::Worktrees { worktrees },
+                    }) if response_id == request_id => {
+                        if let Some(worktree) = worktrees
+                            .into_iter()
+                            .find(|worktree| worktree.branch == branch && worktree.is_hitch_managed)
+                        {
+                            return worktree;
+                        }
+                        break;
+                    }
+                    Packet::Control(ControlMessage::Event {
+                        event: Event::WorktreeUpdated { worktree },
+                    }) if worktree.project_id == project_id && worktree.branch == branch => {
+                        return worktree
+                    }
+                    Packet::Control(ControlMessage::Event {
+                        event: Event::JobCompleted { response, .. },
+                    }) => {
+                        if let Response::Error { error } = *response {
+                            panic!("create worktree failed: {error:?}");
+                        }
+                    }
+                    Packet::Control(_) | Packet::Output { .. } => continue,
+                }
+            }
+            request_id += 1;
+        }
+        panic!("timed out waiting for created worktree");
+    }
+
     fn add_project(&mut self, id: u64, root: &Path) -> Project {
         self.send_request(id, Request::AddProject { root: root.into() });
         loop {
@@ -1164,8 +1287,9 @@ impl TestClient {
     }
 
     fn read_ack(&mut self, id: u64) {
-        loop {
-            match self.read_packet() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
                 Packet::Control(ControlMessage::Response {
                     id: response_id,
                     response: Response::Ack,
@@ -1177,10 +1301,31 @@ impl TestClient {
                 Packet::Control(_) | Packet::Output { .. } => continue,
             }
         }
+        panic!("timed out waiting for ack to request {id}");
     }
 
     // ---- Job helpers (ADR 0008) ------------------------------------------
     //
+
+    fn expect_error(&mut self, id: u64, request: Request, code: ErrorCode) {
+        self.send_request(id, request);
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::Error { error },
+                }) if response_id == id => {
+                    assert_eq!(error.code, code);
+                    return;
+                }
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response,
+                }) if response_id == id => panic!("expected error response, got {response:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
     // Long-running ops (push/pull/PR/drafts) now reply `JobStarted { job_id }`
     // synchronously and deliver their real `Response` later inside a
     // `JobCompleted` event. These mirror the desktop client's StartJob ->
@@ -1205,8 +1350,9 @@ impl TestClient {
 
     /// Read the `JobCompleted` event for `job_id`, returning the wrapped response.
     fn read_job_completed(&mut self, job_id: hitch_core::JobId) -> Response {
-        loop {
-            match self.read_packet() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
                 Packet::Control(ControlMessage::Event {
                     event:
                         Event::JobCompleted {
@@ -1217,6 +1363,7 @@ impl TestClient {
                 Packet::Control(_) | Packet::Output { .. } => continue,
             }
         }
+        panic!("timed out waiting for job {job_id} completion");
     }
 
     /// Send a `StartJob` wrapper and block until its Job completes, returning
@@ -1265,6 +1412,26 @@ impl TestClient {
                 Packet::Control(_) | Packet::Output { .. } => continue,
             }
         }
+    }
+
+    fn read_worktree_removed(&mut self, worktree_id: hitch_core::WorktreeId, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::WorktreeRemoved {
+                            worktree_id: removed,
+                        },
+                }) if removed == worktree_id => return,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("daemon error while waiting for worktree removal: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for worktree {worktree_id} removal");
     }
 
     fn send_session_input(&mut self, id: u64, session_id: SessionId, payload: &[u8]) {
@@ -1526,6 +1693,24 @@ fn spawn_daemon_command(mut command: Command) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn hitch-daemon")
+}
+
+#[cfg(any(unix, windows))]
+fn git_worktree_paths(repo: &Path) -> Vec<PathBuf> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git worktree list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree ").map(PathBuf::from))
+        .collect()
 }
 
 #[cfg(any(unix, windows))]
