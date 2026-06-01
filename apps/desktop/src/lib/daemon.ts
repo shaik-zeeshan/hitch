@@ -21,6 +21,7 @@ import {
   type ChangedFile,
   type CommitDraft,
   type DaemonStatus,
+  type DraftGenerationSettings,
   type FileStatus,
   type GitStatus,
   type HitchEvent,
@@ -40,7 +41,13 @@ import {
   type SessionParent,
   type Worktree,
 } from "./types";
-import { draftModel, draftProvider, type DraftProvider } from "./settings";
+import {
+  draftClaudePath,
+  draftCodexPath,
+  draftModel,
+  draftProvider,
+  type DraftProvider,
+} from "./settings";
 
 export type Connection = "connecting" | "ready" | "offline";
 
@@ -1763,9 +1770,12 @@ export async function commit(
   }
 }
 
-export async function listDraftModels(provider: DraftProvider): Promise<string[]> {
+export async function listDraftModels(
+  provider: DraftProvider,
+  paths: { claudePath?: string; codexPath?: string } = {},
+): Promise<string[]> {
   const response = await runJob<Response & { models: string[] }>(
-    { type: "list-draft-models", provider },
+    { type: "list-draft-models", provider, settings: draftDiscoverySettings(provider, paths) },
     "draft-models",
   );
   return response.models;
@@ -1801,14 +1811,34 @@ export async function generatePullRequestDraft(base: string | null): Promise<Pul
   return response.draft;
 }
 
-function draftGenerationSettings(): { provider: string; model: string | null } | null {
+function draftDiscoverySettings(
+  provider: DraftProvider,
+  paths: { claudePath?: string; codexPath?: string } = {},
+): DraftGenerationSettings | null {
+  if (provider === "stub") return null;
+  return draftSettingsForProvider(provider, null, paths);
+}
+
+function draftGenerationSettings(): DraftGenerationSettings | null {
   const provider = get(draftProvider);
   // No explicit desktop choice → omit settings so the daemon keeps its own
-  // configured provider/model default instead of being forced to "stub".
+  // configured provider/model/path defaults instead of being forced to "stub".
   if (!provider) return null;
+  return draftSettingsForProvider(provider, get(draftModel).trim() || null);
+}
+
+function draftSettingsForProvider(
+  provider: DraftProvider,
+  model: string | null,
+  paths: { claudePath?: string; codexPath?: string } = {},
+): DraftGenerationSettings {
+  const claudePath = (paths.claudePath ?? get(draftClaudePath)).trim() || null;
+  const codexPath = (paths.codexPath ?? get(draftCodexPath)).trim() || null;
   return {
     provider,
-    model: get(draftModel).trim() || null,
+    model,
+    claude_path: claudePath,
+    codex_path: codexPath,
   };
 }
 

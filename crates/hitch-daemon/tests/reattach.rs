@@ -262,6 +262,7 @@ fn windows_cancel_draft_provider_job_kills_process_tree_and_reports_cancelled() 
         Request::StartJob {
             request: JobRequest::ListDraftModels {
                 provider: DraftProvider::Codex,
+                settings: None,
             },
         },
     );
@@ -283,6 +284,54 @@ fn windows_cancel_draft_provider_job_kills_process_tree_and_reports_cancelled() 
     let _ = std::fs::remove_file(codex);
     let _ = std::fs::remove_file(started);
     let _ = std::fs::remove_file(heartbeat);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_successful_draft_generation_reports_job_progress_and_completion() {
+    let socket = test_socket_path("windows-draft-success");
+    let repo = test_dir_path("windows-draft-success-repo");
+    let codex = write_windows_success_codex_stub();
+    init_git_repo(&repo);
+    let mut daemon = DaemonGuard::start_with_codex(&socket, &codex);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &repo);
+    let worktree = client.list_worktrees(3, project.id).remove(0);
+
+    std::fs::write(repo.join("tracked.txt"), "staged windows draft\n").unwrap();
+    client.ack(
+        4,
+        Request::StageFiles {
+            worktree_id: worktree.id,
+            paths: vec!["tracked.txt".into()],
+        },
+    );
+    client.send_request(
+        5,
+        Request::GenerateCommitDraft {
+            worktree_id: worktree.id,
+            settings: None,
+        },
+    );
+    let job_id = client.read_job_started(5);
+    client.read_job_progress_status(job_id, JobStatus::Running, Duration::from_secs(5));
+    let draft = match client.read_job_completed(job_id) {
+        Response::CommitDraft { draft } => draft,
+        Response::Error { error } => panic!("generate commit draft failed: {error:?}"),
+        other => panic!("unexpected draft job response: {other:?}"),
+    };
+    assert_eq!(draft.subject, "test: windows job draft");
+    assert_eq!(draft.body, "Generated through job");
+
+    client.shutdown(6);
+    daemon.wait_for_exit();
+
+    let _ = std::fs::remove_dir_all(repo);
+    if let Some(parent) = codex.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
 }
 
 #[cfg(unix)]
@@ -2142,6 +2191,43 @@ fn write_windows_hanging_git_stub(started: &Path, heartbeat: &Path) -> PathBuf {
     )
 }
 
+#[cfg(windows)]
+fn write_windows_success_codex_stub() -> PathBuf {
+    let dir = test_dir_path("windows codex provider path with spaces");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = dir.join("provider.rs");
+    let exe_path = dir.join("codex provider.exe");
+    std::fs::write(
+        &source_path,
+        r###"
+use std::{env, process, thread, time::Duration};
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.len() < 4 { process::exit(11); }
+    if args[0] != "exec" { process::exit(13); }
+    if args[1] != "--sandbox" { process::exit(14); }
+    if args[2] != "read-only" { process::exit(15); }
+    thread::sleep(Duration::from_millis(250));
+    println!("{}", "{\"subject\":\"test: windows job draft\",\"body\":\"Generated through job\"}");
+}
+"###,
+    )
+    .unwrap();
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = Command::new(rustc)
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&exe_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "rustc failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    exe_path
+}
 #[cfg(windows)]
 fn write_windows_hanging_codex_stub(started: &Path, heartbeat: &Path) -> PathBuf {
     write_windows_hanging_command_stub(

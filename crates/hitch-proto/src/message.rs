@@ -29,8 +29,9 @@ use serde::{Deserialize, Serialize};
 /// child-process repaint after activation or resize. v16 adds fetch as an
 /// explicit Job so remote refs can be refreshed without blocking the request loop.
 /// v17 adds `Event::WorktreeRemoved` so peers can drop daemon-owned removed
-/// worktrees without waiting for a full tree refresh.
-pub const PROTOCOL_VERSION: u16 = 17;
+/// worktrees without waiting for a full tree refresh. v18 adds Draft Generator
+/// CLI path overrides and passes draft settings into model-discovery Jobs.
+pub const PROTOCOL_VERSION: u16 = 18;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -83,7 +84,10 @@ pub enum JobRequest {
         mode: WorktreeCreateMode,
     },
     /// List available Draft Generator models for a provider.
-    ListDraftModels { provider: DraftProvider },
+    ListDraftModels {
+        provider: DraftProvider,
+        settings: Option<DraftGenerationSettings>,
+    },
     /// Generate a commit draft from staged changes.
     GenerateCommitDraft {
         worktree_id: WorktreeId,
@@ -232,7 +236,10 @@ pub enum Request {
         body: Option<String>,
     },
     /// List available Draft Generator models for a provider.
-    ListDraftModels { provider: DraftProvider },
+    ListDraftModels {
+        provider: DraftProvider,
+        settings: Option<DraftGenerationSettings>,
+    },
     /// Generate a commit draft from staged changes.
     GenerateCommitDraft {
         worktree_id: WorktreeId,
@@ -307,7 +314,9 @@ impl From<JobRequest> for Request {
                 base,
                 mode,
             },
-            JobRequest::ListDraftModels { provider } => Request::ListDraftModels { provider },
+            JobRequest::ListDraftModels { provider, settings } => {
+                Request::ListDraftModels { provider, settings }
+            }
             JobRequest::GenerateCommitDraft {
                 worktree_id,
                 settings,
@@ -373,7 +382,9 @@ impl TryFrom<Request> for JobRequest {
                 base,
                 mode,
             }),
-            Request::ListDraftModels { provider } => Ok(JobRequest::ListDraftModels { provider }),
+            Request::ListDraftModels { provider, settings } => {
+                Ok(JobRequest::ListDraftModels { provider, settings })
+            }
             Request::GenerateCommitDraft {
                 worktree_id,
                 settings,
@@ -663,6 +674,8 @@ pub struct FileDiff {
 pub struct DraftGenerationSettings {
     pub provider: DraftProvider,
     pub model: Option<String>,
+    pub claude_path: Option<PathBuf>,
+    pub codex_path: Option<PathBuf>,
 }
 
 /// Headless provider used for Draft Generator runs.
@@ -903,21 +916,55 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_tracks_worktree_removed_wire_contract() {
-        let (_, worktree_id, session_id) = ids();
-        let request = Request::RepaintSession { session_id };
+    fn protocol_version_tracks_draft_generator_settings_wire_contract() {
+        let (_, worktree_id, _) = ids();
+        let settings = DraftGenerationSettings {
+            provider: DraftProvider::Claude,
+            model: Some("sonnet".into()),
+            claude_path: Some(r"C:\Program Files\Claude\claude.exe".into()),
+            codex_path: None,
+        };
+
+        let request = Request::ListDraftModels {
+            provider: DraftProvider::Claude,
+            settings: Some(settings.clone()),
+        };
         let value: serde_json::Value = serde_json::to_value(&request).unwrap();
-        assert_eq!(value["type"], "repaint-session");
-        assert_eq!(value["session_id"], session_id.to_string());
+        assert_eq!(value["type"], "list-draft-models");
+        assert_eq!(value["provider"], "claude");
+        assert_eq!(value["settings"]["provider"], "claude");
+        assert_eq!(value["settings"]["model"], "sonnet");
+        assert_eq!(
+            value["settings"]["claude_path"],
+            r"C:\Program Files\Claude\claude.exe"
+        );
+        assert!(value["settings"]["codex_path"].is_null());
+        let back: Request = serde_json::from_value(value).unwrap();
 
-        let event = Event::WorktreeRemoved { worktree_id };
-        let value: serde_json::Value = serde_json::to_value(&event).unwrap();
-        assert_eq!(value["type"], "worktree-removed");
-        assert_eq!(value["worktree_id"], worktree_id.to_string());
-        let back: Event = serde_json::from_value(value).unwrap();
-        assert_eq!(event, back);
+        let job = JobRequest::try_from(request.clone()).unwrap();
+        assert_eq!(
+            job,
+            JobRequest::ListDraftModels {
+                provider: DraftProvider::Claude,
+                settings: Some(settings.clone()),
+            }
+        );
+        assert_eq!(Request::from(job), request);
+        assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 17);
+        let request = Request::GenerateCommitDraft {
+            worktree_id,
+            settings: Some(settings),
+        };
+        let value: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["settings"]["claude_path"],
+            r"C:\Program Files\Claude\claude.exe"
+        );
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(request, back);
+
+        assert_eq!(PROTOCOL_VERSION, 18);
     }
 
     #[test]
@@ -1033,12 +1080,20 @@ mod tests {
             },
             JobRequest::ListDraftModels {
                 provider: DraftProvider::Codex,
+                settings: Some(DraftGenerationSettings {
+                    provider: DraftProvider::Codex,
+                    model: None,
+                    claude_path: None,
+                    codex_path: Some(r"C:\Program Files\Codex\codex.exe".into()),
+                }),
             },
             JobRequest::GenerateCommitDraft {
                 worktree_id,
                 settings: Some(DraftGenerationSettings {
                     provider: DraftProvider::Claude,
                     model: Some("sonnet".into()),
+                    claude_path: Some(r"C:\Program Files\Claude\claude.exe".into()),
+                    codex_path: None,
                 }),
             },
             JobRequest::GeneratePullRequestDraft {
@@ -1047,6 +1102,8 @@ mod tests {
                 settings: Some(DraftGenerationSettings {
                     provider: DraftProvider::Codex,
                     model: Some("gpt-5-codex".into()),
+                    claude_path: None,
+                    codex_path: Some(r"C:\Program Files\Codex\codex.exe".into()),
                 }),
             },
             JobRequest::Push { worktree_id },
@@ -1183,12 +1240,20 @@ mod tests {
             },
             Request::ListDraftModels {
                 provider: DraftProvider::Codex,
+                settings: Some(DraftGenerationSettings {
+                    provider: DraftProvider::Codex,
+                    model: None,
+                    claude_path: None,
+                    codex_path: Some(r"C:\Program Files\Codex\codex.exe".into()),
+                }),
             },
             Request::GenerateCommitDraft {
                 worktree_id,
                 settings: Some(DraftGenerationSettings {
                     provider: DraftProvider::Claude,
                     model: Some("sonnet".into()),
+                    claude_path: Some(r"C:\Program Files\Claude\claude.exe".into()),
+                    codex_path: None,
                 }),
             },
             Request::GeneratePullRequestDraft {
@@ -1197,6 +1262,8 @@ mod tests {
                 settings: Some(DraftGenerationSettings {
                     provider: DraftProvider::Codex,
                     model: Some("gpt-5-codex".into()),
+                    claude_path: None,
+                    codex_path: Some(r"C:\Program Files\Codex\codex.exe".into()),
                 }),
             },
             Request::Fetch { worktree_id },

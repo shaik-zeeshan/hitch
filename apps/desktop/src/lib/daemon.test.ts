@@ -45,13 +45,15 @@ import {
   disposeDaemon,
   error,
   fetchRemote,
+  generateCommitDraft,
+  gitStatus,
   initDaemon,
   isJobCancellable,
   jobs,
+  listDraftModels,
   loadPrStatus,
   loadProjectPrStatuses,
   prByWorktree,
-  gitStatus,
   prInfo,
   prUrl,
   projects,
@@ -68,6 +70,7 @@ import {
   viewDiff,
   worktreeLineStats,
 } from "./daemon";
+import { draftClaudePath, draftCodexPath, draftModel, draftProvider } from "./settings";
 
 // Flush the StartJob promise chain (runJob -> daemonRequest -> invoke) so the
 // pending resolver is registered before we deliver the JobCompleted event.
@@ -99,6 +102,10 @@ beforeEach(() => {
   sessionCommands.set({});
   diffText.set(null);
   diffActive.set(false);
+  draftProvider.set(null);
+  draftModel.set("");
+  draftClaudePath.set("");
+  draftCodexPath.set("");
 });
 
 describe("daemon status mapping", () => {
@@ -631,6 +638,65 @@ describe("job store: StartJob -> JobCompleted", () => {
 
     completeJob("j-fetch", { type: "ack" });
     await expect(promise).resolves.toBeUndefined();
+  });
+
+  it("passes configured draft provider executable paths to model discovery", async () => {
+    invokeMock.mockResolvedValueOnce({ type: "job-started", job_id: "j-models" });
+
+    const promise = listDraftModels("codex", { codexPath: "C:\\Program Files\\Codex\\codex.exe" });
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "list-draft-models",
+          provider: "codex",
+          settings: {
+            provider: "codex",
+            model: null,
+            claude_path: null,
+            codex_path: "C:\\Program Files\\Codex\\codex.exe",
+          },
+        },
+      },
+    });
+
+    completeJob("j-models", { type: "draft-models", provider: "codex", models: ["gpt-5-codex"] });
+    await expect(promise).resolves.toEqual(["gpt-5-codex"]);
+  });
+
+  it("passes saved draft provider executable paths to generation jobs", async () => {
+    draftProvider.set("claude");
+    draftModel.set("sonnet");
+    draftClaudePath.set("C:\\Program Files\\Claude\\claude.exe");
+    draftCodexPath.set("C:\\Program Files\\Codex\\codex.exe");
+    invokeMock.mockResolvedValueOnce({ type: "job-started", job_id: "j-draft" });
+
+    const promise = generateCommitDraft("w-draft");
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "generate-commit-draft",
+          worktree_id: "w-draft",
+          settings: {
+            provider: "claude",
+            model: "sonnet",
+            claude_path: "C:\\Program Files\\Claude\\claude.exe",
+            codex_path: "C:\\Program Files\\Codex\\codex.exe",
+          },
+        },
+      },
+    });
+
+    completeJob("j-draft", {
+      type: "commit-draft",
+      draft: { subject: "feat: generated", body: "- Generated" },
+    });
+    await expect(promise).resolves.toEqual({ subject: "feat: generated", body: "- Generated" });
   });
 
   it("rebuilds a replayed running job so its later completion is applied", () => {

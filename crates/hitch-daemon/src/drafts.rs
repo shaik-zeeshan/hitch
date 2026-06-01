@@ -123,6 +123,12 @@ impl DraftProviderConfig {
                 .model
                 .map(|model| model.trim().to_string())
                 .filter(|model| !model.is_empty());
+            if let Some(path) = settings.claude_path.and_then(trim_non_empty_path) {
+                self.claude = path;
+            }
+            if let Some(path) = settings.codex_path.and_then(trim_non_empty_path) {
+                self.codex = path;
+            }
             match request_model {
                 // An explicit request model always wins.
                 Some(model) => self.model = Some(model),
@@ -138,6 +144,16 @@ impl DraftProviderConfig {
             self.kind = requested;
         }
         self
+    }
+}
+
+fn trim_non_empty_path(path: PathBuf) -> Option<PathBuf> {
+    match path.to_str() {
+        Some(path) => {
+            let path = path.trim();
+            (!path.is_empty()).then(|| PathBuf::from(path))
+        }
+        None => (!path.as_os_str().is_empty()).then_some(path),
     }
 }
 
@@ -159,6 +175,7 @@ pub(crate) struct PullRequestDraftInput {
 pub(crate) fn list_models(
     config: &DraftProviderConfig,
     provider: DraftProvider,
+    settings: Option<DraftGenerationSettings>,
     cancel: Option<&crate::JobControl>,
 ) -> Result<Vec<String>, ProtocolError> {
     match provider {
@@ -177,7 +194,7 @@ pub(crate) fn list_models(
             "claude-haiku-4-5-20251001".into(),
         ]),
         DraftProvider::Codex => {
-            let mut codex_config = config.clone();
+            let mut codex_config = config.clone().with_settings(settings);
             codex_config.kind = DraftProviderKind::Codex;
             // Model discovery is best-effort UI chrome; never let it block the
             // daemon as long as generation can.
@@ -884,28 +901,32 @@ mod tests {
         }
     }
 
+    fn draft_settings(provider: DraftProvider, model: Option<&str>) -> DraftGenerationSettings {
+        DraftGenerationSettings {
+            provider,
+            model: model.map(str::to_string),
+            claude_path: None,
+            codex_path: None,
+        }
+    }
+
     #[test]
     fn with_settings_keeps_configured_model_when_request_model_is_absent_or_empty() {
         // Request without a model must not clobber the operator-configured model.
-        let kept = config_with_model(Some("opus")).with_settings(Some(DraftGenerationSettings {
-            provider: DraftProvider::Claude,
-            model: None,
-        }));
+        let kept = config_with_model(Some("opus"))
+            .with_settings(Some(draft_settings(DraftProvider::Claude, None)));
         assert_eq!(kept.model.as_deref(), Some("opus"));
 
         // An empty/whitespace request model is also ignored.
-        let kept = config_with_model(Some("opus")).with_settings(Some(DraftGenerationSettings {
-            provider: DraftProvider::Claude,
-            model: Some("   ".into()),
-        }));
+        let kept = config_with_model(Some("opus"))
+            .with_settings(Some(draft_settings(DraftProvider::Claude, Some("   "))));
         assert_eq!(kept.model.as_deref(), Some("opus"));
 
         // A real request model still overrides.
-        let overridden =
-            config_with_model(Some("opus")).with_settings(Some(DraftGenerationSettings {
-                provider: DraftProvider::Codex,
-                model: Some("gpt-5-codex".into()),
-            }));
+        let overridden = config_with_model(Some("opus")).with_settings(Some(draft_settings(
+            DraftProvider::Codex,
+            Some("gpt-5-codex"),
+        )));
         assert_eq!(overridden.model.as_deref(), Some("gpt-5-codex"));
         assert_eq!(overridden.kind, DraftProviderKind::Codex);
     }
@@ -916,22 +937,31 @@ mod tests {
         // Codex without naming a model must not carry the Claude model into
         // `codex exec --model sonnet` (provider-incompatible → generation
         // fails).
-        let switched =
-            config_with_model(Some("sonnet")).with_settings(Some(DraftGenerationSettings {
-                provider: DraftProvider::Codex,
-                model: None,
-            }));
+        let switched = config_with_model(Some("sonnet"))
+            .with_settings(Some(draft_settings(DraftProvider::Codex, None)));
         assert_eq!(switched.kind, DraftProviderKind::Codex);
         assert_eq!(switched.model, None);
 
         // Switching to stub likewise drops the stale model.
-        let stubbed =
-            config_with_model(Some("sonnet")).with_settings(Some(DraftGenerationSettings {
-                provider: DraftProvider::Stub,
-                model: None,
-            }));
+        let stubbed = config_with_model(Some("sonnet"))
+            .with_settings(Some(draft_settings(DraftProvider::Stub, None)));
         assert_eq!(stubbed.kind, DraftProviderKind::Stub);
         assert_eq!(stubbed.model, None);
+    }
+
+    #[test]
+    fn with_settings_applies_non_empty_path_overrides() {
+        let mut settings = draft_settings(DraftProvider::Claude, None);
+        settings.claude_path = Some(PathBuf::from(r"  C:\Program Files\Claude\claude.exe  "));
+        settings.codex_path = Some(PathBuf::from("   "));
+
+        let configured = config_with_model(None).with_settings(Some(settings));
+
+        assert_eq!(
+            configured.claude,
+            PathBuf::from(r"C:\Program Files\Claude\claude.exe")
+        );
+        assert_eq!(configured.codex, PathBuf::from("codex"));
     }
 
     #[test]
@@ -1029,6 +1059,101 @@ mod tests {
         let _ = fs::remove_dir_all(cwd);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn claude_provider_accepts_windows_path_with_spaces_and_preserves_read_only_argv() {
+        let (dir, script) = windows_rust_provider_stub(
+            "claude provider path with spaces",
+            r###"
+use std::{env, process};
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.len() < 7 { process::exit(11); }
+    if args[0] != "--model" { process::exit(12); }
+    if args[1] != "sonnet" { process::exit(13); }
+    if args[2] != "--tools" { process::exit(14); }
+    if !args[3].is_empty() { process::exit(15); }
+    if args[4] != "--output-format" { process::exit(16); }
+    if args[5] != "json" { process::exit(17); }
+    if args[6] != "-p" { process::exit(18); }
+    println!("{}", "{\"subject\":\"feat: windows claude\",\"body\":\"Generated body\"}");
+}
+"###,
+        );
+        let cwd = temp_dir("claude provider cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Claude,
+            claude: script.clone(),
+            codex: PathBuf::from("codex"),
+            timeout: Duration::from_secs(2),
+            model: Some("sonnet".into()),
+        };
+        let draft = generate_commit_draft(
+            &config,
+            CommitDraftInput {
+                worktree_path: cwd.clone(),
+                staged_paths: vec![PathBuf::from("tracked.txt")],
+                staged_patch: "+change".into(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(draft.subject, "feat: windows claude");
+        assert_eq!(draft.body, "Generated body");
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_provider_accepts_windows_path_with_spaces_and_preserves_read_only_argv() {
+        let (dir, script) = windows_rust_provider_stub(
+            "codex provider path with spaces",
+            r###"
+use std::{env, process};
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.len() < 6 { process::exit(11); }
+    if args[0] != "exec" { process::exit(13); }
+    if args[1] != "--sandbox" { process::exit(14); }
+    if args[2] != "read-only" { process::exit(15); }
+    if args[3] != "--model" { process::exit(16); }
+    if args[4] != "gpt-5-codex" { process::exit(17); }
+    println!("{}", "{\"title\":\"Generated Windows PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}");
+}
+"###,
+        );
+        let cwd = temp_dir("codex provider cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Codex,
+            claude: PathBuf::from("claude"),
+            codex: script.clone(),
+            timeout: Duration::from_secs(2),
+            model: Some("gpt-5-codex".into()),
+        };
+        let draft = generate_pull_request_draft(
+            &config,
+            PullRequestDraftInput {
+                worktree_path: cwd.clone(),
+                branch: "feature/windows-drafts".into(),
+                base: "main".into(),
+                commits: vec!["add windows drafts".into()],
+                changed_paths: vec![PathBuf::from("tracked.txt")],
+                diff: "+change".into(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(draft.title, "Generated Windows PR");
+        assert!(draft.body.contains("## Testing"));
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
     #[cfg(unix)]
     #[test]
     fn provider_timeout_does_not_block_on_grandchild_holding_the_pipe() {
@@ -1063,6 +1188,48 @@ mod tests {
             "timeout path blocked for {elapsed:?}; process-tree termination should free the inherited pipe promptly"
         );
         let _ = fs::remove_file(script);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn provider_timeout_stops_windows_grandchild_heartbeat() {
+        let heartbeat = temp_file("windows-provider-timeout-heartbeat", "txt");
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'\r\n\
+             $childScript = \"while (`$true) {{ Add-Content -LiteralPath {heartbeat} -Value ([DateTime]::UtcNow.Ticks); Start-Sleep -Milliseconds 100 }}\"\r\n\
+             Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-Command',$childScript) | Out-Null\r\n\
+             while ($true) {{ Start-Sleep -Milliseconds 100 }}\r\n",
+            heartbeat = powershell_literal(&heartbeat),
+        );
+        let cwd = temp_dir("windows-provider-timeout-cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Codex,
+            claude: PathBuf::from("claude"),
+            codex: PathBuf::from("powershell.exe"),
+            timeout: Duration::from_secs(1),
+            model: None,
+        };
+        let mut command = Command::new("powershell.exe");
+        command
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(script);
+
+        let started = Instant::now();
+        let result = run_provider_command(&mut command, &cwd, &config, None);
+        assert!(result.is_err(), "expected timeout error");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "provider timeout did not terminate the process tree promptly"
+        );
+        assert_heartbeat_stopped(&heartbeat);
+
+        let _ = fs::remove_file(heartbeat);
         let _ = fs::remove_dir_all(cwd);
     }
 
@@ -1137,6 +1304,28 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("hitch-{name}-{nonce}"))
+    }
+
+    #[cfg(windows)]
+    fn windows_rust_provider_stub(name: &str, source: &str) -> (PathBuf, PathBuf) {
+        let dir = temp_dir(name);
+        fs::create_dir_all(&dir).unwrap();
+        let source_path = dir.join("provider.rs");
+        let exe_path = dir.join("provider executable.exe");
+        fs::write(&source_path, source).unwrap();
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let output = Command::new(rustc)
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&exe_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "rustc failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (dir, exe_path)
     }
 
     #[cfg(windows)]

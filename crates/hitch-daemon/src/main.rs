@@ -2382,10 +2382,11 @@ fn diff_path_for_worktree<'a>(worktree_path: &Path, path: &'a Path) -> std::borr
 fn list_draft_models(
     state: &Arc<Mutex<DaemonState>>,
     provider: DraftProvider,
+    settings: Option<DraftGenerationSettings>,
     cancel: Option<&JobControl>,
 ) -> Result<Vec<String>, ProtocolError> {
     let config = draft_provider_config(state)?;
-    drafts::list_models(&config, provider, cancel)
+    drafts::list_models(&config, provider, settings, cancel)
 }
 
 fn generate_commit_draft(
@@ -3345,7 +3346,7 @@ fn dispatch_job(
                 do_create_pr(state, worktree_id, title, body, base, draft, control)
             },
         ),
-        JobRequest::ListDraftModels { provider } => start_job(
+        JobRequest::ListDraftModels { provider, settings } => start_job(
             "hitch-draft-models",
             state,
             client_id,
@@ -3353,7 +3354,7 @@ fn dispatch_job(
             Some("draft-models"),
             None,
             move |state, control| {
-                let models = list_draft_models(state, provider, Some(control))?;
+                let models = list_draft_models(state, provider, settings, Some(control))?;
                 Ok(Response::DraftModels { provider, models })
             },
         ),

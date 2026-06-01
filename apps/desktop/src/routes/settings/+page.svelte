@@ -14,6 +14,8 @@
     DEFAULT_DRAFT_PROVIDER,
     DEFAULT_EDITOR,
     DRAFT_MODEL_OPTIONS,
+    draftClaudePath,
+    draftCodexPath,
     draftModel,
     draftProvider,
     editorApp,
@@ -36,6 +38,8 @@
   let draftProviderValue = $state<DraftProvider>(DEFAULT_DRAFT_PROVIDER);
   let selectedDraftModel = $state(DEFAULT_MODEL_VALUE);
   let modelOptions = $state<string[]>(DRAFT_MODEL_OPTIONS[DEFAULT_DRAFT_PROVIDER]);
+  let claudePath = $state("");
+  let codexPath = $state("");
   let modelsLoading = $state(false);
   let modelsError = $state<string | null>(null);
   let modelLoadSeq = 0;
@@ -56,6 +60,8 @@
     // explicit choice (see settings.ts).
     draftProviderValue = $draftProvider ?? DEFAULT_DRAFT_PROVIDER;
     selectedDraftModel = $draftModel || DEFAULT_MODEL_VALUE;
+    claudePath = $draftClaudePath;
+    codexPath = $draftCodexPath;
     lastDraftProvider = draftProviderValue;
     draftsHydrated = true;
   });
@@ -94,7 +100,7 @@
 
     modelsLoading = true;
     try {
-      const models = await withTimeout(listDraftModels(provider), 3500);
+      const models = await withTimeout(listDraftModels(provider, { claudePath, codexPath }), 3500);
       if (seq !== modelLoadSeq) return;
       modelOptions = models.length > 0 ? models : DRAFT_MODEL_OPTIONS[provider];
     } catch (err) {
@@ -121,7 +127,10 @@
   function commitDraftSettings() {
     draftProvider.set(draftProviderValue);
     draftModel.set(selectedDraftModel === DEFAULT_MODEL_VALUE ? DEFAULT_DRAFT_MODEL : selectedDraftModel);
+    draftClaudePath.set(claudePath.trim());
+    draftCodexPath.set(codexPath.trim());
     draftSaved = true;
+    void loadModels(draftProviderValue);
     setTimeout(() => (draftSaved = false), 1600);
   }
 
@@ -253,6 +262,29 @@
             {:else}
               Choose default to omit <span class="mono">--model</span>.
             {/if}
+          </p>
+          <label class="field">
+            <span>Claude executable path</span>
+            <input
+              class="base mono"
+              bind:value={claudePath}
+              placeholder="Use daemon/PATH default"
+              autocomplete="off"
+            />
+          </label>
+          <label class="field">
+            <span>Codex executable path</span>
+            <input
+              class="base mono"
+              bind:value={codexPath}
+              placeholder="Use daemon/PATH default"
+              autocomplete="off"
+            />
+          </label>
+          <p class="help">
+            Leave paths empty to use the daemon default. Windows paths with spaces are supported:
+            paste the normal path, for example
+            <span class="mono">C:\Program Files\Claude\claude.exe</span>; do not wrap it in quotes.
           </p>
           <div class="row">
             <button class="btn primary" onclick={commitDraftSettings}>Save</button>
