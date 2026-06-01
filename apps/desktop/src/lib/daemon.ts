@@ -32,6 +32,7 @@ import {
   isOpenPr,
   type PullRequestDraft,
   type Project,
+  type RepaintSessionRequest,
   type Request,
   type Response,
   type StartJobRequest,
@@ -1484,8 +1485,29 @@ export async function resizeSession(
 ): Promise<void> {
   try {
     await daemonRequest({ type: "resize-session", session_id: sessionId, cols, rows });
+  } catch (err) {
+    // Resize is best-effort: NEVER throw, so keystrokes keep flowing even if
+    // the PTY exited mid-resize. But a dropped final size is a real bug (the
+    // child renders at the wrong grid), so log it — a silent swallow hid lost
+    // resizes. The debounce trailing edge still chains a repaint afterward.
+    console.warn(`resize-session failed for ${sessionId} (${cols}x${rows})`, err);
+  }
+}
+
+// Ask the daemon to force the session's PTY child to redraw a clean full frame
+// (it replies with an Ack). Used right after a settled resize and on tab
+// re-activation so a TUI like Claude Code repaints crisply at the new/current
+// grid. Best-effort: a missing or dead PTY must never break the UI, so all
+// errors are swallowed. Emits the agreed `{ type, session_id }` contract.
+export async function repaintSession(sessionId: Id): Promise<void> {
+  try {
+    const request: RepaintSessionRequest = {
+      type: "repaint-session",
+      session_id: sessionId,
+    };
+    await daemonRequest(request);
   } catch {
-    // Resize is best-effort; keep keystrokes flowing even if the PTY exits.
+    // Repaint is best-effort; a missing/dead PTY must not break the UI.
   }
 }
 
@@ -1510,7 +1532,13 @@ export function resizeSessionDebounced(
     sessionId,
     setTimeout(() => {
       resizeTimers.delete(sessionId);
-      void resizeSession(sessionId, cols, rows);
+      // Lossless settle: the final size always reaches the daemon, and once it
+      // has LANDED we force a repaint so the child redraws clean at the new
+      // grid. `.finally` runs the repaint even if the resize errored — the
+      // settled-frame repaint is the whole point and must not be skipped.
+      void resizeSession(sessionId, cols, rows).finally(() => {
+        void repaintSession(sessionId);
+      });
     }, RESIZE_DEBOUNCE_MS),
   );
 }

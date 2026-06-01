@@ -381,6 +381,16 @@ struct HitchClientInner {
     daemon_pid: Mutex<Option<u32>>,
     /// Daemon log path, computed once from `$HOME` to match the daemon writer.
     log_path: PathBuf,
+    /// Ordered, fire-and-forget input lane (Slice 6, "input fast path"). Every
+    /// keystroke is pushed here instead of riding the synchronous request path:
+    /// a single drain thread (`spawn_input_drain`) owns the `Receiver`, writes
+    /// one input frame per item to the shared `writer` IN ORDER, and never waits
+    /// for the daemon's `Ack`. Funnelling all keystrokes through one consumer is
+    /// what guarantees order — concurrent `spawn_blocking` writers could in
+    /// principle interleave, this cannot. Best-effort by design: a write error
+    /// or a disconnected socket drops the keystrokes silently (input flowing
+    /// matters more than surfacing a transient socket error per character).
+    input_tx: mpsc::Sender<(SessionId, Vec<u8>)>,
 }
 
 /// The tray's stable id, used to look it up for tooltip updates.
@@ -388,7 +398,13 @@ const TRAY_ID: &str = "hitch-tray";
 
 impl HitchClient {
     fn new() -> Self {
-        Self(Arc::new(HitchClientInner {
+        // The input lane is built up-front so `input_tx` can be a plain (non-Option)
+        // field: the channel exists for the whole life of the client. The drain
+        // thread needs a `HitchClient` handle to reach the shared `writer`, so we
+        // build the inner first, wrap it, then spawn the drain thread with a clone
+        // and hand it the `Receiver`.
+        let (input_tx, input_rx) = mpsc::channel::<(SessionId, Vec<u8>)>();
+        let client = Self(Arc::new(HitchClientInner {
             socket_path: hitch_proto::transport::default_socket_path(),
             next_request_id: AtomicU64::new(1),
             connected: AtomicBool::new(false),
@@ -406,7 +422,75 @@ impl HitchClient {
             suppress_recovery: AtomicBool::new(false),
             daemon_pid: Mutex::new(None),
             log_path: daemon_log_path(),
-        }))
+            input_tx,
+        }));
+        client.spawn_input_drain(input_rx);
+        client
+    }
+
+    /// Spawn the single drain thread that owns the input lane (Slice 6). It
+    /// `recv`s `(session_id, bytes)` items in the order they were enqueued and
+    /// writes one PTY input frame per item to the daemon, never waiting for an
+    /// `Ack`. Because exactly one thread consumes the channel and writes
+    /// sequentially — locking the shared `writer` per frame — keystroke order is
+    /// preserved end-to-end. The lock is re-taken each item (never held across
+    /// items), so a reconnect that swaps the `writer` in `attach_stream` is
+    /// picked up naturally on the next keystroke. The thread exits only when the
+    /// `Sender` is dropped, i.e. when the client itself is gone.
+    fn spawn_input_drain(&self, input_rx: mpsc::Receiver<(SessionId, Vec<u8>)>) {
+        let client = self.clone();
+        thread::Builder::new()
+            .name("hitch-input-writer".into())
+            .spawn(move || {
+                while let Ok((session_id, bytes)) = input_rx.recv() {
+                    client.write_input_frame(session_id, &bytes);
+                }
+            })
+            .expect("failed to spawn input writer thread");
+    }
+
+    /// Write one fire-and-forget input frame to the daemon (Slice 6). Mirrors the
+    /// frame shape `dispatch_request` writes (control message + PTY payload +
+    /// flush) but deliberately does NOT register a pending-response channel and
+    /// never waits: the daemon's `Ack` for this `request_id` is unmatched in the
+    /// `pending` map and the reader silently drops it. Best-effort throughout — a
+    /// missing writer (disconnected) or a write error just drops the keystrokes
+    /// and returns. We do not call `handle_connection_lost` from here: that path
+    /// re-enters the client and could deadlock against the heartbeat/reader, which
+    /// already detect a dead socket; the next keystroke after reconnect succeeds.
+    fn write_input_frame(&self, session_id: SessionId, bytes: &[u8]) {
+        // A fresh id is still required on the control message even though the
+        // reply is ignored; pull it from the same monotonic counter as everyone
+        // else so ids stay unique across the connection.
+        let request_id = self.0.next_request_id.fetch_add(1, Ordering::SeqCst);
+        let request = Request::SendSessionInput {
+            session_id,
+            byte_count: bytes.len() as u32,
+        };
+
+        let Ok(mut writer_guard) = self.0.writer.lock() else {
+            return;
+        };
+        let Some(writer) = writer_guard.as_mut() else {
+            // Disconnected: drop the keystroke. The reader/heartbeat own recovery.
+            return;
+        };
+        let Ok(control) = encode_control_message(&ControlMessage::request(request_id, request))
+        else {
+            return;
+        };
+        // On any write/flush error, stop touching this frame and bail. The socket
+        // is likely dead; leave teardown to the reader thread.
+        if writer.write_all(&control).is_err() {
+            return;
+        }
+        let Ok(frame) = encode_pty_frame(bytes) else {
+            return;
+        };
+        if writer.write_all(&frame).is_err() {
+            return;
+        }
+        let _ = writer.flush();
     }
 
     /// Current Daemon Status snapshot for the tray, events, and `get_daemon_status`.
@@ -1324,27 +1408,30 @@ async fn hitch_request(
         .map_err(|err| format!("daemon request task failed: {err}"))?
 }
 
+/// Fire-and-forget keystroke path (Slice 6, "input fast path"). The old
+/// implementation ran a per-keystroke `spawn_blocking` that wrote the input frame
+/// AND blocked a pool thread on the daemon's `Ack`; that made typing feel laggy
+/// and, with concurrent tasks, could in principle reorder characters. We now just
+/// enqueue the bytes on the ordered input lane and return immediately — the single
+/// `hitch-input-writer` drain thread serialises the actual socket writes, so order
+/// is guaranteed and no thread blocks per keystroke. Input is best-effort like
+/// resize: a disconnected socket drops keystrokes inside the drain thread; the
+/// only error we can surface here is the drain thread being gone, which never
+/// happens in practice (it lives as long as the client). The frontend's
+/// `void invoke("send_session_input", { sessionId, data })` ignores the result, so
+/// returning `Response::Ack` immediately keeps the external contract intact.
 #[tauri::command]
-async fn send_session_input(
-    app: AppHandle,
+fn send_session_input(
     state: State<'_, HitchClient>,
     session_id: SessionId,
     data: String,
 ) -> Result<Response, String> {
-    let client = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let bytes = data.into_bytes();
-        client.send_request_with_payload(
-            &app,
-            Request::SendSessionInput {
-                session_id,
-                byte_count: bytes.len() as u32,
-            },
-            Some(bytes),
-        )
-    })
-    .await
-    .map_err(|err| format!("session input task failed: {err}"))?
+    state
+        .0
+        .input_tx
+        .send((session_id, data.into_bytes()))
+        .map_err(|_| "input writer thread is gone".to_string())?;
+    Ok(Response::Ack)
 }
 
 /// Register the webview's per-session output channel (ADR 0007). Any bytes that
@@ -1481,10 +1568,10 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        describe_handshake_failure, read_control_message, read_log_tail, recovery_mode_for_loss,
-        should_force_kill_daemon, tray_status_text, wait_for_socket_release, ControlMessage,
-        CrashLoopGuard, DaemonStatus, ErrorCode, HitchClient, OutputRouter, ProtocolError,
-        RecoveryMode, Request, Response, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
+        describe_handshake_failure, read_control_message, read_log_tail, read_pty_payload,
+        recovery_mode_for_loss, should_force_kill_daemon, tray_status_text, wait_for_socket_release,
+        ControlMessage, CrashLoopGuard, DaemonStatus, ErrorCode, HitchClient, OutputRouter,
+        ProtocolError, RecoveryMode, Request, Response, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
     };
     use hitch_core::SessionId;
     #[cfg(unix)]
@@ -1934,6 +2021,66 @@ mod tests {
         let mut reader = std::io::BufReader::new(reader);
         let message = read_control_message(&mut reader).unwrap().unwrap();
         assert_eq!(message, ControlMessage::request(1, Request::ShutdownDaemon));
+    }
+
+    /// Slice 6: the fire-and-forget input lane must preserve keystroke ORDER. A
+    /// burst of keystrokes pushed onto `input_tx` should arrive on the socket as
+    /// `SendSessionInput` control+payload pairs in exactly the order enqueued,
+    /// proving the single drain thread serialises writes (no reordering, no lost
+    /// frames). We read back through a `UnixStream` pair so this exercises the
+    /// real frame encoding the daemon would see, minus a live daemon.
+    #[cfg(unix)]
+    #[test]
+    fn input_lane_preserves_keystroke_order() {
+        let client = HitchClient::new();
+        let (writer, reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        // Attach the writer end exactly the way `attach_stream` would, so the
+        // drain thread finds a live socket to write to.
+        client
+            .0
+            .connected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *client.0.writer.lock().unwrap() = Some(writer);
+
+        // A rapid, distinct sequence so any reordering is detectable. One byte per
+        // keystroke mirrors typing.
+        let session_id = SessionId::new();
+        let keys: Vec<u8> = (b'a'..=b'z').collect();
+        for &key in &keys {
+            client.0.input_tx.send((session_id, vec![key])).unwrap();
+        }
+
+        // Each enqueued keystroke is one control message (SendSessionInput) plus
+        // one PTY payload frame. Read them back in order and collect the payload
+        // bytes; they must match the order we sent.
+        let mut reader = std::io::BufReader::new(reader);
+        let mut received = Vec::with_capacity(keys.len());
+        for _ in 0..keys.len() {
+            let message = read_control_message(&mut reader).unwrap().unwrap();
+            match message {
+                ControlMessage::Request {
+                    request:
+                        Request::SendSessionInput {
+                            session_id: got_session,
+                            byte_count,
+                        },
+                    ..
+                } => {
+                    assert_eq!(got_session, session_id);
+                    assert_eq!(byte_count, 1);
+                }
+                other => panic!("expected SendSessionInput, got {other:?}"),
+            }
+            let payload = read_pty_payload(&mut reader).unwrap();
+            assert_eq!(payload.len(), 1);
+            received.push(payload[0]);
+        }
+
+        assert_eq!(received, keys, "keystrokes arrived out of order");
     }
 }
 

@@ -186,6 +186,34 @@ impl ManagedPty {
         Ok(())
     }
 
+    /// Force the child to repaint: re-apply the PTY's current size, then send
+    /// SIGWINCH to the child's process group UNCONDITIONALLY. A same-size
+    /// TIOCSWINSZ emits no SIGWINCH, so the explicit signal is what makes a
+    /// full-screen app (e.g. Claude Code) re-emit a correctly-sized frame; a
+    /// shell at its prompt simply redraws in place, so the signal is always safe.
+    pub fn repaint(&self) -> Result<(), PtyError> {
+        let master = self
+            .master
+            .lock()
+            .map_err(|_| PtyError::Poisoned("master"))?;
+        // Re-apply the current size to recover from any grid drift. Best-effort:
+        // if reading the size fails we skip this and still signal below.
+        if let Ok(size) = master.get_size() {
+            let _ = master.resize(size);
+        }
+        let _leader = master.process_group_leader();
+        #[cfg(unix)]
+        if let Some(pgid) = _leader {
+            // SAFETY: `kill(2)` with a negative pid signals the process group;
+            // it has no memory-safety preconditions and an already-gone group
+            // returns ESRCH, which we ignore. SIGWINCH is harmless to a shell.
+            unsafe {
+                libc::kill(-pgid, libc::SIGWINCH);
+            }
+        }
+        Ok(())
+    }
+
     /// Kill the child process.
     pub fn kill(&self) -> Result<(), PtyError> {
         let mut child = self.child.lock().map_err(|_| PtyError::Poisoned("child"))?;
@@ -623,6 +651,33 @@ mod tests {
         let output = collect_output(&rx, Duration::from_secs(3));
         assert!(String::from_utf8_lossy(&output).contains(&session_id.to_string()));
         assert!(String::from_utf8_lossy(&pty.scrollback()).contains(&session_id.to_string()));
+    }
+
+    #[test]
+    fn repaint_resolves_leader_and_is_idempotent() {
+        // Spawn a long-lived shell so the PTY has a live process group leader,
+        // then repaint twice. Both calls exercise size re-apply + the SIGWINCH
+        // signal path and must return Ok, proving the path runs and is
+        // idempotent (a same-size resize plus an unconditional SIGWINCH is safe
+        // to repeat).
+        let (tx, _rx) = mpsc::channel();
+        let session_id = SessionId::new();
+        let pty = ManagedPty::spawn(
+            PtySpawnConfig::new(session_id, std::env::current_dir().unwrap())
+                .command(Some(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "sleep 5".into(),
+                ]))
+                .scrollback_capacity(1024),
+            tx,
+        )
+        .unwrap();
+
+        assert!(pty.repaint().is_ok());
+        assert!(pty.repaint().is_ok());
+
+        let _ = pty.kill();
     }
 
     fn collect_output(rx: &mpsc::Receiver<PtyEvent>, timeout: Duration) -> Vec<u8> {

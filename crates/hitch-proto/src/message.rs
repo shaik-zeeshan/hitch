@@ -182,6 +182,12 @@ pub enum Request {
         cols: u16,
         rows: u16,
     },
+    /// Force the session's child to repaint. The daemon re-applies the PTY's
+    /// current size and then sends SIGWINCH to the child's process group
+    /// unconditionally — a same-size TIOCSWINSZ emits no SIGWINCH, so the
+    /// explicit signal is what makes a full-screen app re-emit a correctly
+    /// sized frame that overwrites garble.
+    RepaintSession { session_id: SessionId },
 
     /// Read current git status for a worktree.
     GitStatus { worktree_id: WorktreeId },
@@ -1046,6 +1052,7 @@ mod tests {
                 cols: 120,
                 rows: 40,
             },
+            Request::RepaintSession { session_id },
             Request::GitStatus { worktree_id },
             Request::PrStatus { worktree_id },
             Request::GitDiff {
