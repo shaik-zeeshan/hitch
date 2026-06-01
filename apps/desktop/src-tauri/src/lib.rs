@@ -459,9 +459,15 @@ impl HitchClient {
     /// re-enters the client and could deadlock against the heartbeat/reader, which
     /// already detect a dead socket; the next keystroke after reconnect succeeds.
     fn write_input_frame(&self, session_id: SessionId, bytes: &[u8]) {
+        let Ok(frame) = encode_pty_frame(bytes) else {
+            return;
+        };
+
         // A fresh id is still required on the control message even though the
         // reply is ignored; pull it from the same monotonic counter as everyone
-        // else so ids stay unique across the connection.
+        // else so ids stay unique across the connection. Only allocate an id
+        // after the payload is encodable: announcing a frame that cannot be sent
+        // leaves the daemon waiting for bytes and corrupts the shared stream.
         let request_id = self.0.next_request_id.fetch_add(1, Ordering::SeqCst);
         let request = Request::SendSessionInput {
             session_id,
@@ -484,9 +490,6 @@ impl HitchClient {
         if writer.write_all(&control).is_err() {
             return;
         }
-        let Ok(frame) = encode_pty_frame(bytes) else {
-            return;
-        };
         if writer.write_all(&frame).is_err() {
             return;
         }
@@ -2022,6 +2025,35 @@ mod tests {
         let mut reader = std::io::BufReader::new(reader);
         let message = read_control_message(&mut reader).unwrap().unwrap();
         assert_eq!(message, ControlMessage::request(1, Request::ShutdownDaemon));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_input_frame_does_not_announce_missing_payload() {
+        let client = HitchClient::new();
+        let (writer, reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        client
+            .0
+            .connected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *client.0.writer.lock().unwrap() = Some(writer);
+
+        let oversized = vec![0_u8; hitch_proto::MAX_PTY_FRAME_LEN + 1];
+        client.write_input_frame(SessionId::new(), &oversized);
+
+        let mut reader = std::io::BufReader::new(reader);
+        let err = read_control_message(&mut reader).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "oversized payload must not write a SendSessionInput control frame first: {err:?}"
+        );
     }
 
     /// Slice 6: the fire-and-forget input lane must preserve keystroke ORDER. A
