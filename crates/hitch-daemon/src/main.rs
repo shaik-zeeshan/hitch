@@ -1073,6 +1073,12 @@ fn handle_request<R: Read>(
                 .map_err(|err| ProtocolError::new(ErrorCode::PtyFailed, err.to_string()))?;
             send_response(state, client_id, request_id, Response::Ack)?;
         }
+        Request::RepaintSession { session_id } => {
+            let pty = find_pty(state, session_id)?;
+            pty.repaint()
+                .map_err(|err| ProtocolError::new(ErrorCode::PtyFailed, err.to_string()))?;
+            send_response(state, client_id, request_id, Response::Ack)?;
+        }
         Request::CloseSession {
             session_id,
             kill_process,

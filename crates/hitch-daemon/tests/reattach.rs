@@ -434,6 +434,40 @@ fn invalid_request_returns_error_without_closing_connection() {
 }
 
 #[test]
+fn prior_protocol_is_rejected_at_hello() {
+    let socket = test_socket_path("proto");
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.send_request(
+        1,
+        Request::Hello {
+            client_name: "old-client".into(),
+            protocol_version: PROTOCOL_VERSION - 1,
+        },
+    );
+
+    loop {
+        match client.read_packet() {
+            Packet::Control(ControlMessage::Response {
+                id: 1,
+                response: Response::Error { error },
+            }) => {
+                assert_eq!(error.code, ErrorCode::UnsupportedProtocol);
+                break;
+            }
+            Packet::Control(_) | Packet::Output { .. } => continue,
+        }
+    }
+
+    drop(client);
+    let mut compatible = TestClient::connect(&socket);
+    compatible.hello(2);
+    compatible.shutdown(3);
+    daemon.wait_for_exit();
+}
+
+#[test]
 fn stage_commit_push_and_create_pr_round_trip_over_socket() {
     let socket = test_socket_path("git-commit");
     let repo = test_dir_path("git-commit-repo");

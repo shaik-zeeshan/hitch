@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 /// PR chip from one `gh pr list` per project instead of one lookup per visit.
 /// v14 makes reported/broadcast agent state nullable (`null` clears daemon-owned
 /// state) and includes current agent metadata on session-open replay payloads.
-pub const PROTOCOL_VERSION: u16 = 14;
+/// v15 adds `Request::RepaintSession` so the GUI can ask the daemon to force a
+/// child-process repaint after activation or resize.
+pub const PROTOCOL_VERSION: u16 = 15;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -184,6 +186,12 @@ pub enum Request {
         cols: u16,
         rows: u16,
     },
+    /// Force the session's child to repaint. The daemon re-applies the PTY's
+    /// current size and then sends SIGWINCH to the child's process group
+    /// unconditionally — a same-size TIOCSWINSZ emits no SIGWINCH, so the
+    /// explicit signal is what makes a full-screen app re-emit a correctly
+    /// sized frame that overwrites garble.
+    RepaintSession { session_id: SessionId },
 
     /// Read current git status for a worktree.
     GitStatus { worktree_id: WorktreeId },
@@ -883,6 +891,16 @@ mod tests {
     }
 
     #[test]
+    fn protocol_version_tracks_repaint_session_wire_contract() {
+        let (_, _, session_id) = ids();
+        let request = Request::RepaintSession { session_id };
+        let value: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["type"], "repaint-session");
+        assert_eq!(value["session_id"], session_id.to_string());
+        assert_eq!(PROTOCOL_VERSION, 15);
+    }
+
+    #[test]
     fn catalog_mentions_core_message_families() {
         assert!(crate::MESSAGE_CATALOG.contains("Request:"));
         assert!(crate::MESSAGE_CATALOG.contains("Response:"));
@@ -1118,6 +1136,7 @@ mod tests {
                 cols: 120,
                 rows: 40,
             },
+            Request::RepaintSession { session_id },
             Request::GitStatus { worktree_id },
             Request::PrStatus { worktree_id },
             Request::GitDiff {
