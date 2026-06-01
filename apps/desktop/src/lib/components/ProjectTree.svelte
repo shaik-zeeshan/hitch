@@ -13,6 +13,7 @@
     agentStateByWorktree,
     dirtyWorktrees,
     openSession,
+    prByWorktree,
     projects,
     selectedProjectId,
     selectedWorktreeId,
@@ -20,7 +21,35 @@
     worktrees,
   } from "../daemon";
   import { createWorktreeFor, removeProjectTarget, removeWorktreeTarget } from "../overlays";
-  import { AGENT_LABEL, type Id, type Project, type Worktree } from "../types";
+  import { AGENT_LABEL, type Id, type PrInfo, type Project, type Worktree } from "../types";
+
+  // The three kinds of worktree, distinguished only visually here — never
+  // reordered (branches stay in daemon order). `main` is the repo's anchor and
+  // is never removable; `managed` worktrees were created by Hitch and are safe
+  // to remove destructively; `external` ones were discovered/imported, so Hitch
+  // shows them but won't manage their lifecycle.
+  type WorktreeKind = "main" | "managed" | "external";
+  function worktreeKind(w: Worktree): WorktreeKind {
+    if (w.is_main) return "main";
+    return w.is_hitch_managed ? "managed" : "external";
+  }
+  const KIND_TITLE: Record<WorktreeKind, string> = {
+    main: "Main worktree",
+    managed: "Hitch-managed worktree",
+    external: "External worktree (not managed by Hitch)",
+  };
+
+  // PR chip styling keys off draft first, then GitHub state. Colours are
+  // GitHub-conventional (open=green, merged=purple, closed=red, draft=grey) and
+  // deliberately distinct from the reserved agent-state hues — a `#`-prefixed
+  // chip reads as a PR, not a status word.
+  function prChipClass(pr: PrInfo): string {
+    return pr.draft ? "draft" : pr.state.toLowerCase();
+  }
+  function prChipTitle(pr: PrInfo): string {
+    const state = pr.draft ? "draft" : pr.state.toLowerCase();
+    return `PR #${pr.number} (${state})`;
+  }
 
   // Open a session under a worktree, selecting it first so the new session
   // lands in view. Used by the worktree context menu's launch items.
@@ -228,35 +257,32 @@
           {@const lineStat = $worktreeLineStats[worktree.id]}
           {@const isActive = worktree.id === $selectedWorktreeId}
           {@const hasLoc = !!lineStat && (lineStat.additions > 0 || lineStat.deletions > 0)}
+          {@const kind = worktreeKind(worktree)}
+          {@const pr = $prByWorktree[worktree.id]}
           <ContextMenu.Root>
             <ContextMenu.Trigger>
               {#snippet child({ props })}
                 <button
                   {...props}
-                  class="row wt-row"
+                  class="row wt-row {kind}"
                   class:sel={isActive}
                   onclick={() => selectWorktree(worktree)}
                 >
+                  <!-- A leading dot marks the worktree's kind: filled accent for
+                       the repo's main anchor, solid for a Hitch-managed branch,
+                       hollow for an external one Hitch only observes. -->
+                  <span class="wt-dot {kind}" title={KIND_TITLE[kind]}></span>
                   <span class="lbl br-name">{worktree.branch}</span>
-                  <!-- One thing on the right, by rule: the worktree you're IN
-                       shows its own +/− line stat (status is redundant — you can
-                       see the agent live in the main pane); every OTHER worktree
-                       shows its agent-state pill so you can triage at a glance.
-                       An idle-but-dirty branch still surfaces its line stat. -->
+                  <!-- A fixed-order right-side cluster, each part shown only when
+                       it applies, so a branch never has to choose between signals:
+                       agent-state word · +/− line stat · PR chip. The agent word
+                       is suppressed on the worktree you're IN — you can see that
+                       agent live in the main pane — but its diff and PR still show. -->
                   <span class="right">
-                    {#if isActive}
-                      {#if hasLoc && lineStat}
-                        <span
-                          class="diffstat"
-                          title={`${lineStat.additions} additions, ${lineStat.deletions} deletions`}
-                        >
-                          {#if lineStat.additions > 0}<span class="add">{lineStat.additions}+</span>{/if}
-                          {#if lineStat.deletions > 0}<span class="del">{lineStat.deletions}-</span>{/if}
-                        </span>
-                      {/if}
-                    {:else if wtStatus}
+                    {#if !isActive && wtStatus}
                       <span class="pill {AGENT_LABEL[wtStatus].cls}">{AGENT_LABEL[wtStatus].label}</span>
-                    {:else if hasLoc && lineStat}
+                    {/if}
+                    {#if hasLoc && lineStat}
                       <span
                         class="diffstat"
                         title={`${lineStat.additions} additions, ${lineStat.deletions} deletions`}
@@ -264,6 +290,9 @@
                         {#if lineStat.additions > 0}<span class="add">{lineStat.additions}+</span>{/if}
                         {#if lineStat.deletions > 0}<span class="del">{lineStat.deletions}-</span>{/if}
                       </span>
+                    {/if}
+                    {#if pr}
+                      <span class="pr-chip {prChipClass(pr)}" title={prChipTitle(pr)}>#{pr.number}</span>
                     {/if}
                   </span>
                 </button>
@@ -424,12 +453,67 @@
     font-family: var(--mono);
     font-size: 11.5px;
   }
-  /* the single right-hand slot: holds exactly one of pill / diffstat */
+  /* the right-hand cluster: agent word · diffstat · PR chip, each optional */
   .right {
     display: flex;
     align-items: center;
-    gap: 7px;
+    gap: 6px;
     flex: none;
+  }
+
+  /* leading kind marker on worktree rows */
+  .wt-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex: none;
+    box-sizing: border-box;
+    background: var(--tx-lo);
+  }
+  .wt-dot.main {
+    background: var(--ac-bright);
+  }
+  .wt-dot.external {
+    background: transparent;
+    border: 1px solid var(--tx-lo);
+  }
+  /* an external worktree isn't ours to manage — read it back a notch */
+  .wt-row.external .br-name {
+    color: var(--tx-lo);
+  }
+  .wt-row.external:hover .br-name,
+  .wt-row.external.sel .br-name {
+    color: var(--tx-md);
+  }
+
+  /* PR chip: GitHub-conventional state colour, distinct from the agent hues */
+  .pr-chip {
+    flex: none;
+    font-family: var(--mono);
+    font-size: 9.5px;
+    font-weight: 600;
+    line-height: 1;
+    padding: 2px 5px;
+    border-radius: 5px;
+    white-space: nowrap;
+    border: 1px solid transparent;
+  }
+  .pr-chip.open {
+    color: oklch(77% 0.13 150);
+    background: oklch(77% 0.13 150 / 0.13);
+  }
+  .pr-chip.merged {
+    color: oklch(72% 0.13 300);
+    background: oklch(72% 0.13 300 / 0.15);
+  }
+  .pr-chip.closed {
+    color: var(--err);
+    background: oklch(68% 0.17 25 / 0.13);
+  }
+  /* a draft is open-but-not-ready: quiet, outlined, no fill */
+  .pr-chip.draft {
+    color: var(--tx-lo);
+    border-color: var(--line-soft);
   }
   .diffstat {
     display: inline-flex;

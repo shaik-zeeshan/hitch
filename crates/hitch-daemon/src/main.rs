@@ -6,9 +6,10 @@
 //! the socket API consumed by the desktop client and `hitch-hook`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -32,7 +33,7 @@ use hitch_proto::{
     encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage,
     DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
     JobRequest, JobStatus, PrInfo, ProtocolError, PullRequestDraft, Request, Response,
-    WorktreeCreateMode, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
+    WorktreeCreateMode, WorktreePr, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
 use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY};
 use hitch_store::Store;
@@ -347,6 +348,22 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
 
     let listener = UnixListener::bind(&config.socket_path)?;
     listener.set_nonblocking(true)?;
+    // Record our pid beside the socket so the GUI can force-kill us even when it
+    // never completed a `Hello` handshake (e.g. a protocol mismatch — the path
+    // that returns no pid in the response). Best-effort: a missing pidfile only
+    // costs the client its force-kill fast path, it does not break startup.
+    let pid_lock = write_pidfile(&config.socket_path);
+    // The setup that follows (`Store::open`, `restore_layout`, the accept loop)
+    // can early-return via `?`. Own the pidfile + socket with a guard so they are
+    // cleared on *every* exit path: otherwise a failed startup would leave a
+    // pidfile pointing at our now-dead pid, which the GUI could later SIGKILL once
+    // the OS reuses that pid. Normal shutdown cleanup runs before the guard drops.
+    // The guard also holds the pidfile's advisory lock for our whole lifetime, so a
+    // client can tell a live daemon from a stale pidfile before force-killing a pid.
+    let _daemon_files = DaemonFileGuard {
+        socket_path: config.socket_path.clone(),
+        _pid_lock: pid_lock,
+    };
 
     let shutdown = Arc::new(AtomicBool::new(false));
     // The dispatcher drains a single ordered channel of `DispatchMsg`. PTY reader
@@ -392,8 +409,60 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     cancel_active_jobs(&state);
     wait_for_jobs_to_finish(&state);
     kill_all_sessions(&state);
-    let _ = fs::remove_file(config.socket_path);
+    // Pidfile + socket are removed by `DaemonFileGuard` as it drops on return.
     Ok(())
+}
+
+/// Removes the daemon's pidfile and socket whenever `run_daemon` returns — by
+/// normal shutdown or by an early `?` during startup. Created right after the
+/// pidfile is written so no exit path can leak a stale pid (see `write_pidfile`).
+struct DaemonFileGuard {
+    socket_path: PathBuf,
+    // Held open for the daemon's whole lifetime so the advisory pidfile lock stays
+    // taken; dropping it (clean exit or unwind) releases the lock, and the OS
+    // releases it on an unclean kill too. Never read — only its lifetime matters.
+    _pid_lock: Option<File>,
+}
+
+impl Drop for DaemonFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(hitch_proto::transport::pidfile_path(&self.socket_path));
+        let _ = fs::remove_file(&self.socket_path);
+    }
+}
+
+/// Write our pid to the daemon's pidfile (see `transport::pidfile_path`) and take
+/// an exclusive advisory lock on it, held via the returned handle for our whole
+/// lifetime. The lock is what lets a client tell a *live* daemon (lock held) from
+/// a *stale* pidfile left by an unclean exit (lock free) before it force-kills the
+/// pid named there — without it, PID reuse could send the kill to an unrelated
+/// process. The OS drops the lock when this process exits by any means, so an
+/// abrupt kill can't strand it.
+///
+/// The pidfile is the GUI's only handle on a daemon it could not handshake with,
+/// so a stale entry must never linger: `truncate` overwrites any prior pid, and
+/// the bind that precedes this call guarantees we are the sole owner of this
+/// socket path. Any failure here only disables forced recovery; it never blocks
+/// startup, so we return `None` and carry on.
+fn write_pidfile(socket_path: &Path) -> Option<File> {
+    let path = hitch_proto::transport::pidfile_path(socket_path);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .ok()?;
+    // SAFETY: `flock` on a freshly opened, valid fd. `LOCK_NB` so a contended lock
+    // fails fast instead of blocking startup. We already own the socket bind, so
+    // contention is not expected; if it happens, skip writing a pid we can't defend
+    // with the lock rather than leave a kill-target we don't own.
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if !locked {
+        return None;
+    }
+    let _ = write!(file, "{}", std::process::id());
+    let _ = file.flush();
+    Some(file)
 }
 
 struct DaemonState {
@@ -1041,6 +1110,7 @@ fn handle_request<R: Read>(
         | Request::Push { .. }
         | Request::Pull { .. }
         | Request::PrStatus { .. }
+        | Request::ProjectPrStatuses { .. }
         | Request::CreatePullRequest { .. } => {
             let request = JobRequest::try_from(request)
                 .map_err(|_| internal("job-capable request rejected during dispatch"))?;
@@ -1196,12 +1266,26 @@ fn list_worktrees(
             .map_err(store_error)?
     };
 
-    worktrees
-        .into_iter()
-        .map(|worktree| {
-            refresh_worktree_branch_from_disk(state, worktree).map(|(worktree, _)| worktree)
-        })
-        .collect()
+    let mut refreshed = Vec::with_capacity(worktrees.len());
+    for worktree in worktrees {
+        // Reconciliation is the single place an external branch change is
+        // picked up and persisted. Broadcast it here so every attached GUI sees
+        // the new branch, not just the one that later selects this worktree:
+        // otherwise a background project-pr-statuses refresh updates the PR chip
+        // by worktree id while the stale branch name lingers beside it. Mirrors
+        // the single-worktree `refreshed_worktree_context` path.
+        let (worktree, branch_changed) = refresh_worktree_branch_from_disk(state, worktree)?;
+        if branch_changed {
+            broadcast_event(
+                state,
+                Event::WorktreeUpdated {
+                    worktree: worktree.clone(),
+                },
+            )?;
+        }
+        refreshed.push(worktree);
+    }
+    Ok(refreshed)
 }
 
 /// Canonicalize a path for identity comparison, falling back to the path as
@@ -1878,6 +1962,58 @@ fn pr_status(
         state: pr.state,
         draft: pr.draft,
     }))
+}
+
+fn project_pr_statuses(
+    state: &Arc<Mutex<DaemonState>>,
+    project_id: ProjectId,
+    control: &JobControl,
+) -> Result<Vec<WorktreePr>, ProtocolError> {
+    let worktrees = list_worktrees(state, project_id)?;
+    if worktrees.is_empty() {
+        return Ok(Vec::new());
+    }
+    // All worktrees of a project share the repo + remote, so one `gh pr list`
+    // covers them all. Prefer the main worktree as a stable cwd.
+    let repo_path = worktrees
+        .iter()
+        .find(|w| w.is_main)
+        .unwrap_or(&worktrees[0])
+        .path
+        .clone();
+    let git = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        state.git.clone()
+    };
+    // Scope the lookup to our worktree branches so a long PR history can't
+    // truncate them out of the result. The git layer exact-matches headRefName
+    // after GitHub's prefix search returns.
+    let branches: Vec<String> = worktrees.iter().map(|w| w.branch.clone()).collect();
+    let prs = git
+        .pr_list_for_branches_with_control(&repo_path, &branches, control)
+        .map_err(git_error)?;
+    Ok(worktrees
+        .into_iter()
+        .map(|worktree| WorktreePr {
+            pr: best_pr_for_branch(&prs, &worktree.branch),
+            worktree_id: worktree.id,
+        })
+        .collect())
+}
+
+/// Pick the PR that best represents a branch when the batched lookup returned
+/// more than one for it: an open PR wins over a closed/merged one, and among
+/// equals the highest number (most recent) wins. Returns the proto `PrInfo`.
+fn best_pr_for_branch(prs: &[(String, hitch_git::PrInfo)], branch: &str) -> Option<PrInfo> {
+    prs.iter()
+        .filter(|(head, _)| head == branch)
+        .max_by_key(|(_, pr)| (pr.state.eq_ignore_ascii_case("OPEN"), pr.number))
+        .map(|(_, pr)| PrInfo {
+            number: pr.number,
+            url: pr.url.clone(),
+            state: pr.state.clone(),
+            draft: pr.draft,
+        })
 }
 
 fn git_diff(
@@ -2724,6 +2860,18 @@ fn dispatch_job(
                 Ok(Response::PrStatus { pr })
             },
         ),
+        JobRequest::ProjectPrStatuses { project_id } => start_job(
+            "hitch-project-pr-statuses",
+            state,
+            client_id,
+            request_id,
+            Some("pr-status"),
+            None,
+            move |state, control| {
+                let statuses = project_pr_statuses(state, project_id, control)?;
+                Ok(Response::ProjectPrStatuses { statuses })
+            },
+        ),
         JobRequest::CreatePullRequest {
             worktree_id,
             title,
@@ -3182,8 +3330,41 @@ fn poisoned(name: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::OutputBroadcaster;
+    use super::{best_pr_for_branch, OutputBroadcaster};
     use hitch_core::SessionId;
+
+    fn git_pr(number: u64, state: &str) -> hitch_git::PrInfo {
+        hitch_git::PrInfo {
+            number,
+            url: format!("https://example.test/pr/{number}"),
+            state: state.to_string(),
+            draft: false,
+        }
+    }
+
+    #[test]
+    fn best_pr_for_branch_matches_by_branch_and_prefers_open_then_newest() {
+        let prs = vec![
+            ("feature".to_string(), git_pr(1, "MERGED")),
+            ("feature".to_string(), git_pr(7, "OPEN")),
+            ("feature".to_string(), git_pr(9, "CLOSED")),
+            ("other".to_string(), git_pr(20, "OPEN")),
+        ];
+        // Open wins over a higher-numbered closed/merged PR on the same branch.
+        assert_eq!(best_pr_for_branch(&prs, "feature").unwrap().number, 7);
+        // A branch with no PR yields None rather than borrowing another's.
+        assert!(best_pr_for_branch(&prs, "missing").is_none());
+    }
+
+    #[test]
+    fn best_pr_for_branch_falls_back_to_newest_when_none_open() {
+        let prs = vec![
+            ("topic".to_string(), git_pr(3, "MERGED")),
+            ("topic".to_string(), git_pr(11, "CLOSED")),
+        ];
+        // No open PR: the most recent (highest number) represents the branch.
+        assert_eq!(best_pr_for_branch(&prs, "topic").unwrap().number, 11);
+    }
 
     // A test harness that mirrors the dispatcher thread's single-threaded
     // serialization: the only legal operations are `record_output` (the
@@ -3998,6 +4179,153 @@ mod tests {
         assert!(!guard.worktrees.contains_key(&linked.id));
 
         drop(guard);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn list_worktrees_broadcasts_external_branch_change() {
+        use hitch_core::{Project, ProjectKind, Worktree};
+        use hitch_proto::{ControlLineDecoder, ControlMessage, Event};
+        use std::io::Read as _;
+        use std::os::unix::net::UnixStream;
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        fn run(command: &mut Command, what: &str) {
+            let status = command.status().unwrap();
+            assert!(status.success(), "{what} failed with {status}");
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-branch-broadcast-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("state.db");
+        let managed_root = dir.join("managed");
+        let project_root = dir.join("repo");
+        std::fs::create_dir_all(&managed_root).unwrap();
+
+        let mut git = Command::new("git");
+        git.arg("init").arg(&project_root);
+        run(&mut git, "git init");
+
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["config", "user.email", "hitch@example.com"]);
+        run(&mut git, "git config user.email");
+
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["config", "user.name", "Hitch Tests"]);
+        run(&mut git, "git config user.name");
+
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["branch", "-M", "main"]);
+        run(&mut git, "git branch -M main");
+
+        std::fs::write(project_root.join("README.md"), "hello\n").unwrap();
+
+        let mut git = Command::new("git");
+        git.arg("-C").arg(&project_root).args(["add", "README.md"]);
+        run(&mut git, "git add README.md");
+
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["commit", "-m", "initial"]);
+        run(&mut git, "git commit");
+
+        let config = super::DaemonConfig {
+            socket_path: dir.join("daemon.sock"),
+            store_path: store_path.clone(),
+            managed_root,
+            hook_helper: dir.join("hook"),
+            git: PathBuf::from("git"),
+            gh: PathBuf::from("gh"),
+            draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+        };
+        let store = hitch_store::Store::open(&store_path).unwrap();
+        let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(store, config)));
+
+        let project = Project::new("hitch", &project_root, ProjectKind::GitBacked);
+        let main = Worktree::new(project.id, &project_root, "main", true, false);
+        {
+            let mut guard = state.lock().unwrap();
+            guard.store.insert_project(&project).unwrap();
+            guard.store.insert_worktree(&main).unwrap();
+            guard.projects.insert(project.id, project.clone());
+            guard.worktrees.insert(main.id, main.clone());
+        }
+
+        // Register a client sink so the broadcast has a destination we can read
+        // back off the wire.
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let sink = Arc::new(super::ClientSink {
+            writer: Mutex::new(writer),
+            live: AtomicBool::new(true),
+            jobs_live: AtomicBool::new(true),
+            pending: Mutex::new(Vec::new()),
+            pending_job_events: Mutex::new(Vec::new()),
+        });
+        {
+            let mut guard = state.lock().unwrap();
+            guard.clients.insert(1, sink);
+        }
+
+        // Switch the worktree's branch outside Hitch, the way a manual checkout
+        // or an agent would.
+        let mut git = Command::new("git");
+        git.arg("-C")
+            .arg(&project_root)
+            .args(["checkout", "-b", "feature/new"]);
+        run(&mut git, "git checkout -b feature/new");
+
+        let listed = super::list_worktrees(&state, project.id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].branch, "feature/new");
+
+        // The external branch change must reach attached GUIs as a
+        // WorktreeUpdated event — not be persisted silently — so a concurrent
+        // PR refresh can't leave a fresh PR chip beside a stale branch name.
+        let mut reader = reader;
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut decoder = ControlLineDecoder::new();
+        let mut buf = [0u8; 8192];
+        let event = loop {
+            let n = reader.read(&mut buf).expect("read worktree-updated broadcast");
+            assert!(n > 0, "client sink closed before delivering the event");
+            if let Some(event) =
+                decoder
+                    .push(&buf[..n])
+                    .unwrap()
+                    .into_iter()
+                    .find_map(|message| match message {
+                        ControlMessage::Event { event } => Some(event),
+                        _ => None,
+                    })
+            {
+                break event;
+            }
+        };
+        match event {
+            Event::WorktreeUpdated { worktree } => {
+                assert_eq!(worktree.id, main.id);
+                assert_eq!(worktree.branch, "feature/new");
+            }
+            other => panic!("expected WorktreeUpdated event, got {other:?}"),
+        }
+
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }
