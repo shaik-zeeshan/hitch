@@ -178,9 +178,9 @@
           <div class="panel-head">
             <h2>Editor</h2>
             <p class="help">
-              Application used by <b>Open in editor</b> on a worktree. Any installed editor by name —
+              Application used by <b>Open in editor</b> on a worktree. Use a common editor name —
               e.g. <span class="mono">Visual Studio Code</span>, <span class="mono">Cursor</span>,
-              <span class="mono">Zed</span>.
+              <span class="mono">Zed</span> — or an executable path.
             </p>
           </div>
           <label class="field">

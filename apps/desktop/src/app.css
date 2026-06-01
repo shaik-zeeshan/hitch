@@ -362,7 +362,7 @@
     margin-top: 1px;
   }
 
-  /* ---- ⌘K command palette (mockup #cmdk-modal) ---- */
+  /* ---- Command palette (mockup #cmdk-modal) ---- */
   .palette {
     position: fixed;
     z-index: 61;

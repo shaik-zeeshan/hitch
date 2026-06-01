@@ -10,9 +10,8 @@ const DRAFT_CLAUDE_PATH_KEY = "hitch.draftClaudePath";
 const DRAFT_CODEX_PATH_KEY = "hitch.draftCodexPath";
 const AUTO_COMMIT_PUSH_KEY = "hitch.autoCommitPush";
 
-// Application name handed to the OS "open with" (macOS: `open -a <app>`). An
-// app name — not a `code`-style CLI shim — so it's PATH-independent and works
-// for any installed editor (Cursor, Zed, Sublime…) by name.
+// Editor preference passed to the desktop backend. It may be a display name
+// (Visual Studio Code, Cursor, Zed…) or an explicit executable path.
 export const DEFAULT_EDITOR = "Visual Studio Code";
 
 export type DraftProvider = "stub" | "claude" | "codex";

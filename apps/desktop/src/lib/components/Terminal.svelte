@@ -402,7 +402,7 @@
     });
     term.loadAddon(webLinks);
 
-    // In-terminal search (Cmd+F overlay below).
+    // In-terminal search (Cmd+F on macOS, Ctrl+F elsewhere).
     searchAddon = new SearchAddon();
     term.loadAddon(searchAddon);
 
@@ -420,12 +420,12 @@
       if (!atBottom) showNewOutput = true;
     });
 
-    // macOS Cmd shortcuts. Only intercept e.metaKey (Cmd) — never Ctrl, so
-    // Ctrl+C stays SIGINT to the child. Returning false consumes the event;
-    // true lets xterm/the child handle it as usual. The intent classification
-    // lives in the pure `classifyTerminalKey` (unit-tested) so the routing —
-    // crucially that Cmd+V is NOT special and passes through to xterm's native
-    // paste (the SOLE keyboard paste route) — is verifiable without a live DOM.
+    // Platform terminal shortcuts. macOS uses Cmd/meta; Windows/Linux use Ctrl.
+    // Returning false consumes the event; true lets xterm/the child handle it as
+    // usual. The intent classification lives in the pure `classifyTerminalKey`
+    // (unit-tested) so the routing — crucially that paste shortcuts are NOT
+    // special and pass through to xterm's native paste (the SOLE keyboard paste
+    // route) — is verifiable without a live DOM.
     term.attachCustomKeyEventHandler((e) => {
       switch (classifyTerminalKey(e)) {
         case "newline":
@@ -440,7 +440,7 @@
           // byte, preserving the old behavior: one LF, no native Enter fallback.
           return false;
         case "copy":
-          // Copy only when there's a selection; otherwise let Cmd+C through.
+          // Copy only when there's a selection; otherwise let the child receive it.
           if (term?.hasSelection()) {
             void navigator.clipboard.writeText(term.getSelection());
             return false;
@@ -450,7 +450,7 @@
           void openSearch();
           return false;
         case "pass":
-          // Includes Cmd+V: native xterm handles paste on its textarea, which
+          // Includes paste shortcuts: native xterm handles paste on its textarea,
           // already honors bracketed-paste (DECSET 2004). No manual term.paste
           // here, so the keyboard paste path cannot double-fire.
           return true;

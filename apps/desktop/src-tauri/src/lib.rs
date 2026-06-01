@@ -8,6 +8,7 @@ use hitch_proto::transport::{
     connect_daemon as connect_transport, endpoint_accepts_connections, DaemonStream,
 };
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,7 +29,7 @@ use hitch_proto::{
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 
 /// Per-session bound on the bytes we stage before the webview registers that
@@ -1486,6 +1487,238 @@ fn daemon_log_path() -> PathBuf {
         .join("daemon.log")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditorLaunchSpec {
+    program: OsString,
+    args: Vec<OsString>,
+}
+
+impl EditorLaunchSpec {
+    fn new(program: impl Into<OsString>, path: &Path) -> Self {
+        Self {
+            program: program.into(),
+            args: vec![path.as_os_str().to_os_string()],
+        }
+    }
+}
+
+fn trim_configured_editor(editor: &str) -> &str {
+    let editor = editor.trim();
+    let unquoted = editor
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .or_else(|| editor.strip_prefix('\'').and_then(|inner| inner.strip_suffix('\'')));
+    unquoted.map(str::trim).unwrap_or(editor)
+}
+
+fn configured_executable(editor: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(editor);
+    path.is_file().then_some(path)
+}
+
+#[cfg(windows)]
+fn normalized_editor_name(editor: &str) -> String {
+    editor
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+#[cfg(windows)]
+fn push_editor_candidate(candidates: &mut Vec<OsString>, base: Option<&Path>, relative: &str) {
+    if let Some(base) = base {
+        candidates.push(base.join(relative).into_os_string());
+    }
+}
+
+#[cfg(windows)]
+fn push_program_files_candidates(
+    candidates: &mut Vec<OsString>,
+    program_files: Option<&Path>,
+    program_files_x86: Option<&Path>,
+    relative: &str,
+) {
+    push_editor_candidate(candidates, program_files, relative);
+    push_editor_candidate(candidates, program_files_x86, relative);
+}
+
+#[cfg(windows)]
+fn windows_editor_candidates_from_dirs(
+    editor: &str,
+    local_app_data: Option<&Path>,
+    program_files: Option<&Path>,
+    program_files_x86: Option<&Path>,
+) -> Vec<OsString> {
+    let mut candidates = Vec::new();
+
+    let normalized = match (normalized_editor_name(editor), editor.contains("++")) {
+        (name, true) if name == "notepad" => "notepadplusplus".to_string(),
+        (name, _) => name,
+    };
+    match normalized.as_str() {
+        "code" | "vscode" | "visualstudiocode" => {
+            push_editor_candidate(
+                &mut candidates,
+                local_app_data,
+                r"Programs\Microsoft VS Code\Code.exe",
+            );
+            push_program_files_candidates(
+                &mut candidates,
+                program_files,
+                program_files_x86,
+                r"Microsoft VS Code\Code.exe",
+            );
+            candidates.push(OsString::from("code"));
+        }
+        "cursor" => {
+            push_editor_candidate(&mut candidates, local_app_data, r"Programs\Cursor\Cursor.exe");
+            push_program_files_candidates(
+                &mut candidates,
+                program_files,
+                program_files_x86,
+                r"Cursor\Cursor.exe",
+            );
+            candidates.push(OsString::from("cursor"));
+        }
+        "codium" | "vscodium" => {
+            push_editor_candidate(&mut candidates, local_app_data, r"Programs\VSCodium\VSCodium.exe");
+            push_program_files_candidates(
+                &mut candidates,
+                program_files,
+                program_files_x86,
+                r"VSCodium\VSCodium.exe",
+            );
+            candidates.push(OsString::from("codium"));
+        }
+        "sublime" | "sublimetext" => {
+            push_editor_candidate(
+                &mut candidates,
+                local_app_data,
+                r"Programs\Sublime Text\sublime_text.exe",
+            );
+            push_program_files_candidates(
+                &mut candidates,
+                program_files,
+                program_files_x86,
+                r"Sublime Text\sublime_text.exe",
+            );
+            candidates.push(OsString::from("sublime_text"));
+            candidates.push(OsString::from("subl"));
+        }
+        "notepadplusplus" => {
+            push_program_files_candidates(
+                &mut candidates,
+                program_files,
+                program_files_x86,
+                r"Notepad++\notepad++.exe",
+            );
+            candidates.push(OsString::from("notepad++"));
+        }
+        "windsurf" => {
+            push_editor_candidate(&mut candidates, local_app_data, r"Programs\Windsurf\Windsurf.exe");
+            push_program_files_candidates(
+                &mut candidates,
+                program_files,
+                program_files_x86,
+                r"Windsurf\Windsurf.exe",
+            );
+            candidates.push(OsString::from("windsurf"));
+        }
+        "zed" => {
+            push_editor_candidate(&mut candidates, local_app_data, r"Programs\Zed\Zed.exe");
+            push_program_files_candidates(
+                &mut candidates,
+                program_files,
+                program_files_x86,
+                r"Zed\Zed.exe",
+            );
+            candidates.push(OsString::from("zed"));
+        }
+        _ => {}
+    }
+
+    candidates
+}
+
+#[cfg(windows)]
+fn windows_editor_candidates(editor: &str) -> Vec<OsString> {
+    windows_editor_candidates_from_dirs(
+        editor,
+        std::env::var_os("LOCALAPPDATA").as_deref().map(Path::new),
+        std::env::var_os("ProgramFiles").as_deref().map(Path::new),
+        std::env::var_os("ProgramFiles(x86)").as_deref().map(Path::new),
+    )
+}
+
+#[cfg(windows)]
+fn first_available_windows_candidate(candidates: &[OsString]) -> Option<OsString> {
+    candidates
+        .iter()
+        .find(|candidate| Path::new(candidate).is_file())
+        .or_else(|| candidates.iter().find(|candidate| !Path::new(candidate).is_absolute()))
+        .cloned()
+}
+
+fn build_editor_launch_spec(editor: &str, path: &Path) -> Option<EditorLaunchSpec> {
+    let editor = trim_configured_editor(editor);
+    if editor.is_empty() {
+        return None;
+    }
+    if let Some(executable) = configured_executable(editor) {
+        return Some(EditorLaunchSpec::new(executable.into_os_string(), path));
+    }
+
+    #[cfg(windows)]
+    {
+        let candidates = windows_editor_candidates(editor);
+        if let Some(program) = first_available_windows_candidate(&candidates) {
+            return Some(EditorLaunchSpec::new(program, path));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return Some(EditorLaunchSpec {
+            program: OsString::from("open"),
+            args: vec![
+                OsString::from("-a"),
+                OsString::from(editor),
+                path.as_os_str().to_os_string(),
+            ],
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    Some(EditorLaunchSpec::new(editor, path))
+}
+
+fn spawn_editor(spec: EditorLaunchSpec) -> Result<(), String> {
+    Command::new(&spec.program)
+        .args(&spec.args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("failed to open editor {:?}: {err}", spec.program))
+}
+
+fn open_path_with_default_viewer(path: &Path) -> Result<(), String> {
+    tauri_plugin_opener::open_path(path.display().to_string(), None::<&str>)
+        .map_err(|err| format!("failed to open path with default viewer: {err}"))
+}
+
+#[tauri::command]
+async fn open_in_editor(path: String, editor: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(path);
+        match build_editor_launch_spec(&editor, &path) {
+            Some(spec) => spawn_editor(spec),
+            None => open_path_with_default_viewer(&path),
+        }
+    })
+    .await
+    .map_err(|err| format!("editor launch task failed: {err}"))?
+}
+
 #[tauri::command]
 async fn connect_daemon(app: AppHandle, state: State<'_, HitchClient>) -> Result<(), String> {
     let client = state.inner().clone();
@@ -1659,6 +1892,34 @@ fn handle_tray_menu_event(app: &AppHandle, event: MenuEvent) {
     }
 }
 
+fn tray_icon_as_template() -> bool {
+    cfg!(target_os = "macos")
+}
+
+fn apply_platform_tray_behavior(builder: TrayIconBuilder<Wry>) -> TrayIconBuilder<Wry> {
+    #[cfg(windows)]
+    {
+        // Windows users expect left click to restore the app and right click to
+        // show the context menu. macOS keeps Tauri's default menu-bar behaviour.
+        builder
+            .show_menu_on_left_click(false)
+            .on_tray_icon_event(|tray, event| {
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    show_main_window(tray.app_handle());
+                }
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        builder
+    }
+}
+
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let status = MenuItem::with_id(
         app,
@@ -1688,8 +1949,8 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .tooltip(tray_status_text(DaemonStatus::Starting, 0))
         .icon(tauri::include_image!("icons/tray.png"))
-        .icon_as_template(true)
-        .on_menu_event(handle_tray_menu_event);
+        .icon_as_template(tray_icon_as_template());
+    let builder = apply_platform_tray_behavior(builder).on_menu_event(handle_tray_menu_event);
     builder.build(app)?;
 
     if let Ok(mut slot) = app.state::<HitchClient>().0.tray_status.lock() {
@@ -1701,9 +1962,14 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        describe_handshake_failure, read_log_tail, recovery_mode_for_loss,
-        should_force_kill_daemon, tray_status_text, CrashLoopGuard, DaemonStatus, ErrorCode,
-        OutputRouter, ProtocolError, RecoveryMode, Response, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
+        build_editor_launch_spec, describe_handshake_failure, read_log_tail,
+        recovery_mode_for_loss, should_force_kill_daemon, tray_status_text, CrashLoopGuard,
+        DaemonStatus, ErrorCode, OutputRouter, ProtocolError, RecoveryMode, Response,
+        CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
+    };
+    #[cfg(windows)]
+    use super::{
+        first_available_windows_candidate, windows_editor_candidates_from_dirs,
     };
     #[cfg(unix)]
     use super::{
@@ -1725,6 +1991,94 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn configured_editor_path_with_spaces_is_preserved_as_program() {
+        let dir = std::env::temp_dir().join(format!(
+            "hitch-editor-test-{}-{}",
+            std::process::id(),
+            "path-with-spaces"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let editor = dir.join("Editor With Spaces.exe");
+        std::fs::write(&editor, b"").unwrap();
+        let worktree = std::path::Path::new(r"C:\repo with spaces");
+
+        let configured = format!(" \"{}\" ", editor.display());
+        let spec = build_editor_launch_spec(&configured, worktree).unwrap();
+
+        assert_eq!(spec.program, editor.as_os_str());
+        assert_eq!(spec.args, vec![worktree.as_os_str().to_os_string()]);
+
+        std::fs::remove_file(editor).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_display_names_resolve_to_installer_locations_and_path_fallbacks() {
+        let local = std::path::Path::new(r"C:\Users\Ada\AppData\Local");
+        let program_files = std::path::Path::new(r"C:\Program Files");
+        let program_files_x86 = std::path::Path::new(r"C:\Program Files (x86)");
+
+        let code = windows_editor_candidates_from_dirs(
+            "Visual Studio Code",
+            Some(local),
+            Some(program_files),
+            Some(program_files_x86),
+        );
+        assert!(code.contains(
+            &local
+                .join(r"Programs\Microsoft VS Code\Code.exe")
+                .into_os_string()
+        ));
+        assert!(code.contains(
+            &program_files
+                .join(r"Microsoft VS Code\Code.exe")
+                .into_os_string()
+        ));
+        assert!(code.contains(&std::ffi::OsString::from("code")));
+
+        let cursor =
+            windows_editor_candidates_from_dirs("Cursor", Some(local), Some(program_files), None);
+        assert!(cursor.contains(&local.join(r"Programs\Cursor\Cursor.exe").into_os_string()));
+        assert!(cursor.contains(&std::ffi::OsString::from("cursor")));
+
+        let notepad = windows_editor_candidates_from_dirs(
+            "Notepad++",
+            Some(local),
+            Some(program_files),
+            Some(program_files_x86),
+        );
+        assert!(notepad.contains(
+            &program_files_x86
+                .join(r"Notepad++\notepad++.exe")
+                .into_os_string()
+        ));
+        assert!(notepad.contains(&std::ffi::OsString::from("notepad++")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_candidate_selection_prefers_existing_executable_before_path_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "hitch-editor-test-{}-{}",
+            std::process::id(),
+            "candidate-precedence"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let editor = dir.join("Code.exe");
+        std::fs::write(&editor, b"").unwrap();
+        let candidates = vec![editor.as_os_str().to_os_string(), std::ffi::OsString::from("code")];
+
+        assert_eq!(
+            first_available_windows_candidate(&candidates),
+            Some(editor.as_os_str().to_os_string())
+        );
+
+        std::fs::remove_file(editor).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]
@@ -2341,6 +2695,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            open_in_editor,
             connect_daemon,
             hitch_request,
             send_session_input,

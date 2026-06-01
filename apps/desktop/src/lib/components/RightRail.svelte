@@ -462,7 +462,7 @@
     {/if}
   </div>
 
-  <!-- Mounted once, triggerless: opened from the action menu (and the ⌘K
+  <!-- Mounted once, triggerless: opened from the action menu (and the command
        palette) via the commitOpen / createPrOpen stores. -->
   <CommitDialog triggerless />
   <CreatePrDialog triggerless />

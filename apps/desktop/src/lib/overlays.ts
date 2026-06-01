@@ -1,5 +1,5 @@
 // Overlay open-state — the small bit of cross-cutting UI state that several
-// surfaces drive (the ⌘K palette opens the same create-worktree dialog the
+// surfaces drive (the command palette opens the same create-worktree dialog the
 // tree's per-project "+" does, etc.). Kept out of daemon.ts (that owns the
 // daemon contract, not view chrome) and shared as stores rather than
 // prop-drilled, mirroring how components read daemon state directly.
@@ -7,7 +7,7 @@
 import { writable } from "svelte/store";
 import type { Project, Worktree } from "./types";
 
-// ⌘K command palette.
+// Command palette.
 export const commandOpen = writable(false);
 
 // Local add-project fallback dialog. The primary flow still goes straight to

@@ -12,6 +12,7 @@
     restartDaemon,
   } from "../daemon";
   import { commandOpen } from "../overlays";
+  import { currentDesktopPlatform, shortcutLabel } from "../desktopPlatform";
 
   let {
     rightCollapsed = false,
@@ -25,6 +26,8 @@
 
   const ahead = $derived($gitStatus?.ahead ?? 0);
   const behind = $derived($gitStatus?.behind ?? 0);
+
+  const commandPaletteShortcut = shortcutLabel(currentDesktopPlatform(), "K");
 
   // Daemon Status indicator (ADR 0009). Always a colored dot + a word — never
   // color alone (design principle #3) — and a click-to-open popover carrying the
@@ -66,7 +69,7 @@
       ><circle cx="7" cy="7" r="4.5" /><line x1="10.5" y1="10.5" x2="14" y2="14" /></svg
     >
     <span class="cmdk-label">Search or jump to…</span>
-    <span class="k">⌘K</span>
+    <span class="k">{commandPaletteShortcut}</span>
   </button>
 
   <div class="nav-grow" data-tauri-drag-region></div>
