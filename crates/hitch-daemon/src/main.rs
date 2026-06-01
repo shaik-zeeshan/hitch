@@ -6,11 +6,12 @@
 //! the socket API consumed by the desktop client and `hitch-hook`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,10 +32,12 @@ use hitch_git::{
     GitClient, GitRepository, RemoveWorktreeRequest, StatusEntry, WorktreeCheckout,
 };
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage,
-    DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
-    JobRequest, JobStatus, KnownAgent, PrInfo, ProtocolError, PullRequestDraft, Request, Response,
-    WorktreeCreateMode, WorktreePr, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
+    encode_control_message, encode_pty_frame,
+    transport::{DaemonListener, DaemonStream},
+    ChangedFile, CommitDraft, ControlMessage, DraftGenerationSettings, DraftProvider, ErrorCode,
+    Event, FileDiff, FileStatus, GitStatus, JobRequest, JobStatus, KnownAgent, PrInfo,
+    ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode, WorktreePr,
+    MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
 use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY};
 use hitch_store::Store;
@@ -338,7 +341,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     install_panic_hook();
-    remove_stale_socket(&config.socket_path)?;
+
     if let Some(parent) = config.socket_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -347,13 +350,19 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     }
     fs::create_dir_all(&config.managed_root)?;
 
-    let listener = UnixListener::bind(&config.socket_path)?;
+    let listener = DaemonListener::bind(&config.socket_path)?;
     listener.set_nonblocking(true)?;
     // Record our pid beside the socket so the GUI can force-kill us even when it
     // never completed a `Hello` handshake (e.g. a protocol mismatch — the path
     // that returns no pid in the response). Best-effort: a missing pidfile only
     // costs the client its force-kill fast path, it does not break startup.
-    let pid_lock = write_pidfile(&config.socket_path);
+    let pid_lock = match write_pidfile(&config.socket_path) {
+        Ok(pid_lock) => pid_lock,
+        Err(err) => {
+            eprintln!("hitch-daemon: pidfile recovery disabled: {err}");
+            None
+        }
+    };
     // The setup that follows (`Store::open`, `restore_layout`, the accept loop)
     // can early-return via `?`. Own the pidfile + socket with a guard so they are
     // cleared on *every* exit path: otherwise a failed startup would leave a
@@ -386,7 +395,7 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
 
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok(stream) => {
                 stream.set_nonblocking(false)?;
                 let client_id = register_client(&state, &stream)?;
                 let state = Arc::clone(&state);
@@ -445,25 +454,33 @@ impl Drop for DaemonFileGuard {
 /// the bind that precedes this call guarantees we are the sole owner of this
 /// socket path. Any failure here only disables forced recovery; it never blocks
 /// startup, so we return `None` and carry on.
-fn write_pidfile(socket_path: &Path) -> Option<File> {
+#[cfg(unix)]
+fn write_pidfile(socket_path: &Path) -> io::Result<Option<File>> {
     let path = hitch_proto::transport::pidfile_path(socket_path);
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(&path)
-        .ok()?;
+        .open(&path)?;
     // SAFETY: `flock` on a freshly opened, valid fd. `LOCK_NB` so a contended lock
     // fails fast instead of blocking startup. We already own the socket bind, so
     // contention is not expected; if it happens, skip writing a pid we can't defend
     // with the lock rather than leave a kill-target we don't own.
     let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
     if !locked {
-        return None;
+        return Ok(None);
     }
-    let _ = write!(file, "{}", std::process::id());
-    let _ = file.flush();
-    Some(file)
+    write!(file, "{}", std::process::id())?;
+    file.flush()?;
+    Ok(Some(file))
+}
+
+#[cfg(not(unix))]
+fn write_pidfile(_socket_path: &Path) -> io::Result<Option<File>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "pidfile locking and force-recovery are only supported on Unix",
+    ))
 }
 
 struct DaemonState {
@@ -543,12 +560,12 @@ impl JobControl {
     /// shutdown can cancel them before exit rather than orphaning background work.
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        #[cfg(unix)]
         if let Ok(guard) = self.child_pgid.lock() {
             if let Some(pgid) = *guard {
                 // SAFETY: `kill(2)` with a negative pid signals the process group;
                 // it has no memory-safety preconditions and an already-gone group
                 // returns ESRCH, which we ignore.
-                #[cfg(unix)]
                 unsafe {
                     libc::kill(-pgid, libc::SIGKILL);
                 }
@@ -699,7 +716,7 @@ struct DispatchChannels {
 }
 
 struct ClientSink {
-    writer: Mutex<UnixStream>,
+    writer: Mutex<DaemonStream>,
     /// Output readiness gate. `false` until the replay thread has delivered the
     /// full scrollback snapshot and drained any output buffered in `pending`.
     /// and writes directly once it is open. Job events use their own gate below;
@@ -781,7 +798,7 @@ fn restore_layout(
     Ok(())
 }
 
-fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &UnixStream) -> io::Result<u64> {
+fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &DaemonStream) -> io::Result<u64> {
     let writer = stream.try_clone()?;
     let mut state = state.lock().map_err(|_| poisoned("state"))?;
     let client_id = state.next_client_id;
@@ -810,7 +827,7 @@ fn unregister_client(state: &Arc<Mutex<DaemonState>>, client_id: u64) {
 
 fn handle_client(
     client_id: u64,
-    stream: UnixStream,
+    stream: DaemonStream,
     state: Arc<Mutex<DaemonState>>,
     shutdown: Arc<AtomicBool>,
     channels: DispatchChannels,
@@ -3503,23 +3520,20 @@ fn kill_all_sessions(state: &Arc<Mutex<DaemonState>>) {
     }
 }
 
-fn remove_stale_socket(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path),
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("{} exists and is not a socket", path.display()),
-        )),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
+/// Per-instance data directory. Unix keeps the historical `$HOME/.hitch*`
+/// layout; Windows uses `%LOCALAPPDATA%\Hitch` with a namespace child for dev
+/// or custom instances.
+fn data_dir() -> PathBuf {
+    platform_data_dir()
 }
 
-/// Per-instance data directory under `$HOME`. `.hitch` for release builds,
-/// `.hitch-dev` for debug builds, so a dev daemon never shares a store, managed
-/// worktrees, or log with an installed release daemon (see
-/// `hitch_proto::transport::instance_dir_name`).
-fn data_dir() -> PathBuf {
+#[cfg(windows)]
+fn platform_data_dir() -> PathBuf {
+    hitch_proto::transport::default_data_dir()
+}
+
+#[cfg(not(windows))]
+fn platform_data_dir() -> PathBuf {
     home_dir().join(hitch_proto::transport::instance_dir_name())
 }
 
@@ -3549,9 +3563,11 @@ fn hook_helper_path_for_daemon_exe(exe: &Path) -> PathBuf {
     parent.join(format!("hitch-hook{suffix}"))
 }
 
+#[cfg(not(windows))]
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
         .unwrap_or_else(std::env::temp_dir)
 }
 
@@ -3711,6 +3727,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn agent_state_before_replay_waits_until_session_snapshot_is_sent() {
         use hitch_core::{AgentState, WorktreeId};
@@ -4273,6 +4290,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn start_job_releases_worker_before_running_broadcast() {
         use std::os::unix::net::UnixStream;
@@ -4542,6 +4560,7 @@ mod tests {
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[cfg(unix)]
     #[test]
     fn list_worktrees_broadcasts_external_branch_change() {
         use hitch_core::{Project, ProjectKind, Worktree};

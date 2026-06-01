@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};

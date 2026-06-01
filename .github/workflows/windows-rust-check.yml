@@ -1,0 +1,17 @@
+name: Windows Rust check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  affected-crates:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build desktop sidecars for Tauri check
+        run: cargo build --target x86_64-pc-windows-msvc -p hitch-daemon -p hitch-hook
+      - name: Check affected Rust crates on Windows
+        run: cargo check --target x86_64-pc-windows-msvc -p hitch-proto -p hitch-daemon -p hitch-desktop

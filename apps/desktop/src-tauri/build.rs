@@ -20,13 +20,23 @@ fn main() {
         })
         .expect("workspace root not found");
 
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root.join("target"));
+    let exe_suffix = std::env::var("CARGO_CFG_TARGET_OS")
+        .map(|os| if os == "windows" { ".exe" } else { "" })
+        .unwrap_or("");
     let binaries_dir = manifest_dir.join("binaries");
     for binary in ["hitch-daemon", "hitch-hook"] {
-        let src = workspace_root.join(format!("target/{profile}/{binary}"));
-        if src.exists() {
+        let file_name = format!("{binary}{exe_suffix}");
+        let candidates = [
+            target_dir.join(&target).join(&profile).join(&file_name),
+            target_dir.join(&profile).join(&file_name),
+        ];
+        if let Some(src) = candidates.iter().find(|path| path.exists()) {
             std::fs::create_dir_all(&binaries_dir).unwrap();
-            let dst = binaries_dir.join(format!("{binary}-{target}"));
-            std::fs::copy(&src, &dst).unwrap_or_else(|err| {
+            let dst = binaries_dir.join(format!("{binary}-{target}{exe_suffix}"));
+            std::fs::copy(src, &dst).unwrap_or_else(|err| {
                 panic!(
                     "failed to copy {binary} from {} to {}: {err}",
                     src.display(),
@@ -40,8 +50,9 @@ fn main() {
                 ""
             };
             println!(
-                "cargo:warning={binary} not found at {}; run `cargo build -p hitch-daemon -p hitch-hook{build_flag}` first",
-                src.display()
+                "cargo:warning={binary} not found at {} or {}; run `cargo build -p hitch-daemon -p hitch-hook{build_flag}` first",
+                candidates[0].display(),
+                candidates[1].display()
             );
         }
     }

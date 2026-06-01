@@ -1,14 +1,26 @@
-//! Minimal Unix-domain socket transport scaffolding.
+//! Minimal platform-neutral daemon transport scaffolding.
 //!
 //! This module intentionally provides blocking, low-level primitives. Higher
 //! level connection lifecycle, subscriptions, retries, and async task ownership
 //! belong in `hitch-daemon` / `src-tauri`, not in the protocol crate.
 
+#[cfg(unix)]
 use std::fs;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+
+#[cfg(windows)]
+use interprocess::{
+    local_socket::{
+        prelude::*, GenericNamespaced, ListenerNonblockingMode, ListenerOptions,
+        Name as LocalSocketName,
+    },
+    TryClone as _,
+};
 
 use crate::framing::{
     encode_control_message, encode_pty_frame, ControlLineDecoder, FrameError, PtyFrameDecoder,
@@ -52,9 +64,33 @@ pub fn instance_dir_name() -> String {
     format!(".hitch{}", instance_infix())
 }
 
+/// Per-user data directory for Windows builds. Release uses `%LOCALAPPDATA%\Hitch`;
+/// debug/custom instances live under a namespace child so store, logs, and pipe
+/// rendezvous stay isolated without drifting across crates.
+#[cfg(windows)]
+pub fn default_data_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Hitch");
+    let namespace = instance_namespace();
+    if namespace.is_empty() {
+        base
+    } else {
+        base.join(namespace)
+    }
+}
+
 /// Default daemon socket path for the current user and build namespace.
+#[cfg(unix)]
 pub fn default_socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("hitch{}-{}.sock", instance_infix(), current_uid()))
+}
+
+/// Default daemon endpoint for the current user and build namespace.
+#[cfg(windows)]
+pub fn default_socket_path() -> PathBuf {
+    default_data_dir().join("daemon.sock")
 }
 
 /// Path to the daemon's pidfile, derived from its socket path.
@@ -72,13 +108,13 @@ pub fn pidfile_path(socket_path: &Path) -> PathBuf {
 /// Blocking client connection to the daemon socket.
 #[derive(Debug)]
 pub struct UnixSocketClient {
-    connection: UnixSocketConnection,
+    connection: DaemonStream,
 }
 
 impl UnixSocketClient {
     pub fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
         Ok(Self {
-            connection: UnixSocketConnection::new(UnixStream::connect(path)?),
+            connection: connect_daemon(path)?,
         })
     }
 
@@ -91,27 +127,72 @@ impl UnixSocketClient {
     }
 }
 
+/// Backwards-compatible daemon-side listener name.
+pub type UnixSocketListener = DaemonListener;
+
+/// Backwards-compatible connected socket name.
+pub type UnixSocketConnection = DaemonStream;
+
+#[cfg(unix)]
+type PlatformListener = UnixListener;
+
+#[cfg(windows)]
+type PlatformListener = LocalSocketListener;
+
+#[cfg(unix)]
+type PlatformStream = UnixStream;
+
+#[cfg(windows)]
+type PlatformStream = LocalSocketStream;
+
 /// Blocking daemon-side listener.
 #[derive(Debug)]
-pub struct UnixSocketListener {
-    listener: UnixListener,
+pub struct DaemonListener {
+    listener: PlatformListener,
     path: PathBuf,
 }
 
-impl UnixSocketListener {
-    /// Bind a socket path. If a stale filesystem socket exists at that path, it
-    /// is removed first.
+impl DaemonListener {
+    /// Bind a socket path. On Unix, if a stale filesystem socket exists at that
+    /// path, it is removed first. On Windows, the path is a logical per-user
+    /// endpoint name mapped to an Interprocess local socket backed by named pipes.
     pub fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        remove_stale_socket(&path)?;
-        let listener = UnixListener::bind(&path)?;
+        #[cfg(unix)]
+        let listener = {
+            remove_stale_socket(&path)?;
+            UnixListener::bind(&path)?
+        };
+        #[cfg(windows)]
+        let listener = ListenerOptions::new()
+            .name(windows_socket_name(&path)?)
+            .create_sync()?;
         Ok(Self { listener, path })
     }
 
     /// Accept one client connection.
-    pub fn accept(&self) -> io::Result<UnixSocketConnection> {
-        let (stream, _) = self.listener.accept()?;
-        Ok(UnixSocketConnection::new(stream))
+    pub fn accept(&self) -> io::Result<DaemonStream> {
+        #[cfg(unix)]
+        {
+            let (stream, _) = self.listener.accept()?;
+            Ok(DaemonStream::from_stream(stream))
+        }
+        #[cfg(windows)]
+        {
+            Ok(DaemonStream::from_stream(self.listener.accept()?))
+        }
+    }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.listener.set_nonblocking(nonblocking)
+        }
+        #[cfg(windows)]
+        {
+            self.listener
+                .set_nonblocking(ListenerNonblockingMode::from_bool(nonblocking, false))
+        }
     }
 
     pub fn local_path(&self) -> &Path {
@@ -119,22 +200,59 @@ impl UnixSocketListener {
     }
 }
 
-impl Drop for UnixSocketListener {
+impl Drop for DaemonListener {
     fn drop(&mut self) {
+        #[cfg(unix)]
         let _ = fs::remove_file(&self.path);
     }
 }
 
-/// A single connected Unix socket with incremental control and PTY decoders.
+/// Connect to the daemon endpoint at `path`.
+pub fn connect_daemon(path: impl AsRef<Path>) -> io::Result<DaemonStream> {
+    let path = path.as_ref();
+    #[cfg(unix)]
+    {
+        DaemonStream::connect(path)
+    }
+    #[cfg(windows)]
+    {
+        DaemonStream::connect(path)
+    }
+}
+
+/// Return whether a daemon endpoint currently accepts connections.
+pub fn endpoint_accepts_connections(path: &Path) -> bool {
+    connect_daemon(path).is_ok()
+}
+
+/// A single connected daemon socket with incremental control and PTY decoders.
 #[derive(Debug)]
-pub struct UnixSocketConnection {
-    stream: UnixStream,
+pub struct DaemonStream {
+    stream: PlatformStream,
     control_decoder: ControlLineDecoder,
     pty_decoder: PtyFrameDecoder,
 }
 
-impl UnixSocketConnection {
+impl DaemonStream {
+    #[cfg(unix)]
     pub fn new(stream: UnixStream) -> Self {
+        Self::from_stream(stream)
+    }
+
+    fn connect(path: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Ok(Self::from_stream(UnixStream::connect(path)?))
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self::from_stream(LocalSocketStream::connect(
+                windows_socket_name(path)?,
+            )?))
+        }
+    }
+
+    fn from_stream(stream: PlatformStream) -> Self {
         Self {
             stream,
             control_decoder: ControlLineDecoder::new(),
@@ -143,7 +261,11 @@ impl UnixSocketConnection {
     }
 
     pub fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self::new(self.stream.try_clone()?))
+        Ok(Self::from_stream(self.stream.try_clone()?))
+    }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.stream.set_nonblocking(nonblocking)
     }
 
     pub fn send_control(&mut self, message: &ControlMessage) -> Result<(), TransportError> {
@@ -182,8 +304,25 @@ impl UnixSocketConnection {
         Ok(self.pty_decoder.push(&buf[..len])?)
     }
 
+    #[cfg(unix)]
     pub fn into_inner(self) -> UnixStream {
         self.stream
+    }
+}
+
+impl Read for DaemonStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(buf)
+    }
+}
+
+impl Write for DaemonStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
     }
 }
 
@@ -227,6 +366,26 @@ impl From<FrameError> for TransportError {
     }
 }
 
+#[cfg(windows)]
+fn windows_socket_name(path: &Path) -> io::Result<LocalSocketName<'static>> {
+    logical_socket_name(path).to_ns_name::<GenericNamespaced>()
+}
+
+#[cfg(windows)]
+fn logical_socket_name(path: &Path) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+
+    let path = path.as_os_str().to_string_lossy();
+    let mut hash = FNV_OFFSET;
+    for byte in path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("hitch-{hash:016x}")
+}
+
+#[cfg(unix)]
 fn remove_stale_socket(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path),
@@ -239,6 +398,7 @@ fn remove_stale_socket(path: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn current_uid() -> u32 {
     // Avoid adding a libc dependency to the protocol crate for a diagnostic path.
     std::env::var("UID")
@@ -296,6 +456,7 @@ mod tests {
         );
 
         server.join().unwrap();
+        #[cfg(unix)]
         let _ = fs::remove_file(path);
     }
 

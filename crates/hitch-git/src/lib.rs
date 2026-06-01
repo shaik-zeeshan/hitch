@@ -1817,7 +1817,6 @@ fn path_os(path: impl AsRef<Path>) -> OsString {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use tempfile::TempDir;
@@ -1837,6 +1836,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn pr_list_for_branches_queries_ored_heads_without_author_filter() {
         let fixture = RepoFixture::new();
         let bin = TempDir::new().unwrap();
@@ -1907,6 +1907,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn pr_list_for_branches_drops_fork_prs_sharing_a_local_branch_name() {
         let fixture = RepoFixture::new();
         // Anchor the project on a known owner; a same-named fork PR from another
@@ -2059,7 +2060,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            fs::read_to_string(fixture.path().join("tracked.txt")).unwrap(),
+            fs::read_to_string(fixture.path().join("tracked.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
             "initial\n"
         );
         assert!(!fixture.path().join("staged.txt").exists());
@@ -2166,6 +2169,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn commit_uses_system_git_and_fires_repo_hooks() {
         let fixture = RepoFixture::new();
         let marker = fixture.path().join("hook-ran");
@@ -2175,9 +2179,7 @@ mod tests {
             format!("#!/bin/sh\necho hook > {}\n", marker.display()),
         )
         .unwrap();
-        let mut permissions = fs::metadata(&hook).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&hook, permissions).unwrap();
+        make_executable(&hook);
 
         fixture.write("tracked.txt", "hooked\n");
         let client = GitClient::default();
@@ -2521,6 +2523,7 @@ mod tests {
         assert!(worktree_path.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn create_pr_pushes_first_when_needed_and_invokes_gh_with_default_base() {
         let fixture = RepoFixture::new();
@@ -2610,6 +2613,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn fake_program(path: PathBuf, log: &Path, stdout: &str) -> PathBuf {
         let script = format!(
             "#!/bin/sh\nprintf '%s ' \"$(basename $0)\" >> {log}\nfor arg in \"$@\"; do printf '%s ' \"$arg\" >> {log}; done\nprintf '\\n' >> {log}\nprintf '{stdout}'\n",
@@ -2617,26 +2621,39 @@ mod tests {
             stdout = stdout.replace('\\', "\\\\").replace('\'', "'\\''")
         );
         fs::write(&path, script).unwrap();
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).unwrap();
+        make_executable(&path);
         path
     }
 
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
     }
+    #[cfg(unix)]
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Mutex,
     };
 
+    #[cfg(unix)]
     struct TestControl {
         cancelled: AtomicBool,
         pgids: Mutex<Vec<Option<i32>>>,
         cancel_on_clear: bool,
     }
 
+    #[cfg(unix)]
     impl TestControl {
         fn new(cancel_on_clear: bool) -> Self {
             Self {
@@ -2651,6 +2668,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl CommandControl for TestControl {
         fn is_cancelled(&self) -> bool {
             self.cancelled.load(Ordering::SeqCst)
@@ -2664,14 +2682,13 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_command_keeps_success_when_cancellation_arrives_after_exit() {
         let temp = TempDir::new().unwrap();
         let script = temp.path().join("git-success");
         fs::write(&script, "#!/bin/sh\nprintf 'done'\n").unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
+        make_executable(&script);
 
         let control = TestControl::new(true);
         let output = run_command(&script, temp.path(), Vec::new(), Some(&control)).unwrap();
@@ -2695,9 +2712,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let script = temp.path().join("git-sleep");
         fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
+        make_executable(&script);
 
         let control = std::sync::Arc::new(TestControl::new(false));
         let cancel = std::sync::Arc::clone(&control);
@@ -2727,9 +2742,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let script = temp.path().join("git-sleep");
         fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
+        make_executable(&script);
 
         let client = GitClient::with_programs(&script, &script);
         let control = Arc::new(TestControl::new(false));

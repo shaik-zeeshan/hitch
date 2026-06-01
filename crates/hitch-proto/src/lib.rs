@@ -27,7 +27,6 @@
 
 pub mod framing;
 pub mod message;
-#[cfg(unix)]
 pub mod transport;
 
 pub use framing::{

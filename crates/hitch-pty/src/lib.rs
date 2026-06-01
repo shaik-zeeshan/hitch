@@ -65,7 +65,7 @@ impl From<TerminalSize> for PtySize {
 pub struct PtySpawnConfig {
     pub session_id: SessionId,
     pub cwd: PathBuf,
-    /// Program + args. `None` means `$SHELL -l` or `/bin/sh -l`.
+    /// Program + args. `None` means `$SHELL -l`/`/bin/sh -l` on Unix or `cmd.exe` on Windows.
     pub command: Option<Vec<String>>,
     pub size: TerminalSize,
     pub scrollback_capacity: usize,
@@ -201,14 +201,16 @@ impl ManagedPty {
         if let Ok(size) = master.get_size() {
             let _ = master.resize(size);
         }
-        let _leader = master.process_group_leader();
         #[cfg(unix)]
-        if let Some(pgid) = _leader {
-            // SAFETY: `kill(2)` with a negative pid signals the process group;
-            // it has no memory-safety preconditions and an already-gone group
-            // returns ESRCH, which we ignore. SIGWINCH is harmless to a shell.
-            unsafe {
-                libc::kill(-pgid, libc::SIGWINCH);
+        {
+            let leader = master.process_group_leader();
+            if let Some(pgid) = leader {
+                // SAFETY: `kill(2)` with a negative pid signals the process group;
+                // it has no memory-safety preconditions and an already-gone group
+                // returns ESRCH, which we ignore. SIGWINCH is harmless to a shell.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGWINCH);
+                }
             }
         }
         Ok(())
@@ -224,12 +226,19 @@ impl ManagedPty {
     /// Best-effort name of the PTY's foreground process group leader — the
     /// command the user is currently interacting with (a tool launched inside
     /// the shell, or the shell itself). `None` when it can't be resolved.
+    #[cfg(unix)]
     pub fn foreground_command(&self) -> Option<String> {
         let pid = {
             let master = self.master.lock().ok()?;
             master.process_group_leader()?
         };
         command_name_for_pid(pid)
+    }
+
+    /// Return a best-effort foreground command when the PTY backend exposes one.
+    #[cfg(not(unix))]
+    pub fn foreground_command(&self) -> Option<String> {
+        None
     }
 
     /// Return a point-in-time copy of buffered scrollback bytes.
@@ -301,15 +310,30 @@ fn build_command(
         }
         builder
     } else {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut builder = CommandBuilder::new(shell);
-        builder.arg("-l");
-        builder
+        default_command()
     };
     builder.env("TERM", "xterm-256color");
     builder.env(SESSION_ID_ENV, session_id.to_string());
     builder.cwd(cwd);
     builder
+}
+
+#[cfg(windows)]
+fn default_command() -> CommandBuilder {
+    CommandBuilder::new(std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()))
+}
+
+#[cfg(unix)]
+fn default_command() -> CommandBuilder {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let mut builder = CommandBuilder::new(shell);
+    builder.arg("-l");
+    builder
+}
+
+#[cfg(not(any(unix, windows)))]
+fn default_command() -> CommandBuilder {
+    CommandBuilder::new("sh")
 }
 
 #[cfg(target_os = "macos")]
@@ -336,12 +360,14 @@ fn command_name_for_pid(pid: libc::pid_t) -> Option<String> {
     normalize_command_name(name, args.as_deref())
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn normalize_command_name(executable: &str, args: Option<&[String]>) -> Option<String> {
     runtime_agent_command(executable, args)
         .map(str::to_string)
         .or_else(|| Some(executable.to_string()))
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn runtime_agent_command(executable: &str, args: Option<&[String]>) -> Option<&'static str> {
     if !executable.eq_ignore_ascii_case("node") {
         return None;
@@ -359,6 +385,7 @@ fn runtime_agent_command(executable: &str, args: Option<&[String]>) -> Option<&'
     None
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn path_basename_or_stem_eq(path: &str, expected: &str) -> bool {
     let Some(name) = std::path::Path::new(path)
         .file_name()
@@ -377,6 +404,7 @@ fn path_basename_or_stem_eq(path: &str, expected: &str) -> bool {
 /// Recognizes an agent CLI by its package/bin directory (e.g.
 /// `.../@anthropic-ai/claude-code/cli.js`) without matching unrelated scripts
 /// that merely embed the name as a substring (e.g. `./scripts/claude-codegen.js`).
+#[cfg_attr(not(unix), allow(dead_code))]
 fn path_has_component(arg: &str, expected: &str) -> bool {
     std::path::Path::new(arg).components().any(|component| {
         component
@@ -459,7 +487,8 @@ fn parse_nul_args(buf: &[u8], limit: usize) -> Option<Vec<String>> {
     (!args.is_empty()).then_some(args)
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn command_name_for_pid(_pid: libc::pid_t) -> Option<String> {
+#[allow(dead_code)]
+fn command_name_for_pid<P>(_pid: P) -> Option<String> {
     None
 }
 
@@ -556,6 +585,7 @@ impl ScrollbackBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     #[test]
@@ -611,6 +641,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn spawned_pty_streams_output_into_scrollback() {
         let (tx, rx) = mpsc::channel();
@@ -632,6 +663,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&pty.scrollback()).contains("hitch-pty-test"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn spawned_pty_exports_hitch_session_id() {
         let (tx, rx) = mpsc::channel();
@@ -653,6 +685,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&pty.scrollback()).contains(&session_id.to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn repaint_resolves_leader_and_is_idempotent() {
         // Spawn a long-lived shell so the PTY has a live process group leader,
@@ -676,6 +709,7 @@ mod tests {
         let _ = pty.kill();
     }
 
+    #[cfg(unix)]
     fn collect_output(rx: &mpsc::Receiver<PtyEvent>, timeout: Duration) -> Vec<u8> {
         let deadline = Instant::now() + timeout;
         let mut output = Vec::new();

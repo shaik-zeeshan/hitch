@@ -4,9 +4,11 @@
 //! socket connection, starts the daemon when needed, and relays `hitch-proto`
 //! requests/responses/events to Tauri IPC.
 
+use hitch_proto::transport::{
+    connect_daemon as connect_transport, endpoint_accepts_connections, DaemonStream,
+};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -183,6 +185,7 @@ fn describe_handshake_failure(outcome: &Result<Response, String>) -> String {
 /// its whole lifetime (see `write_pidfile`), so a *free* lock means the writer is
 /// gone and the pid is unsafe to target. Returns `None` if the file is absent,
 /// unparsable, or stale (lock free).
+#[cfg(unix)]
 fn read_daemon_pidfile(socket_path: &Path) -> Option<u32> {
     let path = hitch_proto::transport::pidfile_path(socket_path);
     let pid: u32 = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
@@ -192,6 +195,7 @@ fn read_daemon_pidfile(socket_path: &Path) -> Option<u32> {
     Some(pid)
 }
 
+#[cfg(unix)]
 fn daemon_pid_for_force_kill(socket_path: &Path, cached_pid: Option<u32>) -> Option<u32> {
     cached_pid.or_else(|| read_daemon_pidfile(socket_path))
 }
@@ -219,15 +223,10 @@ fn pidfile_is_stale(path: &Path) -> bool {
     acquired
 }
 
-#[cfg(not(unix))]
-fn pidfile_is_stale(_path: &Path) -> bool {
-    false
-}
-
 fn wait_for_socket_release(path: &Path, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if UnixStream::connect(path).is_err() {
+        if !endpoint_accepts_connections(path) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -354,7 +353,7 @@ struct HitchClientInner {
     /// clobber a newer one (e.g. after a protocol-mismatch daemon restart).
     connection_generation: AtomicU64,
     connect_lock: Mutex<()>,
-    writer: Mutex<Option<UnixStream>>,
+    writer: Mutex<Option<DaemonStream>>,
     pending: Mutex<HashMap<RequestId, mpsc::Sender<Response>>>,
     /// Live sessions, mirrored from daemon session-opened/closed events so the
     /// menu-bar tray can show how many sessions are still running.
@@ -546,6 +545,7 @@ impl HitchClient {
         self.0.daemon_pid.lock().ok().and_then(|slot| *slot)
     }
 
+    #[cfg(unix)]
     fn force_kill_daemon(&self, preferred_pid: Option<u32>) -> Result<(), String> {
         // Heartbeat recovery has a trustworthy pid from the last successful Hello,
         // but `restart_daemon` must disconnect before it can respawn; pass that pid
@@ -554,7 +554,6 @@ impl HitchClient {
         // daemon could be stale while an upgraded daemon owns the socket.
         let daemon_pid = daemon_pid_for_force_kill(&self.0.socket_path, preferred_pid)
             .ok_or_else(|| "cannot force-restart daemon: daemon pid is unknown".to_string())?;
-        #[cfg(unix)]
         unsafe {
             if libc::kill(daemon_pid as i32, libc::SIGKILL) != 0 {
                 let err = io::Error::last_os_error();
@@ -563,11 +562,12 @@ impl HitchClient {
                 }
             }
         }
-        #[cfg(not(unix))]
-        {
-            return Err("force-restarting the daemon is unsupported on this platform".into());
-        }
         wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)
+    }
+
+    #[cfg(not(unix))]
+    fn force_kill_daemon(&self, _preferred_pid: Option<u32>) -> Result<(), String> {
+        Err("force-restarting the daemon is not implemented on this platform".into())
     }
 
     fn record_startup_failure(&self, app: &AppHandle, err: String) -> String {
@@ -618,7 +618,7 @@ impl HitchClient {
             return Ok(());
         }
 
-        let stream = match UnixStream::connect(&self.0.socket_path) {
+        let stream = match connect_transport(&self.0.socket_path) {
             Ok(stream) => stream,
             Err(_) => {
                 // Socket absent: we must (re)spawn. Guard against a crash loop —
@@ -718,7 +718,7 @@ impl HitchClient {
         self.handshake_after_restart(app)
     }
 
-    fn attach_stream(&self, app: &AppHandle, stream: UnixStream) -> Result<(), String> {
+    fn attach_stream(&self, app: &AppHandle, stream: DaemonStream) -> Result<(), String> {
         stream
             .set_nonblocking(false)
             .map_err(|err| format!("failed to configure daemon socket: {err}"))?;
@@ -787,13 +787,22 @@ impl HitchClient {
             self.record_spawn_attempt(app)?;
             self.set_status(app, DaemonStatus::Starting, None);
 
-            // For a wedged or incompatible daemon, SIGKILL by pid is the fast path
-            // — but it's best-effort: a daemon predating the pidfile (the very
-            // stale-daemon-across-an-upgrade case) reports no pid, so we must not
-            // hard-fail on it. In every case we then wait for the socket to be
-            // released so we never spawn a second daemon over a live one.
+            // For a wedged or incompatible daemon, Unix SIGKILL by pid is the fast
+            // path. Platforms without a safe force-kill implementation fail here
+            // with an explicit status reason instead of applying Unix pidfile
+            // assumptions. In every successful case we then wait for the endpoint
+            // to stop accepting connections so we never spawn over a live daemon.
             if force_kill {
-                let _ = self.force_kill_daemon(force_kill_pid);
+                let kill_result = self.force_kill_daemon(force_kill_pid);
+                #[cfg(unix)]
+                {
+                    let _ = kill_result;
+                }
+                #[cfg(not(unix))]
+                if let Err(err) = kill_result {
+                    self.set_status(app, DaemonStatus::Failed, Some(err.clone()));
+                    return Err(err);
+                }
             }
             wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)?;
 
@@ -902,7 +911,7 @@ impl HitchClient {
         }
     }
 
-    fn start_reader(&self, app: AppHandle, stream: UnixStream, generation: u64) {
+    fn start_reader(&self, app: AppHandle, stream: DaemonStream, generation: u64) {
         let client = self.clone();
         thread::Builder::new()
             .name("hitch-daemon-reader".into())
@@ -1183,11 +1192,11 @@ impl HitchClient {
         Err("hitch-daemon binary was not found next to the app; set HITCH_DAEMON_PATH".into())
     }
 
-    fn wait_for_daemon(&self) -> Result<UnixStream, String> {
+    fn wait_for_daemon(&self) -> Result<DaemonStream, String> {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut last_error = None;
         while Instant::now() < deadline {
-            match UnixStream::connect(&self.0.socket_path) {
+            match connect_transport(&self.0.socket_path) {
                 Ok(stream) => return Ok(stream),
                 Err(err) => {
                     last_error = Some(err);
@@ -1214,7 +1223,7 @@ impl HitchClient {
     }
 }
 
-fn reader_loop(app: &AppHandle, client: &HitchClient, stream: UnixStream) -> io::Result<()> {
+fn reader_loop(app: &AppHandle, client: &HitchClient, stream: DaemonStream) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
     loop {
         let Some(message) = read_control_message(&mut reader)? else {
@@ -1318,18 +1327,48 @@ fn daemon_binary_path() -> Option<PathBuf> {
 
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let sibling = dir.join("hitch-daemon");
-    if sibling.is_file() {
-        return Some(sibling);
+    let plain = dir.join(daemon_plain_name());
+    if plain.is_file() {
+        return Some(plain);
+    }
+    if let Some(name) = sidecar_daemon_name() {
+        let sidecar = dir.join(name);
+        if sidecar.is_file() {
+            return Some(sidecar);
+        }
     }
 
     None
 }
 
+#[cfg(not(debug_assertions))]
+fn daemon_plain_name() -> &'static str {
+    if cfg!(windows) {
+        "hitch-daemon.exe"
+    } else {
+        "hitch-daemon"
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn sidecar_daemon_name() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => Some("hitch-daemon-x86_64-pc-windows-msvc.exe"),
+        ("windows", "aarch64") => Some("hitch-daemon-aarch64-pc-windows-msvc.exe"),
+        ("macos", "x86_64") => Some("hitch-daemon-x86_64-apple-darwin"),
+        ("macos", "aarch64") => Some("hitch-daemon-aarch64-apple-darwin"),
+        ("linux", "x86_64") => Some("hitch-daemon-x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64") => Some("hitch-daemon-aarch64-unknown-linux-gnu"),
+        _ => None,
+    }
+}
+
 #[cfg(any(not(debug_assertions), test))]
 fn hook_binary_path_for_daemon(daemon: &Path) -> Option<PathBuf> {
     let dir = daemon.parent()?;
-    let hook = dir.join("hitch-hook");
+    let file_name = daemon.file_name()?.to_str()?;
+    let suffix = file_name.strip_prefix("hitch-daemon").unwrap_or_default();
+    let hook = dir.join(format!("hitch-hook{suffix}"));
     hook.is_file().then_some(hook)
 }
 
@@ -1338,22 +1377,22 @@ struct DisconnectedPayload {
     reason: String,
 }
 
-/// Path to the daemon's log. MUST match the daemon's own `daemon_log_path`
-/// (same `$HOME`-based per-instance dir, `.hitch/daemon.log` for release and
-/// `.hitch-dev/daemon.log` for debug) so the tail the GUI reads is the file the
-/// daemon writes — never derived from the socket parent, to avoid drift. The
-/// GUI and the daemon agree on the namespace because both honour their own
-/// build profile (ADR 0009).
+/// Path to the daemon's log. MUST match the daemon's own `daemon_log_path` so
+/// the GUI tails the file the daemon writes — never derived from the endpoint
+/// parent, to avoid drift. Unix keeps the existing `$HOME/.hitch*` layout;
+/// Windows uses the transport-owned `%LOCALAPPDATA%\Hitch\<namespace>` layout.
+#[cfg(windows)]
 fn daemon_log_path() -> PathBuf {
-    home_dir()
-        .join(hitch_proto::transport::instance_dir_name())
-        .join("daemon.log")
+    hitch_proto::transport::default_data_dir().join("daemon.log")
 }
 
-fn home_dir() -> PathBuf {
+#[cfg(not(windows))]
+fn daemon_log_path() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
+        .join(hitch_proto::transport::instance_dir_name())
+        .join("daemon.log")
 }
 
 #[tauri::command]
@@ -1788,6 +1827,22 @@ mod tests {
 
         std::fs::write(&hook, "").unwrap();
         assert_eq!(super::hook_binary_path_for_daemon(&daemon), Some(hook));
+
+        let suffixed_daemon = dir.join(format!(
+            "hitch-daemon-x86_64-pc-windows-msvc{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let suffixed_hook = dir.join(format!(
+            "hitch-hook-x86_64-pc-windows-msvc{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        std::fs::write(&suffixed_daemon, "").unwrap();
+        assert_eq!(super::hook_binary_path_for_daemon(&suffixed_daemon), None);
+        std::fs::write(&suffixed_hook, "").unwrap();
+        assert_eq!(
+            super::hook_binary_path_for_daemon(&suffixed_daemon),
+            Some(suffixed_hook)
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

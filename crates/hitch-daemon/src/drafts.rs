@@ -801,7 +801,9 @@ fn nonzero_provider_error(label: &str, status: ExitStatus, stderr: &str) -> Prot
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -856,6 +858,7 @@ mod tests {
         assert_eq!(draft.subject, "chore: braces { } in text");
     }
 
+    #[cfg(unix)]
     #[test]
     fn provider_commit_draft_falls_back_to_context_body_when_body_is_empty() {
         let script = temp_file("empty-commit-body-provider", "sh");
@@ -973,6 +976,7 @@ mod tests {
         assert_eq!(models, vec!["gpt-5-codex", "gpt-5.5"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn claude_provider_runs_headless_print_mode() {
         let script = temp_file("claude-provider", "sh");
@@ -1007,6 +1011,7 @@ mod tests {
         let _ = fs::remove_dir_all(cwd);
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_provider_runs_exec_mode() {
         let script = temp_file("codex-provider", "sh");
@@ -1081,6 +1086,7 @@ mod tests {
         let _ = fs::remove_dir_all(cwd);
     }
 
+    #[cfg(unix)]
     fn temp_file(name: &str, extension: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1089,6 +1095,7 @@ mod tests {
         std::env::temp_dir().join(format!("hitch-{name}-{nonce}.{extension}"))
     }
 
+    #[cfg(unix)]
     fn temp_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1097,6 +1104,7 @@ mod tests {
         std::env::temp_dir().join(format!("hitch-{name}-{nonce}"))
     }
 
+    #[cfg(unix)]
     fn make_executable(path: &Path) {
         #[cfg(unix)]
         {

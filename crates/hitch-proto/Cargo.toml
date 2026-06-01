@@ -10,3 +10,6 @@ description = "Hitch IPC wire contract: message enum, PTY framing, and socket tr
 hitch-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+interprocess = "2.4.2"
