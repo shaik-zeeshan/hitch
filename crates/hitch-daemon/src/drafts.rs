@@ -4,6 +4,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hitch_core::ProcessTree;
 use hitch_proto::{
     CommitDraft, DraftGenerationSettings, DraftProvider, ErrorCode, ProtocolError, PullRequestDraft,
 };
@@ -388,18 +389,12 @@ fn run_provider_command(
         // for this process tree, so commit/PR drafts never disturb sessions.
         .env(hitch_proto::SUPPRESS_AGENT_HOOKS_ENV, "1");
 
-    // Run the provider as its own process-group leader so a timeout can signal
-    // the whole tree. Otherwise killing only the direct child leaves any
-    // grandchild it spawned (a wrapper shell, an MCP/helper subprocess) alive
-    // holding the inherited stdout/stderr pipes, and the reader-thread joins
-    // below would block long past the configured timeout.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-
-    let mut child = command.spawn().map_err(|err| {
+    // Run the provider in a `ProcessTree` so a timeout or `CancelJob` can
+    // terminate the whole tree. On Windows this is a Job Object; on Unix it is
+    // a process group. Killing only the direct child can leave wrapper shells,
+    // MCP/helper subprocesses, or inherited pipe holders alive, making the
+    // reader-thread joins below block past the configured timeout.
+    let (mut child, process_tree) = ProcessTree::spawn(command).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             let bin = match config.kind {
                 DraftProviderKind::Claude => config.claude.display().to_string(),
@@ -437,10 +432,10 @@ fn run_provider_command(
     let stdout_reader = read_pipe(stdout);
     let stderr_reader = read_pipe(stderr);
 
-    // Register this child's process group so a `CancelJob` can SIGKILL the whole
-    // tree (the child is its own group leader, see `process_group(0)` above).
+    // Register this child's process tree so a `CancelJob` can terminate the
+    // provider and any grandchildren it spawned.
     if let Some(control) = cancel {
-        control.set_child_pgid(Some(child.id() as i32));
+        control.set_process_tree(Some(process_tree.clone()));
     }
 
     let deadline = Instant::now() + config.timeout;
@@ -451,12 +446,12 @@ fn run_provider_command(
             // mirroring the timeout path. The `start_job` runner reports the Job
             // as cancelled regardless of this error.
             Ok(None) if cancel.is_some_and(|control| control.is_cancelled()) => {
-                kill_process_tree(&mut child);
+                terminate_process_tree(&process_tree, &mut child);
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 if let Some(control) = cancel {
-                    control.set_child_pgid(None);
+                    control.set_process_tree(None);
                 }
                 return Err(provider_error(format!(
                     "{} draft provider cancelled",
@@ -465,12 +460,12 @@ fn run_provider_command(
                 .retryable(true));
             }
             Ok(None) if Instant::now() >= deadline => {
-                kill_process_tree(&mut child);
+                terminate_process_tree(&process_tree, &mut child);
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 if let Some(control) = cancel {
-                    control.set_child_pgid(None);
+                    control.set_process_tree(None);
                 }
                 return Err(provider_error(format!(
                     "{} draft provider timed out after {}s",
@@ -486,7 +481,7 @@ fn run_provider_command(
 
     // Child exited on its own; it can no longer be the cancel target.
     if let Some(control) = cancel {
-        control.set_child_pgid(None);
+        control.set_process_tree(None);
     }
 
     let stdout = join_reader(stdout_reader)?;
@@ -497,27 +492,12 @@ fn run_provider_command(
     Ok(stdout)
 }
 
-/// Kill the provider and every descendant it spawned. On Unix the provider is
-/// its own process-group leader (see `process_group(0)` at spawn), so signalling
-/// the negated pid reaches grandchildren that inherited the stdout/stderr
-/// pipes; without that, the reader-thread joins would block until those
-/// grandchildren exit, defeating the timeout for wrapper-script providers.
-#[cfg(unix)]
-fn kill_process_tree(child: &mut std::process::Child) {
-    let pid = child.id() as libc::pid_t;
-    // SAFETY: `kill(2)` with a negative pid signals the process group whose id
-    // is `pid`. It has no memory-safety preconditions; an already-gone group
-    // simply returns ESRCH, which we ignore.
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
-    // Belt-and-braces: also signal the leader directly in case the group send
-    // missed it (e.g. the child re-set its own process group).
-    let _ = child.kill();
-}
-
-#[cfg(not(unix))]
-fn kill_process_tree(child: &mut std::process::Child) {
+/// Terminate the provider process tree and then directly kill the child as a
+/// fallback. `ProcessTree` reaches descendants via a Windows Job Object or Unix
+/// process group; the direct-child kill covers already-detached or reparented
+/// providers without changing cancellation into a hard failure path.
+fn terminate_process_tree(process_tree: &ProcessTree, child: &mut std::process::Child) {
+    let _ = process_tree.terminate();
     let _ = child.kill();
 }
 
@@ -801,9 +781,9 @@ fn nonzero_provider_error(label: &str, status: ExitStatus, stderr: &str) -> Prot
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::fs;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1053,10 +1033,10 @@ mod tests {
     #[test]
     fn provider_timeout_does_not_block_on_grandchild_holding_the_pipe() {
         // Regression: a provider that backgrounds a child inheriting stdout must
-        // not keep the daemon blocked past the timeout. Before the
-        // process-group kill, signalling only the direct child left the
-        // grandchild holding the stdout pipe, so the reader-thread join blocked
-        // until that grandchild exited (~30s here) instead of ~1s.
+        // not keep the daemon blocked past the timeout. Before the `ProcessTree`
+        // termination path, signalling only the direct child left the grandchild
+        // holding the stdout pipe, so the reader-thread join blocked until that
+        // grandchild exited (~30s here) instead of ~1s.
         let script = temp_file("blocking-grandchild-provider", "sh");
         fs::write(
             &script,
@@ -1080,13 +1060,68 @@ mod tests {
         assert!(result.is_err(), "expected a timeout error");
         assert!(
             elapsed < Duration::from_secs(10),
-            "timeout path blocked for {elapsed:?}; the process-group kill should free the inherited pipe promptly"
+            "timeout path blocked for {elapsed:?}; process-tree termination should free the inherited pipe promptly"
         );
         let _ = fs::remove_file(script);
         let _ = fs::remove_dir_all(cwd);
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    #[test]
+    fn provider_cancellation_stops_windows_grandchild_heartbeat() {
+        let started_marker = temp_file("windows-provider-started", "txt");
+        let heartbeat = temp_file("windows-provider-heartbeat", "txt");
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'\r\n\
+             Set-Content -LiteralPath {started} -Value 'started'\r\n\
+             $childScript = \"while (`$true) {{ Add-Content -LiteralPath {heartbeat} -Value ([DateTime]::UtcNow.Ticks); Start-Sleep -Milliseconds 100 }}\"\r\n\
+             Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-Command',$childScript) | Out-Null\r\n\
+             while ($true) {{ Start-Sleep -Milliseconds 100 }}\r\n",
+            started = powershell_literal(&started_marker),
+            heartbeat = powershell_literal(&heartbeat),
+        );
+        let cwd = temp_dir("windows-provider-cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Codex,
+            claude: PathBuf::from("claude"),
+            codex: PathBuf::from("powershell.exe"),
+            timeout: Duration::from_secs(10),
+            model: None,
+        };
+        let mut command = Command::new("powershell.exe");
+        command
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(script);
+
+        let control = std::sync::Arc::new(crate::JobControl::default());
+        let cancel = std::sync::Arc::clone(&control);
+        let heartbeat_for_thread = heartbeat.clone();
+        let trigger = thread::spawn(move || {
+            wait_for_path(&heartbeat_for_thread, Duration::from_secs(5));
+            cancel.cancel();
+        });
+
+        let started = Instant::now();
+        let result = run_provider_command(&mut command, &cwd, &config, Some(control.as_ref()));
+        trigger.join().unwrap();
+        assert!(result.is_err(), "expected cancellation error");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "provider cancellation did not terminate the process tree promptly"
+        );
+        assert_heartbeat_stopped(&heartbeat);
+
+        let _ = fs::remove_file(started_marker);
+        let _ = fs::remove_file(heartbeat);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[cfg(any(unix, windows))]
     fn temp_file(name: &str, extension: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1095,7 +1130,7 @@ mod tests {
         std::env::temp_dir().join(format!("hitch-{name}-{nonce}.{extension}"))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn temp_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1104,6 +1139,43 @@ mod tests {
         std::env::temp_dir().join(format!("hitch-{name}-{nonce}"))
     }
 
+    #[cfg(windows)]
+    fn powershell_literal(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "''"))
+    }
+
+    #[cfg(windows)]
+    fn wait_for_path(path: &Path, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if path.exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("timed out waiting for {}", path.display());
+    }
+
+    #[cfg(windows)]
+    fn assert_heartbeat_stopped(path: &Path) {
+        thread::sleep(Duration::from_millis(250));
+        let first = heartbeat_count(path);
+        thread::sleep(Duration::from_millis(600));
+        let second = heartbeat_count(path);
+        assert_eq!(
+            first,
+            second,
+            "cancelled provider left a descendant writing {}",
+            path.display()
+        );
+    }
+
+    #[cfg(windows)]
+    fn heartbeat_count(path: &Path) -> usize {
+        fs::read_to_string(path)
+            .map(|contents| contents.lines().count())
+            .unwrap_or(0)
+    }
     #[cfg(unix)]
     fn make_executable(path: &Path) {
         #[cfg(unix)]

@@ -24,8 +24,8 @@ mod drafts;
 use drafts::{CommitDraftInput, DraftProviderConfig, PullRequestDraftInput};
 use hitch_agent::HookInstallOptions;
 use hitch_core::{
-    AgentState, JobId, Project, ProjectId, ProjectKind, Session, SessionId, SessionParent,
-    Worktree, WorktreeId,
+    AgentState, JobId, ProcessTree, Project, ProjectId, ProjectKind, Session, SessionId,
+    SessionParent, Worktree, WorktreeId,
 };
 use hitch_git::{
     staged_diff, CommandControl, CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState,
@@ -528,16 +528,15 @@ struct ActiveJob {
 
 /// Shared control handle for one running **Job** (ADR 0008). The Job registry on
 /// `DaemonState` and the Job worker thread both hold an `Arc<JobControl>`:
-/// `CancelJob` flips `cancelled` and kills any registered child process group;
-/// the worker checks `is_cancelled()` and registers the pid of a cancellable
-/// child (the Draft Generator's provider tree) so the kill reaches grandchildren.
+/// `CancelJob` flips `cancelled` and terminates any registered process tree;
+/// the worker checks `is_cancelled()` and registers the cancellable child tree
+/// (the Draft Generator's provider tree, or git/gh commands) so cancellation
+/// reaches grandchildren. On Windows the tree is a Job Object; on Unix it is a
+/// process group.
 #[derive(Default)]
 struct JobControl {
     cancelled: AtomicBool,
-    /// Process-group leader pid of the Job's currently-running child, if any.
-    /// Drafts spawn their provider as its own group leader (see `drafts.rs`), so
-    /// signalling the negated pid reaches the whole tree.
-    child_pgid: Mutex<Option<i32>>,
+    process_tree: Mutex<Option<ProcessTree>>,
 }
 
 impl JobControl {
@@ -545,42 +544,38 @@ impl JobControl {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    /// Register (or clear) the pid of the child process group the Job is running,
-    /// so a concurrent cancel can kill it. The worker sets it just after spawn and
-    /// clears it on exit.
-    fn set_child_pgid(&self, pgid: Option<i32>) {
-        if let Ok(mut guard) = self.child_pgid.lock() {
-            *guard = pgid;
+    /// Register (or clear) the process tree the Job is running, so a concurrent
+    /// cancel can terminate it. The worker sets it just after spawn and clears it
+    /// on exit.
+    fn set_process_tree(&self, process_tree: Option<ProcessTree>) {
+        if let Ok(mut guard) = self.process_tree.lock() {
+            *guard = process_tree;
         }
     }
 
-    /// Signal cancellation and, if a child process group is registered, SIGKILL it
-    /// (process-group kill, mirroring `drafts::kill_process_tree`). Jobs that run
-    /// a subprocess-backed `git`/`gh` command register that group too, so daemon
-    /// shutdown can cancel them before exit rather than orphaning background work.
+    /// Signal cancellation and, if a child process tree is registered, terminate
+    /// it. Jobs that run a subprocess-backed `git`/`gh` command register that
+    /// tree too, so daemon shutdown can cancel them before exit rather than
+    /// orphaning background work.
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
-        #[cfg(unix)]
-        if let Ok(guard) = self.child_pgid.lock() {
-            if let Some(pgid) = *guard {
-                // SAFETY: `kill(2)` with a negative pid signals the process group;
-                // it has no memory-safety preconditions and an already-gone group
-                // returns ESRCH, which we ignore.
-                unsafe {
-                    libc::kill(-pgid, libc::SIGKILL);
-                }
-            }
+        let process_tree = self
+            .process_tree
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(process_tree) = process_tree {
+            let _ = process_tree.terminate();
         }
     }
 }
-
 impl CommandControl for JobControl {
     fn is_cancelled(&self) -> bool {
         JobControl::is_cancelled(self)
     }
 
-    fn set_child_pgid(&self, pgid: Option<i32>) {
-        JobControl::set_child_pgid(self, pgid);
+    fn set_process_tree(&self, process_tree: Option<ProcessTree>) {
+        JobControl::set_process_tree(self, process_tree);
     }
 }
 
@@ -4529,25 +4524,24 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn job_control_cancel_kills_registered_child_process_group() {
-        use std::os::unix::process::CommandExt;
+        use hitch_core::ProcessTree;
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
 
-        // A long-lived child in its own process group, exactly as the Draft
-        // Generator spawns its provider. `CancelJob` must reach it via the
-        // process-group SIGKILL path so it dies promptly rather than running its
+        // A long-lived child in a registered process tree, exactly as the Draft
+        // Generator spawns its provider. On Unix the tree is a process group;
+        // `CancelJob` must reach it so it dies promptly rather than running its
         // full sleep.
         let control = super::JobControl::default();
-        let mut child = {
+        let (mut child, process_tree) = {
             let mut cmd = Command::new("sleep");
             cmd.arg("30")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            cmd.process_group(0);
-            cmd.spawn().expect("spawn sleep")
+            ProcessTree::spawn(&mut cmd).expect("spawn sleep")
         };
-        control.set_child_pgid(Some(child.id() as i32));
+        control.set_process_tree(Some(process_tree));
 
         control.cancel();
         assert!(control.is_cancelled());
@@ -4559,6 +4553,51 @@ mod tests {
                 None if started.elapsed() > Duration::from_secs(5) => {
                     let _ = child.kill();
                     panic!("cancel did not kill the registered child process group");
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn job_control_cancel_kills_registered_windows_process_tree() {
+        use hitch_core::ProcessTree;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        // A PowerShell provider that starts a long-lived child and then stays
+        // alive itself. On Windows the registered `ProcessTree` is a Job Object;
+        // `CancelJob` must terminate it promptly instead of waiting for either
+        // sleep to finish.
+        let control = super::JobControl::default();
+        let (mut child, process_tree) = {
+            let mut cmd = Command::new("powershell.exe");
+            cmd.arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-Command")
+                .arg(
+                    "$child = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -PassThru; Start-Sleep -Seconds 30",
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            ProcessTree::spawn(&mut cmd).expect("spawn powershell")
+        };
+        control.set_process_tree(Some(process_tree));
+
+        control.cancel();
+        assert!(control.is_cancelled());
+
+        let started = Instant::now();
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(_) => break,
+                None if started.elapsed() > Duration::from_secs(5) => {
+                    let _ = child.kill();
+                    panic!("cancel did not kill the registered Windows process tree");
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),
             }

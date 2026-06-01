@@ -10,14 +10,12 @@
 //! crate.
 
 use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
-use hitch_core::{ProjectId, Worktree};
+use hitch_core::{ProcessTree, ProjectId, Worktree};
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -141,12 +139,11 @@ pub struct GitClient {
     gh: PathBuf,
 }
 /// Hooks a long-running `git`/`gh` child into a higher-level cancellation path.
-///
 /// The daemon's Job registry implements this so `ShutdownDaemon`/`CancelJob`
-/// can kill the subprocess group and wait for the worker to drain before exit.
+/// can kill the subprocess tree and wait for the worker to drain before exit.
 pub trait CommandControl {
     fn is_cancelled(&self) -> bool;
-    fn set_child_pgid(&self, pgid: Option<i32>);
+    fn set_process_tree(&self, tree: Option<ProcessTree>);
 }
 
 impl Default for GitClient {
@@ -1650,11 +1647,8 @@ fn run_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let mut child = command.spawn()?;
-    control.set_child_pgid(Some(child.id() as i32));
+    let (mut child, tree) = ProcessTree::spawn(&mut command)?;
+    control.set_process_tree(Some(tree.clone()));
     let stdout_reader = spawn_pipe_reader(
         child
             .stdout
@@ -1674,20 +1668,14 @@ fn run_command(
             Some(status) => break status,
             None if control.is_cancelled() => {
                 cancelled = true;
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(-(child.id() as i32), libc::SIGKILL);
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = child.kill();
-                }
+                let _ = tree.terminate();
+                let _ = child.kill();
                 break child.wait()?;
             }
             None => thread::sleep(Duration::from_millis(25)),
         }
     };
-    control.set_child_pgid(None);
+    control.set_process_tree(None);
 
     let stdout = String::from_utf8(join_pipe_reader(stdout_reader)?)?;
     let stderr = String::from_utf8(join_pipe_reader(stderr_reader)?)?;
@@ -2863,25 +2851,27 @@ mod tests {
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Mutex,
     };
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     struct TestControl {
         cancelled: AtomicBool,
-        pgids: Mutex<Vec<Option<i32>>>,
+        registrations: Mutex<Vec<bool>>,
+        current: Mutex<Option<ProcessTree>>,
         cancel_on_clear: bool,
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl TestControl {
         fn new(cancel_on_clear: bool) -> Self {
             Self {
                 cancelled: AtomicBool::new(false),
-                pgids: Mutex::new(Vec::new()),
+                registrations: Mutex::new(Vec::new()),
+                current: Mutex::new(None),
                 cancel_on_clear,
             }
         }
@@ -2891,15 +2881,17 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl CommandControl for TestControl {
         fn is_cancelled(&self) -> bool {
             self.cancelled.load(Ordering::SeqCst)
         }
 
-        fn set_child_pgid(&self, pgid: Option<i32>) {
-            self.pgids.lock().unwrap().push(pgid);
-            if self.cancel_on_clear && pgid.is_none() {
+        fn set_process_tree(&self, tree: Option<ProcessTree>) {
+            let registered = tree.is_some();
+            *self.current.lock().unwrap() = tree;
+            self.registrations.lock().unwrap().push(registered);
+            if self.cancel_on_clear && !registered {
                 self.cancel();
             }
         }
@@ -2922,9 +2914,9 @@ mod tests {
             control.is_cancelled(),
             "test precondition: cancel should flip after exit"
         );
-        let pgids = control.pgids.lock().unwrap();
-        assert!(pgids.first().is_some_and(|pgid| pgid.is_some()));
-        assert_eq!(pgids.last().copied(), Some(None));
+        let registrations = control.registrations.lock().unwrap();
+        assert_eq!(registrations.first().copied(), Some(true));
+        assert_eq!(registrations.last().copied(), Some(false));
     }
 
     #[cfg(unix)]
@@ -2952,9 +2944,9 @@ mod tests {
             GitError::CommandFailed { stderr, .. } => assert!(stderr.contains("command cancelled")),
             other => panic!("unexpected error: {other:?}"),
         }
-        let pgids = control.pgids.lock().unwrap();
-        assert!(pgids.first().is_some_and(|pgid| pgid.is_some()));
-        assert_eq!(pgids.last().copied(), Some(None));
+        let registrations = control.registrations.lock().unwrap();
+        assert_eq!(registrations.first().copied(), Some(true));
+        assert_eq!(registrations.last().copied(), Some(false));
     }
 
     #[cfg(unix)]
@@ -2995,9 +2987,56 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
 
-        let pgids = control.pgids.lock().unwrap();
-        assert!(pgids.first().is_some_and(|pgid| pgid.is_some()));
-        assert_eq!(pgids.last().copied(), Some(None));
+        let registrations = control.registrations.lock().unwrap();
+        assert_eq!(registrations.first().copied(), Some(true));
+        assert_eq!(registrations.last().copied(), Some(false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn controlled_clone_cancellation_kills_windows_job_tree_with_grandchild() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("git-sleep.cmd");
+        fs::write(
+            &script,
+            "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -Command \"Start-Process powershell -ArgumentList '-NoProfile','-Command','while ($true) { Write-Output grandchild; Write-Error grandchild; Start-Sleep -Seconds 1 }' -NoNewWindow; while ($true) { Start-Sleep -Seconds 1 }\"\r\n",
+        )
+        .unwrap();
+
+        let client = GitClient::with_programs(&script, &script);
+        let control = Arc::new(TestControl::new(false));
+        let cancel = Arc::clone(&control);
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel.cancel();
+        });
+        let started = Instant::now();
+        let err = client
+            .clone_repo_with_control(
+                "https://example.com/repo.git",
+                temp.path().join("target"),
+                control.as_ref(),
+            )
+            .unwrap_err();
+        trigger.join().unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancellation should not wait for a stdout/stderr-inheriting grandchild"
+        );
+        match err {
+            GitError::CommandFailed { stderr, .. } => {
+                assert!(stderr.contains("command cancelled"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let registrations = control.registrations.lock().unwrap();
+        assert_eq!(registrations.first().copied(), Some(true));
+        assert_eq!(registrations.last().copied(), Some(false));
     }
 
     #[allow(dead_code)]

@@ -13,8 +13,8 @@ use hitch_core::{Project, Session, SessionId, SessionParent, Worktree};
 use hitch_proto::transport::{connect_daemon, DaemonStream};
 #[cfg(any(unix, windows))]
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, CommitDraft, Event, FileDiff, GitStatus, JobRequest,
-    PullRequestDraft, WorktreeCreateMode,
+    encode_control_message, encode_pty_frame, CommitDraft, DraftProvider, Event, FileDiff,
+    GitStatus, JobRequest, JobStatus, PullRequestDraft, WorktreeCreateMode,
 };
 use hitch_proto::{ControlMessage, ErrorCode, Request, Response, PROTOCOL_VERSION};
 
@@ -87,6 +87,87 @@ fn windows_default_shell_session_accepts_input_resize_and_kills_descendants() {
         !orphan_marker.exists(),
         "closing a Windows PTY session left a shell descendant running"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_cancel_git_job_kills_process_tree_and_reports_cancelled() {
+    let socket = test_socket_path("windows-cancel-git");
+    let started = test_file_path("windows-git-started", "txt");
+    let heartbeat = test_file_path("windows-git-heartbeat", "txt");
+    let git = write_windows_hanging_git_stub(&started, &heartbeat);
+    let clone_destination = test_dir_path("windows-cancel-git-clone");
+    let mut daemon = DaemonGuard::start_with_git(&socket, &git);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    client.send_request(
+        2,
+        Request::StartJob {
+            request: JobRequest::CloneProject {
+                remote_url: "https://example.invalid/hitch.git".into(),
+                destination: clone_destination.clone(),
+                name: None,
+            },
+        },
+    );
+    let job_id = client.read_job_started(2);
+    client.read_job_progress_status(job_id, JobStatus::Running, Duration::from_secs(5));
+    wait_for_file(&started, Duration::from_secs(5));
+    wait_for_heartbeat(&heartbeat, Duration::from_secs(5));
+
+    client.send_request(3, Request::CancelJob { job_id });
+    client.read_cancel_ack_and_progress(3, job_id, Duration::from_secs(5));
+    assert_job_completed_with_cancel_error(client.read_job_completed(job_id));
+    assert_heartbeat_stopped(&heartbeat);
+
+    client.shutdown(4);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(clone_destination);
+    let _ = std::fs::remove_file(git.with_extension("ps1"));
+    let _ = std::fs::remove_file(git.with_extension("child.ps1"));
+    let _ = std::fs::remove_file(git);
+    let _ = std::fs::remove_file(started);
+    let _ = std::fs::remove_file(heartbeat);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_cancel_draft_provider_job_kills_process_tree_and_reports_cancelled() {
+    let socket = test_socket_path("windows-cancel-draft-provider");
+    let started = test_file_path("windows-codex-started", "txt");
+    let heartbeat = test_file_path("windows-codex-heartbeat", "txt");
+    let codex = write_windows_hanging_codex_stub(&started, &heartbeat);
+    let mut daemon = DaemonGuard::start_with_codex(&socket, &codex);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    client.send_request(
+        2,
+        Request::StartJob {
+            request: JobRequest::ListDraftModels {
+                provider: DraftProvider::Codex,
+            },
+        },
+    );
+    let job_id = client.read_job_started(2);
+    client.read_job_progress_status(job_id, JobStatus::Running, Duration::from_secs(5));
+    wait_for_file(&started, Duration::from_secs(5));
+    wait_for_heartbeat(&heartbeat, Duration::from_secs(5));
+
+    client.send_request(3, Request::CancelJob { job_id });
+    client.read_cancel_ack_and_progress(3, job_id, Duration::from_secs(5));
+    assert_job_completed_with_cancel_error(client.read_job_completed(job_id));
+    assert_heartbeat_stopped(&heartbeat);
+
+    client.shutdown(4);
+    daemon.wait_for_exit();
+
+    let _ = std::fs::remove_file(codex.with_extension("ps1"));
+    let _ = std::fs::remove_file(codex.with_extension("child.ps1"));
+    let _ = std::fs::remove_file(codex);
+    let _ = std::fs::remove_file(started);
+    let _ = std::fs::remove_file(heartbeat);
 }
 
 #[cfg(unix)]
@@ -907,11 +988,23 @@ impl DaemonGuard {
         Self::start_inner(socket, Some(gh))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn start_with_codex(socket: &Path, codex: &Path) -> Self {
         let store = test_file_path("daemon-store", "sqlite");
         let managed_root = test_dir_path("daemon-managed");
         let child = spawn_daemon_with_codex(socket, &store, &managed_root, codex);
+        Self {
+            child,
+            store,
+            managed_root,
+        }
+    }
+
+    #[cfg(windows)]
+    fn start_with_git(socket: &Path, git: &Path) -> Self {
+        let store = test_file_path("daemon-store", "sqlite");
+        let managed_root = test_dir_path("daemon-managed");
+        let child = spawn_daemon_with_git(socket, &store, &managed_root, git);
         Self {
             child,
             store,
@@ -1366,6 +1459,65 @@ impl TestClient {
         panic!("timed out waiting for job {job_id} completion");
     }
 
+    fn read_job_progress_status(
+        &mut self,
+        job_id: hitch_core::JobId,
+        expected: JobStatus,
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::JobProgress {
+                            job_id: progressed,
+                            status,
+                            ..
+                        },
+                }) if progressed == job_id && status == expected => return,
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for job {job_id} progress {expected:?}");
+    }
+
+    fn read_cancel_ack_and_progress(
+        &mut self,
+        request_id: u64,
+        job_id: hitch_core::JobId,
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
+        let mut saw_ack = false;
+        let mut saw_cancelled = false;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Response {
+                    id,
+                    response: Response::Ack,
+                }) if id == request_id => saw_ack = true,
+                Packet::Control(ControlMessage::Response {
+                    id,
+                    response: Response::Error { error },
+                }) if id == request_id => panic!("cancel job failed: {error:?}"),
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::JobProgress {
+                            job_id: progressed,
+                            status: JobStatus::Cancelled,
+                            ..
+                        },
+                }) if progressed == job_id => saw_cancelled = true,
+                Packet::Control(_) | Packet::Output { .. } => {}
+            }
+            if saw_ack && saw_cancelled {
+                return;
+            }
+        }
+        panic!("timed out waiting for cancel ack and cancelled progress for job {job_id}");
+    }
+
     /// Send a `StartJob` wrapper and block until its Job completes, returning
     /// the wrapped response.
     fn run_job(&mut self, id: u64, request: JobRequest) -> Response {
@@ -1651,7 +1803,7 @@ fn spawn_daemon_full(socket: &Path, store: &Path, managed_root: &Path, gh: Optio
     spawn_daemon_command(command)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn spawn_daemon_with_codex(
     socket: &Path,
     store: &Path,
@@ -1666,6 +1818,13 @@ fn spawn_daemon_with_codex(
         .arg(codex)
         .arg("--draft-timeout-secs")
         .arg("5");
+    spawn_daemon_command(command)
+}
+
+#[cfg(windows)]
+fn spawn_daemon_with_git(socket: &Path, store: &Path, managed_root: &Path, git: &Path) -> Child {
+    let mut command = daemon_command(socket, store, managed_root);
+    command.arg("--git").arg(git);
     spawn_daemon_command(command)
 }
 
@@ -1764,6 +1923,71 @@ fn write_executable_script(path: &Path, contents: &str) {
     }
 }
 
+#[cfg(windows)]
+fn write_windows_hanging_git_stub(started: &Path, heartbeat: &Path) -> PathBuf {
+    write_windows_hanging_command_stub(
+        "git-stub",
+        "if ($Args.Count -eq 0 -or $Args[0] -ne 'clone') { exit 64 }",
+        started,
+        heartbeat,
+    )
+}
+
+#[cfg(windows)]
+fn write_windows_hanging_codex_stub(started: &Path, heartbeat: &Path) -> PathBuf {
+    write_windows_hanging_command_stub(
+        "codex-stub",
+        "if ($Args.Count -lt 2 -or $Args[0] -ne 'debug' -or $Args[1] -ne 'models') { exit 64 }",
+        started,
+        heartbeat,
+    )
+}
+
+#[cfg(windows)]
+fn write_windows_hanging_command_stub(
+    name: &str,
+    validation: &str,
+    started: &Path,
+    heartbeat: &Path,
+) -> PathBuf {
+    let cmd = test_file_path(name, "cmd");
+    let script = cmd.with_extension("ps1");
+    let child_script = cmd.with_extension("child.ps1");
+    std::fs::write(
+        &cmd,
+        "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%~dpn0.ps1\" \"%~1\" \"%~2\"\r\nexit /b %ERRORLEVEL%\r\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &script,
+        format!(
+            "$ErrorActionPreference = 'Stop'\r\n\
+             {validation}\r\n\
+             Set-Content -LiteralPath {started} -Value 'started'\r\n\
+             $child = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',{child}) -PassThru\r\n\
+             while ($true) {{ Start-Sleep -Milliseconds 100 }}\r\n",
+            started = powershell_literal(started),
+            child = powershell_literal(&child_script),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &child_script,
+        format!(
+            "$ErrorActionPreference = 'SilentlyContinue'\r\n\
+             while ($true) {{ Add-Content -LiteralPath {heartbeat} -Value ([DateTime]::UtcNow.Ticks); Start-Sleep -Milliseconds 100 }}\r\n",
+            heartbeat = powershell_literal(heartbeat),
+        ),
+    )
+    .unwrap();
+    cmd
+}
+
+#[cfg(windows)]
+fn powershell_literal(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "''"))
+}
+
 #[cfg(any(unix, windows))]
 fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) {
     let output = Command::new("git")
@@ -1796,6 +2020,69 @@ fn test_dir_path(name: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("hitch-daemon-{name}-{nonce}"))
+}
+
+#[cfg(windows)]
+fn assert_job_completed_with_cancel_error(response: Response) {
+    match response {
+        Response::Error { error } => {
+            assert_eq!(error.code, ErrorCode::Unavailable);
+            assert!(error.retryable, "cancelled job error should be retryable");
+        }
+        other => panic!("cancelled job should complete with an error: {other:?}"),
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_file(path: &Path, timeout: Duration) {
+    if !wait_for_file_result(path, timeout) {
+        panic!("timed out waiting for {}", path.display());
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_file_result(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    false
+}
+
+#[cfg(windows)]
+fn wait_for_heartbeat(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if heartbeat_count(path) > 0 {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for heartbeat {}", path.display());
+}
+
+#[cfg(windows)]
+fn assert_heartbeat_stopped(path: &Path) {
+    thread::sleep(Duration::from_millis(250));
+    let first = heartbeat_count(path);
+    thread::sleep(Duration::from_millis(600));
+    let second = heartbeat_count(path);
+    assert_eq!(
+        first,
+        second,
+        "cancelled job left a descendant process writing {}",
+        path.display()
+    );
+}
+
+#[cfg(windows)]
+fn heartbeat_count(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|contents| contents.lines().count())
+        .unwrap_or(0)
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {

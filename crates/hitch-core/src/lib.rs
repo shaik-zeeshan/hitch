@@ -14,6 +14,7 @@ mod worktree;
 
 pub use agent::AgentState;
 pub use ids::{JobId, ProjectId, SessionId, WorktreeId};
+pub use process_tree::ProcessTree;
 pub use project::{Project, ProjectKind};
 pub use session::{Session, SessionParent};
 pub use worktree::Worktree;
@@ -21,3 +22,167 @@ pub use worktree::Worktree;
 /// Environment variable Hitch sets in every PTY session so agent hooks launched
 /// from that shell can report state against the correct Hitch session tab.
 pub const SESSION_ID_ENV: &str = "HITCH_SESSION_ID";
+
+mod process_tree {
+    use std::process::{Child, Command};
+
+    /// Platform process-tree handle for long-running cancellable child processes.
+    ///
+    /// Unix uses a fresh process group and kills that group. Windows uses a Job
+    /// Object configured with `KILL_ON_JOB_CLOSE`, held alive by cloned handles.
+    /// Other platforms retain the child pid only so callers can still use direct
+    /// child termination while keeping this API portable.
+    #[derive(Clone, Debug)]
+    pub struct ProcessTree {
+        inner: imp::ProcessTree,
+    }
+
+    impl ProcessTree {
+        pub fn spawn(command: &mut Command) -> std::io::Result<(Child, Self)> {
+            imp::ProcessTree::spawn(command).map(|(child, inner)| (child, Self { inner }))
+        }
+
+        pub fn terminate(&self) -> std::io::Result<()> {
+            self.inner.terminate()
+        }
+    }
+
+    #[cfg(unix)]
+    mod imp {
+        use std::process::{Child, Command};
+
+        use std::os::unix::process::CommandExt;
+
+        #[derive(Clone, Debug)]
+        pub(super) struct ProcessTree {
+            pgid: i32,
+        }
+
+        impl ProcessTree {
+            pub(super) fn spawn(command: &mut Command) -> std::io::Result<(Child, Self)> {
+                command.process_group(0);
+                let child = command.spawn()?;
+                let pgid = child.id() as i32;
+                Ok((child, Self { pgid }))
+            }
+
+            pub(super) fn terminate(&self) -> std::io::Result<()> {
+                let result = unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    mod imp {
+        use std::io;
+        use std::os::windows::io::AsRawHandle;
+        use std::process::{Child, Command};
+        use std::sync::Arc;
+
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        #[derive(Clone, Debug)]
+        pub(super) struct ProcessTree {
+            job: Arc<JobHandle>,
+        }
+
+        #[derive(Debug)]
+        struct JobHandle(HANDLE);
+
+        unsafe impl Send for JobHandle {}
+        unsafe impl Sync for JobHandle {}
+
+        impl Drop for JobHandle {
+            fn drop(&mut self) {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+
+        impl ProcessTree {
+            pub(super) fn spawn(command: &mut Command) -> io::Result<(Child, Self)> {
+                let job = create_kill_on_close_job()?;
+                let mut child = command.spawn()?;
+                let process = child.as_raw_handle() as HANDLE;
+                let assigned = unsafe { AssignProcessToJobObject(job.0, process) };
+                if assigned == 0 {
+                    let error = io::Error::last_os_error();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+                Ok((child, Self { job: Arc::new(job) }))
+            }
+
+            pub(super) fn terminate(&self) -> io::Result<()> {
+                let result = unsafe { TerminateJobObject(self.job.0, 1) };
+                if result == 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        fn create_kill_on_close_job() -> io::Result<JobHandle> {
+            let handle = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let result = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &limits as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if result == 0 {
+                let error = io::Error::last_os_error();
+                unsafe {
+                    CloseHandle(handle);
+                }
+                return Err(error);
+            }
+
+            Ok(JobHandle(handle))
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    mod imp {
+        use std::process::{Child, Command};
+
+        #[derive(Clone, Debug)]
+        pub(super) struct ProcessTree {
+            #[allow(dead_code)]
+            pid: u32,
+        }
+
+        impl ProcessTree {
+            pub(super) fn spawn(command: &mut Command) -> std::io::Result<(Child, Self)> {
+                let child = command.spawn()?;
+                let pid = child.id();
+                Ok((child, Self { pid }))
+            }
+
+            pub(super) fn terminate(&self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+    }
+}
