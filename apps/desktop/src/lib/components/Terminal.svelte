@@ -1,13 +1,14 @@
 <script lang="ts">
   // Live PTY terminal (mockup .term). Ported from the React TerminalPane: one
   // xterm instance per session, fed from the daemon's per-session binary output
-  // channel (ADR 0007). The parent keeps every session's Terminal mounted for
-  // the active parent's lifetime and toggles visibility (the `active` prop)
-  // rather than mounting/unmounting per tab/diff switch, so scroll + buffer
-  // survive a tab change. This instance lives for one session: it mounts when
-  // its session first appears in the active parent and unmounts only when the
-  // session closes (removed from the keyed list) or the parent changes. There
-  // is therefore no changing `session` prop to react to.
+  // channel (ADR 0007). Center.svelte keys a Terminal off EVERY session (across
+  // all parents, not just the active one) and toggles visibility (the `active`
+  // prop) rather than mounting/unmounting per tab/diff/worktree switch, so
+  // scroll + buffer + the PTY-aligned grid survive every switch. This instance
+  // lives for exactly one session for its whole lifetime: it mounts when the
+  // session first appears and unmounts ONLY when the session closes (removed
+  // from the keyed list) — NOT on a parent/worktree switch. There is therefore
+  // no changing `session` prop to react to.
   //
   // Output flow: raw PTY bytes arrive as Uint8Array tails from
   // `subscribeSessionOutput`; we feed them straight to `term.write`, which does
@@ -30,12 +31,16 @@
   import "@xterm/xterm/css/xterm.css";
   import {
     recordTerminalSize,
+    repaintSession,
     resizeSessionDebounced,
     sendInput,
     subscribeSessionOutput,
   } from "../daemon";
   import { WebglAddon } from "@xterm/addon-webgl";
   import type { Session } from "../types";
+  import { classifyTerminalKey } from "../terminalKeys";
+  import { createOutputBatcher } from "../outputBatch";
+  import { releaseWebgl, retainWebgl, touchWebgl } from "../webglBudget";
 
   // `active` is true only when this is the visible terminal (its tab is
   // selected AND the diff isn't covering the view). The parent keeps every
@@ -63,11 +68,14 @@
   let fit: FitAddon | null = null;
   let webLinks: WebLinksAddon | null = null;
   let searchAddon: SearchAddon | null = null;
-  // GPU renderer, attached ONLY while this terminal is the active (visible)
-  // one and has a real size. Each WebGL context counts against the browser's
-  // ~16 live-context cap, so we dispose it the moment the terminal is hidden
-  // and re-create it on re-activation; null means we're on xterm's default DOM
-  // renderer (either inactive, or WebGL is unsupported / lost its context).
+  // GPU renderer, attached when this terminal first becomes active with a real
+  // size. Each WebGL context counts against the browser's ~16 live-context cap,
+  // so rather than churn a context on every hide we keep the most-recently-
+  // active terminals WARM via the module-level webglBudget LRU: hiding this
+  // terminal no longer disposes its context; the budget evicts the coldest
+  // terminal only when the warm set overflows its cap. null means we're on
+  // xterm's default DOM renderer (not yet attached, evicted by the budget, or
+  // WebGL is unsupported / lost its context).
   let webgl: WebglAddon | null = null;
   // Total PTY bytes seen by this terminal (the offset basis; matches the ring's
   // `totalSeen`), not a buffer length — so head-trims in the byte ring never
@@ -118,6 +126,19 @@
   function closeSearch() {
     searchOpen = false;
     term?.focus();
+  }
+
+  // Right-click → paste. We OWN the context menu: suppressing the webview's
+  // default menu also suppresses any native paste it would offer, so this is the
+  // ONE remaining manual term.paste call and it cannot double-fire with another
+  // path. Routed through term.paste so bracketed-paste (DECSET 2004) is honored.
+  // (tauri.conf.json does not independently enable a context menu — suppression
+  // lives entirely in this handler.) Guarded against a not-yet/already-disposed
+  // term so a stray right-click during mount/teardown is a no-op.
+  function onContextMenu(e: MouseEvent) {
+    e.preventDefault();
+    if (!term) return;
+    void navigator.clipboard.readText().then((t) => term?.paste(t));
   }
 
   function onSearchKeydown(e: KeyboardEvent) {
@@ -171,17 +192,38 @@
     return theme;
   }
 
-  // New PTY bytes for this session. xterm's `write` accepts a Uint8Array and
-  // streams the UTF-8 decode across frames, so we hand it the raw tail directly.
+  // Coalesce PTY output to one xterm write per animation frame. The daemon
+  // delivers bytes as many small tails per frame (one per channel message);
+  // writing each tail separately thrashes xterm's parser under bursty output.
+  // The batcher buffers tails arriving within a frame and hands xterm a SINGLE
+  // concatenated write per frame. Concatenating the RAW bytes in arrival order
+  // keeps multi-byte UTF-8 sequences split across tails intact, and xterm's
+  // streaming decoder sees the exact same byte stream it would have per-tail.
+  // The injected scheduler is real rAF here; tests drive a synchronous one.
+  const outputBatch = createOutputBatcher({
+    schedule: (flush) => requestAnimationFrame(flush),
+    cancel: (handle) => cancelAnimationFrame(handle),
+    emit: (chunk) => {
+      if (!term) return;
+      term.write(chunk);
+      // Keep `written` as TOTAL-BYTES-SEEN: bump by exactly the bytes handed to
+      // xterm, identical to the pre-batching per-tail accounting.
+      written += chunk.length;
+    },
+  });
+
+  // New PTY bytes for this session: buffer the tail; the batcher flushes one
+  // concatenated `term.write` on the next animation frame (see above).
   function onData(tail: Uint8Array) {
-    if (!term || tail.length === 0) return;
-    term.write(tail);
-    written += tail.length;
+    outputBatch.push(tail);
   }
 
-  // The byte ring was reset (a reconnect scrollback replay): wipe the terminal
-  // and restart the offset so the replayed bytes repaint cleanly.
+  // The byte ring was reset (a reconnect scrollback replay): drop any buffered-
+  // but-unflushed tails (they belong to the pre-reset stream and must not paint
+  // after the wipe), reset the offset, and clear the terminal so the replayed
+  // bytes repaint cleanly.
   function onReset() {
+    outputBatch.reset();
     written = 0;
     term?.reset();
   }
@@ -261,15 +303,26 @@
   // WebGL can fail (unsupported GPU/driver, headless) or lose its context at
   // runtime; on any such failure we silently fall back to xterm's default DOM
   // renderer — the terminal keeps working, just without GPU acceleration.
+  // On success we register the context with the module-level warm-LRU budget so
+  // it can later evict THIS terminal (calling disposeWebgl) when too many
+  // contexts are live, instead of every hide churning its own context.
   function attachWebgl() {
     if (!term || webgl || isZeroSize()) return;
     try {
       const addon = new WebglAddon();
       // A lost context (GPU reset, tab backgrounded, driver hiccup) would leave
       // a dead canvas; dispose so xterm transparently reverts to DOM rendering.
-      addon.onContextLoss(() => disposeWebgl());
+      // The addon disposed itself here, so also drop it from the warm budget so
+      // it doesn't hold a stale disposer pointing at a dead context.
+      addon.onContextLoss(() => {
+        disposeWebgl();
+        releaseWebgl(sessionId);
+      });
       term.loadAddon(addon);
       webgl = addon;
+      // Now warm: keep this context alive across hides until the budget evicts
+      // it. The disposer releases THIS terminal's actual addon on eviction.
+      retainWebgl(sessionId, () => disposeWebgl());
     } catch {
       // WebGL unavailable — stay on the default renderer. Never re-throw.
       webgl = null;
@@ -300,6 +353,11 @@
       // Open + fitted to the live grid: now replay the ring at the correct size.
       ensureSubscribed();
       resizeSessionDebounced(sessionId, term.cols, term.rows);
+      // Force a clean repaint even when the size did NOT change (returning to a
+      // tab whose grid is identical): the debounce may resize to the same size
+      // or coalesce away, but this unconditional repaint still makes Claude Code
+      // redraw a crisp frame. Best-effort; never throws (see daemon helper).
+      void repaintSession(sessionId);
       // Now that the box has a real size, GPU-accelerate the active terminal.
       attachWebgl();
       term.focus();
@@ -314,10 +372,13 @@
   let wasActive = active;
   $effect(() => {
     if (active && !wasActive) activate();
-    // Falling edge (visible→hidden): release the GPU context so live WebGL
-    // contexts can't accumulate past the browser's ~16 cap as the user switches
-    // tabs/parents. The terminal stays mounted on the default DOM renderer.
-    else if (!active && wasActive) disposeWebgl();
+    // Falling edge (visible→hidden): KEEP the GPU context warm instead of
+    // disposing it. The module-level webglBudget caps total live contexts well
+    // under the browser's ~16 limit and evicts the least-recently-active when
+    // the warm set overflows, so switching tabs/parents no longer churns a
+    // context per hide. touchWebgl bumps recency so the terminal the user just
+    // left stays at the warm end of the LRU (cheap to re-show).
+    else if (!active && wasActive) touchWebgl(sessionId);
     wasActive = active;
   });
 
@@ -361,37 +422,35 @@
 
     // macOS Cmd shortcuts. Only intercept e.metaKey (Cmd) — never Ctrl, so
     // Ctrl+C stays SIGINT to the child. Returning false consumes the event;
-    // true lets xterm/the child handle it as usual.
+    // true lets xterm/the child handle it as usual. The intent classification
+    // lives in the pure `classifyTerminalKey` (unit-tested) so the routing —
+    // crucially that Cmd+V is NOT special and passes through to xterm's native
+    // paste (the SOLE keyboard paste route) — is verifiable without a live DOM.
     term.attachCustomKeyEventHandler((e) => {
-      // Send Shift+Enter as a line feed (\n) rather than carriage return (\r),
-      // so terminal apps (e.g. Claude Code) can tell Enter (execute) apart from
-      // Shift+Enter (insert newline). Consume every event type for this combo so
-      // xterm doesn't also emit its default \r. xterm.js 6.1 may handle this
-      // natively; remove the workaround then.
-      if (e.shiftKey && e.key === "Enter") {
-        if (e.type === "keydown") sendInput(sessionId, "\n");
-        return false;
-      }
-      if (e.type !== "keydown" || !e.metaKey) return true;
-      if (e.key === "c") {
-        // Copy only when there's a selection; otherwise let Cmd+C through.
-        if (term?.hasSelection()) {
-          void navigator.clipboard.writeText(term.getSelection());
+      switch (classifyTerminalKey(e)) {
+        case "newline":
+          // Send Shift+Enter as a line feed (\n) rather than carriage return
+          // (\r) so apps (e.g. Claude Code) can tell Enter (execute) apart from
+          // Shift+Enter (insert newline). Consume so xterm doesn't also emit \r.
+          // xterm.js 6.1 may handle this natively; remove the workaround then.
+          sendInput(sessionId, "\n");
           return false;
-        }
-        return true;
+        case "copy":
+          // Copy only when there's a selection; otherwise let Cmd+C through.
+          if (term?.hasSelection()) {
+            void navigator.clipboard.writeText(term.getSelection());
+            return false;
+          }
+          return true;
+        case "search":
+          void openSearch();
+          return false;
+        case "pass":
+          // Includes Cmd+V: native xterm handles paste on its textarea, which
+          // already honors bracketed-paste (DECSET 2004). No manual term.paste
+          // here, so the keyboard paste path cannot double-fire.
+          return true;
       }
-      if (e.key === "v") {
-        // Route paste through term.paste so bracketed-paste (DECSET 2004) is
-        // honored when the child app has enabled it.
-        void navigator.clipboard.readText().then((t) => term?.paste(t));
-        return false;
-      }
-      if (e.key === "f") {
-        void openSearch();
-        return false;
-      }
-      return true;
     });
 
     term.onData((data) => sendInput(sessionId, data));
@@ -407,6 +466,10 @@
     // make those ticks no-ops — fit-on-activate catches the size up when shown.
     resizeObserver = new ResizeObserver(() => scheduleFit());
     resizeObserver.observe(host);
+
+    // Own the right-click menu (paste). On `host` so it covers the whole
+    // terminal area; removed in onDestroy.
+    host.addEventListener("contextmenu", onContextMenu);
 
     // Open + fit + focus only if we mounted visible. A non-active tab in the
     // same parent mounts hidden (`display:none`) alongside the active one; even
@@ -428,6 +491,7 @@
   onDestroy(() => {
     unsubOutput?.();
     resizeObserver?.disconnect();
+    host?.removeEventListener("contextmenu", onContextMenu);
     // Cancel any frame queued by scheduleFit so it can't run against a disposed
     // term. The per-session daemon debounce timer is cleared centrally in
     // daemon.ts on session close (closeSessionOutput); a parent-switch unmount
@@ -436,6 +500,9 @@
       cancelAnimationFrame(fitFrame);
       fitFrame = null;
     }
+    // Cancel any pending output-batch flush so it can't write against a disposed
+    // term. Buffered bytes are dropped — fine, the terminal is going away.
+    outputBatch.reset();
     // Drop the scroll / write listeners feeding the "new output" nudge.
     scrollDisposable?.dispose();
     writeDisposable?.dispose();
@@ -443,7 +510,10 @@
     writeDisposable = null;
     // Dispose addons before the terminal. Guarded so unmount never throws.
     // WebGL first so its GPU context is released even if a later dispose throws.
+    // Then drop this terminal from the warm budget AFTER disposing our own addon
+    // (releaseWebgl does not call the disposer again — no double-dispose).
     disposeWebgl();
+    releaseWebgl(sessionId);
     try {
       webLinks?.dispose();
     } catch {

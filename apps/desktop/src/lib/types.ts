@@ -118,6 +118,13 @@ export type BranchSummary = {
 
 export type Request = { type: string; [key: string]: unknown };
 
+// Force a fresh full repaint of a session's PTY child after its size has
+// settled (daemon replies with an Ack). Modeled on the inline `resize-session`
+// request shape (`{ type, session_id }`) used in daemon.ts; the daemon is the
+// source of truth for this contract. `Request` is structurally open, but we
+// name this variant so the frontend emits exactly the agreed shape.
+export type RepaintSessionRequest = { type: "repaint-session"; session_id: Id };
+
 // Shared allowlist accepted inside `start-job`. Keep this in lockstep with
 // hitch-proto's `JobRequest` so the desktop cannot advertise unsupported work.
 export type JobRequest =

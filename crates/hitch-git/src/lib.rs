@@ -1901,7 +1901,12 @@ mod tests {
         let fixture = RepoFixture::new();
         // Anchor the project on a known owner; a same-named fork PR from another
         // owner must not be mapped onto this local worktree branch.
-        fixture.git(["remote", "add", "origin", "https://github.com/myowner/repo.git"]);
+        fixture.git([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/myowner/repo.git",
+        ]);
         let bin = TempDir::new().unwrap();
         let log = bin.path().join("calls.log");
         let gh = fake_program(
@@ -1915,7 +1920,11 @@ mod tests {
         let prs = pr_list_for_branches_with_client(&client, fixture.path(), &branches, None)
             .expect("PR list should parse fake gh output");
 
-        assert_eq!(prs.len(), 1, "fork PR sharing the branch name must be dropped");
+        assert_eq!(
+            prs.len(),
+            1,
+            "fork PR sharing the branch name must be dropped"
+        );
         assert_eq!(prs[0].0, "patch-1");
         assert_eq!(prs[0].1.number, 10);
     }

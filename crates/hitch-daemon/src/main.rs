@@ -1044,6 +1044,12 @@ fn handle_request<R: Read>(
                 .map_err(|err| ProtocolError::new(ErrorCode::PtyFailed, err.to_string()))?;
             send_response(state, client_id, request_id, Response::Ack)?;
         }
+        Request::RepaintSession { session_id } => {
+            let pty = find_pty(state, session_id)?;
+            pty.repaint()
+                .map_err(|err| ProtocolError::new(ErrorCode::PtyFailed, err.to_string()))?;
+            send_response(state, client_id, request_id, Response::Ack)?;
+        }
         Request::CloseSession {
             session_id,
             kill_process,
@@ -4254,7 +4260,9 @@ mod tests {
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
-        let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(store, config)));
+        let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
+            store, config,
+        )));
 
         let project = Project::new("hitch", &project_root, ProjectKind::GitBacked);
         let main = Worktree::new(project.id, &project_root, "main", true, false);
@@ -4303,17 +4311,18 @@ mod tests {
         let mut decoder = ControlLineDecoder::new();
         let mut buf = [0u8; 8192];
         let event = loop {
-            let n = reader.read(&mut buf).expect("read worktree-updated broadcast");
+            let n = reader
+                .read(&mut buf)
+                .expect("read worktree-updated broadcast");
             assert!(n > 0, "client sink closed before delivering the event");
-            if let Some(event) =
-                decoder
-                    .push(&buf[..n])
-                    .unwrap()
-                    .into_iter()
-                    .find_map(|message| match message {
-                        ControlMessage::Event { event } => Some(event),
-                        _ => None,
-                    })
+            if let Some(event) = decoder
+                .push(&buf[..n])
+                .unwrap()
+                .into_iter()
+                .find_map(|message| match message {
+                    ControlMessage::Event { event } => Some(event),
+                    _ => None,
+                })
             {
                 break event;
             }
