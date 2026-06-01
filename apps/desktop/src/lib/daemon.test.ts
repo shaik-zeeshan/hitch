@@ -396,6 +396,33 @@ describe("agent state propagation", () => {
     }
   });
 
+  it("acknowledges replayed waiting status for the already active tab", () => {
+    vi.useFakeTimers();
+    try {
+      sessions.set([
+        { id: "s1", name: "codex", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
+      ]);
+      activeSessionId.set("s1");
+
+      applyHitchEvent({
+        type: "session-opened",
+        session: { id: "s1", name: "codex", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
+        agent: "codex",
+        agent_state: "waiting",
+        agent_detail: null,
+      } as any);
+
+      expect(get(visibleAgentStates)).toEqual({ s1: "waiting" });
+      vi.advanceTimersByTime(2_499);
+      expect(get(visibleAgentStates)).toEqual({ s1: "waiting" });
+      vi.advanceTimersByTime(1);
+      expect(get(dismissedSessionAgentStates)).toEqual({ s1: "waiting" });
+      expect(get(visibleAgentStates)).toEqual({});
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps needs-approval tab status sticky until state changes or clears", () => {
     sessions.set([
       { id: "s1", name: "codex", parent: { kind: "project", id: "p1" }, cwd: "/repo" },

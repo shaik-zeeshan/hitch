@@ -807,6 +807,11 @@ export function applyHitchEvent(event: HitchEvent): void {
     if (state) {
       resetDismissedSessionState(session.id);
       agentStates.update((current) => ({ ...current, [session.id]: state }));
+      if (get(activeSessionId) === session.id && !get(diffActive)) {
+        acknowledgeVisibleSessionState(session.id);
+      } else {
+        clearDismissibleTabTimer(session.id);
+      }
     } else {
       agentStates.update((current) => {
         if (!(session.id in current)) return current;

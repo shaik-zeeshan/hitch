@@ -718,6 +718,13 @@ struct ClientSink {
     /// this under the lock before opening the gate, so late-attaching clients see
     /// running-job snapshots before any raced completion/cancellation.
     pending_job_events: Mutex<Vec<Event>>,
+    /// Agent-state readiness gate. `false` until reconnect replay has sent the
+    /// per-session agent snapshots embedded in `SessionOpened`; raced live
+    /// `AgentState` events wait here so a stale replay snapshot cannot regress
+    /// the attaching client's newer view.
+    agent_state_live: AtomicBool,
+    /// Agent-state events buffered while `agent_state_live` is closed.
+    pending_agent_state_events: Mutex<Vec<Event>>,
 }
 
 fn restore_layout(
@@ -787,6 +794,8 @@ fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &UnixStream) -> io::
             jobs_live: AtomicBool::new(false),
             pending: Mutex::new(Vec::new()),
             pending_job_events: Mutex::new(Vec::new()),
+            agent_state_live: AtomicBool::new(false),
+            pending_agent_state_events: Mutex::new(Vec::new()),
         }),
     );
     Ok(client_id)
@@ -1186,7 +1195,7 @@ fn handle_request<R: Read>(
                 cwd.as_deref(),
                 detail,
             )? {
-                broadcast_event(
+                broadcast_agent_state_event(
                     state,
                     Event::AgentState {
                         session_id: Some(event.session_id),
@@ -2336,7 +2345,7 @@ fn spawn_command_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool
                         );
                     }
                     if let Some(event) = clear_stale_agent_state(&state, id, command.as_deref()) {
-                        let _ = broadcast_event(
+                        let _ = broadcast_agent_state_event(
                             &state,
                             Event::AgentState {
                                 session_id: Some(event.session_id),
@@ -2704,6 +2713,8 @@ fn replay_sessions_to_client(
             },
         )?;
     }
+
+    drain_pending_agent_state_events(state, client_id)?;
 
     for (job_id, message, kind) in &jobs {
         send_event_to_client(
@@ -3197,6 +3208,75 @@ fn broadcast_event(state: &Arc<Mutex<DaemonState>>, event: Event) -> Result<(), 
     Ok(())
 }
 
+fn broadcast_agent_state_event(
+    state: &Arc<Mutex<DaemonState>>,
+    event: Event,
+) -> Result<(), ProtocolError> {
+    let clients = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        state
+            .clients
+            .iter()
+            .map(|(id, sink)| (*id, Arc::clone(sink)))
+            .collect::<Vec<_>>()
+    };
+
+    let mut dead = Vec::new();
+    for (id, sink) in clients {
+        let write_result = if sink.agent_state_live.load(Ordering::SeqCst) {
+            write_control_to_sink(&sink, &ControlMessage::event(event.clone()))
+        } else {
+            let mut pending = sink
+                .pending_agent_state_events
+                .lock()
+                .map_err(|_| internal("agent-state replay buffer lock poisoned"))?;
+            if sink.agent_state_live.load(Ordering::SeqCst) {
+                drop(pending);
+                write_control_to_sink(&sink, &ControlMessage::event(event.clone()))
+            } else {
+                pending.push(event.clone());
+                Ok(())
+            }
+        };
+        if write_result.is_err() {
+            dead.push(id);
+        }
+    }
+
+    if !dead.is_empty() {
+        if let Ok(mut state) = state.lock() {
+            for id in dead {
+                state.clients.remove(&id);
+                state.broadcaster.forget_client(id);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn drain_pending_agent_state_events(
+    state: &Arc<Mutex<DaemonState>>,
+    client_id: u64,
+) -> Result<(), ProtocolError> {
+    let sink = client_sink(state, client_id)?;
+    let mut pending = sink
+        .pending_agent_state_events
+        .lock()
+        .map_err(|_| internal("agent-state replay buffer lock poisoned"))?;
+    for event in pending.drain(..) {
+        write_control_to_sink(&sink, &ControlMessage::event(event)).map_err(|err| {
+            ProtocolError::new(
+                ErrorCode::Unavailable,
+                format!("failed to write buffered agent-state event to client {client_id}: {err}"),
+            )
+            .retryable(true)
+        })?;
+    }
+    sink.agent_state_live.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
 fn broadcast_job_event(state: &Arc<Mutex<DaemonState>>, event: Event) -> Result<(), ProtocolError> {
     let clients = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
@@ -3603,6 +3683,98 @@ mod tests {
             b"pre-replay",
             "output before replay must arrive exactly once, inside the snapshot"
         );
+    }
+
+    #[test]
+    fn agent_state_before_replay_waits_until_session_snapshot_is_sent() {
+        use hitch_core::{AgentState, WorktreeId};
+        use hitch_proto::{ControlLineDecoder, ControlMessage, Event, KnownAgent};
+        use std::io::Read as _;
+        use std::os::unix::net::UnixStream;
+        use std::path::PathBuf;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-agent-replay-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("state.db");
+        let config = super::DaemonConfig {
+            socket_path: dir.join("daemon.sock"),
+            store_path: store_path.clone(),
+            managed_root: dir.join("managed"),
+            hook_helper: dir.join("hook"),
+            git: PathBuf::from("git"),
+            gh: PathBuf::from("gh"),
+            draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+        };
+        let store = hitch_store::Store::open(&store_path).unwrap();
+        let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
+            store, config,
+        )));
+
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        let sink = Arc::new(super::ClientSink {
+            writer: Mutex::new(writer),
+            live: AtomicBool::new(true),
+            jobs_live: AtomicBool::new(true),
+            agent_state_live: AtomicBool::new(false),
+            pending: Mutex::new(Vec::new()),
+            pending_job_events: Mutex::new(Vec::new()),
+            pending_agent_state_events: Mutex::new(Vec::new()),
+        });
+        {
+            let mut guard = state.lock().unwrap();
+            guard.clients.insert(1, Arc::clone(&sink));
+        }
+
+        let event = Event::AgentState {
+            session_id: Some(SessionId::new()),
+            worktree_id: Some(WorktreeId::new()),
+            agent: KnownAgent::ClaudeCode,
+            state: Some(AgentState::Running),
+            detail: None,
+        };
+
+        super::broadcast_agent_state_event(&state, event.clone()).unwrap();
+        assert!(!sink.agent_state_live.load(Ordering::SeqCst));
+        assert_eq!(sink.pending_agent_state_events.lock().unwrap().len(), 1);
+
+        super::drain_pending_agent_state_events(&state, 1).unwrap();
+        assert!(sink.agent_state_live.load(Ordering::SeqCst));
+        assert!(sink.pending_agent_state_events.lock().unwrap().is_empty());
+
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut decoder = ControlLineDecoder::new();
+        let mut buf = [0u8; 8192];
+        let delivered = loop {
+            let n = reader.read(&mut buf).expect("read buffered agent-state");
+            assert!(n > 0, "client sink closed before delivering the event");
+            if let Some(delivered) =
+                decoder
+                    .push(&buf[..n])
+                    .unwrap()
+                    .into_iter()
+                    .find_map(|message| match message {
+                        ControlMessage::Event { event } => Some(event),
+                        _ => None,
+                    })
+            {
+                break delivered;
+            }
+        };
+        assert_eq!(delivered, event);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4112,15 +4284,19 @@ mod tests {
             writer: Mutex::new(request_writer),
             live: AtomicBool::new(true),
             jobs_live: AtomicBool::new(true),
+            agent_state_live: AtomicBool::new(true),
             pending: Mutex::new(Vec::new()),
             pending_job_events: Mutex::new(Vec::new()),
+            pending_agent_state_events: Mutex::new(Vec::new()),
         });
         let blocked = Arc::new(super::ClientSink {
             writer: Mutex::new(peer_writer),
             live: AtomicBool::new(true),
             jobs_live: AtomicBool::new(true),
+            agent_state_live: AtomicBool::new(true),
             pending: Mutex::new(Vec::new()),
             pending_job_events: Mutex::new(Vec::new()),
+            pending_agent_state_events: Mutex::new(Vec::new()),
         });
         {
             let mut guard = state.lock().unwrap();
@@ -4433,8 +4609,10 @@ mod tests {
             writer: Mutex::new(writer),
             live: AtomicBool::new(true),
             jobs_live: AtomicBool::new(true),
+            agent_state_live: AtomicBool::new(true),
             pending: Mutex::new(Vec::new()),
             pending_job_events: Mutex::new(Vec::new()),
+            pending_agent_state_events: Mutex::new(Vec::new()),
         });
         {
             let mut guard = state.lock().unwrap();
