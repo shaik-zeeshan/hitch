@@ -1,17 +1,21 @@
 use std::io;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
+#[cfg(windows)]
+use hitch_core::SESSION_ID_ENV;
+#[cfg(any(unix, windows))]
 use hitch_core::{Project, Session, SessionId, SessionParent, Worktree};
 use hitch_proto::transport::{connect_daemon, DaemonStream};
 #[cfg(unix)]
+use hitch_proto::ErrorCode;
+#[cfg(any(unix, windows))]
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, CommitDraft, ErrorCode, Event, GitStatus, JobRequest,
+    encode_control_message, encode_pty_frame, CommitDraft, Event, GitStatus, JobRequest,
     PullRequestDraft,
 };
 use hitch_proto::{ControlMessage, Request, Response, PROTOCOL_VERSION};
@@ -40,6 +44,51 @@ fn daemon_transport_answers_hello_ping_and_shutdown() {
     send_transport_request(&mut stream, 3, Request::ShutdownDaemon);
     expect_transport_response(&mut stream, 3, |response| matches!(response, Response::Ack));
     daemon.wait_for_exit();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_default_shell_session_accepts_input_resize_and_kills_descendants() {
+    let socket = test_socket_path("windows-session");
+    let project_root = test_dir_path("windows-session-project");
+    let orphan_marker = project_root.join("hitch-orphan-marker.txt");
+    let _ = std::fs::remove_file(&orphan_marker);
+    std::fs::create_dir_all(&project_root).unwrap();
+    let _daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &project_root);
+    let session = client.open_default_session(3, SessionParent::Project(project.id));
+
+    let input = format!(
+        "@echo off\r\n\
+         echo {env}=%{env}%\r\n\
+         start \"\" /b cmd.exe /d /q /c \"echo HITCH_CHILD_STARTED & ping -n 5 127.0.0.1 >nul & echo HITCH_ORPHANED>hitch-orphan-marker.txt\"\r\n",
+        env = SESSION_ID_ENV,
+    );
+    client.send_session_input(4, session.id, input.as_bytes());
+
+    let output =
+        client.read_output_until(session.id, "HITCH_CHILD_STARTED", Duration::from_secs(5));
+    assert!(
+        output.contains(&format!("{SESSION_ID_ENV}={}", session.id)),
+        "default shell did not inherit {SESSION_ID_ENV}; saw {output:?}"
+    );
+    assert!(
+        output.contains("HITCH_CHILD_STARTED"),
+        "descendant process did not start; saw {output:?}"
+    );
+
+    client.resize_session(5, session.id, 100, 30);
+    client.close_session(6, session.id, true);
+    client.read_session_closed(session.id, Duration::from_secs(5));
+
+    thread::sleep(Duration::from_secs(5));
+    assert!(
+        !orphan_marker.exists(),
+        "closing a Windows PTY session left a shell descendant running"
+    );
 }
 
 #[cfg(unix)]
@@ -767,12 +816,13 @@ impl Drop for DaemonGuard {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct TestClient {
     stream: BufReader<DaemonStream>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+#[allow(dead_code)]
 impl TestClient {
     fn connect(socket: &Path) -> Self {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -975,6 +1025,10 @@ impl TestClient {
 
     fn ack(&mut self, id: u64, request: Request) {
         self.send_request(id, request);
+        self.read_ack(id);
+    }
+
+    fn read_ack(&mut self, id: u64) {
         loop {
             match self.read_packet() {
                 Packet::Control(ControlMessage::Response {
@@ -1039,12 +1093,25 @@ impl TestClient {
     }
 
     fn open_session(&mut self, id: u64, parent: SessionParent, command: Vec<String>) -> Session {
+        self.open_session_with_command(id, parent, Some(command))
+    }
+
+    fn open_default_session(&mut self, id: u64, parent: SessionParent) -> Session {
+        self.open_session_with_command(id, parent, None)
+    }
+
+    fn open_session_with_command(
+        &mut self,
+        id: u64,
+        parent: SessionParent,
+        command: Option<Vec<String>>,
+    ) -> Session {
         self.send_request(
             id,
             Request::OpenSession {
                 parent,
                 name: "test-shell".into(),
-                command: Some(command),
+                command,
                 cols: 80,
                 rows: 24,
             },
@@ -1063,6 +1130,60 @@ impl TestClient {
                 Packet::Control(_) | Packet::Output { .. } => continue,
             }
         }
+    }
+
+    fn send_session_input(&mut self, id: u64, session_id: SessionId, payload: &[u8]) {
+        self.send_request_with_pty_frame(
+            id,
+            Request::SendSessionInput {
+                session_id,
+                byte_count: payload.len() as u32,
+            },
+            payload,
+        );
+        self.read_ack(id);
+    }
+
+    fn resize_session(&mut self, id: u64, session_id: SessionId, cols: u16, rows: u16) {
+        self.ack(
+            id,
+            Request::ResizeSession {
+                session_id,
+                cols,
+                rows,
+            },
+        );
+    }
+
+    fn close_session(&mut self, id: u64, session_id: SessionId, kill_process: bool) {
+        self.ack(
+            id,
+            Request::CloseSession {
+                session_id,
+                kill_process,
+            },
+        );
+    }
+
+    fn read_session_closed(&mut self, session_id: SessionId, timeout: Duration) -> Option<i32> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::SessionClosed {
+                            session_id: closed,
+                            exit_code,
+                        },
+                }) if closed == session_id => return exit_code,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("daemon error while waiting for session close: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for session {session_id} to close");
     }
 
     fn read_output_until(
@@ -1141,6 +1262,9 @@ impl TestClient {
         let mut line = Vec::new();
         loop {
             match self.stream.read_until(b'\n', &mut line) {
+                Ok(0) if cfg!(windows) && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
                 Ok(0) => panic!("daemon closed connection"),
                 Ok(_) => break,
                 Err(err)
@@ -1183,6 +1307,9 @@ impl TestClient {
         let mut read = 0;
         while read < buf.len() {
             match self.stream.read(&mut buf[read..]) {
+                Ok(0) if cfg!(windows) && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
                 Ok(0) => panic!("daemon closed connection"),
                 Ok(len) => read += len,
                 Err(err)
@@ -1196,7 +1323,7 @@ impl TestClient {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum Packet {
     Control(ControlMessage),
     Output {

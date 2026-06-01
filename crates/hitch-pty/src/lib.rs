@@ -14,6 +14,15 @@ use std::thread;
 
 use hitch_core::{SessionId, SESSION_ID_ENV};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    },
+};
 
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 40;
@@ -117,6 +126,8 @@ pub struct ManagedPty {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
+    #[cfg(windows)]
+    job: WindowsJobObject,
     scrollback: ScrollbackBuffer,
 }
 
@@ -147,6 +158,18 @@ impl ManagedPty {
             &config.command,
             &config.cwd,
         ))?;
+        #[cfg(windows)]
+        let (child, job) = {
+            let mut child = child;
+            let job = match WindowsJobObject::for_child(child.as_ref()) {
+                Ok(job) => job,
+                Err(err) => {
+                    let _ = child.kill();
+                    return Err(err);
+                }
+            };
+            (child, job)
+        };
         drop(pair.slave);
 
         let pty = Arc::new(Self {
@@ -154,6 +177,8 @@ impl ManagedPty {
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             child: Mutex::new(child),
+            #[cfg(windows)]
+            job,
             scrollback: ScrollbackBuffer::new(config.scrollback_capacity),
         });
 
@@ -219,8 +244,17 @@ impl ManagedPty {
     /// Kill the child process.
     pub fn kill(&self) -> Result<(), PtyError> {
         let mut child = self.child.lock().map_err(|_| PtyError::Poisoned("child"))?;
-        child.kill()?;
-        Ok(())
+        #[cfg(windows)]
+        {
+            let job_result = self.job.terminate();
+            let _ = child.kill();
+            job_result
+        }
+        #[cfg(not(windows))]
+        {
+            child.kill()?;
+            Ok(())
+        }
     }
 
     /// Best-effort name of the PTY's foreground process group leader — the
@@ -296,6 +330,82 @@ fn spawn_reader_thread(
             });
         })
         .expect("failed to spawn PTY reader thread");
+}
+
+#[cfg(windows)]
+struct WindowsJobObject {
+    handle: HANDLE,
+}
+
+#[cfg(windows)]
+unsafe impl Send for WindowsJobObject {}
+
+#[cfg(windows)]
+unsafe impl Sync for WindowsJobObject {}
+
+#[cfg(windows)]
+impl WindowsJobObject {
+    fn for_child(child: &(dyn Child + Send + Sync)) -> Result<Self, PtyError> {
+        let process = child.as_raw_handle().ok_or_else(|| {
+            PtyError::Io(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "PTY child does not expose a Windows process handle",
+            ))
+        })?;
+
+        // SAFETY: Passing null security attributes and name requests a new unnamed
+        // job object. On failure Windows returns a null handle, converted below.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(PtyError::Io(io::Error::last_os_error()));
+        }
+
+        let job = Self { handle };
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        // SAFETY: `job.handle` is a live job handle owned by `job`, `limits` points
+        // to a properly initialized JOBOBJECT_EXTENDED_LIMIT_INFORMATION, and the
+        // byte count matches that structure.
+        let configured = unsafe {
+            SetInformationJobObject(
+                job.handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            return Err(PtyError::Io(io::Error::last_os_error()));
+        }
+
+        // SAFETY: `process` is the process handle exposed by portable-pty for the
+        // spawned child, and `job.handle` is configured to kill members on close.
+        let assigned = unsafe { AssignProcessToJobObject(job.handle, process.cast()) };
+        if assigned == 0 {
+            return Err(PtyError::Io(io::Error::last_os_error()));
+        }
+
+        Ok(job)
+    }
+
+    fn terminate(&self) -> Result<(), PtyError> {
+        // SAFETY: `self.handle` is a live job handle for this PTY until Drop.
+        if unsafe { TerminateJobObject(self.handle, 1) } == 0 {
+            return Err(PtyError::Io(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJobObject {
+    fn drop(&mut self) {
+        // SAFETY: `handle` is owned by this wrapper and closed exactly once here.
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
 }
 
 fn build_command(
