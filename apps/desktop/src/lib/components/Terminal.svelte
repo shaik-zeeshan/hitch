@@ -1,13 +1,14 @@
 <script lang="ts">
   // Live PTY terminal (mockup .term). Ported from the React TerminalPane: one
   // xterm instance per session, fed from the daemon's per-session binary output
-  // channel (ADR 0007). The parent keeps every session's Terminal mounted for
-  // the active parent's lifetime and toggles visibility (the `active` prop)
-  // rather than mounting/unmounting per tab/diff switch, so scroll + buffer
-  // survive a tab change. This instance lives for one session: it mounts when
-  // its session first appears in the active parent and unmounts only when the
-  // session closes (removed from the keyed list) or the parent changes. There
-  // is therefore no changing `session` prop to react to.
+  // channel (ADR 0007). Center.svelte keys a Terminal off EVERY session (across
+  // all parents, not just the active one) and toggles visibility (the `active`
+  // prop) rather than mounting/unmounting per tab/diff/worktree switch, so
+  // scroll + buffer + the PTY-aligned grid survive every switch. This instance
+  // lives for exactly one session for its whole lifetime: it mounts when the
+  // session first appears and unmounts ONLY when the session closes (removed
+  // from the keyed list) — NOT on a parent/worktree switch. There is therefore
+  // no changing `session` prop to react to.
   //
   // Output flow: raw PTY bytes arrive as Uint8Array tails from
   // `subscribeSessionOutput`; we feed them straight to `term.write`, which does
