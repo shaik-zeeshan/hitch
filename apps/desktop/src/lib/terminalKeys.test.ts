@@ -38,10 +38,15 @@ describe("classifyTerminalKey", () => {
     );
   });
 
-  it("does not fire newline on the keyup phase of Shift+Enter", () => {
+  it("suppresses non-keydown phases of Shift+Enter", () => {
     expect(
       classifyTerminalKey(ev({ type: "keyup", shiftKey: true, key: "Enter" })),
-    ).toBe("pass");
+    ).toBe("suppress");
+    expect(
+      classifyTerminalKey(
+        ev({ type: "keypress", shiftKey: true, key: "Enter" }),
+      ),
+    ).toBe("suppress");
   });
 
   it("passes Cmd shortcuts on non-keydown phases through", () => {

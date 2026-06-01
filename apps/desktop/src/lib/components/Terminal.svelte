@@ -435,6 +435,10 @@
           // xterm.js 6.1 may handle this natively; remove the workaround then.
           sendInput(sessionId, "\n");
           return false;
+        case "suppress":
+          // Non-keydown Shift+Enter phases are consumed without sending another
+          // byte, preserving the old behavior: one LF, no native Enter fallback.
+          return false;
         case "copy":
           // Copy only when there's a selection; otherwise let Cmd+C through.
           if (term?.hasSelection()) {
