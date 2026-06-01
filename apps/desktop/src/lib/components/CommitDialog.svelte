@@ -60,11 +60,13 @@
 
   async function generate() {
     if (!canGenerate || !confirmReplace()) return;
+    const worktreeId = $gitStatus?.worktree_id ?? null;
+    if (!worktreeId) return;
     const seq = generationSeq;
     generating = true;
     errMsg = null;
     try {
-      const draft = await generateCommitDraft();
+      const draft = await generateCommitDraft(worktreeId);
       if (seq !== generationSeq) return;
       subject = draft.subject;
       body = draft.body;
@@ -78,17 +80,19 @@
 
   async function stageAllAndGenerate() {
     if (!canStageAllAndGenerate || !confirmReplace()) return;
+    const worktreeId = $gitStatus?.worktree_id ?? null;
+    if (!worktreeId) return;
     const seq = generationSeq;
     generating = true;
     errMsg = null;
     try {
       const paths = unstaged.map((file) => file.path);
-      await setFilesStaged(paths, true);
-      const draft = await generateCommitDraft();
+      await setFilesStaged(paths, true, worktreeId);
+      const draft = await generateCommitDraft(worktreeId);
       if (seq !== generationSeq) return;
       subject = draft.subject;
       body = draft.body;
-      if ($gitStatus?.worktree_id) void loadGitStatus($gitStatus.worktree_id).catch(() => {});
+      void loadGitStatus(worktreeId).catch(() => {});
     } catch (err) {
       if (seq !== generationSeq) return;
       errMsg = err instanceof Error ? err.message : String(err);
@@ -99,10 +103,12 @@
 
   async function submit() {
     if (!canCommit) return;
+    const worktreeId = $gitStatus?.worktree_id ?? null;
+    if (!worktreeId) return;
     submitting = true;
     errMsg = null;
     try {
-      await commit(subject, body);
+      await commit(subject, body, worktreeId);
       commitOpen.set(false);
     } catch (err) {
       errMsg = err instanceof Error ? err.message : String(err);

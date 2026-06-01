@@ -29,6 +29,7 @@ import {
   applyJobProgress,
   cancellableJobForSelectedWorktree,
   cancelJob,
+  commit,
   completeJob,
   connection,
   createWorktree,
@@ -47,6 +48,7 @@ import {
   prByWorktree,
   prInfo,
   projects,
+  push,
   reconnect,
   restartDaemon,
   runJob,
@@ -868,6 +870,56 @@ describe("job store: StartJob -> JobCompleted", () => {
     completeJob("foreign", { type: "ack" });
     await expect(promise).resolves.toMatchObject({ type: "ack" });
     expect(settled).toBe(true);
+  });
+
+});
+
+describe("worktree-scoped git actions", () => {
+  it("keeps a commit-then-push sequence on the triggering worktree after selection changes", async () => {
+    const requests: unknown[] = [];
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; request?: { type: string } } }) => {
+        requests.push(request);
+        if (request.type === "commit") {
+          selectedWorktreeId.set("w-active");
+          return { type: "ack" };
+        }
+        if (request.type === "git-status") {
+          return {
+            type: "git-status",
+            status: {
+              worktree_id: "w-trigger",
+              branch: "feature",
+              dirty: false,
+              ahead: 1,
+              behind: 0,
+              additions: 0,
+              deletions: 0,
+              files: [],
+            },
+          };
+        }
+        if (request.type === "start-job" && request.request?.type === "push") {
+          return { type: "job-started", job_id: "j-trigger-push" };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    selectedWorktreeId.set("w-trigger");
+    await commit("Lock target", null, "w-trigger");
+    expect(get(selectedWorktreeId)).toBe("w-active");
+
+    const pushPromise = push("w-trigger");
+    await flush();
+
+    expect(requests).toContainEqual({
+      type: "start-job",
+      request: { type: "push", worktree_id: "w-trigger" },
+    });
+
+    completeJob("j-trigger-push", { type: "ack" });
+    await expect(pushPromise).resolves.toBeUndefined();
   });
 });
 

@@ -1613,8 +1613,8 @@ export function closeDiff(): void {
 export async function setFilesStaged(
   paths: string[],
   staged: boolean,
+  worktreeId: Id | null = get(gitWorktreeId),
 ): Promise<void> {
-  const worktreeId = get(gitWorktreeId);
   if (!worktreeId || paths.length === 0) return;
   const before = get(gitStatus);
   // Invalidate any in-flight status poll so it cannot briefly undo the
@@ -1691,8 +1691,11 @@ export function discardAllFiles(): Promise<void> {
   return discardFiles(paths);
 }
 
-export async function commit(subject: string, body: string | null = null): Promise<void> {
-  const worktreeId = get(gitWorktreeId);
+export async function commit(
+  subject: string,
+  body: string | null = null,
+  worktreeId: Id | null = get(gitWorktreeId),
+): Promise<void> {
   const trimmedSubject = subject.trim();
   const trimmedBody = body?.trim() || null;
   if (!worktreeId || !trimmedSubject) return;
@@ -1723,8 +1726,9 @@ export async function listDraftModels(provider: DraftProvider): Promise<string[]
   return response.models;
 }
 
-export async function generateCommitDraft(): Promise<CommitDraft> {
-  const worktreeId = get(gitWorktreeId);
+export async function generateCommitDraft(
+  worktreeId: Id | null = get(gitWorktreeId),
+): Promise<CommitDraft> {
   if (!worktreeId) throw new Error("Select a git worktree first.");
   const response = await runJob<Response & { draft: CommitDraft }>(
     {
@@ -1763,8 +1767,7 @@ function draftGenerationSettings(): { provider: string; model: string | null } |
   };
 }
 
-export async function push(): Promise<void> {
-  const worktreeId = get(gitWorktreeId);
+export async function push(worktreeId: Id | null = get(gitWorktreeId)): Promise<void> {
   if (!worktreeId) return;
   gitBusy.set(true);
   try {
@@ -1778,8 +1781,7 @@ export async function push(): Promise<void> {
   }
 }
 
-export async function pull(): Promise<void> {
-  const worktreeId = get(gitWorktreeId);
+export async function pull(worktreeId: Id | null = get(gitWorktreeId)): Promise<void> {
   if (!worktreeId) return;
   gitBusy.set(true);
   try {

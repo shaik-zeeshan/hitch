@@ -78,12 +78,13 @@ Request:
   generate-commit-draft(worktree_id, settings?)
   generate-pull-request-draft(worktree_id, base?, settings?)
   push(worktree_id)
+  fetch(worktree_id)
   pull(worktree_id)
   create-pull-request(worktree_id, title, body?, base?, draft)
   install-agent-hooks(worktree_id)
   report-agent-state(agent, state, session_id?, cwd?, detail?)
   ping
-  start-job(clone-project | create-worktree | list-draft-models | generate-commit-draft | generate-pull-request-draft | push | pull | pr-status | create-pull-request)
+  start-job(clone-project | create-worktree | list-draft-models | generate-commit-draft | generate-pull-request-draft | push | fetch | pull | pr-status | project-pr-statuses | create-pull-request)
   cancel-job(job_id)
 
 Response:

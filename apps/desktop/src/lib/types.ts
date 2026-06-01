@@ -154,6 +154,7 @@ export type JobRequest =
       settings: { provider: string; model: string | null } | null;
     }
   | { type: "push"; worktree_id: Id }
+  | { type: "fetch"; worktree_id: Id }
   | { type: "pull"; worktree_id: Id }
   | { type: "pr-status"; worktree_id: Id }
   | { type: "project-pr-statuses"; project_id: Id }

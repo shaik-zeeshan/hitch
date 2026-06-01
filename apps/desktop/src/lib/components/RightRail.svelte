@@ -115,23 +115,23 @@
   }
 
   async function handleAutoCommitPush() {
-    if ($gitBusy || autoRunning) return;
+    const worktreeId = $gitWorktreeId;
+    if ($gitBusy || autoRunning || !worktreeId) return;
+    const pathsToStage = unstaged.map((file) => file.path);
     autoRunning = true;
     const id = toast.loading("Staging files…");
     try {
-      if (unstaged.length > 0) {
-        await setFilesStaged(unstaged.map((f) => f.path), true);
+      if (pathsToStage.length > 0) {
+        await setFilesStaged(pathsToStage, true, worktreeId);
       }
       toast.loading("Generating commit message…", { id });
-      const draft = await generateCommitDraft();
+      const draft = await generateCommitDraft(worktreeId);
       toast.loading("Committing…", { id });
-      await commit(draft.subject, draft.body);
+      await commit(draft.subject, draft.body, worktreeId);
       toast.loading("Pushing…", { id });
-      await push();
-      if ($gitStatus?.worktree_id) {
-        void loadGitStatus($gitStatus.worktree_id).catch(() => {});
-        void loadPrStatus($gitStatus.worktree_id);
-      }
+      await push(worktreeId);
+      void loadGitStatus(worktreeId).catch(() => {});
+      void loadPrStatus(worktreeId);
       toast.success(draft.subject, { id });
     } catch (err) {
       toast.error(shortError(err), { id });
@@ -141,14 +141,14 @@
   }
 
   async function handleManualPush() {
+    const worktreeId = $gitWorktreeId;
+    if (!worktreeId) return;
     const count = ahead;
     const id = toast.loading("Pushing…");
     try {
-      await push();
-      if ($gitStatus?.worktree_id) {
-        void loadGitStatus($gitStatus.worktree_id).catch(() => {});
-        void loadPrStatus($gitStatus.worktree_id);
-      }
+      await push(worktreeId);
+      void loadGitStatus(worktreeId).catch(() => {});
+      void loadPrStatus(worktreeId);
       toast.success(`Pushed ↑${count}`, { id });
     } catch (err) {
       toast.error(shortError(err), { id });
@@ -156,11 +156,13 @@
   }
 
   async function handleManualPull() {
+    const worktreeId = $gitWorktreeId;
+    if (!worktreeId) return;
     const count = behind;
     const id = toast.loading("Pulling…");
     try {
-      await pull();
-      if ($gitStatus?.worktree_id) void loadGitStatus($gitStatus.worktree_id).catch(() => {});
+      await pull(worktreeId);
+      void loadGitStatus(worktreeId).catch(() => {});
       toast.success(`Pulled ↓${count}`, { id });
     } catch (err) {
       toast.error(shortError(err), { id });

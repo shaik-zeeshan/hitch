@@ -1143,6 +1143,7 @@ fn handle_request<R: Read>(
         | Request::GenerateCommitDraft { .. }
         | Request::GeneratePullRequestDraft { .. }
         | Request::Push { .. }
+        | Request::Fetch { .. }
         | Request::Pull { .. }
         | Request::PrStatus { .. }
         | Request::ProjectPrStatuses { .. }
@@ -2998,6 +2999,15 @@ fn dispatch_job(
             Some("Pushing…"),
             move |state, control| do_push(state, worktree_id, control),
         ),
+        JobRequest::Fetch { worktree_id } => start_job(
+            "hitch-fetch",
+            state,
+            client_id,
+            request_id,
+            Some("fetch"),
+            Some("Fetching…"),
+            move |state, control| do_fetch(state, worktree_id, control),
+        ),
         JobRequest::Pull { worktree_id } => start_job(
             "hitch-pull",
             state,
@@ -3102,6 +3112,16 @@ fn do_push(
 ) -> Result<Response, ProtocolError> {
     let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
     git.push_with_control(&worktree.path, "origin", &worktree.branch, true, control)
+        .map_err(git_error)?;
+    Ok(Response::Ack)
+}
+fn do_fetch(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+    control: &JobControl,
+) -> Result<Response, ProtocolError> {
+    let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
+    git.fetch_with_control(&worktree.path, "origin", control)
         .map_err(git_error)?;
     Ok(Response::Ack)
 }

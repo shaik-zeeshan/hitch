@@ -345,6 +345,16 @@ impl GitClient {
         self.run_git(repo_path.as_ref(), vec![os("fetch"), os(remote)])
     }
 
+    /// Fetch from a remote as a cancellable child process.
+    pub fn fetch_with_control(
+        &self,
+        repo_path: impl AsRef<Path>,
+        remote: &str,
+        control: &dyn CommandControl,
+    ) -> Result<CommandOutput> {
+        self.run_git_with_control(repo_path.as_ref(), vec![os("fetch"), os(remote)], control)
+    }
+
     /// Pull a branch using the system git executable (relies on user's pull
     /// config — ff/merge/rebase).
     pub fn pull(

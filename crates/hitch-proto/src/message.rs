@@ -26,8 +26,9 @@ use serde::{Deserialize, Serialize};
 /// v14 makes reported/broadcast agent state nullable (`null` clears daemon-owned
 /// state) and includes current agent metadata on session-open replay payloads.
 /// v15 adds `Request::RepaintSession` so the GUI can ask the daemon to force a
-/// child-process repaint after activation or resize.
-pub const PROTOCOL_VERSION: u16 = 15;
+/// child-process repaint after activation or resize. v16 adds fetch as an
+/// explicit Job so remote refs can be refreshed without blocking the request loop.
+pub const PROTOCOL_VERSION: u16 = 16;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -94,6 +95,8 @@ pub enum JobRequest {
     },
     /// Push the current branch using the system `git` CLI.
     Push { worktree_id: WorktreeId },
+    /// Fetch remote refs using the system `git` CLI.
+    Fetch { worktree_id: WorktreeId },
     /// Pull the current branch from its upstream using the system `git` CLI.
     Pull { worktree_id: WorktreeId },
     /// Look up the GitHub PR (if any) for a worktree's current branch via `gh`.
@@ -241,6 +244,8 @@ pub enum Request {
     },
     /// Push the current branch using the system `git` CLI.
     Push { worktree_id: WorktreeId },
+    /// Fetch remote refs using the system `git` CLI.
+    Fetch { worktree_id: WorktreeId },
     /// Pull the current branch from its upstream using the system `git` CLI.
     Pull { worktree_id: WorktreeId },
     /// Create a GitHub PR through `gh`.
@@ -318,6 +323,7 @@ impl From<JobRequest> for Request {
                 settings,
             },
             JobRequest::Push { worktree_id } => Request::Push { worktree_id },
+            JobRequest::Fetch { worktree_id } => Request::Fetch { worktree_id },
             JobRequest::Pull { worktree_id } => Request::Pull { worktree_id },
             JobRequest::PrStatus { worktree_id } => Request::PrStatus { worktree_id },
             JobRequest::ProjectPrStatuses { project_id } => {
@@ -383,6 +389,7 @@ impl TryFrom<Request> for JobRequest {
                 settings,
             }),
             Request::Push { worktree_id } => Ok(JobRequest::Push { worktree_id }),
+            Request::Fetch { worktree_id } => Ok(JobRequest::Fetch { worktree_id }),
             Request::Pull { worktree_id } => Ok(JobRequest::Pull { worktree_id }),
             Request::PrStatus { worktree_id } => Ok(JobRequest::PrStatus { worktree_id }),
             Request::ProjectPrStatuses { project_id } => {
@@ -897,7 +904,7 @@ mod tests {
         let value: serde_json::Value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["type"], "repaint-session");
         assert_eq!(value["session_id"], session_id.to_string());
-        assert_eq!(PROTOCOL_VERSION, 15);
+        assert_eq!(PROTOCOL_VERSION, 16);
     }
 
     #[test]
@@ -1178,6 +1185,7 @@ mod tests {
                     model: Some("gpt-5-codex".into()),
                 }),
             },
+            Request::Fetch { worktree_id },
             Request::Push { worktree_id },
             Request::Pull { worktree_id },
             Request::CreatePullRequest {

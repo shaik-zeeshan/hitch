@@ -527,6 +527,57 @@ fn stage_commit_push_and_create_pr_round_trip_over_socket() {
 }
 
 #[test]
+fn fetch_job_updates_behind_count_from_remote() {
+    let socket = test_socket_path("git-fetch");
+    let repo = test_dir_path("git-fetch-repo");
+    let remote = test_dir_path("git-fetch-remote");
+    let peer = test_dir_path("git-fetch-peer");
+    init_git_repo(&repo);
+    init_bare_remote(&remote);
+    let remote_str = remote.to_str().unwrap();
+    run_git(&repo, ["remote", "add", "origin", remote_str]);
+    run_git(&repo, ["push", "-u", "origin", "main"]);
+
+    let peer_str = peer.to_str().unwrap();
+    run_git(
+        std::env::temp_dir().as_path(),
+        ["clone", remote_str, peer_str],
+    );
+    run_git(&peer, ["config", "user.name", "Hitch Test"]);
+    run_git(&peer, ["config", "user.email", "hitch@example.test"]);
+    std::fs::write(peer.join("tracked.txt"), "remote change\n").unwrap();
+    run_git(&peer, ["add", "tracked.txt"]);
+    run_git(&peer, ["commit", "-m", "remote change"]);
+    run_git(&peer, ["push", "origin", "main"]);
+
+    let mut daemon = DaemonGuard::start(&socket);
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &repo);
+    let worktree = client.list_worktrees(3, project.id).remove(0);
+
+    let before = client.git_status(4, worktree.id);
+    assert_eq!(before.behind, 0);
+    match client.run_job(
+        5,
+        JobRequest::Fetch {
+            worktree_id: worktree.id,
+        },
+    ) {
+        Response::Ack => {}
+        other => panic!("fetch job did not ack: {other:?}"),
+    }
+    let after = client.git_status(6, worktree.id);
+    assert_eq!(after.behind, 1);
+
+    client.shutdown(7);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(repo);
+    let _ = std::fs::remove_dir_all(remote);
+    let _ = std::fs::remove_dir_all(peer);
+}
+
+#[test]
 fn detach_mode_survives_spawning_process_exit() {
     let socket = test_socket_path("detach");
     let store = test_file_path("detach-store", "sqlite");
