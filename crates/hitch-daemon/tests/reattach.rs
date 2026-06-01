@@ -1,18 +1,48 @@
-#![cfg(unix)]
-
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
 use hitch_core::{Project, Session, SessionId, SessionParent, Worktree};
+use hitch_proto::transport::{connect_daemon, DaemonStream};
+#[cfg(unix)]
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, CommitDraft, ControlMessage, ErrorCode, Event,
-    GitStatus, JobRequest, PullRequestDraft, Request, Response, PROTOCOL_VERSION,
+    encode_control_message, encode_pty_frame, CommitDraft, ErrorCode, Event, GitStatus, JobRequest,
+    PullRequestDraft,
 };
+use hitch_proto::{ControlMessage, Request, Response, PROTOCOL_VERSION};
 
+#[test]
+fn daemon_transport_answers_hello_ping_and_shutdown() {
+    let socket = test_socket_path("transport-basic");
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut stream = connect_test_daemon(&socket);
+    send_transport_request(
+        &mut stream,
+        1,
+        Request::Hello {
+            client_name: "reattach-test".into(),
+            protocol_version: PROTOCOL_VERSION,
+        },
+    );
+    expect_transport_response(&mut stream, 1, |response| {
+        matches!(response, Response::Hello { .. })
+    });
+    send_transport_request(&mut stream, 2, Request::Ping);
+    expect_transport_response(&mut stream, 2, |response| {
+        matches!(response, Response::Pong)
+    });
+    send_transport_request(&mut stream, 3, Request::ShutdownDaemon);
+    expect_transport_response(&mut stream, 3, |response| matches!(response, Response::Ack));
+    daemon.wait_for_exit();
+}
+
+#[cfg(unix)]
 #[test]
 fn reconnect_replays_scrollback_and_receives_live_output() {
     let socket = test_socket_path("reattach");
@@ -60,6 +90,7 @@ fn reconnect_replays_scrollback_and_receives_live_output() {
     let _ = std::fs::remove_dir_all(project_root);
 }
 
+#[cfg(unix)]
 #[test]
 fn simulated_reboot_restores_persisted_session_layout_as_fresh_session() {
     let socket = test_socket_path("restore-one");
@@ -99,6 +130,7 @@ fn simulated_reboot_restores_persisted_session_layout_as_fresh_session() {
     let _ = std::fs::remove_dir_all(project_root);
 }
 
+#[cfg(unix)]
 #[test]
 fn graceful_quit_preserves_layout_for_next_launch() {
     // A menu-bar "Quit Hitch" sends ShutdownDaemon, which kills live PTYs. Those
@@ -140,6 +172,7 @@ fn graceful_quit_preserves_layout_for_next_launch() {
     let _ = std::fs::remove_dir_all(project_root);
 }
 
+#[cfg(unix)]
 #[test]
 fn worktree_branch_tracks_unborn_head_renames() {
     let socket = test_socket_path("unborn-branch");
@@ -165,6 +198,7 @@ fn worktree_branch_tracks_unborn_head_renames() {
     let _ = std::fs::remove_dir_all(repo);
 }
 
+#[cfg(unix)]
 #[test]
 fn git_status_stage_and_unstage_round_trip_over_socket() {
     let socket = test_socket_path("git-flow");
@@ -209,6 +243,7 @@ fn git_status_stage_and_unstage_round_trip_over_socket() {
     let _ = std::fs::remove_dir_all(repo);
 }
 
+#[cfg(unix)]
 #[test]
 fn draft_generation_round_trips_over_socket() {
     let socket = test_socket_path("drafts");
@@ -256,6 +291,7 @@ fn draft_generation_round_trips_over_socket() {
     let _ = std::fs::remove_dir_all(repo);
 }
 
+#[cfg(unix)]
 #[test]
 fn slow_draft_generation_does_not_block_follow_up_requests() {
     let socket = test_socket_path("async-drafts");
@@ -313,6 +349,7 @@ fn slow_draft_generation_does_not_block_follow_up_requests() {
     let _ = std::fs::remove_file(codex);
 }
 
+#[cfg(unix)]
 #[test]
 fn cancel_job_kills_running_draft_and_completes_promptly() {
     // A draft Job spawns a slow provider child in its own process group.
@@ -368,6 +405,7 @@ fn cancel_job_kills_running_draft_and_completes_promptly() {
     let _ = std::fs::remove_file(codex);
 }
 
+#[cfg(unix)]
 #[test]
 fn discard_files_round_trip_over_socket_keeps_connection_open() {
     let socket = test_socket_path("git-discard");
@@ -402,6 +440,7 @@ fn discard_files_round_trip_over_socket_keeps_connection_open() {
     let _ = std::fs::remove_dir_all(repo);
 }
 
+#[cfg(unix)]
 #[test]
 fn invalid_request_returns_error_without_closing_connection() {
     let socket = test_socket_path("invalid-request");
@@ -435,6 +474,7 @@ fn invalid_request_returns_error_without_closing_connection() {
     daemon.wait_for_exit();
 }
 
+#[cfg(unix)]
 #[test]
 fn prior_protocol_is_rejected_at_hello() {
     let socket = test_socket_path("proto");
@@ -469,6 +509,7 @@ fn prior_protocol_is_rejected_at_hello() {
     daemon.wait_for_exit();
 }
 
+#[cfg(unix)]
 #[test]
 fn stage_commit_push_and_create_pr_round_trip_over_socket() {
     let socket = test_socket_path("git-commit");
@@ -528,6 +569,7 @@ fn stage_commit_push_and_create_pr_round_trip_over_socket() {
     let _ = std::fs::remove_file(gh_stub);
 }
 
+#[cfg(unix)]
 #[test]
 fn fetch_job_updates_behind_count_from_remote() {
     let socket = test_socket_path("git-fetch");
@@ -579,6 +621,7 @@ fn fetch_job_updates_behind_count_from_remote() {
     let _ = std::fs::remove_dir_all(peer);
 }
 
+#[cfg(unix)]
 #[test]
 fn detach_mode_survives_spawning_process_exit() {
     let socket = test_socket_path("detach");
@@ -608,6 +651,58 @@ fn detach_mode_survives_spawning_process_exit() {
     let _ = std::fs::remove_file(store);
     let _ = std::fs::remove_dir_all(managed_root);
 }
+fn connect_test_daemon(socket: &Path) -> DaemonStream {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match connect_daemon(socket) {
+            Ok(stream) => return stream,
+            Err(err) if Instant::now() < deadline => {
+                if err.kind() != io::ErrorKind::NotFound
+                    && err.kind() != io::ErrorKind::ConnectionRefused
+                {
+                    // The daemon may have bound the endpoint but not yet entered accept.
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => panic!("connect {}: {err}", socket.display()),
+        }
+    }
+}
+
+fn send_transport_request(stream: &mut DaemonStream, id: u64, request: Request) {
+    stream
+        .send_control(&ControlMessage::request(id, request))
+        .expect("send request");
+}
+
+fn expect_transport_response(
+    stream: &mut DaemonStream,
+    expected_id: u64,
+    expected: impl Fn(&Response) -> bool,
+) {
+    loop {
+        let messages = stream.read_control_messages().expect("read response");
+        for message in messages {
+            match message {
+                ControlMessage::Response { id, response }
+                    if id == expected_id && expected(&response) =>
+                {
+                    return;
+                }
+                ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                } => panic!("request failed: {error:?}"),
+                ControlMessage::Response { id, response } if id == expected_id => {
+                    panic!("unexpected response: {response:?}");
+                }
+                ControlMessage::Event { .. }
+                | ControlMessage::Request { .. }
+                | ControlMessage::Response { .. } => {}
+            }
+        }
+    }
+}
 
 struct DaemonGuard {
     child: Child,
@@ -620,10 +715,12 @@ impl DaemonGuard {
         Self::start_inner(socket, None)
     }
 
+    #[cfg(unix)]
     fn start_with_gh(socket: &Path, gh: &Path) -> Self {
         Self::start_inner(socket, Some(gh))
     }
 
+    #[cfg(unix)]
     fn start_with_codex(socket: &Path, codex: &Path) -> Self {
         let store = test_file_path("daemon-store", "sqlite");
         let managed_root = test_dir_path("daemon-managed");
@@ -670,24 +767,21 @@ impl Drop for DaemonGuard {
     }
 }
 
+#[cfg(unix)]
 struct TestClient {
-    writer: UnixStream,
-    reader: BufReader<UnixStream>,
+    stream: BufReader<DaemonStream>,
 }
 
+#[cfg(unix)]
 impl TestClient {
     fn connect(socket: &Path) -> Self {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            match UnixStream::connect(socket) {
+            match connect_daemon(socket) {
                 Ok(stream) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .expect("set timeout");
-                    let reader_stream = stream.try_clone().expect("clone stream");
+                    stream.set_nonblocking(true).expect("set nonblocking");
                     return Self {
-                        writer: stream,
-                        reader: BufReader::new(reader_stream),
+                        stream: BufReader::new(stream),
                     };
                 }
                 Err(err) if Instant::now() < deadline => {
@@ -721,6 +815,23 @@ impl TestClient {
                     response: Response::Error { error },
                     ..
                 }) => panic!("hello failed: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
+
+    fn ping(&mut self, id: u64) {
+        self.send_request(id, Request::Ping);
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::Pong,
+                }) if response_id == id => return,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("ping failed: {error:?}"),
                 Packet::Control(_) | Packet::Output { .. } => continue,
             }
         }
@@ -963,7 +1074,7 @@ impl TestClient {
         let deadline = Instant::now() + timeout;
         let mut bytes = Vec::new();
         while Instant::now() < deadline {
-            match self.read_packet() {
+            match self.read_packet_until(deadline) {
                 Packet::Output {
                     session_id: packet_session_id,
                     bytes: packet_bytes,
@@ -991,7 +1102,7 @@ impl TestClient {
         self.send_request(id, Request::ShutdownDaemon);
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            match self.read_packet() {
+            match self.read_packet_until(deadline) {
                 Packet::Control(ControlMessage::Response {
                     id: response_id,
                     response: Response::Ack,
@@ -1004,28 +1115,42 @@ impl TestClient {
 
     fn send_request(&mut self, id: u64, request: Request) {
         let bytes = encode_control_message(&ControlMessage::request(id, request)).unwrap();
-        self.writer.write_all(&bytes).unwrap();
-        self.writer.flush().unwrap();
+        self.stream.get_mut().write_all(&bytes).unwrap();
+        self.stream.get_mut().flush().unwrap();
     }
 
     fn send_raw_control(&mut self, bytes: &[u8]) {
-        self.writer.write_all(bytes).unwrap();
-        self.writer.flush().unwrap();
+        self.stream.get_mut().write_all(bytes).unwrap();
+        self.stream.get_mut().flush().unwrap();
     }
 
     #[allow(dead_code)]
     fn send_request_with_pty_frame(&mut self, id: u64, request: Request, payload: &[u8]) {
         let control = encode_control_message(&ControlMessage::request(id, request)).unwrap();
         let frame = encode_pty_frame(payload).unwrap();
-        self.writer.write_all(&control).unwrap();
-        self.writer.write_all(&frame).unwrap();
-        self.writer.flush().unwrap();
+        self.stream.get_mut().write_all(&control).unwrap();
+        self.stream.get_mut().write_all(&frame).unwrap();
+        self.stream.get_mut().flush().unwrap();
     }
 
     fn read_packet(&mut self) -> Packet {
+        self.read_packet_until(Instant::now() + Duration::from_secs(5))
+    }
+
+    fn read_packet_until(&mut self, deadline: Instant) -> Packet {
         let mut line = Vec::new();
-        let len = self.reader.read_until(b'\n', &mut line).unwrap();
-        assert!(len > 0, "daemon closed connection");
+        loop {
+            match self.stream.read_until(b'\n', &mut line) {
+                Ok(0) => panic!("daemon closed connection"),
+                Ok(_) => break,
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("read control line: {err}"),
+            }
+        }
         if line.last() == Some(&b'\n') {
             line.pop();
         }
@@ -1040,21 +1165,38 @@ impl TestClient {
         } = message
         {
             let mut prefix = [0_u8; 4];
-            self.reader.read_exact(&mut prefix).unwrap();
+            self.read_exact_until(&mut prefix, deadline);
             let len = u32::from_be_bytes(prefix);
             assert_eq!(
                 len, byte_count,
                 "event byte_count and frame length should match"
             );
             let mut bytes = vec![0_u8; len as usize];
-            self.reader.read_exact(&mut bytes).unwrap();
+            self.read_exact_until(&mut bytes, deadline);
             Packet::Output { session_id, bytes }
         } else {
             Packet::Control(message)
         }
     }
+
+    fn read_exact_until(&mut self, buf: &mut [u8], deadline: Instant) {
+        let mut read = 0;
+        while read < buf.len() {
+            match self.stream.read(&mut buf[read..]) {
+                Ok(0) => panic!("daemon closed connection"),
+                Ok(len) => read += len,
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("read pty frame: {err}"),
+            }
+        }
+    }
 }
 
+#[cfg(unix)]
 enum Packet {
     Control(ControlMessage),
     Output {
@@ -1067,6 +1209,7 @@ fn daemon_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hitch-daemon"))
 }
 
+#[cfg(unix)]
 fn spawn_daemon(socket: &Path, store: &Path, managed_root: &Path) -> Child {
     spawn_daemon_full(socket, store, managed_root, None)
 }
@@ -1079,6 +1222,7 @@ fn spawn_daemon_full(socket: &Path, store: &Path, managed_root: &Path, gh: Optio
     spawn_daemon_command(command)
 }
 
+#[cfg(unix)]
 fn spawn_daemon_with_codex(
     socket: &Path,
     store: &Path,
@@ -1122,6 +1266,7 @@ fn spawn_daemon_command(mut command: Command) -> Child {
         .expect("spawn hitch-daemon")
 }
 
+#[cfg(unix)]
 fn init_git_repo(path: &Path) {
     std::fs::create_dir_all(path).unwrap();
     run_git(path, ["init", "--initial-branch=main"]);
@@ -1132,6 +1277,7 @@ fn init_git_repo(path: &Path) {
     run_git(path, ["commit", "-m", "initial"]);
 }
 
+#[cfg(unix)]
 fn init_bare_remote(path: &Path) {
     std::fs::create_dir_all(path).unwrap();
     run_git(path, ["init", "--bare", "--initial-branch=main"]);
@@ -1139,6 +1285,7 @@ fn init_bare_remote(path: &Path) {
 
 /// Write an executable shell script that impersonates `gh`, echoing a fixed PR
 /// URL so create-PR can be exercised over the socket without hitting GitHub.
+#[cfg(unix)]
 fn write_gh_stub() -> PathBuf {
     let path = test_file_path("gh-stub", "sh");
     write_executable_script(
@@ -1148,6 +1295,7 @@ fn write_gh_stub() -> PathBuf {
     path
 }
 
+#[cfg(unix)]
 fn write_slow_codex_stub() -> PathBuf {
     let path = test_file_path("codex-stub", "sh");
     write_executable_script(
@@ -1157,6 +1305,7 @@ fn write_slow_codex_stub() -> PathBuf {
     path
 }
 
+#[cfg(unix)]
 fn write_executable_script(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
     #[cfg(unix)]
@@ -1168,6 +1317,7 @@ fn write_executable_script(path: &Path, contents: &str) {
     }
 }
 
+#[cfg(unix)]
 fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) {
     let output = Command::new("git")
         .current_dir(cwd)
@@ -1201,6 +1351,7 @@ fn test_dir_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("hitch-daemon-{name}-{nonce}"))
 }
 
+#[cfg(unix)]
 fn wait_for_socket_gone(socket: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {

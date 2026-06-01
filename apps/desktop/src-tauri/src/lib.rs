@@ -15,6 +15,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
 use hitch_core::SessionId;
 use hitch_proto::{
@@ -160,9 +164,16 @@ fn is_handshake_timeout(reason: &str) -> bool {
 fn should_force_kill_daemon(reason: &str) -> bool {
     // A wedged daemon (missed heartbeat) and an incompatible one are both
     // untrustworthy to shut themselves down on request — an incompatible daemon
-    // may not even parse our ShutdownDaemon message. SIGKILL by pid instead of
-    // asking nicely and waiting on a graceful unbind that may never come.
+    // may not even parse our ShutdownDaemon message. Hard-kill by a platform-safe
+    // process identity instead of asking nicely and waiting on a graceful unbind
+    // that may never come.
     reason == HEARTBEAT_LOST_REASON || reason.starts_with(INCOMPATIBLE_DAEMON_PREFIX)
+}
+#[cfg(windows)]
+fn windows_force_kill_pid_for_reason(reason: &str, cached_server_pid: Option<u32>) -> Option<u32> {
+    should_force_kill_daemon(reason)
+        .then_some(cached_server_pid)
+        .flatten()
 }
 
 /// Render a failed `Hello` exchange into a human reason for the daemon status.
@@ -198,6 +209,41 @@ fn read_daemon_pidfile(socket_path: &Path) -> Option<u32> {
 #[cfg(unix)]
 fn daemon_pid_for_force_kill(socket_path: &Path, cached_pid: Option<u32>) -> Option<u32> {
     cached_pid.or_else(|| read_daemon_pidfile(socket_path))
+}
+
+#[cfg(windows)]
+fn terminate_process(pid: u32) -> Result<(), String> {
+    // SAFETY: Win32 process handle lifecycle is bounded to this function. The
+    // handle is opened only with PROCESS_TERMINATE and is closed on every path
+    // after a successful OpenProcess.
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            return Ok(());
+        }
+        return Err(format!(
+            "failed to open daemon process {pid} for termination: {err}"
+        ));
+    }
+
+    // SAFETY: `handle` is a live process handle from OpenProcess. Exit code 1 is
+    // arbitrary; the daemon is being force-terminated because graceful shutdown
+    // cannot be trusted.
+    let terminated = unsafe { TerminateProcess(handle, 1) } != 0;
+    let terminate_err = if terminated {
+        None
+    } else {
+        Some(io::Error::last_os_error())
+    };
+    // SAFETY: close the handle acquired above exactly once.
+    unsafe {
+        CloseHandle(handle);
+    }
+    if let Some(err) = terminate_err {
+        return Err(format!("failed to terminate daemon process {pid}: {err}"));
+    }
+    Ok(())
 }
 
 /// Whether the pidfile's advisory lock is free — i.e. no live daemon holds it, so
@@ -375,10 +421,15 @@ struct HitchClientInner {
     /// Set while the user-requested restart path intentionally drops the old
     /// socket. EOF from that socket is expected and must not start auto-recovery.
     suppress_recovery: AtomicBool,
-    /// Pid reported by the last successful Hello handshake. Auto-recovery uses
+    /// Pid reported by the last successful Hello handshake. Unix auto-recovery uses
     /// it to SIGKILL a heartbeat-wedged daemon before waiting on socket release.
     daemon_pid: Mutex<Option<u32>>,
-    /// Daemon log path, computed once from `$HOME` to match the daemon writer.
+    /// Windows named-pipe server pid captured from a connected transport. This is
+    /// available before Hello, so an incompatible daemon that never handshakes can
+    /// still be force-restarted without Unix pidfile assumptions (ADR 0012).
+    #[cfg(windows)]
+    daemon_pipe_server_pid: Mutex<Option<u32>>,
+    /// Daemon log path, computed once to match the daemon writer.
     log_path: PathBuf,
     /// Ordered, fire-and-forget input lane (Slice 6, "input fast path"). Every
     /// keystroke is pushed here instead of riding the synchronous request path:
@@ -420,6 +471,8 @@ impl HitchClient {
             recovering: AtomicBool::new(false),
             suppress_recovery: AtomicBool::new(false),
             daemon_pid: Mutex::new(None),
+            #[cfg(windows)]
+            daemon_pipe_server_pid: Mutex::new(None),
             log_path: daemon_log_path(),
             input_tx,
         }));
@@ -540,9 +593,25 @@ impl HitchClient {
             *slot = daemon_pid;
         }
     }
-
+    #[cfg(unix)]
     fn cached_daemon_pid(&self) -> Option<u32> {
         self.0.daemon_pid.lock().ok().and_then(|slot| *slot)
+    }
+
+    #[cfg(windows)]
+    fn set_daemon_pipe_server_pid(&self, pid: Option<u32>) {
+        if let Ok(mut slot) = self.0.daemon_pipe_server_pid.lock() {
+            *slot = pid;
+        }
+    }
+
+    #[cfg(windows)]
+    fn cached_daemon_pipe_server_pid(&self) -> Option<u32> {
+        self.0
+            .daemon_pipe_server_pid
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
     }
 
     #[cfg(unix)]
@@ -565,9 +634,16 @@ impl HitchClient {
         wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)
     }
 
-    #[cfg(not(unix))]
-    fn force_kill_daemon(&self, _preferred_pid: Option<u32>) -> Result<(), String> {
-        Err("force-restarting the daemon is not implemented on this platform".into())
+    #[cfg(windows)]
+    fn force_kill_daemon(&self, preferred_pid: Option<u32>) -> Result<(), String> {
+        let daemon_pid = preferred_pid
+            .or_else(|| self.cached_daemon_pipe_server_pid())
+            .ok_or_else(|| {
+                "cannot force-restart daemon: connected named-pipe server pid is unknown"
+                    .to_string()
+            })?;
+        terminate_process(daemon_pid)?;
+        wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)
     }
 
     fn record_startup_failure(&self, app: &AppHandle, err: String) -> String {
@@ -723,6 +799,11 @@ impl HitchClient {
             .set_nonblocking(false)
             .map_err(|err| format!("failed to configure daemon socket: {err}"))?;
 
+        #[cfg(windows)]
+        let pipe_server_pid = stream
+            .connected_pipe_server_pid()
+            .map_err(|err| format!("failed to identify daemon named-pipe server: {err}"))?;
+
         let writer = stream
             .try_clone()
             .map_err(|err| format!("failed to clone daemon socket: {err}"))?;
@@ -731,6 +812,8 @@ impl HitchClient {
             .writer
             .lock()
             .map_err(|_| "writer lock poisoned".to_string())? = Some(writer);
+        #[cfg(windows)]
+        self.set_daemon_pipe_server_pid(Some(pipe_server_pid));
         self.0.connected.store(true, Ordering::SeqCst);
 
         let generation = self.0.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -778,27 +861,31 @@ impl HitchClient {
             // works across protocol versions.
             self.request_daemon_shutdown();
             let force_kill = should_force_kill_daemon(&reason);
+            #[cfg(unix)]
             let force_kill_pid = if reason == HEARTBEAT_LOST_REASON {
                 self.cached_daemon_pid()
             } else {
                 None
             };
+            #[cfg(windows)]
+            let force_kill_pid =
+                windows_force_kill_pid_for_reason(&reason, self.cached_daemon_pipe_server_pid());
             self.mark_disconnected(app, reason.clone());
             self.record_spawn_attempt(app)?;
             self.set_status(app, DaemonStatus::Starting, None);
 
-            // For a wedged or incompatible daemon, Unix SIGKILL by pid is the fast
-            // path. Platforms without a safe force-kill implementation fail here
-            // with an explicit status reason instead of applying Unix pidfile
-            // assumptions. In every successful case we then wait for the endpoint
-            // to stop accepting connections so we never spawn over a live daemon.
+            // Wedged and incompatible daemons are torn down with the platform's
+            // non-cooperative kill primitive: Unix uses a verified pidfile/Hello
+            // pid, Windows uses the connected named-pipe server pid (ADR 0012).
+            // In every successful case we then wait for the endpoint to stop
+            // accepting connections so we never spawn over a live daemon.
             if force_kill {
                 let kill_result = self.force_kill_daemon(force_kill_pid);
                 #[cfg(unix)]
                 {
                     let _ = kill_result;
                 }
-                #[cfg(not(unix))]
+                #[cfg(windows)]
                 if let Err(err) = kill_result {
                     self.set_status(app, DaemonStatus::Failed, Some(err.clone()));
                     return Err(err);
@@ -931,14 +1018,18 @@ impl HitchClient {
 
     fn clear_connection_state(&self, reason: &str, drop_writer: bool) {
         self.0.connected.store(false, Ordering::SeqCst);
-        // The cached pid is only meaningful while we're handshook with that exact
-        // daemon. Once disconnected it's stale — a daemon swapped underneath us
-        // (upgrade, crash+respawn) leaves an incompatible daemon at the socket
-        // whose pid lives only in the pidfile. Clearing here means `force_kill_daemon`
-        // falls through to the pidfile for the protocol-mismatch case instead of
-        // SIGKILLing a stale/reused pid while the real daemon keeps the socket.
+        // The cached Hello pid is only meaningful while we're handshook with that
+        // exact daemon. Once disconnected it's stale — a daemon swapped underneath
+        // us (upgrade, crash+respawn) leaves an incompatible daemon at the socket
+        // whose pid lives only in the pidfile on Unix or the connected pipe handle
+        // on Windows. Clearing here means force-kill falls back to the platform
+        // identity for the current endpoint instead of killing a stale/reused pid.
         if let Ok(mut slot) = self.0.daemon_pid.lock() {
             *slot = None;
+        }
+        #[cfg(windows)]
+        if drop_writer {
+            self.set_daemon_pipe_server_pid(None);
         }
         if drop_writer {
             if let Ok(mut writer) = self.0.writer.lock() {
@@ -1610,11 +1701,14 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        describe_handshake_failure, read_control_message, read_log_tail, read_pty_payload,
-        recovery_mode_for_loss, should_force_kill_daemon, tray_status_text,
-        wait_for_socket_release, ControlMessage, CrashLoopGuard, DaemonStatus, ErrorCode,
-        HitchClient, OutputRouter, ProtocolError, RecoveryMode, Request, Response, CRASH_LOOP_MAX,
-        HEARTBEAT_LOST_REASON,
+        describe_handshake_failure, read_log_tail, recovery_mode_for_loss,
+        should_force_kill_daemon, tray_status_text, CrashLoopGuard, DaemonStatus, ErrorCode,
+        OutputRouter, ProtocolError, RecoveryMode, Response, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
+    };
+    #[cfg(unix)]
+    use super::{
+        read_control_message, read_pty_payload, wait_for_socket_release, ControlMessage,
+        HitchClient, Request,
     };
     use hitch_core::SessionId;
     #[cfg(unix)]
@@ -1928,6 +2022,28 @@ mod tests {
         );
         assert_eq!(super::daemon_pid_for_force_kill(&socket_path, None), None);
         let _ = std::fs::remove_file(&pidfile);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_force_kill_uses_connected_pipe_server_pid_for_unhandshakeable_daemon() {
+        let incompatible = "restarting incompatible daemon: unsupported protocol";
+        assert_eq!(
+            super::windows_force_kill_pid_for_reason(incompatible, Some(424242)),
+            Some(424242)
+        );
+        assert_eq!(
+            super::windows_force_kill_pid_for_reason(HEARTBEAT_LOST_REASON, Some(424242)),
+            Some(424242)
+        );
+        assert_eq!(
+            super::windows_force_kill_pid_for_reason("daemon socket closed", Some(424242)),
+            None
+        );
+        assert_eq!(
+            super::windows_force_kill_pid_for_reason(incompatible, None),
+            None
+        );
     }
 
     #[test]

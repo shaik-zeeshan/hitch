@@ -6,7 +6,7 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 
 use hitch_core::{AgentState, SessionId, SESSION_ID_ENV};
-use hitch_proto::transport::UnixSocketClient;
+use hitch_proto::transport::DaemonClient;
 use hitch_proto::{ControlMessage, KnownAgent, Request};
 
 fn main() {
@@ -165,7 +165,7 @@ struct HookReport {
 }
 
 fn send_report(report: HookReport) -> Result<(), HookError> {
-    let mut client = UnixSocketClient::connect(&report.socket_path)?;
+    let mut client = DaemonClient::connect(&report.socket_path)?;
     let detail = report
         .detail
         .or(report.event.map(|event| format!("event: {event}")));
@@ -339,10 +339,9 @@ impl From<io::Error> for HookError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hitch_proto::transport::UnixSocketListener;
+    use hitch_proto::transport::DaemonListener;
     use hitch_proto::{ControlMessage, Request};
-    use std::fs;
-    use std::io::{BufRead, BufReader, Cursor};
+    use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -431,15 +430,14 @@ mod tests {
     #[test]
     fn reports_agent_state_to_socket() {
         let socket = test_socket_path();
-        let listener = UnixSocketListener::bind(&socket).unwrap();
+        let listener = DaemonListener::bind(&socket).unwrap();
         let socket_for_client = socket.clone();
 
         let server = thread::spawn(move || {
-            let stream = listener.accept().unwrap().into_inner();
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            serde_json::from_str::<ControlMessage>(line.trim()).unwrap()
+            let mut stream = listener.accept().unwrap();
+            let messages = stream.read_control_messages().unwrap();
+            assert_eq!(messages.len(), 1);
+            messages.into_iter().next().unwrap()
         });
 
         let mut stdin = Cursor::new(r#"{"message":"permission requested"}"#.as_bytes());
@@ -477,7 +475,8 @@ mod tests {
         assert_eq!(cwd, Some(PathBuf::from("/repo/worktree")));
         assert_eq!(detail.as_deref(), Some("permission requested"));
 
-        let _ = fs::remove_file(socket);
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(socket);
     }
 
     #[test]
@@ -501,15 +500,14 @@ mod tests {
     #[test]
     fn session_end_reports_clear_state_to_socket() {
         let socket = test_socket_path();
-        let listener = UnixSocketListener::bind(&socket).unwrap();
+        let listener = DaemonListener::bind(&socket).unwrap();
         let socket_for_client = socket.clone();
 
         let server = thread::spawn(move || {
-            let stream = listener.accept().unwrap().into_inner();
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            serde_json::from_str::<ControlMessage>(line.trim()).unwrap()
+            let mut stream = listener.accept().unwrap();
+            let messages = stream.read_control_messages().unwrap();
+            assert_eq!(messages.len(), 1);
+            messages.into_iter().next().unwrap()
         });
 
         let mut stdin = Cursor::new(b"{}" as &[u8]);
@@ -535,7 +533,8 @@ mod tests {
         };
         assert_eq!(state, None);
 
-        let _ = fs::remove_file(socket);
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(socket);
     }
 
     #[test]

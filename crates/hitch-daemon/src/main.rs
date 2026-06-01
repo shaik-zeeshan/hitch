@@ -352,25 +352,29 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
 
     let listener = DaemonListener::bind(&config.socket_path)?;
     listener.set_nonblocking(true)?;
-    // Record our pid beside the socket so the GUI can force-kill us even when it
-    // never completed a `Hello` handshake (e.g. a protocol mismatch — the path
-    // that returns no pid in the response). Best-effort: a missing pidfile only
-    // costs the client its force-kill fast path, it does not break startup.
-    let pid_lock = match write_pidfile(&config.socket_path) {
-        Ok(pid_lock) => pid_lock,
-        Err(err) => {
-            eprintln!("hitch-daemon: pidfile recovery disabled: {err}");
-            None
+    #[cfg(unix)]
+    let pid_lock = {
+        // Record our pid beside the socket so the GUI can force-kill us even when it
+        // never completed a `Hello` handshake (e.g. a protocol mismatch — the path
+        // that returns no pid in the response). Best-effort: a missing pidfile only
+        // costs the client its force-kill fast path, it does not break startup.
+        match write_pidfile(&config.socket_path) {
+            Ok(pid_lock) => pid_lock,
+            Err(err) => {
+                eprintln!("hitch-daemon: pidfile recovery disabled: {err}");
+                None
+            }
         }
     };
+    #[cfg(windows)]
+    let pid_lock = None;
     // The setup that follows (`Store::open`, `restore_layout`, the accept loop)
-    // can early-return via `?`. Own the pidfile + socket with a guard so they are
-    // cleared on *every* exit path: otherwise a failed startup would leave a
-    // pidfile pointing at our now-dead pid, which the GUI could later SIGKILL once
-    // the OS reuses that pid. Normal shutdown cleanup runs before the guard drops.
-    // The guard also holds the pidfile's advisory lock for our whole lifetime, so a
-    // client can tell a live daemon from a stale pidfile before force-killing a pid.
+    // can early-return via `?`. Own Unix pidfile + socket cleanup with a guard so
+    // every exit path clears filesystem rendezvous state. Windows local sockets
+    // are named-pipe endpoints owned by the listener; there is no socket path or
+    // pidfile to unlink.
     let _daemon_files = DaemonFileGuard {
+        #[cfg(unix)]
         socket_path: config.socket_path.clone(),
         _pid_lock: pid_lock,
     };
@@ -419,14 +423,15 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     cancel_active_jobs(&state);
     wait_for_jobs_to_finish(&state);
     kill_all_sessions(&state);
-    // Pidfile + socket are removed by `DaemonFileGuard` as it drops on return.
+    // Unix pidfile + socket are removed by `DaemonFileGuard` as it drops on return.
     Ok(())
 }
 
-/// Removes the daemon's pidfile and socket whenever `run_daemon` returns — by
-/// normal shutdown or by an early `?` during startup. Created right after the
-/// pidfile is written so no exit path can leak a stale pid (see `write_pidfile`).
+/// Removes Unix daemon files whenever `run_daemon` returns — by normal shutdown
+/// or by an early `?` during startup. Created right after the pidfile is written
+/// so no exit path can leak a stale pid (see `write_pidfile`).
 struct DaemonFileGuard {
+    #[cfg(unix)]
     socket_path: PathBuf,
     // Held open for the daemon's whole lifetime so the advisory pidfile lock stays
     // taken; dropping it (clean exit or unwind) releases the lock, and the OS
@@ -436,8 +441,11 @@ struct DaemonFileGuard {
 
 impl Drop for DaemonFileGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(hitch_proto::transport::pidfile_path(&self.socket_path));
-        let _ = fs::remove_file(&self.socket_path);
+        #[cfg(unix)]
+        {
+            let _ = fs::remove_file(hitch_proto::transport::pidfile_path(&self.socket_path));
+            let _ = fs::remove_file(&self.socket_path);
+        }
     }
 }
 
@@ -473,14 +481,6 @@ fn write_pidfile(socket_path: &Path) -> io::Result<Option<File>> {
     write!(file, "{}", std::process::id())?;
     file.flush()?;
     Ok(Some(file))
-}
-
-#[cfg(not(unix))]
-fn write_pidfile(_socket_path: &Path) -> io::Result<Option<File>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "pidfile locking and force-recovery are only supported on Unix",
-    ))
 }
 
 struct DaemonState {

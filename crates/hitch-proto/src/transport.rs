@@ -105,32 +105,35 @@ pub fn pidfile_path(socket_path: &Path) -> PathBuf {
     socket_path.with_extension("pid")
 }
 
-/// Blocking client connection to the daemon socket.
+/// Blocking client connection to the daemon endpoint.
 #[derive(Debug)]
-pub struct UnixSocketClient {
+pub struct DaemonClient {
     connection: DaemonStream,
 }
 
-impl UnixSocketClient {
+impl DaemonClient {
     pub fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
         Ok(Self {
             connection: connect_daemon(path)?,
         })
     }
 
-    pub fn into_connection(self) -> UnixSocketConnection {
+    pub fn into_connection(self) -> DaemonStream {
         self.connection
     }
 
-    pub fn connection_mut(&mut self) -> &mut UnixSocketConnection {
+    pub fn connection_mut(&mut self) -> &mut DaemonStream {
         &mut self.connection
     }
 }
 
-/// Backwards-compatible daemon-side listener name.
+/// Backwards-compatible Unix-named client surface.
+pub type UnixSocketClient = DaemonClient;
+
+/// Backwards-compatible Unix-named daemon-side listener surface.
 pub type UnixSocketListener = DaemonListener;
 
-/// Backwards-compatible connected socket name.
+/// Backwards-compatible Unix-named connected stream surface.
 pub type UnixSocketConnection = DaemonStream;
 
 #[cfg(unix)]
@@ -304,6 +307,16 @@ impl DaemonStream {
         Ok(self.pty_decoder.push(&buf[..len])?)
     }
 
+    #[cfg(windows)]
+    pub fn connected_pipe_server_pid(&self) -> io::Result<u32> {
+        self.stream.peer_creds()?.pid().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "connected pipe peer did not expose a process id",
+            )
+        })
+    }
+
     #[cfg(unix)]
     pub fn into_inner(self) -> UnixStream {
         self.stream
@@ -417,7 +430,7 @@ mod tests {
     #[test]
     fn client_and_listener_exchange_control_message() {
         let path = test_socket_path();
-        let listener = UnixSocketListener::bind(&path).unwrap();
+        let listener = DaemonListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
             let mut conn = listener.accept().unwrap();
             let messages = conn.read_control_messages().unwrap();
@@ -432,7 +445,7 @@ mod tests {
             .unwrap();
         });
 
-        let mut client = UnixSocketClient::connect(&path).unwrap();
+        let mut client = DaemonClient::connect(&path).unwrap();
         client
             .connection_mut()
             .send_control(&ControlMessage::request(

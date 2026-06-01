@@ -31,6 +31,9 @@ hitch-core.workspace = true
 hitch-proto.workspace = true
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 # macOS-only: at startup we register `ApplePressAndHoldEnabled = NO` via Cocoa so
 # WKWebView lets keys repeat (see lib.rs `run`). These are already in the tree
 # (pulled by Tauri/wry); pinned to the resolved versions to avoid a duplicate.
