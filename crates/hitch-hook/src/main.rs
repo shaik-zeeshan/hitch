@@ -40,9 +40,9 @@ where
     R: Read,
 {
     // A draft-generation run loads the worktree's installed hooks; without this
-    // guard those reports would resolve by cwd to whatever live shell session
-    // shares the worktree and flip it to running/completed. Bail before touching
-    // the socket so draft generation never disturbs unrelated sessions.
+    // guard those reports would resolve to whatever live shell session shares
+    // the worktree. Bail before touching the socket so draft generation never
+    // disturbs unrelated sessions.
     if suppressed {
         return Ok(());
     }
@@ -55,9 +55,13 @@ where
         }
     }
 
-    let state = args
-        .state
-        .unwrap_or_else(|| infer_state(args.agent, args.event.as_deref(), &payload));
+    let state = match args.state {
+        Some(state) => state,
+        None => match state_from_event(args.agent, args.event.as_deref()) {
+            Some(state) => state,
+            None => return Ok(()),
+        },
+    };
     let cwd = match args.cwd {
         Some(cwd) => Some(cwd),
         None => cwd_from_payload(&payload).or_else(|| std::env::current_dir().ok()),
@@ -80,7 +84,7 @@ struct HookArgs {
     socket_path: PathBuf,
     agent: KnownAgent,
     event: Option<String>,
-    state: Option<AgentState>,
+    state: Option<Option<AgentState>>,
     session_id: Option<SessionId>,
     cwd: Option<PathBuf>,
     detail: Option<String>,
@@ -154,7 +158,7 @@ struct HookReport {
     socket_path: PathBuf,
     agent: KnownAgent,
     event: Option<String>,
-    state: AgentState,
+    state: Option<AgentState>,
     session_id: Option<SessionId>,
     cwd: Option<PathBuf>,
     detail: Option<String>,
@@ -181,47 +185,37 @@ fn send_report(report: HookReport) -> Result<(), HookError> {
     Ok(())
 }
 
-fn infer_state(agent: KnownAgent, event: Option<&str>, payload: &str) -> AgentState {
-    let event = event.unwrap_or_default().to_ascii_lowercase();
-    match agent {
-        KnownAgent::ClaudeCode => match event.as_str() {
-            "notification" => AgentState::NeedsApproval,
-            "stop" | "subagent-stop" | "session-stop" => AgentState::Completed,
-            "error" => AgentState::Error,
-            "user-prompt-submit" | "pre-tool-use" | "post-tool-use" => AgentState::Running,
-            _ => infer_state_from_text(&format!("{event}\n{payload}")),
-        },
-        KnownAgent::Codex => infer_state_from_text(&format!("{event}\n{payload}")),
-    }
-}
-
-fn infer_state_from_text(text: &str) -> AgentState {
-    let lower = text.to_ascii_lowercase();
-    if contains_any(
-        &lower,
-        &[
-            "approval",
-            "permission",
-            "confirm",
-            "authorize",
-            "waiting for user",
-        ],
-    ) {
-        AgentState::NeedsApproval
-    } else if contains_any(&lower, &["error", "failed", "failure", "panic"]) {
-        AgentState::Error
-    } else if contains_any(
-        &lower,
-        &["completed", "complete", "finished", "done", "success"],
-    ) {
-        AgentState::Completed
+fn state_from_event(agent: KnownAgent, event: Option<&str>) -> Option<Option<AgentState>> {
+    let event = event?;
+    if event_matches(event, b"userpromptsubmit") || event_matches(event, b"posttooluse") {
+        Some(Some(AgentState::Running))
+    } else if event_matches(event, b"permissionrequest") {
+        Some(Some(AgentState::NeedsApproval))
+    } else if agent == KnownAgent::ClaudeCode && event_matches(event, b"notification") {
+        Some(Some(AgentState::NeedsApproval))
+    } else if event_matches(event, b"stop") {
+        Some(Some(AgentState::Waiting))
+    } else if agent == KnownAgent::ClaudeCode && event_matches(event, b"stopfailure") {
+        Some(Some(AgentState::Error))
+    } else if event_matches(event, b"sessionend") {
+        Some(None)
     } else {
-        AgentState::Running
+        None
     }
 }
 
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
+fn event_matches(event: &str, expected: &[u8]) -> bool {
+    let mut index = 0;
+    for byte in event.bytes() {
+        if byte == b'-' || byte == b'_' {
+            continue;
+        }
+        if index == expected.len() || byte.to_ascii_lowercase() != expected[index] {
+            return false;
+        }
+        index += 1;
+    }
+    index == expected.len()
 }
 
 fn cwd_from_payload(payload: &str) -> Option<PathBuf> {
@@ -282,12 +276,13 @@ fn parse_agent(value: &str) -> Result<KnownAgent, HookError> {
     }
 }
 
-fn parse_state(value: &str) -> Result<AgentState, HookError> {
+fn parse_state(value: &str) -> Result<Option<AgentState>, HookError> {
     match value {
-        "running" => Ok(AgentState::Running),
-        "needs-approval" | "needs_approval" | "approval" => Ok(AgentState::NeedsApproval),
-        "completed" | "complete" | "done" => Ok(AgentState::Completed),
-        "error" | "failed" => Ok(AgentState::Error),
+        "running" => Ok(Some(AgentState::Running)),
+        "needs-approval" | "needs_approval" | "approval" => Ok(Some(AgentState::NeedsApproval)),
+        "waiting" => Ok(Some(AgentState::Waiting)),
+        "error" | "failed" => Ok(Some(AgentState::Error)),
+        "none" | "clear" | "null" => Ok(None),
         _ => Err(HookError::Usage(format!("unknown state: {value}"))),
     }
 }
@@ -306,7 +301,7 @@ where
 }
 
 fn usage() -> String {
-    "usage: hitch-hook --agent <claude-code|codex> [--event NAME] [--state STATE] [--socket PATH] [--session-id UUID] [--cwd PATH] [--detail TEXT]".into()
+    "usage: hitch-hook --agent <claude-code|codex> [--event NAME] [--state running|needs-approval|waiting|error|none] [--socket PATH] [--session-id UUID] [--cwd PATH] [--detail TEXT]".into()
 }
 
 #[derive(Debug)]
@@ -348,9 +343,11 @@ mod tests {
     use hitch_proto::{ControlMessage, Request};
     use std::fs;
     use std::io::{BufRead, BufReader, Cursor};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    static SOCKET_NONCE: AtomicU64 = AtomicU64::new(0);
     #[test]
     fn explicit_state_args_parse() {
         let args = HookArgs::parse([
@@ -366,35 +363,39 @@ mod tests {
         .unwrap();
         assert_eq!(args.agent, KnownAgent::ClaudeCode);
         assert_eq!(args.event.as_deref(), Some("notification"));
-        assert_eq!(args.state, Some(AgentState::NeedsApproval));
+        assert_eq!(args.state, Some(Some(AgentState::NeedsApproval)));
         assert_eq!(args.socket_path, PathBuf::from("/tmp/hitch.sock"));
     }
 
     #[test]
-    fn infers_common_hook_events() {
+    fn explicit_clear_state_args_parse() {
+        for value in ["none", "clear", "null"] {
+            let args = HookArgs::parse(["--agent", "claude-code", "--state", value]).unwrap();
+            assert_eq!(args.state, Some(None));
+        }
+    }
+
+    #[test]
+    fn maps_known_hook_events() {
         assert_eq!(
-            infer_state(KnownAgent::ClaudeCode, Some("notification"), "{}"),
-            AgentState::NeedsApproval
+            state_from_event(KnownAgent::ClaudeCode, Some("notification")),
+            Some(Some(AgentState::NeedsApproval))
         );
         assert_eq!(
-            infer_state(KnownAgent::ClaudeCode, Some("stop"), "{}"),
-            AgentState::Completed
+            state_from_event(KnownAgent::ClaudeCode, Some("stop")),
+            Some(Some(AgentState::Waiting))
         );
         assert_eq!(
-            infer_state(
-                KnownAgent::Codex,
-                Some("permission-request"),
-                r#"{"tool_input":{"description":"permission requested"}}"#
-            ),
-            AgentState::NeedsApproval
+            state_from_event(KnownAgent::Codex, Some("post-tool-use")),
+            Some(Some(AgentState::Running))
         );
         assert_eq!(
-            infer_state(
-                KnownAgent::Codex,
-                Some("stop"),
-                r#"{"last_assistant_message":"run completed"}"#
-            ),
-            AgentState::Completed
+            state_from_event(KnownAgent::ClaudeCode, Some("session-end")),
+            Some(None)
+        );
+        assert_eq!(
+            state_from_event(KnownAgent::Codex, Some("notification")),
+            None
         );
     }
 
@@ -409,12 +410,12 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            infer_state(
-                KnownAgent::Codex,
-                args.event.as_deref(),
-                args.payload.as_deref().unwrap()
-            ),
-            AgentState::NeedsApproval
+            args.payload.as_deref(),
+            Some(r#"{"message":"permission requested"}"#)
+        );
+        assert_eq!(
+            state_from_event(KnownAgent::Codex, args.event.as_deref()),
+            Some(Some(AgentState::NeedsApproval))
         );
     }
 
@@ -472,9 +473,67 @@ mod tests {
             panic!("expected report-agent-state");
         };
         assert_eq!(agent, KnownAgent::Codex);
-        assert_eq!(state, AgentState::NeedsApproval);
+        assert_eq!(state, Some(AgentState::NeedsApproval));
         assert_eq!(cwd, Some(PathBuf::from("/repo/worktree")));
         assert_eq!(detail.as_deref(), Some("permission requested"));
+
+        let _ = fs::remove_file(socket);
+    }
+
+    #[test]
+    fn unknown_event_without_state_does_not_touch_socket() {
+        let mut stdin = Cursor::new(r#"{"message":"permission requested"}"#.as_bytes());
+        run(
+            [
+                "--agent".to_string(),
+                "codex".to_string(),
+                "--event".to_string(),
+                "mystery-event".to_string(),
+                "--socket".to_string(),
+                "/nonexistent/hitch-unknown-event.sock".to_string(),
+            ],
+            &mut stdin,
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn session_end_reports_clear_state_to_socket() {
+        let socket = test_socket_path();
+        let listener = UnixSocketListener::bind(&socket).unwrap();
+        let socket_for_client = socket.clone();
+
+        let server = thread::spawn(move || {
+            let stream = listener.accept().unwrap().into_inner();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<ControlMessage>(line.trim()).unwrap()
+        });
+
+        let mut stdin = Cursor::new(b"{}" as &[u8]);
+        real_main(
+            [
+                "--agent".to_string(),
+                "claude-code".to_string(),
+                "--event".to_string(),
+                "session-end".to_string(),
+                "--socket".to_string(),
+                socket_for_client.display().to_string(),
+            ],
+            &mut stdin,
+        )
+        .unwrap();
+
+        let message = server.join().unwrap();
+        let ControlMessage::Request { request, .. } = message else {
+            panic!("expected request");
+        };
+        let Request::ReportAgentState { state, .. } = request else {
+            panic!("expected report-agent-state");
+        };
+        assert_eq!(state, None);
 
         let _ = fs::remove_file(socket);
     }
@@ -501,10 +560,14 @@ mod tests {
     }
 
     fn test_socket_path() -> PathBuf {
-        let nonce = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("hitch-hook-test-{nonce}.sock"))
+        let seq = SOCKET_NONCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "hitch-hook-test-{}-{now}-{seq}.sock",
+            std::process::id()
+        ))
     }
 }

@@ -238,8 +238,10 @@ fn install_claude_hooks(
             "UserPromptSubmit": [claude_hook_entry(helper_path, "user-prompt-submit", AgentState::Running)],
             "PermissionRequest": [claude_hook_entry(helper_path, "permission-request", AgentState::NeedsApproval)],
             "Notification": [claude_hook_entry_with_matcher(helper_path, "permission_prompt", "notification", AgentState::NeedsApproval)],
-            "Stop": [claude_hook_entry(helper_path, "stop", AgentState::Completed)],
-            "StopFailure": [claude_hook_entry(helper_path, "stop-failure", AgentState::Error)]
+            "PostToolUse": [claude_hook_entry(helper_path, "post-tool-use", AgentState::Running)],
+            "Stop": [claude_hook_entry(helper_path, "stop", AgentState::Waiting)],
+            "StopFailure": [claude_hook_entry(helper_path, "stop-failure", AgentState::Error)],
+            "SessionEnd": [claude_clear_hook_entry(helper_path, "session-end")]
         }
     });
     merge_json_file(
@@ -250,6 +252,7 @@ fn install_claude_hooks(
             "UserPromptSubmit",
             "PermissionRequest",
             "Notification",
+            "PostToolUse",
             "Stop",
             "StopFailure",
             "SessionStart",
@@ -273,7 +276,9 @@ fn install_codex_hooks(
         "hooks": {
             "UserPromptSubmit": [codex_hook_entry(helper_path, "user-prompt-submit", AgentState::Running)],
             "PermissionRequest": [codex_hook_entry(helper_path, "permission-request", AgentState::NeedsApproval)],
-            "Stop": [codex_hook_entry(helper_path, "stop", AgentState::Completed)]
+            "PostToolUse": [codex_hook_entry(helper_path, "post-tool-use", AgentState::Running)],
+            "Stop": [codex_hook_entry(helper_path, "stop", AgentState::Waiting)],
+            "SessionEnd": [codex_clear_hook_entry(helper_path, "session-end")]
         }
     });
     merge_json_file(
@@ -283,8 +288,10 @@ fn install_codex_hooks(
         &[
             "UserPromptSubmit",
             "PermissionRequest",
+            "PostToolUse",
             "Stop",
             "SessionStart",
+            "SessionEnd",
         ],
     )?;
     installed_configs.push(InstalledHookConfig {
@@ -300,6 +307,26 @@ fn codex_hook_entry(helper_path: &Path, event: &str, state: AgentState) -> Value
         "hooks": [{
             "type": "command",
             "command": hook_command(helper_path, AgentKind::Codex, event, Some(state))
+        }]
+    })
+}
+
+fn codex_clear_hook_entry(helper_path: &Path, event: &str) -> Value {
+    json!({
+        "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": hook_command(helper_path, AgentKind::Codex, event, None)
+        }]
+    })
+}
+
+fn claude_clear_hook_entry(helper_path: &Path, event: &str) -> Value {
+    json!({
+        "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": hook_command(helper_path, AgentKind::ClaudeCode, event, None)
         }]
     })
 }
@@ -345,7 +372,7 @@ fn state_arg(state: AgentState) -> &'static str {
     match state {
         AgentState::Running => "running",
         AgentState::NeedsApproval => "needs-approval",
-        AgentState::Completed => "completed",
+        AgentState::Waiting => "waiting",
         AgentState::Error => "error",
     }
 }
@@ -664,7 +691,7 @@ mod tests {
   "hooks": {
     "Notification": [{"matcher":"user", "hooks": []}],
     "SessionStart": [{"matcher":"startup", "hooks": [{"type":"command","command":"/opt/hitch/hitch-hook --agent claude-code --event session-start --state running"}]}],
-    "SessionEnd": [{"matcher":"other", "hooks": [{"type":"command","command":"/opt/hitch/hitch-hook --agent claude-code --event session-end --state completed"}]}]
+    "SessionEnd": [{"matcher":"other", "hooks": [{"type":"command","command":"/opt/hitch/hitch-hook --agent claude-code --event session-end --state none"}]}]
   }
 }"#,
         )
@@ -698,7 +725,12 @@ mod tests {
                 && value.to_string().contains("--state needs-approval")
         }));
         assert!(config["hooks"]["SessionStart"].is_null());
-        assert!(config["hooks"]["SessionEnd"].is_null());
+        let session_end_hooks = config["hooks"]["SessionEnd"].as_array().unwrap();
+        assert!(session_end_hooks.iter().any(|value| {
+            value.to_string().contains("--agent claude-code")
+                && value.to_string().contains("session-end")
+                && !value.to_string().contains("--state")
+        }));
 
         let codex: Value =
             serde_json::from_str(&fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap())
@@ -711,6 +743,12 @@ mod tests {
                 && value.to_string().contains("--state running")
         }));
         assert!(codex["hooks"]["SessionStart"].is_null());
+        let codex_session_end_hooks = codex["hooks"]["SessionEnd"].as_array().unwrap();
+        assert!(codex_session_end_hooks.iter().any(|value| {
+            value.to_string().contains("--agent codex")
+                && value.to_string().contains("session-end")
+                && !value.to_string().contains("--state")
+        }));
 
         assert!(!worktree.join(".gitignore").exists());
 
@@ -786,12 +824,12 @@ mod tests {
 
         let claude = fs::read_to_string(&claude_path).unwrap();
         assert!(!claude.contains("/old/target/debug/hitch-hook"));
-        assert_eq!(claude.matches("/new/target/debug/hitch-hook").count(), 5);
+        assert_eq!(claude.matches("/new/target/debug/hitch-hook").count(), 7);
         assert!(claude.contains("echo keep-me"));
 
         let codex = fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap();
         assert!(!codex.contains("/old/target/debug/hitch-hook"));
-        assert_eq!(codex.matches("/new/target/debug/hitch-hook").count(), 3);
+        assert_eq!(codex.matches("/new/target/debug/hitch-hook").count(), 5);
 
         fs::remove_dir_all(worktree).unwrap();
     }

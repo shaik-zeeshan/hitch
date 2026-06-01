@@ -1171,7 +1171,7 @@ fn reader_loop(app: &AppHandle, client: &HitchClient, stream: UnixStream) -> io:
                         }
                         continue;
                     }
-                    Event::SessionOpened { session } => {
+                    Event::SessionOpened { session, .. } => {
                         if let Ok(mut router) = client.0.output_router.lock() {
                             router.prepare_fresh_registration(session.id);
                         }

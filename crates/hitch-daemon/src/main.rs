@@ -23,7 +23,8 @@ mod drafts;
 use drafts::{CommitDraftInput, DraftProviderConfig, PullRequestDraftInput};
 use hitch_agent::HookInstallOptions;
 use hitch_core::{
-    JobId, Project, ProjectId, ProjectKind, Session, SessionId, SessionParent, Worktree, WorktreeId,
+    AgentState, JobId, Project, ProjectId, ProjectKind, Session, SessionId, SessionParent,
+    Worktree, WorktreeId,
 };
 use hitch_git::{
     staged_diff, CommandControl, CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState,
@@ -32,7 +33,7 @@ use hitch_git::{
 use hitch_proto::{
     encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage,
     DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
-    JobRequest, JobStatus, PrInfo, ProtocolError, PullRequestDraft, Request, Response,
+    JobRequest, JobStatus, KnownAgent, PrInfo, ProtocolError, PullRequestDraft, Request, Response,
     WorktreeCreateMode, WorktreePr, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
 use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY};
@@ -574,6 +575,10 @@ struct DaemonSession {
     /// fresh terminals (no cross-restart scrollback); kept as the seam the
     /// broadcaster's `replay_snapshot` composes against.
     restored_scrollback: Vec<u8>,
+    agent: Option<KnownAgent>,
+    agent_state: Option<AgentState>,
+    agent_detail: Option<String>,
+    agent_report_requires_running: bool,
 }
 
 /// The dispatcher thread's authoritative, per-session record of "what has been
@@ -759,6 +764,10 @@ fn restore_layout(
                 session,
                 pty,
                 restored_scrollback: Vec::new(),
+                agent: None,
+                agent_state: None,
+                agent_detail: None,
+                agent_report_requires_running: false,
             },
         );
     }
@@ -1011,9 +1020,20 @@ fn handle_request<R: Read>(
                 request_id,
                 Response::SessionOpened {
                     session: session.clone(),
+                    agent: None,
+                    agent_state: None,
+                    agent_detail: None,
                 },
             )?;
-            broadcast_event(state, Event::SessionOpened { session })?;
+            broadcast_event(
+                state,
+                Event::SessionOpened {
+                    session,
+                    agent: None,
+                    agent_state: None,
+                    agent_detail: None,
+                },
+            )?;
         }
         Request::SendSessionInput {
             session_id,
@@ -1158,18 +1178,25 @@ fn handle_request<R: Read>(
             cwd,
             detail,
         } => {
-            let (matched_session_id, worktree_id) =
-                resolve_agent_target(state, session_id, cwd.as_deref())?;
-            broadcast_event(
+            if let Some(event) = store_agent_report(
                 state,
-                Event::AgentState {
-                    session_id: matched_session_id,
-                    worktree_id,
-                    agent,
-                    state: agent_state,
-                    detail,
-                },
-            )?;
+                agent,
+                agent_state,
+                session_id,
+                cwd.as_deref(),
+                detail,
+            )? {
+                broadcast_event(
+                    state,
+                    Event::AgentState {
+                        session_id: Some(event.session_id),
+                        worktree_id: event.worktree_id,
+                        agent: event.agent,
+                        state: event.state,
+                        detail: event.detail,
+                    },
+                )?;
+            }
             send_response(state, client_id, request_id, Response::Ack)?;
         }
         Request::ShutdownDaemon => {
@@ -1835,6 +1862,10 @@ fn open_session(
             session: session.clone(),
             pty,
             restored_scrollback: Vec::new(),
+            agent: None,
+            agent_state: None,
+            agent_detail: None,
+            agent_report_requires_running: false,
         },
     );
     Ok(session)
@@ -2273,7 +2304,9 @@ fn spawn_dirty_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>)
 
 /// Poll each live session's foreground command once a second and broadcast
 /// a SessionCommand event whenever it changes. Broadcasting only on change
-/// keeps idle terminals quiet.
+/// keeps idle terminals quiet. Agent-state exit detection is deliberately
+/// conservative: tools spawned by an agent can become the foreground process,
+/// so only returning to an interactive shell is treated as "agent gone".
 fn spawn_command_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>) {
     thread::Builder::new()
         .name("hitch-cmd-poll".into())
@@ -2298,7 +2331,19 @@ fn spawn_command_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool
                             &state,
                             Event::SessionCommand {
                                 session_id: id,
-                                command,
+                                command: command.clone(),
+                            },
+                        );
+                    }
+                    if let Some(event) = clear_stale_agent_state(&state, id, command.as_deref()) {
+                        let _ = broadcast_event(
+                            &state,
+                            Event::AgentState {
+                                session_id: Some(event.session_id),
+                                worktree_id: event.worktree_id,
+                                agent: event.agent,
+                                state: event.state,
+                                detail: event.detail,
                             },
                         );
                     }
@@ -2456,50 +2501,137 @@ fn find_pty(
         .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "session not found"))
 }
 
-fn resolve_agent_target(
+struct AgentStateBroadcast {
+    session_id: SessionId,
+    worktree_id: Option<WorktreeId>,
+    agent: KnownAgent,
+    state: Option<AgentState>,
+    detail: Option<String>,
+}
+
+fn store_agent_report(
     state: &Arc<Mutex<DaemonState>>,
+    agent: KnownAgent,
+    agent_state: Option<AgentState>,
     session_id: Option<SessionId>,
     cwd: Option<&Path>,
-) -> Result<(Option<SessionId>, Option<WorktreeId>), ProtocolError> {
-    let cwd = cwd.map(canonical_or_self);
-    let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
-    let matched_session = session_id
-        .and_then(|id| state.sessions.get(&id).map(|session| (id, session)))
-        .or_else(|| {
-            cwd.as_deref().and_then(|cwd| {
-                state
-                    .sessions
-                    .iter()
-                    .find(|(_, session)| canonical_or_self(&session.session.cwd) == cwd)
-                    .map(|(id, session)| (*id, session))
-            })
-        });
+    detail: Option<String>,
+) -> Result<Option<AgentStateBroadcast>, ProtocolError> {
+    let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    let Some(session_id) = session_id else {
+        eprintln!(
+            "hitch-daemon: dropping agent state report: agent={agent:?} cwd={} reason=missing-session-id",
+            cwd.map(path_display).unwrap_or("<none>")
+        );
+        return Ok(None);
+    };
+    let Some(daemon_session) = state.sessions.get_mut(&session_id) else {
+        eprintln!(
+            "hitch-daemon: dropping agent state report: agent={agent:?} cwd={} reason=unknown-session-id",
+            cwd.map(path_display).unwrap_or("<none>")
+        );
+        return Ok(None);
+    };
 
-    if let Some((session_id, daemon_session)) = matched_session {
-        let worktree_id = match daemon_session.session.parent {
-            SessionParent::Worktree(worktree_id) => Some(worktree_id),
-            SessionParent::Project(_) => None,
-        };
-        return Ok((Some(session_id), worktree_id));
+    if daemon_session.agent_report_requires_running
+        && !matches!(agent_state, Some(AgentState::Running))
+    {
+        eprintln!(
+            "hitch-daemon: dropping late agent state report: agent={agent:?} session_id={session_id} reason=awaiting-running"
+        );
+        return Ok(None);
     }
 
-    let worktree_id = cwd.as_deref().and_then(|cwd| {
-        // Worktrees can nest (e.g. a linked worktree under `<repo>/.hitch/...`),
-        // so several paths may prefix `cwd`. `worktrees` is a HashMap with
-        // arbitrary iteration order, so pick the deepest (longest) matching path
-        // rather than whichever happens to be visited first.
-        state
-            .worktrees
-            .values()
-            .filter_map(|worktree| {
-                let path = canonical_or_self(&worktree.path);
-                cwd.starts_with(&path)
-                    .then(|| (worktree.id, path.components().count()))
-            })
-            .max_by_key(|&(_, depth)| depth)
-            .map(|(id, _)| id)
-    });
-    Ok((session_id, worktree_id))
+    let worktree_id = session_worktree_id(&daemon_session.session);
+    match agent_state {
+        Some(state) => {
+            daemon_session.agent = Some(agent);
+            daemon_session.agent_state = Some(state);
+            daemon_session.agent_detail = detail.clone();
+            daemon_session.agent_report_requires_running = false;
+            Ok(Some(AgentStateBroadcast {
+                session_id,
+                worktree_id,
+                agent,
+                state: Some(state),
+                detail,
+            }))
+        }
+        None => {
+            daemon_session.agent = None;
+            daemon_session.agent_state = None;
+            daemon_session.agent_detail = None;
+            daemon_session.agent_report_requires_running = true;
+            Ok(Some(AgentStateBroadcast {
+                session_id,
+                worktree_id,
+                agent,
+                state: None,
+                detail: None,
+            }))
+        }
+    }
+}
+
+fn clear_stale_agent_state(
+    state: &Arc<Mutex<DaemonState>>,
+    session_id: SessionId,
+    command: Option<&str>,
+) -> Option<AgentStateBroadcast> {
+    let mut state = state.lock().ok()?;
+    let daemon_session = state.sessions.get_mut(&session_id)?;
+    let agent = daemon_session.agent?;
+    daemon_session.agent_state?;
+    let Some(command) = command else {
+        return None;
+    };
+    if !foreground_command_is_shell(command) || agent_command_matches(agent, command) {
+        return None;
+    }
+    let worktree_id = session_worktree_id(&daemon_session.session);
+    daemon_session.agent = None;
+    daemon_session.agent_state = None;
+    daemon_session.agent_detail = None;
+    daemon_session.agent_report_requires_running = true;
+    Some(AgentStateBroadcast {
+        session_id,
+        worktree_id,
+        agent,
+        state: None,
+        detail: None,
+    })
+}
+
+fn agent_command_matches(agent: KnownAgent, command: &str) -> bool {
+    let executable = command.split_whitespace().next().unwrap_or(command);
+    let executable = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(executable);
+    match agent {
+        KnownAgent::ClaudeCode => executable == "claude",
+        KnownAgent::Codex => executable == "codex",
+    }
+}
+fn foreground_command_is_shell(command: &str) -> bool {
+    let executable = command.split_whitespace().next().unwrap_or(command);
+    let executable = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(executable)
+        .trim_start_matches('-');
+    matches!(executable, "sh" | "bash" | "zsh" | "fish" | "nu" | "xonsh")
+}
+
+fn session_worktree_id(session: &Session) -> Option<WorktreeId> {
+    match session.parent {
+        SessionParent::Worktree(worktree_id) => Some(worktree_id),
+        SessionParent::Project(_) => None,
+    }
+}
+
+fn path_display(path: &Path) -> &str {
+    path.to_str().unwrap_or("<non-utf8>")
 }
 
 /// Replay every session's scrollback to one client, then open its output gate.
@@ -2530,7 +2662,14 @@ fn replay_sessions_to_client(
                     &daemon_session.restored_scrollback,
                 );
                 let command = daemon_session.pty.foreground_command();
-                (daemon_session.session.clone(), scrollback, command)
+                (
+                    daemon_session.session.clone(),
+                    scrollback,
+                    command,
+                    daemon_session.agent,
+                    daemon_session.agent_state,
+                    daemon_session.agent_detail.clone(),
+                )
             })
             .collect::<Vec<_>>();
         let jobs = state
@@ -2545,12 +2684,15 @@ fn replay_sessions_to_client(
     // dispatcher thread, then spawn a thread to do the potentially blocking
     // replay output writes. This prevents slow clients from freezing the
     // dispatcher and blocking output delivery for other sessions.
-    for (session, _, command) in &replay_items {
+    for (session, _, command, agent, agent_state, agent_detail) in &replay_items {
         send_event_to_client(
             state,
             client_id,
             Event::SessionOpened {
                 session: session.clone(),
+                agent: *agent,
+                agent_state: *agent_state,
+                agent_detail: agent_detail.clone(),
             },
         )?;
         send_event_to_client(
@@ -2583,7 +2725,7 @@ fn replay_sessions_to_client(
     // strictly: snapshot bytes → pending bytes → live broadcasts.
     let state_clone = Arc::clone(state);
     thread::spawn(move || {
-        for (session, scrollback, _) in &replay_items {
+        for (session, scrollback, _, _, _, _) in &replay_items {
             if !scrollback.is_empty() {
                 let _ = send_output_to_client(&state_clone, client_id, session.id, scrollback);
             }
@@ -3705,8 +3847,8 @@ mod tests {
     }
 
     #[test]
-    fn hook_report_from_worktree_subdirectory_resolves_worktree_without_session() {
-        use hitch_core::{Project, ProjectKind, Worktree};
+    fn hook_report_without_session_id_is_dropped_even_with_worktree_cwd() {
+        use hitch_proto::KnownAgent;
         use std::path::PathBuf;
         use std::sync::{Arc, Mutex};
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -3715,9 +3857,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("hitch-daemon-resolve-hook-{nonce}"));
-        let project_root = dir.join("repo");
-        let subdir = project_root.join("src");
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-drop-hook-{nonce}"));
+        let subdir = dir.join("repo/src");
         std::fs::create_dir_all(&subdir).unwrap();
         let store_path = dir.join("state.db");
         let config = super::DaemonConfig {
@@ -3731,23 +3872,40 @@ mod tests {
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
-        let project = Project::new("hitch", &project_root, ProjectKind::GitBacked);
-        let worktree = Worktree::new(project.id, &project_root, "main", true, false);
-        {
-            let mut guard = state.lock().unwrap();
-            guard.store.insert_project(&project).unwrap();
-            guard.store.insert_worktree(&worktree).unwrap();
-            guard.projects.insert(project.id, project);
-            guard.worktrees.insert(worktree.id, worktree.clone());
-        }
 
-        let (session_id, worktree_id) =
-            super::resolve_agent_target(&state, None, Some(&subdir)).unwrap();
-        assert_eq!(session_id, None);
-        assert_eq!(worktree_id, Some(worktree.id));
+        let event = super::store_agent_report(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(hitch_core::AgentState::Running),
+            None,
+            Some(&subdir),
+            Some("ignored".into()),
+        )
+        .unwrap();
+        assert!(event.is_none());
 
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_command_match_uses_known_executable_name_only() {
+        use hitch_proto::KnownAgent;
+
+        assert!(super::agent_command_matches(
+            KnownAgent::ClaudeCode,
+            "/usr/local/bin/claude"
+        ));
+        assert!(super::agent_command_matches(
+            KnownAgent::Codex,
+            "codex --sandbox read-only"
+        ));
+        assert!(!super::agent_command_matches(KnownAgent::ClaudeCode, "zsh"));
+        assert!(super::foreground_command_is_shell("zsh"));
+        assert!(super::foreground_command_is_shell("-zsh"));
+        assert!(super::foreground_command_is_shell("/bin/bash -l"));
+        assert!(!super::foreground_command_is_shell("git status"));
+        assert!(!super::foreground_command_is_shell("python -m pytest"));
     }
 
     #[test]
@@ -4254,7 +4412,9 @@ mod tests {
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
-        let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(store, config)));
+        let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
+            store, config,
+        )));
 
         let project = Project::new("hitch", &project_root, ProjectKind::GitBacked);
         let main = Worktree::new(project.id, &project_root, "main", true, false);
@@ -4303,17 +4463,18 @@ mod tests {
         let mut decoder = ControlLineDecoder::new();
         let mut buf = [0u8; 8192];
         let event = loop {
-            let n = reader.read(&mut buf).expect("read worktree-updated broadcast");
+            let n = reader
+                .read(&mut buf)
+                .expect("read worktree-updated broadcast");
             assert!(n > 0, "client sink closed before delivering the event");
-            if let Some(event) =
-                decoder
-                    .push(&buf[..n])
-                    .unwrap()
-                    .into_iter()
-                    .find_map(|message| match message {
-                        ControlMessage::Event { event } => Some(event),
-                        _ => None,
-                    })
+            if let Some(event) = decoder
+                .push(&buf[..n])
+                .unwrap()
+                .into_iter()
+                .find_map(|message| match message {
+                    ControlMessage::Event { event } => Some(event),
+                    _ => None,
+                })
             {
                 break event;
             }

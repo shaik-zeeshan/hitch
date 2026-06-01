@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 /// Jobs via `JobRequest::PrStatus`. v13 adds the batched
 /// `JobRequest::ProjectPrStatuses` so the sidebar can populate every worktree's
 /// PR chip from one `gh pr list` per project instead of one lookup per visit.
-pub const PROTOCOL_VERSION: u16 = 13;
+/// v14 makes reported/broadcast agent state nullable (`null` clears daemon-owned
+/// state) and includes current agent metadata on session-open replay payloads.
+pub const PROTOCOL_VERSION: u16 = 14;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -247,7 +249,7 @@ pub enum Request {
     /// Hook helper report: map a known agent hook event to Hitch Agent State.
     ReportAgentState {
         agent: KnownAgent,
-        state: AgentState,
+        state: Option<AgentState>,
         session_id: Option<SessionId>,
         cwd: Option<PathBuf>,
         detail: Option<String>,
@@ -441,6 +443,9 @@ pub enum Response {
     },
     SessionOpened {
         session: Session,
+        agent: Option<KnownAgent>,
+        agent_state: Option<AgentState>,
+        agent_detail: Option<String>,
     },
     GitStatus {
         status: GitStatus,
@@ -502,6 +507,9 @@ pub enum JobStatus {
 pub enum Event {
     SessionOpened {
         session: Session,
+        agent: Option<KnownAgent>,
+        agent_state: Option<AgentState>,
+        agent_detail: Option<String>,
     },
     SessionClosed {
         session_id: SessionId,
@@ -516,7 +524,7 @@ pub enum Event {
         session_id: Option<SessionId>,
         worktree_id: Option<WorktreeId>,
         agent: KnownAgent,
-        state: AgentState,
+        state: Option<AgentState>,
         detail: Option<String>,
     },
     WorktreeDirty {
@@ -789,6 +797,70 @@ mod tests {
         };
         let value: serde_json::Value = serde_json::to_value(&cleared).unwrap();
         assert!(value["command"].is_null());
+    }
+
+    #[test]
+    fn agent_state_null_clears_request_and_event_state() {
+        let (_, worktree_id, session_id) = ids();
+        let request = Request::ReportAgentState {
+            agent: KnownAgent::ClaudeCode,
+            state: None,
+            session_id: Some(session_id),
+            cwd: Some("/repo".into()),
+            detail: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["type"], "report-agent-state");
+        assert!(value["state"].is_null());
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(request, back);
+
+        let event = Event::AgentState {
+            session_id: Some(session_id),
+            worktree_id: Some(worktree_id),
+            agent: KnownAgent::ClaudeCode,
+            state: None,
+            detail: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "agent-state");
+        assert!(value["state"].is_null());
+        let back: Event = serde_json::from_value(value).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn session_opened_replay_carries_current_agent_state() {
+        let (_, worktree_id, session_id) = ids();
+        let session = sample_session(worktree_id, session_id);
+
+        let response = Response::SessionOpened {
+            session: session.clone(),
+            agent: Some(KnownAgent::ClaudeCode),
+            agent_state: Some(AgentState::NeedsApproval),
+            agent_detail: Some("permission prompt".into()),
+        };
+        let value: serde_json::Value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "session-opened");
+        assert_eq!(value["agent"], "claude-code");
+        assert_eq!(value["agent_state"], "needs-approval");
+        assert_eq!(value["agent_detail"], "permission prompt");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(response, back);
+
+        let event = Event::SessionOpened {
+            session,
+            agent: None,
+            agent_state: None,
+            agent_detail: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "session-opened");
+        assert!(value["agent"].is_null());
+        assert!(value["agent_state"].is_null());
+        assert!(value["agent_detail"].is_null());
+        let back: Event = serde_json::from_value(value).unwrap();
+        assert_eq!(event, back);
     }
 
     #[test]
@@ -1099,7 +1171,7 @@ mod tests {
             Request::InstallAgentHooks { worktree_id },
             Request::ReportAgentState {
                 agent: KnownAgent::ClaudeCode,
-                state: AgentState::NeedsApproval,
+                state: Some(AgentState::NeedsApproval),
                 session_id: Some(session_id),
                 cwd: Some("/repo".into()),
                 detail: Some("permission prompt".into()),
@@ -1134,7 +1206,12 @@ mod tests {
             Response::Sessions {
                 sessions: vec![session.clone()],
             },
-            Response::SessionOpened { session },
+            Response::SessionOpened {
+                session,
+                agent: Some(KnownAgent::ClaudeCode),
+                agent_state: Some(AgentState::NeedsApproval),
+                agent_detail: Some("permission prompt".into()),
+            },
             Response::GitStatus {
                 status: sample_status(worktree_id),
             },
@@ -1184,7 +1261,12 @@ mod tests {
         let worktree = sample_worktree(project_id, worktree_id);
         let session = sample_session(worktree_id, session_id);
         vec![
-            Event::SessionOpened { session },
+            Event::SessionOpened {
+                session,
+                agent: Some(KnownAgent::ClaudeCode),
+                agent_state: Some(AgentState::Running),
+                agent_detail: Some("working".into()),
+            },
             Event::SessionClosed {
                 session_id,
                 exit_code: Some(0),
@@ -1197,7 +1279,7 @@ mod tests {
                 session_id: Some(session_id),
                 worktree_id: Some(worktree_id),
                 agent: KnownAgent::Codex,
-                state: AgentState::Running,
+                state: Some(AgentState::Running),
                 detail: None,
             },
             Event::WorktreeDirty {

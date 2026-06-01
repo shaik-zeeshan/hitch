@@ -90,7 +90,6 @@ export const visibleAgentStates = derived(
     return map;
   },
 );
-export const worktreeAgentStates = writable<Record<Id, AgentState>>({});
 export const dismissedWorktreeAgentStates = writable<Record<Id, AgentState>>({});
 // Live foreground command per session (the process the user is interacting
 // with in the PTY), pushed by the daemon. Absent until the first report.
@@ -179,15 +178,43 @@ const STATUS_POLL_MS = 1_000;
 // minutes of latency is fine. We also skip it while the window is hidden (the
 // focus refresh catches up on return), so a backgrounded app spawns no `gh`.
 const PR_POLL_MS = 180_000;
-const COMPLETED_TAB_VISIBLE_MS = 2_500;
-const completedTabTimers = new Map<Id, ReturnType<typeof setTimeout>>();
+const DISMISSIBLE_TAB_VISIBLE_MS = 2_500;
+const dismissibleTabTimers = new Map<Id, ReturnType<typeof setTimeout>>();
 
-function clearCompletedTabTimer(sessionId: Id): void {
-  const timer = completedTabTimers.get(sessionId);
+function isDismissibleSessionState(state: AgentState | undefined): state is "waiting" | "error" {
+  return state === "waiting" || state === "error";
+}
+
+function clearDismissibleTabTimer(sessionId: Id): void {
+  const timer = dismissibleTabTimers.get(sessionId);
   if (!timer) return;
   clearTimeout(timer);
-  completedTabTimers.delete(sessionId);
+  dismissibleTabTimers.delete(sessionId);
 }
+
+function scheduleVisibleSessionStateDismissal(sessionId: Id, state: "waiting" | "error"): void {
+  clearDismissibleTabTimer(sessionId);
+  dismissibleTabTimers.set(
+    sessionId,
+    setTimeout(() => {
+      dismissibleTabTimers.delete(sessionId);
+      if (get(activeSessionId) !== sessionId) return;
+      if (get(diffActive)) return;
+      if (get(agentStates)[sessionId] !== state) return;
+      dismissSessionState(sessionId, state);
+    }, DISMISSIBLE_TAB_VISIBLE_MS),
+  );
+}
+
+function acknowledgeVisibleSessionState(sessionId: Id): void {
+  const state = get(agentStates)[sessionId];
+  if (!isDismissibleSessionState(state)) {
+    clearDismissibleTabTimer(sessionId);
+    return;
+  }
+  scheduleVisibleSessionStateDismissal(sessionId, state);
+}
+
 
 function dismissSessionState(sessionId: Id, state: AgentState): void {
   dismissedSessionAgentStates.update((current) =>
@@ -211,22 +238,6 @@ function resetDismissedWorktreeState(worktreeId: Id): void {
     delete next[worktreeId];
     return next;
   });
-}
-
-function scheduleActiveCompletedTabDismissal(sessionId: Id): void {
-  clearCompletedTabTimer(sessionId);
-  completedTabTimers.set(
-    sessionId,
-    setTimeout(() => {
-      completedTabTimers.delete(sessionId);
-      if (get(activeSessionId) !== sessionId) return;
-      // The user may have opened the diff tab during the visible window; don't
-      // dismiss a badge the session tab is no longer showing.
-      if (get(diffActive)) return;
-      if (get(agentStates)[sessionId] !== "completed") return;
-      dismissSessionState(sessionId, "completed");
-    }, COMPLETED_TAB_VISIBLE_MS),
-  );
 }
 
 // ---- derived stores -------------------------------------------------------
@@ -275,21 +286,19 @@ export const activeSession = derived(
   ([$sessions, $id]) => $sessions.find((s) => s.id === $id) ?? null,
 );
 
-// Raw hook state by worktree. This is not rendered directly: worktree/project
-// badges are attention indicators. The current worktree is suppressed because
-// the user is already there. Terminal/non-running states are dismissed after the
-// user visits them; running stays visible again when the user leaves.
+// Per-worktree rollups are derived only from daemon-owned per-session state.
+// Waiting/error states can be dismissed locally after the user sees them;
+// needs-approval stays visible until the daemon reports a different state or clears it.
 const rawAgentStateByWorktree = derived(
-  [worktrees, sessions, agentStates, worktreeAgentStates],
-  ([$worktrees, $sessions, $agentStates, $worktreeAgentStates]) => {
+  [worktrees, sessions, agentStates],
+  ([$worktrees, $sessions, $agentStates]) => {
     const map: Record<Id, AgentState> = {};
     for (const worktree of $worktrees) {
-      const agg = aggregateAgentState([
-        $worktreeAgentStates[worktree.id],
-        ...$sessions
+      const agg = aggregateAgentState(
+        $sessions
           .filter((s) => s.parent.kind === "worktree" && s.parent.id === worktree.id)
           .map((s) => $agentStates[s.id]),
-      ]);
+      );
       if (agg) map[worktree.id] = agg;
     }
     return map;
@@ -297,12 +306,19 @@ const rawAgentStateByWorktree = derived(
 );
 
 export const agentStateByWorktree = derived(
-  [rawAgentStateByWorktree, selectedWorktreeId, dismissedWorktreeAgentStates],
-  ([$raw, $selectedWorktreeId, $dismissed]) => {
+  [rawAgentStateByWorktree, selectedWorktreeId, dismissedWorktreeAgentStates, sessions, agentStates, activeSessionId, diffActive],
+  ([$raw, $selectedWorktreeId, $dismissed, $sessions, $agentStates, $activeSessionId, $diffActive]) => {
+    const activeSession = $sessions.find((session) => session.id === $activeSessionId);
+    const activeRunningWorktree =
+      !$diffActive &&
+      activeSession?.parent.kind === "worktree" &&
+      $agentStates[activeSession.id] === "running"
+        ? activeSession.parent.id
+        : null;
     const map: Record<Id, AgentState> = {};
     for (const [worktreeId, state] of Object.entries($raw)) {
-      if (worktreeId === $selectedWorktreeId) continue;
-      if (state !== "running" && $dismissed[worktreeId] === state) continue;
+      if (worktreeId === $selectedWorktreeId && state === "running" && worktreeId === activeRunningWorktree) continue;
+      if (state !== "needs-approval" && $dismissed[worktreeId] === state) continue;
       map[worktreeId] = state;
     }
     return map;
@@ -743,28 +759,29 @@ export function applyHitchEvent(event: HitchEvent): void {
     void loadGitStatus(worktreeId).catch(() => {});
   }
   if (event.type === "agent-state") {
-    const sessionId = event.session_id as Id | null;
-    const worktreeId = event.worktree_id as Id | null;
-    const state = event.state as AgentState;
+    const sessionId = (event.session_id as Id | null) ?? null;
+    const worktreeId = (event.worktree_id as Id | null) ?? null;
+    const state = (event.state as AgentState | null) ?? null;
+    if (worktreeId) resetDismissedWorktreeState(worktreeId);
     if (sessionId) {
-      agentStates.update((current) => ({ ...current, [sessionId]: state }));
-      resetDismissedSessionState(sessionId);
-      // Only auto-dismiss when the session tab is the visible center view. If
-      // the diff tab is showing, the session is hidden behind it, so its
-      // completed badge must persist until the user actually reveals the tab.
-      if (
-        state === "completed" &&
-        get(activeSessionId) === sessionId &&
-        !get(diffActive)
-      ) {
-        scheduleActiveCompletedTabDismissal(sessionId);
+      if (state) {
+        resetDismissedSessionState(sessionId);
+        agentStates.update((current) => ({ ...current, [sessionId]: state }));
+        if (get(activeSessionId) === sessionId && !get(diffActive)) {
+          acknowledgeVisibleSessionState(sessionId);
+        } else {
+          clearDismissibleTabTimer(sessionId);
+        }
       } else {
-        clearCompletedTabTimer(sessionId);
+        agentStates.update((current) => {
+          if (!(sessionId in current)) return current;
+          const next = { ...current };
+          delete next[sessionId];
+          return next;
+        });
+        resetDismissedSessionState(sessionId);
+        clearDismissibleTabTimer(sessionId);
       }
-    }
-    if (worktreeId) {
-      resetDismissedWorktreeState(worktreeId);
-      worktreeAgentStates.update((current) => ({ ...current, [worktreeId]: state }));
     }
   }
   if (event.type === "session-command") {
@@ -786,6 +803,20 @@ export function applyHitchEvent(event: HitchEvent): void {
   if (event.type === "session-opened") {
     const session = event.session as Session;
     sessions.update((items) => upsert(items, session));
+    const state = (event.agent_state as AgentState | null | undefined) ?? null;
+    if (state) {
+      resetDismissedSessionState(session.id);
+      agentStates.update((current) => ({ ...current, [session.id]: state }));
+    } else {
+      agentStates.update((current) => {
+        if (!(session.id in current)) return current;
+        const next = { ...current };
+        delete next[session.id];
+        return next;
+      });
+      resetDismissedSessionState(session.id);
+      clearDismissibleTabTimer(session.id);
+    }
     activeSessionId.update((current) => current ?? session.id);
     // Reset the ring + (re)register the output channel. On a reconnect the
     // daemon replays the full scrollback right after this event, so the
@@ -794,11 +825,8 @@ export function applyHitchEvent(event: HitchEvent): void {
   }
   if (event.type === "session-closed") {
     const sessionId = event.session_id as Id;
-    // Capture the worktree parent before dropping the session so we can clear
-    // its standalone hook state below if this was the last live session.
-    const closing = get(sessions).find((s) => s.id === sessionId);
-    const closingWorktreeId =
-      closing?.parent.kind === "worktree" ? closing.parent.id : null;
+    // Drop the session locally; per-worktree/project badges derive from the
+    // remaining sessions' daemon-owned agent state.
     sessions.update((items) => items.filter((s) => s.id !== sessionId));
     activeSessionId.update((current) => (current === sessionId ? null : current));
     agentStates.update((current) => {
@@ -811,36 +839,14 @@ export function applyHitchEvent(event: HitchEvent): void {
       delete next[sessionId];
       return next;
     });
-    clearCompletedTabTimer(sessionId);
+    clearDismissibleTabTimer(sessionId);
     sessionCommands.update((current) => {
       const next = { ...current };
       delete next[sessionId];
       return next;
     });
     closeSessionOutput(sessionId);
-    // The session's own agent state is gone above, but the worktree-keyed hook
-    // state (set by cwd-resolved hooks) lingers. If no live session remains for
-    // that worktree, drop it so a worktree whose agent never fired a terminal
-    // hook before the tab closed stops showing "working" forever.
-    if (closingWorktreeId !== null) {
-      const stillLive = get(sessions).some(
-        (s) => s.parent.kind === "worktree" && s.parent.id === closingWorktreeId,
-      );
-      if (!stillLive) {
-        worktreeAgentStates.update((current) => {
-          if (!(closingWorktreeId in current)) return current;
-          const next = { ...current };
-          delete next[closingWorktreeId];
-          return next;
-        });
-        dismissedWorktreeAgentStates.update((current) => {
-          if (!(closingWorktreeId in current)) return current;
-          const next = { ...current };
-          delete next[closingWorktreeId];
-          return next;
-        });
-      }
-    }
+
   }
   if (event.type === "project-removed") {
     // A project was forgotten (possibly by another window). Drop it and
@@ -861,11 +867,6 @@ export function applyHitchEvent(event: HitchEvent): void {
     }
     projects.update((items) => items.filter((p) => p.id !== projectId));
     worktrees.update((items) => items.filter((w) => w.project_id !== projectId));
-    worktreeAgentStates.update((current) => {
-      const next = { ...current };
-      for (const id of removedWorktreeIds) delete next[id];
-      return next;
-    });
     dismissedWorktreeAgentStates.update((current) => {
       const next = { ...current };
       for (const id of removedWorktreeIds) delete next[id];
@@ -965,6 +966,9 @@ export function disposeDaemon(): void {
   unlisteners = [];
   stopGitStatusPolling();
   stopPrStatusPolling();
+  for (const id of Array.from(dismissibleTabTimers.keys())) {
+    clearDismissibleTabTimer(id);
+  }
   booted = false;
 }
 
@@ -1848,14 +1852,15 @@ visibleSessions.subscribe(($visible) => {
   activeSessionId.set($visible[0]?.id ?? null);
 });
 
-// Visiting a worktree acknowledges its current non-running agent state. Running
-// is live activity, not a stale notification: hide it while the worktree is
+// Visiting a worktree acknowledges its current waiting/error rollup. Running is
+// live activity, not a stale notification: hide it while the worktree is
 // selected, then show it again elsewhere after the user leaves.
 derived([selectedWorktreeId, rawAgentStateByWorktree], ([$id, $states]) => ({
   id: $id,
   state: $id ? $states[$id] : undefined,
 })).subscribe(({ id, state }) => {
-  if (!id || !state || state === "running") return;
+  if (!id) return;
+  if (state !== "waiting" && state !== "error") return;
   dismissedWorktreeAgentStates.update((current) =>
     current[id] === state ? current : { ...current, [id]: state },
   );
@@ -1868,28 +1873,20 @@ activeSessionId.subscribe(($id) => {
   lastActiveByParent.set(parentKey(parent), $id);
 });
 
-// Visiting a tab acknowledges a completed turn. If completion happens while the
-// tab is already active, leave the status visible briefly so the transition is
-// perceptible before dismissing it.
+// Viewing a tab acknowledges waiting/error states after a short visible dwell.
+// If the state arrives while the tab is already active, the event handler starts
+// the same dwell timer. Approval-needed is sticky until the daemon reports a
+// different state or clears it.
 activeSessionId.subscribe(($id) => {
-  if (!$id) return;
-  // The diff tab can be the visible view while `activeSessionId` still points
-  // at a session behind it; don't treat that as a visit.
-  if (get(diffActive)) return;
-  if (get(agentStates)[$id] !== "completed") return;
-  clearCompletedTabTimer($id);
-  dismissSessionState($id, "completed");
+  if (!$id || get(diffActive)) return;
+  acknowledgeVisibleSessionState($id);
 });
 
-// Closing the diff reveals the active session tab again. If that session
-// completed while hidden behind the diff, the reveal is the acknowledgement.
 diffActive.subscribe(($active) => {
   if ($active) return;
   const id = get(activeSessionId);
   if (!id) return;
-  if (get(agentStates)[id] !== "completed") return;
-  clearCompletedTabTimer(id);
-  dismissSessionState(id, "completed");
+  acknowledgeVisibleSessionState(id);
 });
 
 // Drop remembered ids for sessions that have closed.
@@ -1916,9 +1913,10 @@ sessions.subscribe(($sessions) => {
     );
     return Object.keys(next).length === Object.keys(current).length ? current : next;
   });
-  for (const id of Array.from(completedTabTimers.keys())) {
-    if (!liveIds.has(id)) clearCompletedTabTimer(id);
+  for (const id of Array.from(dismissibleTabTimers.keys())) {
+    if (!liveIds.has(id)) clearDismissibleTabTimer(id);
   }
+
   sessionCommands.update((current) => {
     const next = Object.fromEntries(
       Object.entries(current).filter(([id]) => liveIds.has(id)),

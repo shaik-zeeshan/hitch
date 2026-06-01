@@ -43,7 +43,7 @@ Hitch's built-in set of known Agents (Claude Code, Codex to start), each with a 
 _Avoid_: Plugins, Providers.
 
 **Hook helper**:
-A small `hitch` CLI invoked by an Agent's installed hook; it reports the Agent's state to the **Daemon**'s local socket, which **owns** the current value (see ADR 0010). Hitch installs the hook by merging it into a per-Worktree, gitignored agent-local config (e.g. `.claude/settings.local.json`, `.codex/hooks.json`) without overwriting the user's own keys. Every installed hook carries an explicit state; the helper never infers state from payload text. It resolves to a Session by `HITCH_SESSION_ID` (injected into every PTY) only — a report that cannot be resolved is logged and dropped, never smeared onto a Worktree.
+A small `hitch` CLI invoked by an Agent's installed hook; it reports the Agent's state to the **Daemon**'s local socket, which **owns** the current value (see ADR 0011). Hitch installs the hook by merging it into a per-Worktree, gitignored agent-local config (e.g. `.claude/settings.local.json`, `.codex/hooks.json`) without overwriting the user's own keys. Every installed hook carries an explicit state; the helper never infers state from payload text. It resolves to a Session by `HITCH_SESSION_ID` (injected into every PTY) only — a report that cannot be resolved is logged and dropped, never smeared onto a Worktree.
 _Avoid_: Notifier, Bridge.
 
 **Job**:
@@ -71,6 +71,6 @@ _Avoid_: Agent harness, Agent.
 
 - "Tracked task" — there is no Task entity. A Session running an Agent is the closest thing; its "tracking" is just its Agent State, surfaced in the tree/tab. Typing `claude` in any Session reports state because the hook lives in the worktree config, not in how the Session was launched.
 - "Agent harness" — resolved as **Draft Generator** for this feature; **Agent** remains reserved for known CLIs running in Sessions.
-- "completed" / "done" — removed (ADR 0010). An interactive Agent does not terminate into a state: a finished turn is *waiting*, an exited Agent is `None`.
+- "completed" / "done" — removed (ADR 0011). An interactive Agent does not terminate into a state: a finished turn is *waiting*, an exited Agent is `None`.
 - "your turn" is two distinct states: *needs-approval* (blocking gate, sticky until resolved) vs *waiting* (idle prompt, dismiss-on-seen).
-- **Known gap:** Codex exposes no failure hook, so the *error* Agent State is never shown for Codex (a crash clears to `None`); accepted for now (ADR 0010).
+- **Known gap:** Codex exposes no failure hook, so the *error* Agent State is never shown for Codex (a crash clears to `None`); accepted for now (ADR 0011).

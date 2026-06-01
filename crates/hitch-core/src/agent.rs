@@ -14,8 +14,8 @@ pub enum AgentState {
     Running,
     /// The agent is paused, waiting for the user's approval.
     NeedsApproval,
-    /// The agent finished its turn.
-    Completed,
+    /// The agent is idle, waiting for further work or user input.
+    Waiting,
     /// The agent stopped because of an error.
     Error,
 }
@@ -34,6 +34,10 @@ mod tests {
             serde_json::to_string(&AgentState::Running).unwrap(),
             "\"running\""
         );
+        assert_eq!(
+            serde_json::to_string(&AgentState::Waiting).unwrap(),
+            "\"waiting\""
+        );
     }
 
     #[test]
@@ -41,7 +45,7 @@ mod tests {
         for state in [
             AgentState::Running,
             AgentState::NeedsApproval,
-            AgentState::Completed,
+            AgentState::Waiting,
             AgentState::Error,
         ] {
             let json = serde_json::to_string(&state).unwrap();
