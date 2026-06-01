@@ -27,7 +27,11 @@ fn main() {
             std::fs::create_dir_all(&binaries_dir).unwrap();
             let dst = binaries_dir.join(format!("{binary}-{target}"));
             std::fs::copy(&src, &dst).unwrap_or_else(|err| {
-                panic!("failed to copy {binary} from {} to {}: {err}", src.display(), dst.display())
+                panic!(
+                    "failed to copy {binary} from {} to {}: {err}",
+                    src.display(),
+                    dst.display()
+                )
             });
         } else {
             let build_flag = if profile == "release" {

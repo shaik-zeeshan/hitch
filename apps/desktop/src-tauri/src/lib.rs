@@ -1033,9 +1033,17 @@ impl HitchClient {
         // hitch-daemon).
         #[cfg(not(debug_assertions))]
         if let Some(path) = daemon_binary_path() {
+            let hook_path = hook_binary_path_for_daemon(&path).ok_or_else(|| {
+                format!(
+                    "hitch-hook binary was not found next to {}; bundled agent hooks cannot be installed",
+                    path.display()
+                )
+            })?;
             let output = Command::new(&path)
                 .arg("--socket")
                 .arg(&self.0.socket_path)
+                .arg("--hook-helper")
+                .arg(&hook_path)
                 .arg("--detach")
                 .output()
                 .map_err(|err| format!("failed to spawn {}: {err}", path.display()))?;
@@ -1050,6 +1058,20 @@ impl HitchClient {
 
         #[cfg(debug_assertions)]
         {
+            let hook_output = Command::new("cargo")
+                .arg("build")
+                .arg("-p")
+                .arg("hitch-hook")
+                .output()
+                .map_err(|err| format!("failed to run `cargo build -p hitch-hook`: {err}"))?;
+            if !hook_output.status.success() {
+                return Err(format!(
+                    "`cargo build -p hitch-hook` failed: {}{}",
+                    String::from_utf8_lossy(&hook_output.stdout),
+                    String::from_utf8_lossy(&hook_output.stderr)
+                ));
+            }
+
             let output = Command::new("cargo")
                 .arg("run")
                 .arg("-p")
@@ -1215,6 +1237,13 @@ fn daemon_binary_path() -> Option<PathBuf> {
     }
 
     None
+}
+
+#[cfg(any(not(debug_assertions), test))]
+fn hook_binary_path_for_daemon(daemon: &Path) -> Option<PathBuf> {
+    let dir = daemon.parent()?;
+    let hook = dir.join("hitch-hook");
+    hook.is_file().then_some(hook)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1648,6 +1677,28 @@ mod tests {
             tray_status_text(DaemonStatus::Running, 4),
             "Hitch — running 4 sessions"
         );
+    }
+
+    #[test]
+    fn hook_binary_path_tracks_bundled_daemon_sibling() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-sidecar-path-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = dir.join("hitch-daemon");
+        let hook = dir.join("hitch-hook");
+        std::fs::write(&daemon, "").unwrap();
+
+        assert_eq!(super::hook_binary_path_for_daemon(&daemon), None);
+
+        std::fs::write(&hook, "").unwrap();
+        assert_eq!(super::hook_binary_path_for_daemon(&daemon), Some(hook));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

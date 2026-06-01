@@ -246,7 +246,15 @@ fn install_claude_hooks(
         &path,
         overlay,
         AgentKind::ClaudeCode,
-        &["SessionStart", "SessionEnd"],
+        &[
+            "UserPromptSubmit",
+            "PermissionRequest",
+            "Notification",
+            "Stop",
+            "StopFailure",
+            "SessionStart",
+            "SessionEnd",
+        ],
     )?;
     installed_configs.push(InstalledHookConfig {
         agent: AgentKind::ClaudeCode,
@@ -268,7 +276,17 @@ fn install_codex_hooks(
             "Stop": [codex_hook_entry(helper_path, "stop", AgentState::Completed)]
         }
     });
-    merge_json_file(&path, overlay, AgentKind::Codex, &["SessionStart"])?;
+    merge_json_file(
+        &path,
+        overlay,
+        AgentKind::Codex,
+        &[
+            "UserPromptSubmit",
+            "PermissionRequest",
+            "Stop",
+            "SessionStart",
+        ],
+    )?;
     installed_configs.push(InstalledHookConfig {
         agent: AgentKind::Codex,
         path,
@@ -336,7 +354,7 @@ fn merge_json_file(
     path: &Path,
     overlay: Value,
     agent: AgentKind,
-    obsolete_events: &[&str],
+    prune_events: &[&str],
 ) -> Result<(), AgentHookError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -361,35 +379,31 @@ fn merge_json_file(
         });
     }
 
+    prune_hitch_hooks(&mut base, agent, prune_events);
     merge_preserving_existing(&mut base, overlay);
-    prune_obsolete_hitch_hooks(&mut base, agent, obsolete_events);
     let rendered = serde_json::to_string_pretty(&base)?;
     fs::write(path, format!("{rendered}\n"))?;
     Ok(())
 }
 
-fn prune_obsolete_hitch_hooks(base: &mut Value, agent: AgentKind, obsolete_events: &[&str]) {
+fn prune_hitch_hooks(base: &mut Value, agent: AgentKind, events: &[&str]) {
     let Some(hooks) = base.get_mut("hooks").and_then(Value::as_object_mut) else {
         return;
     };
 
-    for event in obsolete_events {
+    for event in events {
         let remove_event = {
             let Some(groups) = hooks.get_mut(*event).and_then(Value::as_array_mut) else {
                 continue;
             };
 
-            for group in groups.iter_mut() {
+            groups.retain_mut(|group| {
                 let Some(commands) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
-                    continue;
+                    return true;
                 };
+                let had_commands = !commands.is_empty();
                 commands.retain(|hook| !is_hitch_hook_command(hook, agent));
-            }
-            groups.retain(|group| {
-                group
-                    .get("hooks")
-                    .and_then(Value::as_array)
-                    .map_or(true, |commands| !commands.is_empty())
+                !had_commands || !commands.is_empty()
             });
             groups.is_empty()
         };
@@ -736,6 +750,53 @@ mod tests {
     }
 
     #[test]
+    fn install_replaces_stale_hitch_hook_paths() {
+        let worktree = temp_dir("stale-helper");
+        init_git_repo(&worktree);
+        install_hooks(
+            &worktree,
+            &HookInstallOptions::new("/old/target/debug/hitch-hook"),
+        )
+        .unwrap();
+
+        let claude_path = worktree.join(".claude/settings.local.json");
+        let mut claude: Value =
+            serde_json::from_str(&fs::read_to_string(&claude_path).unwrap()).unwrap();
+        claude["hooks"]["Notification"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "matcher": "user-owned",
+                "hooks": [{
+                    "type": "command",
+                    "command": "echo keep-me"
+                }]
+            }));
+        fs::write(
+            &claude_path,
+            format!("{}\n", serde_json::to_string_pretty(&claude).unwrap()),
+        )
+        .unwrap();
+
+        install_hooks(
+            &worktree,
+            &HookInstallOptions::new("/new/target/debug/hitch-hook"),
+        )
+        .unwrap();
+
+        let claude = fs::read_to_string(&claude_path).unwrap();
+        assert!(!claude.contains("/old/target/debug/hitch-hook"));
+        assert_eq!(claude.matches("/new/target/debug/hitch-hook").count(), 5);
+        assert!(claude.contains("echo keep-me"));
+
+        let codex = fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap();
+        assert!(!codex.contains("/old/target/debug/hitch-hook"));
+        assert_eq!(codex.matches("/new/target/debug/hitch-hook").count(), 3);
+
+        fs::remove_dir_all(worktree).unwrap();
+    }
+
+    #[test]
     fn install_updates_local_exclude_in_git_directory() {
         let worktree = temp_dir("exclude");
         init_git_repo(&worktree);
@@ -814,7 +875,10 @@ mod tests {
         init_git_repo(&main);
 
         let feature = root.join("feature");
-        git(&main, ["worktree", "add", "--quiet", feature.to_str().unwrap()]);
+        git(
+            &main,
+            ["worktree", "add", "--quiet", feature.to_str().unwrap()],
+        );
 
         let summary =
             install_hooks(&feature, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
