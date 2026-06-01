@@ -118,12 +118,27 @@ export const prByWorktree = writable<Record<Id, PrInfo | null>>({});
 // (e.g. right after creating a PR).
 let prByWorktreeSeq = 0;
 const prByWorktreeApplied = new Map<Id, number>();
+// Highest seq for which a lookup has *started* (not necessarily completed) per
+// worktree. `prByWorktreeApplied` only advances on completed writes, so without
+// this an older project-wide response that resolves while a newer per-worktree
+// lookup is still in flight would apply stale data — and, if that fresher lookup
+// then fails, leave the chip wrong until the next poll. Stamping the started seq
+// lets the freshness guard reject any response older than an in-flight request.
+const prByWorktreeStarted = new Map<Id, number>();
+// The freshest seq known for a worktree, whether a lookup merely started or has
+// fully landed. A write/clear is only fresh if its seq is >= this.
+function freshestPrSeq(worktreeId: Id): number {
+  return Math.max(
+    prByWorktreeApplied.get(worktreeId) ?? 0,
+    prByWorktreeStarted.get(worktreeId) ?? 0,
+  );
+}
 // Returns whether this write was the freshest seen for `worktreeId` (i.e. it
 // actually applied). Callers gate the selected worktree's single `prInfo` on the
 // result so an unrelated project's batched lookup can't drop a newer per-worktree
 // result through a shared global counter.
 function writePrByWorktree(worktreeId: Id, pr: PrInfo | null, seq: number): boolean {
-  if (seq < (prByWorktreeApplied.get(worktreeId) ?? 0)) return false;
+  if (seq < freshestPrSeq(worktreeId)) return false;
   prByWorktreeApplied.set(worktreeId, seq);
   prByWorktree.update((map) => ({ ...map, [worktreeId]: pr }));
   return true;
@@ -131,7 +146,7 @@ function writePrByWorktree(worktreeId: Id, pr: PrInfo | null, seq: number): bool
 // True while no newer per-worktree write has landed — lets the failure path clear
 // the selected `prInfo` without clobbering a fresher success or touching the chip.
 function isFreshestPr(worktreeId: Id, seq: number): boolean {
-  return seq >= (prByWorktreeApplied.get(worktreeId) ?? 0);
+  return seq >= freshestPrSeq(worktreeId);
 }
 
 const diffCache = new Map<string, string>();
@@ -899,6 +914,9 @@ export async function loadGitStatus(worktreeId: Id): Promise<GitStatus> {
 // the UI falls back to offering Create-PR rather than getting stuck.
 export async function loadPrStatus(worktreeId: Id): Promise<void> {
   const freshnessSeq = ++prByWorktreeSeq;
+  // Mark a lookup for this worktree as in flight so a slower, older project-wide
+  // response can't clobber it before it resolves (see prByWorktreeStarted).
+  prByWorktreeStarted.set(worktreeId, freshnessSeq);
   try {
     const response = await runJob<Response & { pr: PrInfo | null }>(
       { type: "pr-status", worktree_id: worktreeId },

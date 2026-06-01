@@ -555,16 +555,84 @@ fn pr_branch_search(branches: &[String]) -> String {
     search
 }
 
+/// Split branch heads into one or more `gh pr list --search` queries. GitHub
+/// rejects a search with more than five boolean operators or longer than 256
+/// characters
+/// (https://docs.github.com/en/rest/search/search#limitations-on-query-length),
+/// and `pr_list_for_branches_with_client` maps any `gh` failure to an empty
+/// result — so a single `(head:b1 OR … OR b7)` query for a project with seven or
+/// more worktree branches (six `OR`s) would silently drop *every* chip. Capping
+/// each query at six heads / a conservative length keeps larger projects working
+/// by spreading the lookup across several `gh` calls.
+fn pr_branch_search_chunks(branches: &[String]) -> Vec<String> {
+    // Five `OR`s join six heads — the documented operator ceiling. Stay well
+    // under the 256-char query cap on the joined branch names too.
+    const MAX_HEADS_PER_QUERY: usize = 6;
+    const MAX_SEARCH_LEN: usize = 200;
+
+    let mut chunks = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut current_len = 0usize;
+    for branch in branches.iter().filter(|branch| !branch.is_empty()) {
+        // `head:` qualifier + the name + a ` OR ` separator as headroom.
+        let cost = branch.len() + 9;
+        if !current.is_empty()
+            && (current.len() == MAX_HEADS_PER_QUERY || current_len + cost > MAX_SEARCH_LEN)
+        {
+            chunks.push(pr_branch_search(&current));
+            current.clear();
+            current_len = 0;
+        }
+        current.push(branch.clone());
+        current_len += cost;
+    }
+    if !current.is_empty() {
+        chunks.push(pr_branch_search(&current));
+    }
+    chunks
+}
+
+/// Owner (`login`) of the `origin` remote, parsed from its URL. Used to discard
+/// fork PRs that merely share a head branch name with a local worktree (see
+/// `pr_list_for_branches_with_client`). Best-effort: `None` when there is no
+/// `origin`, no URL, or an unrecognised URL shape — callers then keep every
+/// name-matched PR rather than risk dropping legitimate chips.
+fn origin_owner(repo_path: &Path) -> Option<String> {
+    let repo = Repository::open(repo_path).ok()?;
+    let remote = repo.find_remote("origin").ok()?;
+    parse_remote_owner(remote.url()?)
+}
+
+/// Extract the owner segment from a git remote URL. Handles the common GitHub
+/// shapes: `git@github.com:owner/repo(.git)`, `https://github.com/owner/repo(.git)`,
+/// and `ssh://git@github.com[:port]/owner/repo(.git)`.
+fn parse_remote_owner(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let path = if let Some((_, rest)) = trimmed.split_once("://") {
+        // URL form: scheme://[user@]host[:port]/owner/repo — owner follows the
+        // first '/' after the host.
+        rest.split_once('/').map(|(_, path)| path)?
+    } else if let Some((_, rest)) = trimmed.split_once(':') {
+        // scp form: [user@]host:owner/repo.
+        rest
+    } else {
+        return None;
+    };
+    let owner = path.trim_start_matches('/').split('/').next()?;
+    (!owner.is_empty()).then(|| owner.to_string())
+}
+
 fn pr_list_for_branches_with_client(
     client: &GitClient,
     repo_path: &Path,
     branches: &[String],
     control: Option<&dyn CommandControl>,
 ) -> Result<Vec<(String, PrInfo)>> {
-    let search = pr_branch_search(branches);
+    let searches = pr_branch_search_chunks(branches);
     // No real branches to look up — an empty query would match every PR, which
     // we don't want, so bail before spending a `gh` call.
-    if search.is_empty() {
+    if searches.is_empty() {
         return Ok(Vec::new());
     }
     // `head:` matches by *prefix* in GitHub search, so a short worktree branch
@@ -577,62 +645,85 @@ fn pr_list_for_branches_with_client(
         .saturating_mul(8)
         .clamp(100, 1000)
         .to_string();
-    // `--state all` so a worktree whose PR has already merged still shows a chip;
-    // `headRefName` is the branch we map back to each worktree.
-    let args = vec![
-        os("pr"),
-        os("list"),
-        os("--state"),
-        os("all"),
-        os("--search"),
-        os(&search),
-        os("--limit"),
-        os(&limit),
-        os("--json"),
-        os("number,url,state,isDraft,headRefName"),
-    ];
-    let output = match control {
-        Some(control) => client.run_gh_with_control(repo_path, args, control),
-        None => client.run_gh(repo_path, args),
-    };
-    let output = match output {
-        Ok(output) => output,
-        Err(err @ GitError::CommandFailed { .. }) => {
-            if control.is_some_and(|control| control.is_cancelled()) {
-                return Err(err);
+    // For repos that accept fork PRs, `head:branch` also matches a contributor's
+    // fork PR whose head branch happens to share a local worktree's name. Anchor
+    // on the project's own `origin` owner so a fork PR is never mapped onto (and
+    // opened from) the wrong local branch. Best-effort: an unknown owner means we
+    // keep every name match rather than drop legitimate chips.
+    let expected_owner = origin_owner(repo_path);
+    let mut prs = Vec::new();
+    // Heads are spread across several queries to stay under GitHub's search
+    // limits (see `pr_branch_search_chunks`); a failed chunk is skipped rather
+    // than abandoning the rest, so one odd/over-long branch can't drop every chip.
+    for search in &searches {
+        // `--state all` so a worktree whose PR has already merged still shows a
+        // chip; `headRefName` is the branch we map back to each worktree.
+        let args = vec![
+            os("pr"),
+            os("list"),
+            os("--state"),
+            os("all"),
+            os("--search"),
+            os(search),
+            os("--limit"),
+            os(&limit),
+            os("--json"),
+            os("number,url,state,isDraft,headRefName,headRepositoryOwner"),
+        ];
+        let output = match control {
+            Some(control) => client.run_gh_with_control(repo_path, args, control),
+            None => client.run_gh(repo_path, args),
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(err @ GitError::CommandFailed { .. }) => {
+                if control.is_some_and(|control| control.is_cancelled()) {
+                    return Err(err);
+                }
+                // No repo / no auth / no network — nothing to show, like
+                // pr_status. Skip this chunk rather than abandon the rest.
+                continue;
             }
-            // No repo / no auth / no network — nothing to show, like pr_status.
-            return Ok(Vec::new());
-        }
-        Err(err) => return Err(err),
-    };
-    let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(&output.stdout) else {
-        return Ok(Vec::new());
-    };
-    let mut prs = Vec::with_capacity(values.len());
-    for value in values {
-        let (Some(number), Some(url), Some(head)) = (
-            value["number"].as_u64(),
-            value["url"].as_str(),
-            value["headRefName"].as_str(),
-        ) else {
+            Err(err) => return Err(err),
+        };
+        let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(&output.stdout) else {
             continue;
         };
-        // `head:` is a prefix match, so the OR'd query can return PRs on branches
-        // that only start with a requested one. Keep exact matches only, so a
-        // prefix hit is never mapped onto the wrong worktree.
-        if !branches.iter().any(|branch| branch.as_str() == head) {
-            continue;
+        for value in values {
+            let (Some(number), Some(url), Some(head)) = (
+                value["number"].as_u64(),
+                value["url"].as_str(),
+                value["headRefName"].as_str(),
+            ) else {
+                continue;
+            };
+            // `head:` is a prefix match, so the OR'd query can return PRs on
+            // branches that only start with a requested one. Keep exact matches
+            // only, so a prefix hit is never mapped onto the wrong worktree.
+            if !branches.iter().any(|branch| branch.as_str() == head) {
+                continue;
+            }
+            // Drop fork PRs that share a head branch name with a local worktree:
+            // keep only PRs whose head repo owner matches `origin`. When we can't
+            // resolve our owner, or gh omits the head owner, fail open and keep it.
+            if let (Some(expected), Some(head_owner)) = (
+                expected_owner.as_deref(),
+                value["headRepositoryOwner"]["login"].as_str(),
+            ) {
+                if !head_owner.eq_ignore_ascii_case(expected) {
+                    continue;
+                }
+            }
+            prs.push((
+                head.to_string(),
+                PrInfo {
+                    number,
+                    url: url.to_string(),
+                    state: value["state"].as_str().unwrap_or_default().to_string(),
+                    draft: value["isDraft"].as_bool().unwrap_or(false),
+                },
+            ));
         }
-        prs.push((
-            head.to_string(),
-            PrInfo {
-                number,
-                url: url.to_string(),
-                state: value["state"].as_str().unwrap_or_default().to_string(),
-                draft: value["isDraft"].as_bool().unwrap_or(false),
-            },
-        ));
     }
     Ok(prs)
 }
@@ -1769,6 +1860,64 @@ mod tests {
             !gh_call.contains("author:@me"),
             "batched worktree PR lookup must keep teammate-authored PRs: {gh_call}"
         );
+    }
+
+    #[test]
+    fn pr_branch_search_chunks_caps_heads_per_query() {
+        // Seven branches => six `OR`s in one query, over GitHub's five-operator
+        // limit; chunking must split into 6 + 1.
+        let branches: Vec<String> = (0..7).map(|n| format!("branch-{n}")).collect();
+        let chunks = pr_branch_search_chunks(&branches);
+        assert_eq!(chunks.len(), 2, "seven heads must split across two queries");
+        assert_eq!(chunks[0].matches(" OR ").count(), 5);
+        assert!(!chunks[1].contains(" OR "), "trailing chunk holds one head");
+        // Blank branches (detached worktrees) still contribute no query.
+        assert!(pr_branch_search_chunks(&[String::new()]).is_empty());
+    }
+
+    #[test]
+    fn parse_remote_owner_handles_common_url_shapes() {
+        assert_eq!(
+            parse_remote_owner("git@github.com:acme/widgets.git").as_deref(),
+            Some("acme")
+        );
+        assert_eq!(
+            parse_remote_owner("https://github.com/acme/widgets.git").as_deref(),
+            Some("acme")
+        );
+        assert_eq!(
+            parse_remote_owner("https://github.com/acme/widgets").as_deref(),
+            Some("acme")
+        );
+        assert_eq!(
+            parse_remote_owner("ssh://git@github.com:22/acme/widgets.git").as_deref(),
+            Some("acme")
+        );
+        assert_eq!(parse_remote_owner("not-a-url").as_deref(), None);
+    }
+
+    #[test]
+    fn pr_list_for_branches_drops_fork_prs_sharing_a_local_branch_name() {
+        let fixture = RepoFixture::new();
+        // Anchor the project on a known owner; a same-named fork PR from another
+        // owner must not be mapped onto this local worktree branch.
+        fixture.git(["remote", "add", "origin", "https://github.com/myowner/repo.git"]);
+        let bin = TempDir::new().unwrap();
+        let log = bin.path().join("calls.log");
+        let gh = fake_program(
+            bin.path().join("gh"),
+            &log,
+            r#"[{"number":10,"url":"https://github.test/pr/10","state":"OPEN","isDraft":false,"headRefName":"patch-1","headRepositoryOwner":{"login":"myowner"}},{"number":99,"url":"https://github.test/pr/99","state":"OPEN","isDraft":false,"headRefName":"patch-1","headRepositoryOwner":{"login":"stranger"}}]"#,
+        );
+        let client = GitClient::with_programs("git", gh);
+        let branches = vec!["patch-1".into()];
+
+        let prs = pr_list_for_branches_with_client(&client, fixture.path(), &branches, None)
+            .expect("PR list should parse fake gh output");
+
+        assert_eq!(prs.len(), 1, "fork PR sharing the branch name must be dropped");
+        assert_eq!(prs[0].0, "patch-1");
+        assert_eq!(prs[0].1.number, 10);
     }
 
     #[test]

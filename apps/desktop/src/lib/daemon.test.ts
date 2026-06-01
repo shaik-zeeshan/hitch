@@ -34,6 +34,10 @@ import {
   initDaemon,
   isJobCancellable,
   jobs,
+  loadPrStatus,
+  loadProjectPrStatuses,
+  prByWorktree,
+  prInfo,
   reconnect,
   restartDaemon,
   runJob,
@@ -472,5 +476,49 @@ describe("job store: StartJob -> JobCompleted", () => {
     completeJob("foreign", { type: "ack" });
     await expect(promise).resolves.toMatchObject({ type: "ack" });
     expect(settled).toBe(true);
+  });
+});
+
+describe("PR status freshness across batched and per-worktree lookups", () => {
+  it("does not let an older project-wide batch clobber a fresher in-flight per-worktree lookup", async () => {
+    // Regression: a project-wide `loadProjectPrStatuses` that *started* before a
+    // fresher per-worktree `loadPrStatus` could resolve afterwards and overwrite
+    // the worktree's chip with stale data — and if the fresher lookup then failed,
+    // the chip stayed wrong until the next poll. The fix stamps an in-flight
+    // (started) seq per worktree so the older batch is rejected.
+    prByWorktree.set({});
+    prInfo.set(null);
+    selectedWorktreeId.set("wt-1");
+
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { request: { type: string } } }) => {
+        const type = request.request.type;
+        if (type === "project-pr-statuses") return { type: "job-started", job_id: "j-batch" };
+        if (type === "pr-status") return { type: "job-started", job_id: "j-pw" };
+        throw new Error(`unexpected request ${type}`);
+      },
+    );
+
+    // Batch starts first (older seq); the fresher per-worktree lookup for the same
+    // worktree starts while the batch is still in flight (newer seq).
+    const batch = loadProjectPrStatuses("proj-1", { force: true });
+    const perWorktree = loadPrStatus("wt-1");
+    await flush();
+
+    // The stale batch resolves first, trying to write an outdated PR for wt-1.
+    completeJob("j-batch", {
+      type: "project-pr-statuses",
+      statuses: [
+        { worktree_id: "wt-1", pr: { number: 1, url: "stale", state: "OPEN", draft: false } },
+      ],
+    });
+    await batch;
+
+    // The fresher per-worktree lookup then fails; the stale chip must not survive.
+    completeJob("j-pw", { type: "error", error: { message: "boom" } });
+    await perWorktree;
+
+    expect(get(prByWorktree)["wt-1"]).toBeUndefined();
+    expect(get(prInfo)).toBeNull();
   });
 });
