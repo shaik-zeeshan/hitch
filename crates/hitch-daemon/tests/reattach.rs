@@ -15,7 +15,7 @@ use hitch_proto::transport::{connect_daemon, DaemonStream};
 use hitch_proto::ErrorCode;
 #[cfg(any(unix, windows))]
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, CommitDraft, Event, GitStatus, JobRequest,
+    encode_control_message, encode_pty_frame, CommitDraft, Event, FileDiff, GitStatus, JobRequest,
     PullRequestDraft,
 };
 use hitch_proto::{ControlMessage, Request, Response, PROTOCOL_VERSION};
@@ -245,6 +245,77 @@ fn worktree_branch_tracks_unborn_head_renames() {
     client.shutdown(6);
     daemon.wait_for_exit();
     let _ = std::fs::remove_dir_all(repo);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn git_project_with_spaces_persists_statuses_diffs_and_dirty_events() {
+    let socket = test_socket_path("windows-paths");
+    let store = test_file_path("windows paths store", "sqlite");
+    let managed_root = test_dir_path("windows paths managed");
+    let repo_parent = test_dir_path("windows paths parent");
+    let repo = repo_parent.join("repo with spaces");
+    init_git_repo(&repo);
+    let spaced_file = PathBuf::from("file with spaces.txt");
+    std::fs::write(repo.join(&spaced_file), "initial\n").unwrap();
+    run_git(&repo, ["add", spaced_file.to_str().unwrap()]);
+    run_git(&repo, ["commit", "-m", "add spaced file"]);
+
+    let mut first = spawn_daemon_full(&socket, &store, &managed_root, None);
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &repo);
+    let mut worktrees = client.list_worktrees(3, project.id);
+    assert_eq!(worktrees.len(), 1);
+    let worktree = worktrees.remove(0);
+    assert!(worktree.is_main);
+    assert!(same_path(&worktree.path, &repo));
+    client.shutdown(4);
+    wait_for_process_exit(&mut first, Duration::from_secs(3));
+
+    let mut second = spawn_daemon_full(&socket, &store, &managed_root, None);
+    let mut reconnected = TestClient::connect(&socket);
+    reconnected.hello(5);
+    let projects = reconnected.list_projects(6);
+    assert!(
+        projects
+            .iter()
+            .any(|stored| stored.id == project.id && same_path(&stored.root, &project.root)),
+        "persisted projects were {projects:?}"
+    );
+    let restored = reconnected.list_worktrees(7, project.id);
+    assert!(
+        restored.iter().any(|stored| {
+            stored.id == worktree.id && same_path(&stored.path, &worktree.path) && stored.is_main
+        }),
+        "persisted worktrees were {restored:?}"
+    );
+
+    thread::sleep(Duration::from_millis(1200));
+    std::fs::write(repo.join(&spaced_file), "initial\nchanged\n").unwrap();
+    let dirty = reconnected.read_worktree_dirty(worktree.id, Duration::from_secs(5));
+    assert!(dirty, "dirty event should mark the worktree dirty");
+
+    let status = reconnected.git_status(8, worktree.id);
+    assert!(status.dirty);
+    assert!(status
+        .files
+        .iter()
+        .any(|file| file.path == spaced_file && !file.staged));
+    let diff = reconnected.git_diff(9, worktree.id, repo.join(&spaced_file));
+    assert_eq!(diff.path, repo.join(&spaced_file));
+    assert!(
+        diff.diff.contains("file with spaces.txt"),
+        "diff was {:?}",
+        diff.diff
+    );
+    assert!(diff.diff.contains("+changed"), "diff was {:?}", diff.diff);
+
+    reconnected.shutdown(10);
+    wait_for_process_exit(&mut second, Duration::from_secs(3));
+    let _ = std::fs::remove_file(store);
+    let _ = std::fs::remove_dir_all(managed_root);
+    let _ = std::fs::remove_dir_all(repo_parent);
 }
 
 #[cfg(unix)]
@@ -904,6 +975,23 @@ impl TestClient {
         }
     }
 
+    fn list_projects(&mut self, id: u64) -> Vec<Project> {
+        self.send_request(id, Request::ListProjects);
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::Projects { projects },
+                }) if response_id == id => return projects,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("list projects failed: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
+
     fn list_worktrees(&mut self, id: u64, project_id: hitch_core::ProjectId) -> Vec<Worktree> {
         self.send_request(id, Request::ListWorktrees { project_id });
         loop {
@@ -953,6 +1041,53 @@ impl TestClient {
                 Packet::Control(_) | Packet::Output { .. } => continue,
             }
         }
+    }
+
+    fn git_diff(
+        &mut self,
+        id: u64,
+        worktree_id: hitch_core::WorktreeId,
+        path: PathBuf,
+    ) -> FileDiff {
+        self.send_request(id, Request::GitDiff { worktree_id, path });
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::FileDiff { diff },
+                }) if response_id == id => return diff,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("git diff failed: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
+
+    fn read_worktree_dirty(
+        &mut self,
+        worktree_id: hitch_core::WorktreeId,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::WorktreeDirty {
+                            worktree_id: changed,
+                            dirty,
+                        },
+                }) if changed == worktree_id => return dirty,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("daemon error while waiting for dirty event: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for worktree dirty event");
     }
 
     fn generate_commit_draft(
@@ -1393,7 +1528,7 @@ fn spawn_daemon_command(mut command: Command) -> Child {
         .expect("spawn hitch-daemon")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn init_git_repo(path: &Path) {
     std::fs::create_dir_all(path).unwrap();
     run_git(path, ["init", "--initial-branch=main"]);
@@ -1444,7 +1579,7 @@ fn write_executable_script(path: &Path, contents: &str) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) {
     let output = Command::new("git")
         .current_dir(cwd)
@@ -1478,6 +1613,23 @@ fn test_dir_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("hitch-daemon-{name}-{nonce}"))
 }
 
+fn same_path(left: &Path, right: &Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    left == right
+}
+
+fn wait_for_process_exit(child: &mut Child, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("try_wait daemon") {
+            assert!(status.success(), "daemon exited with {status}");
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("daemon did not exit after shutdown");
+}
 #[cfg(unix)]
 fn wait_for_socket_gone(socket: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;

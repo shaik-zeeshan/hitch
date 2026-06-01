@@ -20,6 +20,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import {
+  addProject,
   activeSessionId,
   agentStateByProject,
   agentStateByWorktree,
@@ -34,9 +35,12 @@ import {
   connection,
   createWorktree,
   daemonReason,
+  dismissedSessionAgentStates,
   dismissedWorktreeAgentStates,
   diffActive,
-  dismissedSessionAgentStates,
+  diffPath,
+  diffText,
+  dirtyWorktrees,
   daemonStatus,
   disposeDaemon,
   error,
@@ -47,8 +51,10 @@ import {
   loadPrStatus,
   loadProjectPrStatuses,
   prByWorktree,
+  gitStatus,
   prInfo,
   projects,
+  refreshAll,
   push,
   reconnect,
   restartDaemon,
@@ -57,6 +63,8 @@ import {
   sessions,
   worktrees,
   visibleAgentStates,
+  viewDiff,
+  worktreeLineStats,
 } from "./daemon";
 
 // Flush the StartJob promise chain (runJob -> daemonRequest -> invoke) so the
@@ -79,6 +87,12 @@ beforeEach(() => {
   agentStates.set({});
   dismissedSessionAgentStates.set({});
   dismissedWorktreeAgentStates.set({});
+  dirtyWorktrees.set({});
+  worktreeLineStats.set({});
+  gitStatus.set(null);
+  diffPath.set(null);
+  diffText.set(null);
+  diffActive.set(false);
 });
 
 describe("daemon status mapping", () => {
@@ -905,6 +919,115 @@ describe("job store: StartJob -> JobCompleted", () => {
   });
 
 });
+describe("Windows project paths", () => {
+  const projectRoot = String.raw`C:\Users\Ada Lovelace\Repo With Spaces`;
+  const filePath = String.raw`src\folder with spaces\file name.ts`;
+  const worktreePath = String.raw`C:\Users\Ada Lovelace\Repo With Spaces`;
+  const project = {
+    id: "project-win",
+    name: "Repo With Spaces",
+    root: projectRoot,
+    kind: "git-backed",
+  } as const;
+  const worktree = {
+    id: "worktree-win",
+    project_id: "project-win",
+    path: worktreePath,
+    branch: "main",
+    is_main: true,
+    is_hitch_managed: false,
+  } as const;
+
+  function windowsStatus(additions = 12, deletions = 5) {
+    return {
+      worktree_id: worktree.id,
+      branch: "main",
+      dirty: true,
+      ahead: 0,
+      behind: 0,
+      additions,
+      deletions,
+      files: [{ path: filePath, status: "modified" as const, staged: false }],
+    };
+  }
+
+  it("adds and refreshes a git-backed project without changing a Windows root with spaces", async () => {
+    const requests: unknown[] = [];
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; project_id?: string } }) => {
+        requests.push(request);
+        if (request.type === "add-project") return { type: "ack" };
+        if (request.type === "list-projects") return { type: "list-projects", projects: [project] };
+        if (request.type === "list-worktrees") {
+          expect(request.project_id).toBe(project.id);
+          return { type: "list-worktrees", worktrees: [worktree] };
+        }
+        if (request.type === "list-sessions") return { type: "list-sessions", sessions: [] };
+        if (request.type === "git-status") return { type: "git-status", status: windowsStatus() };
+        if (request.type === "start-job") return { type: "job-started", job_id: "j-pr" };
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await addProject(projectRoot);
+
+    expect(requests[0]).toEqual({ type: "add-project", root: projectRoot });
+    expect(get(projects)[0]?.root).toBe(projectRoot);
+    expect(get(worktrees)[0]?.path).toBe(worktreePath);
+    expect(get(dirtyWorktrees)[worktree.id]).toBe(true);
+    expect(get(worktreeLineStats)[worktree.id]).toEqual({ additions: 12, deletions: 5 });
+
+    projects.set([]);
+    worktrees.set([]);
+    dirtyWorktrees.set({});
+    worktreeLineStats.set({});
+
+    await refreshAll();
+
+    expect(get(projects)[0]?.root).toBe(projectRoot);
+    expect(get(worktrees)[0]?.path).toBe(worktreePath);
+  });
+
+  it("refreshes dirty state and line stats from a worktree-dirty event for a Windows worktree path", async () => {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; worktree_id?: string } }) => {
+        expect(request).toEqual({ type: "git-status", worktree_id: worktree.id });
+        return { type: "git-status", status: windowsStatus(7, 3) };
+      },
+    );
+
+    applyHitchEvent({ type: "worktree-dirty", worktree_id: worktree.id, dirty: true });
+    await flush();
+
+    expect(get(dirtyWorktrees)[worktree.id]).toBe(true);
+    expect(get(worktreeLineStats)[worktree.id]).toEqual({ additions: 7, deletions: 3 });
+    expect(get(gitStatus)?.files[0]?.path).toBe(filePath);
+  });
+
+  it("sends the exact Windows file path when requesting a diff", async () => {
+    const requests: unknown[] = [];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string } }) => {
+        requests.push(request);
+        if (request.type === "git-diff") return { type: "git-diff", diff: { diff: "diff --git" } };
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await viewDiff(filePath);
+
+    expect(requests).toEqual([{ type: "git-diff", worktree_id: worktree.id, path: filePath }]);
+    expect(get(diffPath)).toBe(filePath);
+    expect(get(diffText)).toBe("diff --git");
+  });
+});
+
 
 describe("worktree-scoped git actions", () => {
   it("keeps a commit-then-push sequence on the triggering worktree after selection changes", async () => {

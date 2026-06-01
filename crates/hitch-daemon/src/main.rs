@@ -2094,12 +2094,13 @@ fn git_diff(
             .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?
     };
     let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
+    let diff_path = diff_path_for_worktree(&worktree.path, &path);
     let mut diff = repo
-        .diff_file(&path, DiffTarget::Worktree)
+        .diff_file(&diff_path, DiffTarget::Worktree)
         .map_err(git_error)?;
     if diff.is_empty() {
         diff = repo
-            .diff_file(&path, DiffTarget::Staged)
+            .diff_file(&diff_path, DiffTarget::Staged)
             .map_err(git_error)?;
     }
     Ok(FileDiff {
@@ -2107,6 +2108,20 @@ fn git_diff(
         path,
         diff,
     })
+}
+
+fn diff_path_for_worktree<'a>(worktree_path: &Path, path: &'a Path) -> std::borrow::Cow<'a, Path> {
+    if path.is_absolute() {
+        if let Ok(relative) = path.strip_prefix(worktree_path) {
+            return std::borrow::Cow::Owned(relative.to_path_buf());
+        }
+        if let (Ok(root), Ok(file)) = (worktree_path.canonicalize(), path.canonicalize()) {
+            if let Ok(relative) = file.strip_prefix(root) {
+                return std::borrow::Cow::Owned(relative.to_path_buf());
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(path)
 }
 
 fn list_draft_models(

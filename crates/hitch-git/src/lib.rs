@@ -11,6 +11,7 @@
 
 use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
 use hitch_core::{ProjectId, Worktree};
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
@@ -1052,9 +1053,10 @@ pub fn diff_file(
     target: DiffTarget,
 ) -> Result<String> {
     let repo = Repository::discover(repo_path.as_ref())?;
+    let pathspec = diff_pathspec(&repo, path.as_ref());
     let mut options = DiffOptions::new();
     options
-        .pathspec(path.as_ref())
+        .pathspec(pathspec.as_ref())
         .include_untracked(true)
         .recurse_untracked_dirs(true)
         .show_untracked_content(true);
@@ -1072,6 +1074,17 @@ pub fn diff_file(
     };
 
     diff_to_string(&diff)
+}
+
+fn diff_pathspec<'a>(repo: &Repository, path: &'a Path) -> Cow<'a, Path> {
+    if path.is_absolute() {
+        if let Some(workdir) = repo.workdir() {
+            if let Ok(relative) = path.strip_prefix(workdir) {
+                return Cow::Owned(relative.to_path_buf());
+            }
+        }
+    }
+    Cow::Borrowed(path)
 }
 
 /// Read the complete staged diff using libgit2.
@@ -1979,6 +1992,64 @@ mod tests {
     }
 
     #[test]
+    fn status_and_diff_accept_repo_and_file_paths_with_spaces() {
+        let fixture = RepoFixture::new_in_dir("repo with spaces");
+        let file = PathBuf::from("dir with spaces/file with spaces.txt");
+        fs::create_dir(fixture.path().join("dir with spaces")).unwrap();
+        fs::write(fixture.path().join(&file), "initial\n").unwrap();
+        run_real_git(
+            fixture.path(),
+            ["add", "dir with spaces/file with spaces.txt"],
+        );
+        run_real_git(fixture.path(), ["commit", "-m", "add spaced path"]);
+
+        fs::write(fixture.path().join(&file), "changed\n").unwrap();
+
+        let summary = status(fixture.path()).unwrap();
+        let entry = summary.entry_for(&file).unwrap();
+        assert_eq!(entry.working_tree, FileState::Modified);
+
+        let relative = diff_file(fixture.path(), &file, DiffTarget::Worktree).unwrap();
+        assert!(
+            relative.contains("changed"),
+            "relative diff was {relative:?}"
+        );
+
+        let absolute = diff_file(
+            fixture.path(),
+            fixture.path().join(&file),
+            DiffTarget::Worktree,
+        )
+        .unwrap();
+        assert!(
+            absolute.contains("changed"),
+            "absolute diff was {absolute:?}"
+        );
+    }
+
+    #[test]
+    fn staged_diff_accepts_absolute_file_path_with_spaces() {
+        let fixture = RepoFixture::new_in_dir("repo with spaces");
+        let file = PathBuf::from("file with spaces.txt");
+        fs::write(fixture.path().join(&file), "initial\n").unwrap();
+        run_real_git(fixture.path(), ["add", "file with spaces.txt"]);
+        run_real_git(fixture.path(), ["commit", "-m", "add spaced path"]);
+
+        fs::write(fixture.path().join(&file), "staged\n").unwrap();
+        GitClient::default()
+            .stage_files(fixture.path(), std::slice::from_ref(&file))
+            .unwrap();
+
+        let diff = diff_file(
+            fixture.path(),
+            fixture.path().join(&file),
+            DiffTarget::Staged,
+        )
+        .unwrap();
+        assert!(diff.contains("staged"), "staged diff was {diff:?}");
+    }
+
+    #[test]
     fn dirty_check_detects_changes_without_full_status_work() {
         let fixture = RepoFixture::new();
         assert!(!is_dirty(fixture.path()).unwrap());
@@ -2575,8 +2646,12 @@ mod tests {
 
     impl RepoFixture {
         fn new() -> Self {
+            Self::new_in_dir("repo")
+        }
+
+        fn new_in_dir(name: &str) -> Self {
             let temp = TempDir::new().unwrap();
-            let path = temp.path().join("repo");
+            let path = temp.path().join(name);
             fs::create_dir(&path).unwrap();
             run_real_git(&path, ["init", "--initial-branch=main"]);
             run_real_git(&path, ["config", "user.name", "Hitch Test"]);
