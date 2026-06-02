@@ -46,11 +46,12 @@ a system service" model intact.
   connecting either succeeds (daemon alive) or fails with `FILE_NOT_FOUND`
   (no daemon). The Unix `remove_stale_socket` path and its stale-socket race
   simply do not exist on Windows.
-- **Liveness** drops the `flock`-on-pidfile probe. To force-kill an
-  un-handshakeable daemon (an upgrade/version mismatch that never returns a pid in
-  `Hello`), the client calls `GetNamedPipeServerProcessId` on its connected pipe
-  handle — the OS reports the *server's* pid directly, with no pid-reuse hazard
-  and no file to read or lock. This replaces the pidfile entirely.
+- **Liveness** drops the `flock`-on-pidfile probe. After a successful `Hello`,
+  the client caches the daemon pid returned by the protocol and uses that pid for
+  non-cooperative termination. For an incompatible daemon that responds but does
+  not complete `Hello`, the client may call `GetNamedPipeServerProcessId` only
+  after a response has been received; calling it during attach can block before
+  the server accepts the pipe and leave the GUI stuck in *starting*.
 - **Termination** uses `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess`
   in place of `kill(pid, SIGKILL)`. Graceful shutdown is unchanged: the existing
   `ShutdownDaemon` control message travels over the pipe, so no `SIGTERM` analog

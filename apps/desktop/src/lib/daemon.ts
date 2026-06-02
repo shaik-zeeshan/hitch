@@ -983,7 +983,12 @@ export async function initDaemon(): Promise<void> {
     // Seed the log path up front so "View log" works even if the first connect
     // fails (the status events also carry it).
     try {
-      const snapshot = await invoke<{ log_path: string }>("get_daemon_status");
+      const snapshot = await invoke<{
+        status: DaemonStatus;
+        reason: string | null;
+        log_path: string;
+      }>("get_daemon_status");
+      applyDaemonStatus(snapshot.status, snapshot.reason);
       daemonLogPath.set(snapshot.log_path);
     } catch {
       // Non-fatal: the status events populate the path on the next transition.

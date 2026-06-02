@@ -548,7 +548,7 @@ describe("connect snapshot refresh failures", () => {
 
     invokeMock.mockImplementation(async (invokedCommand: string, payload?: { request?: { type: string } }) => {
       if (includeStatusProbe && invokedCommand === "get_daemon_status") {
-        return { log_path: "/tmp/hitch-daemon.log" };
+        return { status: "starting", reason: null, log_path: "/tmp/hitch-daemon.log" };
       }
       if (invokedCommand === command) {
         return undefined;
@@ -567,6 +567,38 @@ describe("connect snapshot refresh failures", () => {
     expect(get(error)).toBe("snapshot blew up");
     expect(get(jobs)["j-keep"]).toBeTruthy();
     expect(rejected).toBe(false);
+  });
+
+
+  it("hydrates daemon status from the startup snapshot before connect returns", async () => {
+    let finishConnect!: () => void;
+    const connectPromise = new Promise<void>((resolve) => {
+      finishConnect = resolve;
+    });
+    invokeMock.mockImplementation(async (invokedCommand: string, payload?: { request?: { type: string } }) => {
+      if (invokedCommand === "get_daemon_status") {
+        return { status: "running", reason: null, log_path: "/tmp/hitch-daemon.log" };
+      }
+      if (invokedCommand === "connect_daemon") {
+        return connectPromise;
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-projects") {
+        return { type: "projects", projects: [] };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-sessions") {
+        return { type: "sessions", sessions: [] };
+      }
+      throw new Error(`unexpected invoke ${invokedCommand}`);
+    });
+
+    const init = initDaemon();
+    await flush();
+
+    expect(get(daemonStatus)).toBe("running");
+    expect(get(connection)).toBe("ready");
+
+    finishConnect();
+    await init;
   });
 
   it("marks the daemon failed when reconnect cannot reach it", async () => {

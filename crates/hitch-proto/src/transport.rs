@@ -473,6 +473,27 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn connected_pipe_server_pid_identifies_listener_process() {
+        let path = test_socket_path();
+        let listener = DaemonListener::bind(&path).unwrap();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let _conn = listener.accept().unwrap();
+            accepted_tx.send(()).unwrap();
+            thread::sleep(std::time::Duration::from_millis(100));
+        });
+
+        let client = DaemonClient::connect(&path).unwrap();
+        accepted_rx.recv().unwrap();
+        let server_pid = client.connection.connected_pipe_server_pid().unwrap();
+        assert_eq!(server_pid, std::process::id());
+
+        drop(client);
+        server.join().unwrap();
+    }
+
     fn test_socket_path() -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

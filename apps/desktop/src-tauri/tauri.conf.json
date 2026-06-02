@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.hitch.desktop",
   "build": {
-    "beforeDevCommand": "cargo build -p hitch-daemon -p hitch-hook && bun run dev",
+    "beforeDevCommand": "bun run stop-dev-daemon && cargo build -p hitch-daemon -p hitch-hook && bun run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "bun run prepare-daemon-sidecar && bun run build",
     "frontendDist": "../build"
@@ -30,12 +30,34 @@
     "active": true,
     "targets": "all",
     "externalBin": ["binaries/hitch-daemon", "binaries/hitch-hook"],
+    "publisher": "Hitch",
+    "category": "DeveloperTool",
+    "shortDescription": "Desktop session manager for git-backed agent worktrees.",
+    "longDescription": "Hitch is a desktop client that connects to the packaged Hitch daemon to manage git-backed agent sessions.",
+    "copyright": "Copyright © 2026 Hitch",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "allowDowngrades": false,
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "installMode": "currentUser",
+        "languages": ["English"]
+      },
+      "wix": {
+        "upgradeCode": "65651318-7c65-59f0-afed-f2cc25d05041",
+        "language": "en-US"
+      }
+    }
   }
 }

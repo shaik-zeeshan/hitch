@@ -4,9 +4,7 @@
 //! socket connection, starts the daemon when needed, and relays `hitch-proto`
 //! requests/responses/events to Tauri IPC.
 
-use hitch_proto::transport::{
-    connect_daemon as connect_transport, endpoint_accepts_connections, DaemonStream,
-};
+use hitch_proto::transport::{connect_daemon as connect_transport, DaemonStream};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -15,13 +13,14 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{env, fs};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
-use hitch_core::SessionId;
+use hitch_core::{SessionId, SessionParent};
 use hitch_proto::{
     encode_control_message, encode_pty_frame, ControlMessage, ErrorCode, Event, ProtocolError,
     Request, RequestId, Response, PROTOCOL_VERSION,
@@ -30,7 +29,7 @@ use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent, Wry};
 
 /// Per-session bound on the bytes we stage before the webview registers that
 /// session's output channel. Mirrors the daemon's `DEFAULT_SCROLLBACK_CAPACITY`
@@ -45,6 +44,7 @@ const OUTPUT_STAGING_CAPACITY: usize = 1024 * 1024;
 /// requests, so a tight timeout would false-positive under load.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const HEARTBEAT_LOST_REASON: &str = "daemon stopped responding to heartbeat";
 const DAEMON_RESPONSE_TIMEOUT_REASON: &str = "timed out waiting for daemon response";
 const HANDSHAKE_FAILURE_PREFIX: &str = "daemon handshake failed: ";
@@ -149,6 +149,14 @@ fn read_log_tail(path: &Path, lines: usize) -> Option<String> {
     Some(all[start..].join("\n"))
 }
 
+fn parse_spawned_daemon_pid(stdout: &[u8]) -> Option<u32> {
+    std::str::from_utf8(stdout)
+        .ok()?
+        .split_whitespace()
+        .rev()
+        .find_map(|token| token.parse().ok())
+}
+
 fn recovery_mode_for_loss(reason: &str) -> RecoveryMode {
     if reason == HEARTBEAT_LOST_REASON || is_handshake_timeout(reason) {
         RecoveryMode::RestartDaemon
@@ -163,12 +171,13 @@ fn is_handshake_timeout(reason: &str) -> bool {
         .is_some_and(|inner| inner == DAEMON_RESPONSE_TIMEOUT_REASON)
 }
 fn should_force_kill_daemon(reason: &str) -> bool {
-    // A wedged daemon (missed heartbeat) and an incompatible one are both
-    // untrustworthy to shut themselves down on request — an incompatible daemon
-    // may not even parse our ShutdownDaemon message. Hard-kill by a platform-safe
-    // process identity instead of asking nicely and waiting on a graceful unbind
-    // that may never come.
-    reason == HEARTBEAT_LOST_REASON || reason.starts_with(INCOMPATIBLE_DAEMON_PREFIX)
+    // A wedged daemon (missed heartbeat), timed-out handshake, and incompatible
+    // daemon are all untrustworthy to shut themselves down on request. Hard-kill
+    // by a platform-safe process identity instead of asking nicely and waiting on
+    // a graceful unbind that may never come.
+    reason == HEARTBEAT_LOST_REASON
+        || reason.starts_with(INCOMPATIBLE_DAEMON_PREFIX)
+        || is_handshake_timeout(reason)
 }
 #[cfg(windows)]
 fn windows_force_kill_pid_for_reason(reason: &str, cached_server_pid: Option<u32>) -> Option<u32> {
@@ -270,10 +279,45 @@ fn pidfile_is_stale(path: &Path) -> bool {
     acquired
 }
 
+fn connect_transport_bounded(path: &Path, timeout: Duration) -> io::Result<DaemonStream> {
+    #[cfg(windows)]
+    {
+        let path = path.to_path_buf();
+        let display_path = path.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("hitch-daemon-connect-probe".into())
+            .spawn(move || {
+                let _ = tx.send(connect_transport(&path));
+            })
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out connecting to daemon at {}",
+                    display_path.display()
+                ),
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "daemon connect probe exited without a result",
+            )),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = timeout;
+        connect_transport(path)
+    }
+}
+
 fn wait_for_socket_release(path: &Path, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if !endpoint_accepts_connections(path) {
+        if connect_transport_bounded(path, Duration::from_millis(250)).is_err() {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -287,7 +331,6 @@ fn wait_for_socket_release(path: &Path, timeout: Duration) -> Result<(), String>
 }
 
 /// Routes raw PTY bytes to the webview per session (ADR 0007).
-///
 /// Lives in the Tauri process. Channels are kept across an ordinary daemon
 /// disconnect, but a `SessionOpened` replay invalidates that session's channel
 /// until the webview has reset its byte ring and registered a fresh channel;
@@ -422,14 +465,14 @@ struct HitchClientInner {
     /// Set while the user-requested restart path intentionally drops the old
     /// socket. EOF from that socket is expected and must not start auto-recovery.
     suppress_recovery: AtomicBool,
-    /// Pid reported by the last successful Hello handshake. Unix auto-recovery uses
-    /// it to SIGKILL a heartbeat-wedged daemon before waiting on socket release.
+    /// Pid reported by the last successful Hello handshake. Recovery uses it to
+    /// terminate a heartbeat-wedged daemon before waiting on endpoint release.
     daemon_pid: Mutex<Option<u32>>,
-    /// Windows named-pipe server pid captured from a connected transport. This is
-    /// available before Hello, so an incompatible daemon that never handshakes can
-    /// still be force-restarted without Unix pidfile assumptions (ADR 0012).
+    /// Windows copy of the last successful Hello pid. Do not query named-pipe
+    /// peer credentials during attach: on Windows that can block until the server
+    /// accepts the pipe, which leaves the GUI stuck in `starting`.
     #[cfg(windows)]
-    daemon_pipe_server_pid: Mutex<Option<u32>>,
+    windows_daemon_pid: Mutex<Option<u32>>,
     /// Daemon log path, computed once to match the daemon writer.
     log_path: PathBuf,
     /// Ordered, fire-and-forget input lane (Slice 6, "input fast path"). Every
@@ -446,6 +489,67 @@ struct HitchClientInner {
 
 /// The tray's stable id, used to look it up for tooltip updates.
 const TRAY_ID: &str = "hitch-tray";
+
+fn connect_and_hello_over_new_connection(
+    socket_path: &Path,
+    request_id: RequestId,
+    timeout: Duration,
+) -> Result<(DaemonStream, Response), String> {
+    let socket_path = socket_path.to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("hitch-daemon-hello-probe".into())
+        .spawn(move || {
+            let result = (|| -> Result<(DaemonStream, Response), String> {
+                let mut stream = connect_transport(&socket_path)
+                    .map_err(|err| format!("failed to connect for daemon hello: {err}"))?;
+                let mut reader = BufReader::new(
+                    stream
+                        .try_clone()
+                        .map_err(|err| format!("failed to clone daemon hello stream: {err}"))?,
+                );
+                let bytes = encode_control_message(&ControlMessage::request(
+                    request_id,
+                    Request::Hello {
+                        client_name: "hitch-desktop".into(),
+                        protocol_version: PROTOCOL_VERSION,
+                    },
+                ))
+                .map_err(|err| err.to_string())?;
+                stream
+                    .write_all(&bytes)
+                    .map_err(|err| format!("failed to send daemon hello: {err}"))?;
+                stream
+                    .flush()
+                    .map_err(|err| format!("failed to flush daemon hello: {err}"))?;
+
+                loop {
+                    match read_control_message(&mut reader) {
+                        Ok(Some(ControlMessage::Response { id, response })) if id == request_id => {
+                            return Ok((stream, response));
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            return Err(
+                                "daemon closed hello connection before response".to_string()
+                            );
+                        }
+                        Err(err) => return Err(format!("failed to read daemon hello: {err}")),
+                    }
+                }
+            })();
+            let _ = tx.send(result);
+        })
+        .map_err(|err| format!("failed to spawn daemon hello probe: {err}"))?;
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(DAEMON_RESPONSE_TIMEOUT_REASON.to_string()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("daemon hello probe exited without a result".to_string())
+        }
+    }
+}
 
 impl HitchClient {
     fn new() -> Self {
@@ -473,7 +577,7 @@ impl HitchClient {
             suppress_recovery: AtomicBool::new(false),
             daemon_pid: Mutex::new(None),
             #[cfg(windows)]
-            daemon_pipe_server_pid: Mutex::new(None),
+            windows_daemon_pid: Mutex::new(None),
             log_path: daemon_log_path(),
             input_tx,
         }));
@@ -600,19 +704,15 @@ impl HitchClient {
     }
 
     #[cfg(windows)]
-    fn set_daemon_pipe_server_pid(&self, pid: Option<u32>) {
-        if let Ok(mut slot) = self.0.daemon_pipe_server_pid.lock() {
+    fn set_windows_daemon_pid(&self, pid: Option<u32>) {
+        if let Ok(mut slot) = self.0.windows_daemon_pid.lock() {
             *slot = pid;
         }
     }
 
     #[cfg(windows)]
-    fn cached_daemon_pipe_server_pid(&self) -> Option<u32> {
-        self.0
-            .daemon_pipe_server_pid
-            .lock()
-            .ok()
-            .and_then(|slot| *slot)
+    fn cached_windows_daemon_pid(&self) -> Option<u32> {
+        self.0.windows_daemon_pid.lock().ok().and_then(|slot| *slot)
     }
 
     #[cfg(unix)]
@@ -638,10 +738,9 @@ impl HitchClient {
     #[cfg(windows)]
     fn force_kill_daemon(&self, preferred_pid: Option<u32>) -> Result<(), String> {
         let daemon_pid = preferred_pid
-            .or_else(|| self.cached_daemon_pipe_server_pid())
+            .or_else(|| self.cached_windows_daemon_pid())
             .ok_or_else(|| {
-                "cannot force-restart daemon: connected named-pipe server pid is unknown"
-                    .to_string()
+                "cannot force-restart daemon: cached daemon pid is unknown".to_string()
             })?;
         terminate_process(daemon_pid)?;
         wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)
@@ -694,21 +793,24 @@ impl HitchClient {
         if self.is_connected() {
             return Ok(());
         }
-
-        let stream = match connect_transport(&self.0.socket_path) {
-            Ok(stream) => stream,
-            Err(_) => {
-                // Socket absent: we must (re)spawn. Guard against a crash loop —
-                // a daemon that dies on startup (corrupt store, bind failure)
-                // must not be respawned forever (ADR 0009).
-                self.record_spawn_attempt(app)?;
-                self.set_status(app, DaemonStatus::Starting, None);
-                self.spawn_daemon()
-                    .map_err(|err| self.record_startup_failure(app, err))?;
-                self.wait_for_daemon()
-                    .map_err(|err| self.record_startup_failure(app, err))?
-            }
-        };
+        let stream =
+            match connect_transport_bounded(&self.0.socket_path, Duration::from_millis(500)) {
+                Ok(stream) => stream,
+                Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+                    return Err(format!("timed out connecting to live daemon: {err}"));
+                }
+                Err(_) => {
+                    // Socket absent: we must (re)spawn. Guard against a crash loop —
+                    // a daemon that dies on startup (corrupt store, bind failure)
+                    // must not be respawned forever (ADR 0009).
+                    self.record_spawn_attempt(app)?;
+                    self.set_status(app, DaemonStatus::Starting, None);
+                    self.spawn_daemon()
+                        .map_err(|err| self.record_startup_failure(app, err))?;
+                    self.wait_for_daemon()
+                        .map_err(|err| self.record_startup_failure(app, err))?
+                }
+            };
         self.attach_stream(app, stream)
     }
 
@@ -717,54 +819,68 @@ impl HitchClient {
     /// `MAX_HANDSHAKE_ATTEMPTS`. On success the Daemon Status becomes `running`
     /// and the crash-loop budget resets. Shared by the `connect_daemon` command
     /// and the auto-recovery loop so both diagnose failures identically.
-    ///
-    /// The key invariant: *any* non-`Hello` outcome — a protocol-rejection
-    /// `Error`, an unexpected variant, a response this client can't even
-    /// deserialize, or a transport error — is treated as "the running daemon is
-    /// incompatible or wedged" and triggers a force-restart. A response we cannot
-    /// parse is itself proof of incompatibility, so it must take the restart path
-    /// rather than leak to the caller (the previous `Ok(Response::Error)`-only
-    /// branch let parse and transport errors surface as a bare mismatch).
     fn connect_and_handshake(&self, app: &AppHandle) -> Result<(), String> {
-        let hello = Request::Hello {
-            client_name: "hitch-desktop".into(),
-            protocol_version: PROTOCOL_VERSION,
-        };
+        let _guard = self
+            .0
+            .connect_lock
+            .lock()
+            .map_err(|_| "connection lock poisoned".to_string())?;
+        if self.is_connected() {
+            return Ok(());
+        }
+
         let mut last_err = String::new();
         for attempt in 0..MAX_HANDSHAKE_ATTEMPTS {
-            self.connect(app)?;
-            match self.send_request(app, hello.clone()) {
-                Ok(Response::Hello { daemon_pid, .. }) => {
+            if connect_transport_bounded(&self.0.socket_path, Duration::from_millis(500)).is_err() {
+                self.record_spawn_attempt(app)?;
+                self.set_status(app, DaemonStatus::Starting, None);
+                self.spawn_daemon()
+                    .map_err(|err| self.record_startup_failure(app, err))?;
+            }
+
+            let request_id = self.0.next_request_id.fetch_add(1, Ordering::SeqCst);
+            match connect_and_hello_over_new_connection(
+                &self.0.socket_path,
+                request_id,
+                HANDSHAKE_TIMEOUT,
+            ) {
+                Ok((stream, Response::Hello { daemon_pid, .. })) => {
+                    self.attach_stream(app, stream)?;
                     self.set_daemon_pid(Some(daemon_pid));
+                    #[cfg(windows)]
+                    self.set_windows_daemon_pid(Some(daemon_pid));
                     self.mark_running(app);
                     return Ok(());
                 }
-                other => {
-                    last_err = describe_handshake_failure(&other);
-                    // Don't burn the final attempt on a restart we won't retry.
-                    if attempt + 1 == MAX_HANDSHAKE_ATTEMPTS {
-                        break;
-                    }
-                    self.restart_daemon(app, format!("{INCOMPATIBLE_DAEMON_PREFIX}: {last_err}"))?;
+                Ok((_stream, other)) => {
+                    last_err = describe_handshake_failure(&Ok(other));
+                }
+                Err(err) => {
+                    last_err = err;
                 }
             }
-        }
-        if self.is_connected() {
-            self.handle_connection_lost(app, &format!("daemon handshake failed: {last_err}"));
+            if attempt + 1 == MAX_HANDSHAKE_ATTEMPTS {
+                break;
+            }
+            self.restart_daemon(app, format!("{INCOMPATIBLE_DAEMON_PREFIX}: {last_err}"))?;
         }
         Err(last_err)
     }
 
     fn handshake_after_restart(&self, app: &AppHandle) -> Result<(), String> {
-        match self.send_request(
+        match self.dispatch_request(
             app,
             Request::Hello {
                 client_name: "hitch-desktop".into(),
                 protocol_version: PROTOCOL_VERSION,
             },
+            None,
+            HANDSHAKE_TIMEOUT,
         ) {
             Ok(Response::Hello { daemon_pid, .. }) => {
                 self.set_daemon_pid(Some(daemon_pid));
+                #[cfg(windows)]
+                self.set_windows_daemon_pid(Some(daemon_pid));
                 self.mark_running(app);
                 let _ = app.emit("hitch-reconnected", ());
                 Ok(())
@@ -800,11 +916,6 @@ impl HitchClient {
             .set_nonblocking(false)
             .map_err(|err| format!("failed to configure daemon socket: {err}"))?;
 
-        #[cfg(windows)]
-        let pipe_server_pid = stream
-            .connected_pipe_server_pid()
-            .map_err(|err| format!("failed to identify daemon named-pipe server: {err}"))?;
-
         let writer = stream
             .try_clone()
             .map_err(|err| format!("failed to clone daemon socket: {err}"))?;
@@ -813,8 +924,6 @@ impl HitchClient {
             .writer
             .lock()
             .map_err(|_| "writer lock poisoned".to_string())? = Some(writer);
-        #[cfg(windows)]
-        self.set_daemon_pipe_server_pid(Some(pipe_server_pid));
         self.0.connected.store(true, Ordering::SeqCst);
 
         let generation = self.0.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -870,16 +979,16 @@ impl HitchClient {
             };
             #[cfg(windows)]
             let force_kill_pid =
-                windows_force_kill_pid_for_reason(&reason, self.cached_daemon_pipe_server_pid());
+                windows_force_kill_pid_for_reason(&reason, self.cached_windows_daemon_pid());
             self.mark_disconnected(app, reason.clone());
             self.record_spawn_attempt(app)?;
             self.set_status(app, DaemonStatus::Starting, None);
 
-            // Wedged and incompatible daemons are torn down with the platform's
-            // non-cooperative kill primitive: Unix uses a verified pidfile/Hello
-            // pid, Windows uses the connected named-pipe server pid (ADR 0012).
-            // In every successful case we then wait for the endpoint to stop
-            // accepting connections so we never spawn over a live daemon.
+            // Wedged daemons are torn down with the platform's non-cooperative
+            // kill primitive: Unix uses a verified pidfile/Hello pid, Windows uses
+            // the last successful Hello pid. In every successful case we then wait
+            // for the endpoint to stop accepting connections so we never spawn
+            // over a live daemon.
             if force_kill {
                 let kill_result = self.force_kill_daemon(force_kill_pid);
                 #[cfg(unix)]
@@ -975,7 +1084,7 @@ impl HitchClient {
             Ok(response) => Ok(response),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.remove_pending(request_id);
-                Err("timed out waiting for daemon response".into())
+                Err(DAEMON_RESPONSE_TIMEOUT_REASON.into())
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 Err("daemon response channel disconnected".into())
@@ -1021,16 +1130,14 @@ impl HitchClient {
         self.0.connected.store(false, Ordering::SeqCst);
         // The cached Hello pid is only meaningful while we're handshook with that
         // exact daemon. Once disconnected it's stale — a daemon swapped underneath
-        // us (upgrade, crash+respawn) leaves an incompatible daemon at the socket
-        // whose pid lives only in the pidfile on Unix or the connected pipe handle
-        // on Windows. Clearing here means force-kill falls back to the platform
-        // identity for the current endpoint instead of killing a stale/reused pid.
+        // us (upgrade, crash+respawn) could leave the old pid reused by another
+        // process. Clear it instead of risking an unrelated kill.
         if let Ok(mut slot) = self.0.daemon_pid.lock() {
             *slot = None;
         }
         #[cfg(windows)]
         if drop_writer {
-            self.set_daemon_pipe_server_pid(None);
+            self.set_windows_daemon_pid(None);
         }
         if drop_writer {
             if let Ok(mut writer) = self.0.writer.lock() {
@@ -1194,23 +1301,78 @@ impl HitchClient {
         });
     }
 
-    /// Fire-and-forget a `ShutdownDaemon` request (full quit). We do not wait for
-    /// the Ack: the caller is about to exit the GUI process, and restart recovery
-    /// may still have a usable writer even after marking the connection unavailable.
-    fn request_daemon_shutdown(&self) {
+    fn request_daemon_shutdown_over_new_connection(
+        socket_path: &Path,
+        request_id: RequestId,
+    ) -> Result<(), String> {
+        let socket_path = socket_path.to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("hitch-daemon-shutdown-probe".into())
+            .spawn(move || {
+                let result = (|| -> Result<(), String> {
+                    let mut stream = connect_transport(&socket_path)
+                        .map_err(|err| format!("failed to connect for daemon shutdown: {err}"))?;
+                    let bytes = encode_control_message(&ControlMessage::request(
+                        request_id,
+                        Request::ShutdownDaemon,
+                    ))
+                    .map_err(|err| err.to_string())?;
+                    stream
+                        .write_all(&bytes)
+                        .map_err(|err| format!("failed to send daemon shutdown: {err}"))?;
+                    stream
+                        .flush()
+                        .map_err(|err| format!("failed to flush daemon shutdown: {err}"))?;
+
+                    let mut reader = BufReader::new(stream);
+                    match read_control_message(&mut reader) {
+                        Ok(Some(ControlMessage::Response {
+                            id,
+                            response: Response::Ack,
+                        })) if id == request_id => Ok(()),
+                        Ok(Some(other)) => {
+                            Err(format!("unexpected daemon shutdown response: {other:?}"))
+                        }
+                        Ok(None) => Err("daemon closed shutdown connection before ack".to_string()),
+                        Err(err) => Err(format!("failed to read daemon shutdown ack: {err}")),
+                    }
+                })();
+                let _ = tx.send(result);
+            })
+            .map_err(|err| format!("failed to spawn daemon shutdown probe: {err}"))?;
+
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err("timed out waiting for daemon shutdown ack".to_string())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("daemon shutdown probe exited without a result".to_string())
+            }
+        }
+    }
+
+    /// Ask the daemon to shut down. When this client has not completed startup
+    /// yet, there may be no persistent writer even though the daemon endpoint is
+    /// live; in that case use a short-lived connection and wait for Ack so manual
+    /// restart can actually release the pipe before spawning.
+    fn request_daemon_shutdown(&self) -> bool {
         let request_id = self.0.next_request_id.fetch_add(1, Ordering::SeqCst);
         let Ok(bytes) = encode_control_message(&ControlMessage::request(
             request_id,
             Request::ShutdownDaemon,
         )) else {
-            return;
+            return false;
         };
         if let Ok(mut guard) = self.0.writer.lock() {
             if let Some(writer) = guard.as_mut() {
-                let _ = writer.write_all(&bytes);
-                let _ = writer.flush();
+                if writer.write_all(&bytes).is_ok() && writer.flush().is_ok() {
+                    return true;
+                }
             }
         }
+        Self::request_daemon_shutdown_over_new_connection(&self.0.socket_path, request_id).is_ok()
     }
 
     fn spawn_daemon(&self) -> Result<(), String> {
@@ -1236,6 +1398,11 @@ impl HitchClient {
                 .output()
                 .map_err(|err| format!("failed to spawn {}: {err}", path.display()))?;
             if output.status.success() {
+                if let Some(pid) = parse_spawned_daemon_pid(&output.stdout) {
+                    self.set_daemon_pid(Some(pid));
+                    #[cfg(windows)]
+                    self.set_windows_daemon_pid(Some(pid));
+                }
                 return Ok(());
             }
             return Err(format!(
@@ -1271,6 +1438,11 @@ impl HitchClient {
                 .output()
                 .map_err(|err| format!("failed to run `cargo run -p hitch-daemon`: {err}"))?;
             if output.status.success() {
+                if let Some(pid) = parse_spawned_daemon_pid(&output.stdout) {
+                    self.set_daemon_pid(Some(pid));
+                    #[cfg(windows)]
+                    self.set_windows_daemon_pid(Some(pid));
+                }
                 return Ok(());
             }
             return Err(format!(
@@ -1288,7 +1460,7 @@ impl HitchClient {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut last_error = None;
         while Instant::now() < deadline {
-            match connect_transport(&self.0.socket_path) {
+            match connect_transport_bounded(&self.0.socket_path, Duration::from_millis(500)) {
                 Ok(stream) => return Ok(stream),
                 Err(err) => {
                     last_error = Some(err);
@@ -1507,7 +1679,11 @@ fn trim_configured_editor(editor: &str) -> &str {
     let unquoted = editor
         .strip_prefix('"')
         .and_then(|inner| inner.strip_suffix('"'))
-        .or_else(|| editor.strip_prefix('\'').and_then(|inner| inner.strip_suffix('\'')));
+        .or_else(|| {
+            editor
+                .strip_prefix('\'')
+                .and_then(|inner| inner.strip_suffix('\''))
+        });
     unquoted.map(str::trim).unwrap_or(editor)
 }
 
@@ -1572,7 +1748,11 @@ fn windows_editor_candidates_from_dirs(
             candidates.push(OsString::from("code"));
         }
         "cursor" => {
-            push_editor_candidate(&mut candidates, local_app_data, r"Programs\Cursor\Cursor.exe");
+            push_editor_candidate(
+                &mut candidates,
+                local_app_data,
+                r"Programs\Cursor\Cursor.exe",
+            );
             push_program_files_candidates(
                 &mut candidates,
                 program_files,
@@ -1582,7 +1762,11 @@ fn windows_editor_candidates_from_dirs(
             candidates.push(OsString::from("cursor"));
         }
         "codium" | "vscodium" => {
-            push_editor_candidate(&mut candidates, local_app_data, r"Programs\VSCodium\VSCodium.exe");
+            push_editor_candidate(
+                &mut candidates,
+                local_app_data,
+                r"Programs\VSCodium\VSCodium.exe",
+            );
             push_program_files_candidates(
                 &mut candidates,
                 program_files,
@@ -1616,7 +1800,11 @@ fn windows_editor_candidates_from_dirs(
             candidates.push(OsString::from("notepad++"));
         }
         "windsurf" => {
-            push_editor_candidate(&mut candidates, local_app_data, r"Programs\Windsurf\Windsurf.exe");
+            push_editor_candidate(
+                &mut candidates,
+                local_app_data,
+                r"Programs\Windsurf\Windsurf.exe",
+            );
             push_program_files_candidates(
                 &mut candidates,
                 program_files,
@@ -1647,7 +1835,9 @@ fn windows_editor_candidates(editor: &str) -> Vec<OsString> {
         editor,
         std::env::var_os("LOCALAPPDATA").as_deref().map(Path::new),
         std::env::var_os("ProgramFiles").as_deref().map(Path::new),
-        std::env::var_os("ProgramFiles(x86)").as_deref().map(Path::new),
+        std::env::var_os("ProgramFiles(x86)")
+            .as_deref()
+            .map(Path::new),
     )
 }
 
@@ -1656,7 +1846,11 @@ fn first_available_windows_candidate(candidates: &[OsString]) -> Option<OsString
     candidates
         .iter()
         .find(|candidate| Path::new(candidate).is_file())
-        .or_else(|| candidates.iter().find(|candidate| !Path::new(candidate).is_absolute()))
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|candidate| !Path::new(candidate).is_absolute())
+        })
         .cloned()
 }
 
@@ -1962,20 +2156,16 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_editor_launch_spec, describe_handshake_failure, read_log_tail,
-        recovery_mode_for_loss, should_force_kill_daemon, tray_status_text, CrashLoopGuard,
-        DaemonStatus, ErrorCode, OutputRouter, ProtocolError, RecoveryMode, Response,
+        build_editor_launch_spec, describe_handshake_failure, encode_control_message,
+        parse_spawned_daemon_pid, read_control_message, read_log_tail, recovery_mode_for_loss,
+        should_force_kill_daemon, tray_status_text, ControlMessage, CrashLoopGuard, DaemonStatus,
+        ErrorCode, HitchClient, OutputRouter, ProtocolError, RecoveryMode, Request, Response,
         CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
     };
     #[cfg(windows)]
-    use super::{
-        first_available_windows_candidate, windows_editor_candidates_from_dirs,
-    };
+    use super::{first_available_windows_candidate, windows_editor_candidates_from_dirs};
     #[cfg(unix)]
-    use super::{
-        read_control_message, read_pty_payload, wait_for_socket_release, ControlMessage,
-        HitchClient, Request,
-    };
+    use super::{read_pty_payload, wait_for_socket_release};
     use hitch_core::SessionId;
     #[cfg(unix)]
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -2070,7 +2260,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let editor = dir.join("Code.exe");
         std::fs::write(&editor, b"").unwrap();
-        let candidates = vec![editor.as_os_str().to_os_string(), std::ffi::OsString::from("code")];
+        let candidates = vec![
+            editor.as_os_str().to_os_string(),
+            std::ffi::OsString::from("code"),
+        ];
 
         assert_eq!(
             first_available_windows_candidate(&candidates),
@@ -2380,7 +2573,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_force_kill_uses_connected_pipe_server_pid_for_unhandshakeable_daemon() {
+    fn windows_force_kill_uses_cached_daemon_pid() {
         let incompatible = "restarting incompatible daemon: unsupported protocol";
         assert_eq!(
             super::windows_force_kill_pid_for_reason(incompatible, Some(424242)),
@@ -2465,7 +2658,7 @@ mod tests {
             RecoveryMode::RestartDaemon
         );
         assert!(should_force_kill_daemon(HEARTBEAT_LOST_REASON));
-        assert!(!should_force_kill_daemon(
+        assert!(should_force_kill_daemon(
             "daemon handshake failed: timed out waiting for daemon response"
         ));
         assert_eq!(
@@ -2499,6 +2692,52 @@ mod tests {
         assert!(
             describe_handshake_failure(&Ok(Response::Ack)).starts_with("unexpected hello response")
         );
+    }
+
+    #[test]
+    fn shutdown_over_new_connection_waits_for_daemon_ack() {
+        use std::io::{BufReader, Write};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hitch-shutdown-new-connection-{}-{nonce}.sock",
+            std::process::id()
+        ));
+        let listener = hitch_proto::transport::DaemonListener::bind(&path).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let stream = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let message = read_control_message(&mut reader).unwrap().unwrap();
+            assert_eq!(
+                message,
+                ControlMessage::request(99, Request::ShutdownDaemon)
+            );
+            let mut stream = reader.into_inner();
+            let ack = encode_control_message(&ControlMessage::response(99, Response::Ack)).unwrap();
+            stream.write_all(&ack).unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        HitchClient::request_daemon_shutdown_over_new_connection(&path, 99).unwrap();
+        server.join().unwrap();
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn spawned_daemon_pid_is_parsed_from_detach_stdout() {
+        assert_eq!(parse_spawned_daemon_pid(b"12345\n"), Some(12345));
+        assert_eq!(
+            parse_spawned_daemon_pid(b"Finished dev profile\n9876\r\n"),
+            Some(9876)
+        );
+        assert_eq!(parse_spawned_daemon_pid(b""), None);
     }
 
     #[cfg(unix)]
@@ -2667,6 +2906,181 @@ fn disable_press_and_hold() {
     }
 }
 
+fn packaged_smoke_enabled() -> bool {
+    matches!(env::var("HITCH_PACKAGED_SMOKE_TEST").as_deref(), Ok("1"))
+}
+
+fn smoke_temp_project_root() -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    env::temp_dir().join(format!(
+        "hitch-packaged-smoke-{}-{timestamp}",
+        std::process::id()
+    ))
+}
+
+fn response_error(context: &str, response: Response) -> String {
+    match response {
+        Response::Error { error } => format!("{context}: {}", error.message),
+        other => format!("{context}: unexpected response {other:?}"),
+    }
+}
+
+fn smoke_request(
+    client: &HitchClient,
+    app: &AppHandle,
+    request: Request,
+    context: &str,
+) -> Result<Response, String> {
+    client
+        .send_request(app, request)
+        .map_err(|err| format!("{context}: {err}"))
+}
+
+fn run_packaged_smoke(app: AppHandle, client: HitchClient) -> Result<(), String> {
+    let project_root = smoke_temp_project_root();
+    let mut project_id = None;
+    let mut session_id = None;
+
+    let result = (|| {
+        fs::create_dir_all(&project_root).map_err(|err| {
+            format!(
+                "failed to create smoke project {}: {err}",
+                project_root.display()
+            )
+        })?;
+
+        client.connect_and_handshake(&app).map_err(|err| {
+            format!("failed to connect and handshake with packaged daemon: {err}")
+        })?;
+
+        let project = match smoke_request(
+            &client,
+            &app,
+            Request::AddProject {
+                root: project_root.clone(),
+            },
+            "failed to add smoke project",
+        )? {
+            Response::Projects { mut projects } if projects.len() == 1 => projects.remove(0),
+            other => return Err(response_error("failed to add smoke project", other)),
+        };
+        project_id = Some(project.id);
+
+        let parent = SessionParent::Project(project.id);
+        let session = match smoke_request(
+            &client,
+            &app,
+            Request::OpenSession {
+                parent,
+                name: "packaged-smoke-shell".into(),
+                command: None,
+                cols: 80,
+                rows: 24,
+            },
+            "failed to open smoke shell session",
+        )? {
+            Response::SessionOpened { session, .. } => session,
+            other => return Err(response_error("failed to open smoke shell session", other)),
+        };
+        session_id = Some(session.id);
+
+        match smoke_request(
+            &client,
+            &app,
+            Request::ListSessions {
+                parent: Some(parent),
+            },
+            "failed to list smoke sessions",
+        )? {
+            Response::Sessions { sessions }
+                if sessions.iter().any(|listed| listed.id == session.id) => {}
+            Response::Sessions { .. } => {
+                return Err("smoke shell session was not returned by ListSessions".to_string());
+            }
+            other => return Err(response_error("failed to list smoke sessions", other)),
+        }
+
+        match smoke_request(
+            &client,
+            &app,
+            Request::CloseSession {
+                session_id: session.id,
+                kill_process: true,
+            },
+            "failed to close smoke shell session",
+        )? {
+            Response::Ack => session_id = None,
+            other => return Err(response_error("failed to close smoke shell session", other)),
+        }
+
+        match smoke_request(
+            &client,
+            &app,
+            Request::RemoveProject {
+                project_id: project.id,
+                force: true,
+            },
+            "failed to remove smoke project",
+        )? {
+            Response::Ack => project_id = None,
+            other => return Err(response_error("failed to remove smoke project", other)),
+        }
+
+        match smoke_request(
+            &client,
+            &app,
+            Request::ShutdownDaemon,
+            "failed to shut down smoke daemon",
+        )? {
+            Response::Ack => Ok(()),
+            other => Err(response_error("failed to shut down smoke daemon", other)),
+        }
+    })();
+
+    if client.is_connected() {
+        if let Some(id) = session_id {
+            let _ = client.send_request(
+                &app,
+                Request::CloseSession {
+                    session_id: id,
+                    kill_process: true,
+                },
+            );
+        }
+        if let Some(id) = project_id {
+            let _ = client.send_request(
+                &app,
+                Request::RemoveProject {
+                    project_id: id,
+                    force: true,
+                },
+            );
+        }
+        if result.is_err() {
+            client.request_daemon_shutdown();
+        }
+    }
+    let _ = fs::remove_dir_all(&project_root);
+
+    result
+}
+
+fn start_daemon_connection_on_launch(app: &tauri::App) {
+    let app_handle = app.handle().clone();
+    let client = app.state::<HitchClient>().inner().clone();
+    thread::Builder::new()
+        .name("hitch-daemon-launch-connect".into())
+        .spawn(move || {
+            if let Err(err) = client.connect_and_handshake(&app_handle) {
+                client.set_status(&app_handle, DaemonStatus::Failed, Some(err));
+            }
+        })
+        .expect("failed to spawn daemon launch connection thread");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2684,6 +3098,7 @@ pub fn run() {
                 let _ = window.set_title("Hitch (dev)");
             }
             build_tray(app)?;
+            start_daemon_connection_on_launch(app);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -2705,6 +3120,25 @@ pub fn run() {
             get_daemon_log_tail,
             restart_daemon_command
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if matches!(event, RunEvent::Ready) && packaged_smoke_enabled() {
+                let app_handle = app_handle.clone();
+                let client = app_handle.state::<HitchClient>().inner().clone();
+                thread::Builder::new()
+                    .name("hitch-packaged-smoke".into())
+                    .spawn(move || {
+                        let exit_code = match run_packaged_smoke(app_handle.clone(), client) {
+                            Ok(()) => 0,
+                            Err(err) => {
+                                eprintln!("packaged smoke test failed: {err}");
+                                1
+                            }
+                        };
+                        std::process::exit(exit_code);
+                    })
+                    .expect("failed to spawn packaged smoke thread");
+            }
+        });
 }
