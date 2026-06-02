@@ -5,7 +5,7 @@
   "identifier": "com.hitch.desktop",
   "build": {
     "beforeDevCommand": "cargo build -p hitch-daemon -p hitch-hook && bun run dev",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "https://hitch.localhost:1355",
     "beforeBuildCommand": "bun run prepare-daemon-sidecar && bun run build",
     "frontendDist": "../build"
   },
