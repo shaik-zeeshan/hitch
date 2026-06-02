@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
@@ -201,7 +201,8 @@ pub(crate) fn list_models(
             codex_config.timeout = codex_config.timeout.min(Duration::from_secs(5));
             let mut command = Command::new(&codex_config.codex);
             command.arg("debug").arg("models");
-            let output = run_provider_command(&mut command, Path::new("."), &codex_config, cancel)?;
+            let output =
+                run_provider_command(&mut command, Path::new("."), &codex_config, cancel, None)?;
             let models = parse_codex_models(&output);
             if models.is_empty() {
                 Ok(vec![
@@ -348,6 +349,7 @@ fn run_headless_provider(
     prompt: String,
     cancel: Option<&crate::JobControl>,
 ) -> Result<String, ProtocolError> {
+    let mut stdin_input = None;
     let mut command = match config.kind {
         DraftProviderKind::Stub => unreachable!("stub provider does not spawn a CLI"),
         DraftProviderKind::Claude => {
@@ -380,11 +382,16 @@ fn run_headless_provider(
             if let Some(model) = config.model.as_deref() {
                 command.arg("--model").arg(model);
             }
-            command.arg(prompt);
+            // Windows caps the CreateProcess command line at 32 KiB. Draft
+            // prompts intentionally include truncated diffs up to 48 KiB, so
+            // pass Codex's prompt through stdin and use `-` as the explicit
+            // prompt sentinel accepted by `codex exec`.
+            command.arg("-");
+            stdin_input = Some(prompt);
             command
         }
     };
-    run_provider_command(&mut command, cwd, config, cancel)
+    run_provider_command(&mut command, cwd, config, cancel, stdin_input)
 }
 
 fn run_provider_command(
@@ -392,10 +399,16 @@ fn run_provider_command(
     cwd: &Path,
     config: &DraftProviderConfig,
     cancel: Option<&crate::JobControl>,
+    stdin_input: Option<String>,
 ) -> Result<String, ProtocolError> {
+    let stdin = if stdin_input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
     command
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Draft runs execute in the worktree's cwd, which may carry Hitch's
@@ -446,6 +459,17 @@ fn run_provider_command(
             config.kind.label()
         ))
     })?;
+    let stdin_writer = if let Some(input) = stdin_input {
+        let stdin = child.stdin.take().ok_or_else(|| {
+            provider_error(format!(
+                "{} draft provider stdin was not captured",
+                config.kind.label()
+            ))
+        })?;
+        Some(write_pipe(stdin, input))
+    } else {
+        None
+    };
     let stdout_reader = read_pipe(stdout);
     let stderr_reader = read_pipe(stderr);
 
@@ -465,6 +489,13 @@ fn run_provider_command(
             Ok(None) if cancel.is_some_and(|control| control.is_cancelled()) => {
                 terminate_process_tree(&process_tree, &mut child);
                 let _ = child.wait();
+                // Don't join the stdin writer on the abort path: its result is
+                // unused here, and a `write_all` parked on a full pipe could
+                // otherwise wedge cancellation/timeout if a descendant that
+                // escaped the process tree still holds the read end open. The
+                // thread exits on its own once the killed tree drops that end.
+                // (The readers below are bounded by EOF, which the kill delivers.)
+                drop(stdin_writer);
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 if let Some(control) = cancel {
@@ -479,6 +510,13 @@ fn run_provider_command(
             Ok(None) if Instant::now() >= deadline => {
                 terminate_process_tree(&process_tree, &mut child);
                 let _ = child.wait();
+                // Don't join the stdin writer on the abort path: its result is
+                // unused here, and a `write_all` parked on a full pipe could
+                // otherwise wedge cancellation/timeout if a descendant that
+                // escaped the process tree still holds the read end open. The
+                // thread exits on its own once the killed tree drops that end.
+                // (The readers below are bounded by EOF, which the kill delivers.)
+                drop(stdin_writer);
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 if let Some(control) = cancel {
@@ -501,10 +539,24 @@ fn run_provider_command(
         control.set_process_tree(None);
     }
 
+    let stdin_result = stdin_writer.map(join_writer);
     let stdout = join_reader(stdout_reader)?;
     let stderr = join_reader(stderr_reader)?;
+
     if !status.success() {
         return Err(nonzero_provider_error(config.kind.label(), status, &stderr).retryable(true));
+    }
+    if let Some(Err(err)) = stdin_result {
+        // The command succeeded, so the child got the input it needed. A
+        // `BrokenPipe` here just means the child closed its stdin after
+        // consuming enough (e.g. codex exits 0 without draining the whole
+        // prompt); that must not turn a successful run into a failure. Other
+        // write errors are genuine and still surfaced.
+        if err.kind() != io::ErrorKind::BrokenPipe {
+            return Err(provider_error(format!(
+                "failed writing draft provider input: {err}"
+            )));
+        }
     }
     Ok(stdout)
 }
@@ -527,6 +579,24 @@ where
         pipe.read_to_string(&mut output)?;
         Ok(output)
     })
+}
+
+fn write_pipe<T>(mut pipe: T, input: String) -> thread::JoinHandle<io::Result<()>>
+where
+    T: Write + Send + 'static,
+{
+    thread::spawn(move || pipe.write_all(input.as_bytes()))
+}
+
+/// Join the stdin writer thread, returning the raw `io::Result` so the caller
+/// can distinguish a `BrokenPipe` (the child closed stdin after consuming what
+/// it needed) from a genuine write failure. A panic in the writer thread is
+/// surfaced as a `BrokenPipe` error so it is treated like a closed pipe; the
+/// caller decides whether the write outcome matters based on the exit status.
+fn join_writer(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
+    handle
+        .join()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "draft provider input writer panicked"))?
 }
 
 fn join_reader(handle: thread::JoinHandle<io::Result<String>>) -> Result<String, ProtocolError> {
@@ -1027,7 +1097,7 @@ mod tests {
         let script = temp_file("codex-provider", "sh");
         fs::write(
             &script,
-            "#!/bin/sh\n[ \"$1\" = \"exec\" ] || exit 13\n[ \"$2\" = \"--sandbox\" ] || exit 14\n[ \"$3\" = \"read-only\" ] || exit 15\n[ \"$4\" = \"--model\" ] || exit 16\n[ \"$5\" = \"gpt-5-codex\" ] || exit 17\nprintf '%s\n' '{\"title\":\"Generated PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}'\n",
+            "#!/bin/sh\n[ \"$1\" = \"exec\" ] || exit 13\n[ \"$2\" = \"--sandbox\" ] || exit 14\n[ \"$3\" = \"read-only\" ] || exit 15\n[ \"$4\" = \"--model\" ] || exit 16\n[ \"$5\" = \"gpt-5-codex\" ] || exit 17\n[ \"$6\" = \"-\" ] || exit 18\ncat >/dev/null\nprintf '%s\n' '{\"title\":\"Generated PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}'\n",
         )
         .unwrap();
         make_executable(&script);
@@ -1112,16 +1182,24 @@ fn main() {
         let (dir, script) = windows_rust_provider_stub(
             "codex provider path with spaces",
             r###"
-use std::{env, process};
+use std::{
+    env,
+    io::{self, Read},
+    process,
+};
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.len() < 6 { process::exit(11); }
+    if args.len() != 6 { process::exit(11); }
     if args[0] != "exec" { process::exit(13); }
     if args[1] != "--sandbox" { process::exit(14); }
     if args[2] != "read-only" { process::exit(15); }
     if args[3] != "--model" { process::exit(16); }
     if args[4] != "gpt-5-codex" { process::exit(17); }
+    if args[5] != "-" { process::exit(18); }
+    let mut prompt = String::new();
+    io::stdin().read_to_string(&mut prompt).unwrap();
+    if prompt.is_empty() { process::exit(19); }
     println!("{}", "{\"title\":\"Generated Windows PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}");
 }
 "###,
@@ -1154,6 +1232,64 @@ fn main() {
         let _ = fs::remove_dir_all(cwd);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn codex_provider_reads_long_prompt_from_stdin_on_windows() {
+        let (dir, script) = windows_rust_provider_stub(
+            "codex long prompt provider",
+            r###"
+use std::{
+    env,
+    io::{self, Read},
+    process,
+};
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.len() != 4 { process::exit(11); }
+    if args[0] != "exec" { process::exit(12); }
+    if args[1] != "--sandbox" { process::exit(13); }
+    if args[2] != "read-only" { process::exit(14); }
+    if args[3] != "-" { process::exit(15); }
+    let mut prompt = String::new();
+    io::stdin().read_to_string(&mut prompt).unwrap();
+    if prompt.len() < 33_000 { process::exit(16); }
+    if !prompt.contains("WINDOWS-LONG-PROMPT-MARKER") { process::exit(17); }
+    println!("{}", "{\"title\":\"Generated Long Prompt PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}");
+}
+"###,
+        );
+        let cwd = temp_dir("codex long prompt cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Codex,
+            claude: PathBuf::from("claude"),
+            codex: script.clone(),
+            timeout: Duration::from_secs(2),
+            model: None,
+        };
+        let draft = generate_pull_request_draft(
+            &config,
+            PullRequestDraftInput {
+                worktree_path: cwd.clone(),
+                branch: "feature/windows-long-drafts".into(),
+                base: "main".into(),
+                commits: vec!["add windows long drafts".into()],
+                changed_paths: vec![PathBuf::from("tracked.txt")],
+                diff: format!(
+                    "WINDOWS-LONG-PROMPT-MARKER\n{}",
+                    "+changed line\n".repeat(40_000)
+                ),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(draft.title, "Generated Long Prompt PR");
+        assert!(draft.body.contains("## Testing"));
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
     #[cfg(unix)]
     #[test]
     fn provider_timeout_does_not_block_on_grandchild_holding_the_pipe() {
@@ -1180,7 +1316,7 @@ fn main() {
         };
         let mut command = Command::new(&config.codex);
         let started = Instant::now();
-        let result = run_provider_command(&mut command, &cwd, &config, None);
+        let result = run_provider_command(&mut command, &cwd, &config, None, None);
         let elapsed = started.elapsed();
         assert!(result.is_err(), "expected a timeout error");
         assert!(
@@ -1221,7 +1357,7 @@ fn main() {
             .arg(script);
 
         let started = Instant::now();
-        let result = run_provider_command(&mut command, &cwd, &config, None);
+        let result = run_provider_command(&mut command, &cwd, &config, None, None);
         assert!(result.is_err(), "expected timeout error");
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -1274,7 +1410,8 @@ fn main() {
         });
 
         let started = Instant::now();
-        let result = run_provider_command(&mut command, &cwd, &config, Some(control.as_ref()));
+        let result =
+            run_provider_command(&mut command, &cwd, &config, Some(control.as_ref()), None);
         trigger.join().unwrap();
         assert!(result.is_err(), "expected cancellation error");
         assert!(

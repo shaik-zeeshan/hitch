@@ -12,6 +12,13 @@ description = "Hitch desktop app — thin Tauri client (ADR 0005)."
 name = "hitch_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Compiles in the destructive packaged smoke-test harness (creates a temp
+# project, opens/closes a session, removes the project, shuts down the daemon,
+# then exits the process). Off by default so it never ships in production
+# builds; CI enables it for the Windows package smoke build.
+packaged-smoke = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

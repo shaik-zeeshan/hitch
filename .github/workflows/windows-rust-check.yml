@@ -26,7 +26,23 @@ jobs:
         working-directory: apps/desktop
         env:
           CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
-        run: bun tauri build --target x86_64-pc-windows-msvc
+        run: bun tauri build --target x86_64-pc-windows-msvc --features packaged-smoke
+      - name: Verify Windows installer was bundled
+        shell: pwsh
+        run: |
+          $bundle = "target/x86_64-pc-windows-msvc/release/bundle"
+          $installers = Get-ChildItem -Path $bundle -Recurse -File -Include *.exe, *.msi -ErrorAction SilentlyContinue
+          if (-not $installers) {
+            # The uploaded artifact also globs the raw release/*.exe build outputs
+            # (hitch-daemon.exe, hitch-hook.exe, hitch-desktop.exe), so
+            # `if-no-files-found: error` on the upload step can't catch a missing
+            # installer on its own. Fail here so a "Windows package" artifact is
+            # never published without an actual packaged app.
+            Write-Error "No Windows installer (.exe/.msi) found under $bundle"
+            exit 1
+          }
+          Write-Host "Bundled installer(s):"
+          $installers | ForEach-Object { Write-Host "  $($_.FullName)" }
       - name: Smoke-test Windows package
         if: ${{ hashFiles('apps/desktop/scripts/smoke-windows-package.ps1') != '' }}
         shell: pwsh
