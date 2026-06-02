@@ -647,10 +647,19 @@ fn posix_command_arg(value: &str) -> String {
 }
 
 fn windows_command_arg(value: &str) -> String {
+    // Quote when the value contains a backslash as well as the usual whitespace /
+    // quote cases. Claude Code (and Codex) run hook commands through Git Bash,
+    // where an unquoted backslash escapes the next character — so a spaceless
+    // Windows path like `C:\...\hitch-hook.exe` would be mangled into
+    // `C:...hitch-hook.exe` and fail with "command not found". Double-quoting
+    // preserves the backslashes under both bash and cmd. Quoting only on spaces
+    // (the previous behavior) is why `Program Files` installs worked but spaceless
+    // `target\debug` dev/CI paths did not. Bare identifiers like event names have
+    // no backslash and stay unquoted.
     if value.is_empty()
         || value
             .bytes()
-            .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'"'))
+            .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\\'))
     {
         let mut quoted = String::with_capacity(value.len() + 2);
         quoted.push('"');
@@ -783,6 +792,39 @@ mod tests {
         assert_eq!(
             command,
             r#""C:\Program Files\Hitch Tools\hitch-hook.exe" --agent codex --event user-prompt-submit --state running"#
+        );
+    }
+
+    #[test]
+    fn windows_command_quotes_spaceless_path_so_bash_keeps_backslashes() {
+        // Regression: Claude Code runs hooks via Git Bash, which strips unquoted
+        // backslashes. A spaceless `target\debug` path must still be quoted, or it
+        // mangles to `C:Code...hitch-hook.exe` -> "command not found".
+        let helper =
+            Path::new(r"C:\Code\worktrees\hitch\round-thrush\hitch\target\debug\hitch-hook.exe");
+
+        let entry = claude_hook_entry(helper, "notification", AgentState::NeedsApproval);
+        let command = entry["hooks"][0]["command"].as_str().unwrap();
+
+        assert!(
+            command.starts_with(
+                r#""C:\Code\worktrees\hitch\round-thrush\hitch\target\debug\hitch-hook.exe""#
+            ),
+            "spaceless Windows helper path must be double-quoted: {command}"
+        );
+    }
+
+    #[test]
+    fn windows_command_argument_quotes_backslash_paths_but_not_bare_identifiers() {
+        // Backslash paths must be quoted so bash keeps the separators...
+        assert_eq!(
+            platform_command_arg(r"C:\a\b.exe", CommandArgStyle::Windows),
+            r#""C:\a\b.exe""#
+        );
+        // ...while safe identifiers (event names) stay bare.
+        assert_eq!(
+            platform_command_arg("user-prompt-submit", CommandArgStyle::Windows),
+            "user-prompt-submit"
         );
     }
 

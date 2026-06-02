@@ -166,7 +166,17 @@ struct HookReport {
 }
 
 fn send_report(report: HookReport) -> Result<(), HookError> {
-    let mut client = DaemonClient::connect(&report.socket_path)?;
+    let mut client = match DaemonClient::connect(&report.socket_path) {
+        Ok(client) => client,
+        // The daemon is GUI-supervised and frequently absent — a bare terminal
+        // session has no Hitch GUI running. Per ADR 0012 a missing daemon leaves
+        // no artifact and surfaces as FILE_NOT_FOUND on Windows / ENOENT or
+        // ECONNREFUSED on Unix. State reporting is best-effort: with nothing
+        // listening there is no session to update, so exit quietly instead of
+        // failing the agent's hook with a spurious error.
+        Err(err) if daemon_unavailable(&err) => return Ok(()),
+        Err(err) => return Err(HookError::Io(err)),
+    };
     let detail = report
         .detail
         .or(report.event.map(|event| format!("event: {event}")));
@@ -184,6 +194,17 @@ fn send_report(report: HookReport) -> Result<(), HookError> {
         ))
         .map_err(|err| HookError::Transport(err.to_string()))?;
     Ok(())
+}
+
+/// True when a connect error means "no daemon is listening" rather than a real
+/// transport fault. These are the kinds the OS reports when nothing has bound
+/// the endpoint: `NotFound` (Windows FILE_NOT_FOUND, Unix ENOENT on a missing
+/// socket path) and `ConnectionRefused` (Unix socket file with no listener).
+fn daemon_unavailable(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
 }
 
 fn state_from_event(agent: KnownAgent, event: Option<&str>) -> Option<Option<AgentState>> {
@@ -616,6 +637,29 @@ mod tests {
 
         #[cfg(unix)]
         let _ = std::fs::remove_file(socket);
+    }
+
+    #[test]
+    fn absent_daemon_is_reported_as_success() {
+        // A stateful event with no daemon listening must NOT fail the agent's
+        // hook: connecting returns NotFound (Windows FILE_NOT_FOUND / Unix
+        // ENOENT) and the helper should exit Ok rather than propagating it. The
+        // socket path points at an endpoint nothing has bound.
+        let socket = test_socket_path();
+        assert!(!socket.exists());
+        let mut stdin = Cursor::new(b"{}" as &[u8]);
+        real_main(
+            [
+                "--agent".to_string(),
+                "claude-code".to_string(),
+                "--event".to_string(),
+                "session-end".to_string(),
+                "--socket".to_string(),
+                socket.display().to_string(),
+            ],
+            &mut stdin,
+        )
+        .unwrap();
     }
 
     #[test]

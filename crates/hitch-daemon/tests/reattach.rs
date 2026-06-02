@@ -60,9 +60,8 @@ fn windows_default_shell_session_accepts_input_resize_and_kills_descendants() {
     let session = client.open_default_session(3, SessionParent::Project(project.id));
 
     let input = format!(
-        "@echo off\r\n\
-         echo {env}=%{env}%\r\n\
-         start \"\" /b cmd.exe /d /q /c \"echo HITCH_CHILD_STARTED & ping -n 5 127.0.0.1 >nul & echo HITCH_ORPHANED>hitch-orphan-marker.txt\"\r\n",
+        "echo \"{env}=$env:{env}\"\r\n\
+         Start-Process -NoNewWindow -FilePath cmd.exe -ArgumentList '/d','/q','/c','echo HITCH_CHILD_STARTED & ping -n 5 127.0.0.1 >nul & echo HITCH_ORPHANED>hitch-orphan-marker.txt'\r\n",
         env = SESSION_ID_ENV,
     );
     client.send_session_input(4, session.id, input.as_bytes());

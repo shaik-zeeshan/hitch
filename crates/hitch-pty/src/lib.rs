@@ -74,7 +74,8 @@ impl From<TerminalSize> for PtySize {
 pub struct PtySpawnConfig {
     pub session_id: SessionId,
     pub cwd: PathBuf,
-    /// Program + args. `None` means `$SHELL -l`/`/bin/sh -l` on Unix or `cmd.exe` on Windows.
+    /// Program + args. `None` means `$SHELL -l`/`/bin/sh -l` on Unix or
+    /// `powershell.exe` (overridable via `HITCH_SHELL`) on Windows.
     pub command: Option<Vec<String>>,
     pub size: TerminalSize,
     pub scrollback_capacity: usize,
@@ -430,7 +431,14 @@ fn build_command(
 
 #[cfg(windows)]
 fn default_command() -> CommandBuilder {
-    CommandBuilder::new(std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()))
+    // Prefer PowerShell over cmd.exe: cmd does not honor a per-process working
+    // directory the way we need (the PTY's `cwd` is ignored for some built-ins),
+    // whereas PowerShell starts in and respects the directory we set.
+    let shell = std::env::var("HITCH_SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "powershell.exe".to_string());
+    CommandBuilder::new(shell)
 }
 
 #[cfg(unix)]
