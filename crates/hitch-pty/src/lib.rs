@@ -414,6 +414,10 @@ fn build_command(
     command: &Option<Vec<String>>,
     cwd: &Path,
 ) -> CommandBuilder {
+    let uses_powershell_cwd = command
+        .as_ref()
+        .map(|command| command_name_is_powershell(&command[0]))
+        .unwrap_or_else(default_command_uses_powershell);
     let mut builder = if let Some(command) = command {
         let mut builder = CommandBuilder::new(&command[0]);
         if command.len() > 1 {
@@ -425,8 +429,73 @@ fn build_command(
     };
     builder.env("TERM", "xterm-256color");
     builder.env(SESSION_ID_ENV, session_id.to_string());
-    builder.cwd(cwd);
+    set_command_cwd(&mut builder, cwd, uses_powershell_cwd);
     builder
+}
+
+#[cfg(windows)]
+fn set_command_cwd(builder: &mut CommandBuilder, cwd: &Path, use_powershell_display_path: bool) {
+    if use_powershell_display_path {
+        let cwd = powershell_display_cwd(cwd);
+        builder.cwd(cwd.as_ref());
+    } else {
+        builder.cwd(cwd);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_command_cwd(builder: &mut CommandBuilder, cwd: &Path, _use_powershell_display_path: bool) {
+    builder.cwd(cwd);
+}
+
+#[cfg(windows)]
+fn default_command_uses_powershell() -> bool {
+    std::env::var("HITCH_SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map_or(true, |shell| command_name_is_powershell(&shell))
+}
+
+#[cfg(not(windows))]
+fn default_command_uses_powershell() -> bool {
+    false
+}
+
+fn command_name_is_powershell(command: &str) -> bool {
+    Path::new(command)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("powershell") || name.eq_ignore_ascii_case("pwsh")
+        })
+}
+
+#[cfg(windows)]
+fn powershell_display_cwd(cwd: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    const SEP: u16 = b'\\' as u16;
+    const DEVICE_PREFIX: &[u16] = &[SEP, SEP, b'?' as u16, SEP];
+    const DEVICE_UNC_PREFIX: &[u16] = &[b'U' as u16, b'N' as u16, b'C' as u16, SEP];
+
+    let mut wide = cwd.as_os_str().encode_wide();
+    for expected in DEVICE_PREFIX {
+        if wide.next() != Some(*expected) {
+            return std::borrow::Cow::Borrowed(cwd);
+        }
+    }
+    let rest = wide.collect::<Vec<_>>();
+    let rest = rest.as_slice();
+
+    if let Some(unc) = rest.strip_prefix(DEVICE_UNC_PREFIX) {
+        let mut display = Vec::with_capacity(2 + unc.len());
+        display.extend_from_slice(&[SEP, SEP]);
+        display.extend_from_slice(unc);
+        return std::borrow::Cow::Owned(PathBuf::from(OsString::from_wide(&display)));
+    }
+
+    std::borrow::Cow::Owned(PathBuf::from(OsString::from_wide(rest)))
 }
 
 #[cfg(windows)]
@@ -703,7 +772,7 @@ impl ScrollbackBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::time::{Duration, Instant};
 
     #[test]
@@ -757,6 +826,56 @@ mod tests {
             ),
             Some("node".into()),
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_cwd_uses_display_path_for_extended_drive_path() {
+        assert_eq!(
+            powershell_display_cwd(Path::new(r"\\?\C:\Code\hitch")).as_ref(),
+            Path::new(r"C:\Code\hitch")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_cwd_uses_display_path_for_extended_unc_path() {
+        assert_eq!(
+            powershell_display_cwd(Path::new(r"\\?\UNC\server\share\hitch")).as_ref(),
+            Path::new(r"\\server\share\hitch")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_prompt_does_not_show_provider_qualified_extended_cwd() {
+        let current = std::env::current_dir().unwrap();
+        let cwd = extended_windows_path(&current);
+        let display_cwd = powershell_display_cwd(&cwd).into_owned();
+        let (tx, rx) = mpsc::channel();
+        let session_id = SessionId::new();
+        let pty = ManagedPty::spawn(
+            PtySpawnConfig::new(session_id, cwd)
+                .command(Some(vec![
+                    "powershell.exe".into(),
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    "function prompt { 'PS ' + (Get-Location) + '> ' }; prompt".into(),
+                ]))
+                .scrollback_capacity(1024),
+            tx,
+        )
+        .unwrap();
+
+        let output = collect_output(&rx, Duration::from_secs(5));
+        let text = String::from_utf8_lossy(&output);
+        let expected = format!("PS {}>", display_cwd.display());
+        assert!(
+            !text.contains("Microsoft.PowerShell.Core\\FileSystem::"),
+            "{text}"
+        );
+        assert!(text.contains(&expected), "{text}");
+        assert!(String::from_utf8_lossy(&pty.scrollback()).contains(&expected));
     }
 
     #[cfg(unix)]
@@ -827,7 +946,19 @@ mod tests {
         let _ = pty.kill();
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    fn extended_windows_path(path: &Path) -> PathBuf {
+        let path = path.to_string_lossy();
+        if path.starts_with(r"\\?\") {
+            return PathBuf::from(path.as_ref());
+        }
+        if let Some(unc) = path.strip_prefix(r"\\") {
+            return PathBuf::from(format!(r"\\?\UNC\{unc}"));
+        }
+        PathBuf::from(format!(r"\\?\{path}"))
+    }
+
+    #[cfg(any(unix, windows))]
     fn collect_output(rx: &mpsc::Receiver<PtyEvent>, timeout: Duration) -> Vec<u8> {
         let deadline = Instant::now() + timeout;
         let mut output = Vec::new();
