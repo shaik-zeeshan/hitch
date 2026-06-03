@@ -41,6 +41,7 @@
   import { classifyTerminalKey } from "../terminalKeys";
   import { createOutputBatcher } from "../outputBatch";
   import { releaseWebgl, retainWebgl, touchWebgl } from "../webglBudget";
+  import { dropTargetSession } from "../fileDrop";
 
   // `active` is true only when this is the visible terminal (its tab is
   // selected AND the diff isn't covering the view). The parent keeps every
@@ -541,7 +542,15 @@
      unpadded box so FitAddon measures the true content area and the rows it
      computes leave the padding (incl. the bottom) intact. -->
 <div class="term">
-  <div class="term-host" bind:this={host}></div>
+  <!-- data-session-id lets the app-wide file-drop listener hit-test a drop
+       point back to this session (see fileDrop.ts); the drop-target ring shows
+       where dragged paths will land before release. -->
+  <div
+    class="term-host"
+    class:drop-target={$dropTargetSession === sessionId}
+    data-session-id={sessionId}
+    bind:this={host}
+  ></div>
   {#if searchOpen}
     <!-- Compact in-terminal search box: Enter → next, Shift+Enter → prev,
          Esc → close. Styled with the app's terminal tokens. -->
@@ -645,6 +654,13 @@
   .term-host {
     height: 100%;
     width: 100%;
+  }
+  /* Drop-target affordance: an inset accent ring while an OS file drag hovers
+     this terminal, so it's clear the paths will land here. inset box-shadow
+     stays inside the host and doesn't shift xterm's layout (no reflow/fit). */
+  .term-host.drop-target {
+    box-shadow: inset 0 0 0 2px var(--ac);
+    border-radius: 4px;
   }
   /* xterm injects its own canvas/layout; keep its viewport scrollbar on theme. */
   .term-host :global(.xterm) {
