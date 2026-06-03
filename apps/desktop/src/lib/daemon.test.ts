@@ -62,6 +62,7 @@ import {
   reconnect,
   restartDaemon,
   runJob,
+  selectedProjectId,
   selectedWorktreeId,
   sessionCommands,
   sessions,
@@ -599,6 +600,149 @@ describe("connect snapshot refresh failures", () => {
 
     finishConnect();
     await init;
+  });
+
+
+  it("registers output channels for sessions returned by the startup snapshot", async () => {
+    const session = {
+      id: "s-live",
+      name: "shell",
+      parent: { kind: "project", id: "p1" },
+      cwd: "C:/repo",
+    };
+
+    invokeMock.mockImplementation(async (invokedCommand: string, payload?: { request?: { type: string } }) => {
+      if (invokedCommand === "get_daemon_status") {
+        return { status: "running", reason: null, log_path: "/tmp/hitch-daemon.log" };
+      }
+      if (invokedCommand === "connect_daemon") {
+        return undefined;
+      }
+      if (invokedCommand === "register_session_output") {
+        return undefined;
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-projects") {
+        return {
+          type: "projects",
+          projects: [{ id: "p1", name: "Repo", root: "C:/repo", kind: "plain" }],
+        };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-sessions") {
+        return { type: "sessions", sessions: [session] };
+      }
+      throw new Error(`unexpected invoke ${invokedCommand}`);
+    });
+
+    await initDaemon();
+
+    expect(get(sessions)).toEqual([session]);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "register_session_output",
+      expect.objectContaining({ sessionId: "s-live" }),
+    );
+  });
+  it("selects the parent of a live snapshot session on startup", async () => {
+    const session = {
+      id: "s-worktree",
+      name: "shell",
+      parent: { kind: "worktree", id: "w2" },
+      cwd: "C:/repo/feature",
+    };
+
+    invokeMock.mockImplementation(async (invokedCommand: string, payload?: { request?: { type: string } }) => {
+      if (invokedCommand === "get_daemon_status") {
+        return { status: "running", reason: null, log_path: "/tmp/hitch-daemon.log" };
+      }
+      if (invokedCommand === "connect_daemon" || invokedCommand === "register_session_output") {
+        return undefined;
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-projects") {
+        return {
+          type: "projects",
+          projects: [{ id: "p1", name: "Repo", root: "C:/repo", kind: "git-backed" }],
+        };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-worktrees") {
+        return {
+          type: "worktrees",
+          worktrees: [
+            {
+              id: "w1",
+              project_id: "p1",
+              path: "C:/repo",
+              branch: "main",
+              is_main: true,
+              is_hitch_managed: false,
+            },
+            {
+              id: "w2",
+              project_id: "p1",
+              path: "C:/repo/feature",
+              branch: "feature",
+              is_main: false,
+              is_hitch_managed: true,
+            },
+          ],
+        };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-sessions") {
+        return { type: "sessions", sessions: [session] };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "git-status") {
+        return {
+          type: "git-status",
+          status: {
+            worktree_id: (payload.request as unknown as { worktree_id: string }).worktree_id,
+            branch: "feature",
+            dirty: false,
+            ahead: 0,
+            behind: 0,
+            additions: 0,
+            deletions: 0,
+            files: [],
+          },
+        };
+      }
+      throw new Error(`unexpected invoke ${invokedCommand}`);
+    });
+
+    await initDaemon();
+
+    expect(get(selectedProjectId)).toBe("p1");
+    expect(get(selectedWorktreeId)).toBe("w2");
+    expect(get(activeSessionId)).toBe("s-worktree");
+  });
+
+
+  it("does not reset an output channel already registered by a session-opened replay", async () => {
+    const session = {
+      id: "s-replayed",
+      name: "shell",
+      parent: { kind: "project", id: "p1" },
+      cwd: "C:/repo",
+    };
+    invokeMock.mockResolvedValue(undefined);
+    applyHitchEvent({ type: "session-opened", session });
+    invokeMock.mockClear();
+    invokeMock.mockImplementation(async (invokedCommand: string, payload?: { request?: { type: string } }) => {
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-projects") {
+        return {
+          type: "projects",
+          projects: [{ id: "p1", name: "Repo", root: "C:/repo", kind: "plain" }],
+        };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-sessions") {
+        return { type: "sessions", sessions: [session] };
+      }
+      throw new Error(`unexpected invoke ${invokedCommand}`);
+    });
+
+    await refreshAll();
+
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "register_session_output",
+      expect.objectContaining({ sessionId: "s-replayed" }),
+    );
   });
 
   it("marks the daemon failed when reconnect cannot reach it", async () => {

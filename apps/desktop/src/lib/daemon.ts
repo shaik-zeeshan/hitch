@@ -618,7 +618,9 @@ function removeWorktreeLocal(worktreeId: Id): void {
 
 // ---- snapshot / refresh ---------------------------------------------------
 
-export async function refreshAll(): Promise<void> {
+export async function refreshAll(
+  options: { restoreLiveSessionSelection?: boolean } = {},
+): Promise<void> {
   const projectResponse = await daemonRequest<Response & { projects: Project[] }>({
     type: "list-projects",
   });
@@ -652,6 +654,10 @@ export async function refreshAll(): Promise<void> {
     parent: null,
   });
   sessions.set(sessionResponse.sessions);
+  if (options.restoreLiveSessionSelection) {
+    restoreLiveSessionSelection(sessionResponse.sessions, allWorktrees);
+  }
+  reconcileSessionOutputs(sessionResponse.sessions);
 
   // Seed dirty indicators and line stats so the tree is useful before the Changes panel opens.
   const statusEntries = await Promise.all(
@@ -679,9 +685,33 @@ export async function refreshAll(): Promise<void> {
     ),
   );
 }
+
+function restoreLiveSessionSelection(liveSessions: Session[], allWorktrees: Worktree[]): void {
+  const currentParent = get(selectedParent);
+  if (currentParent && liveSessions.some((session) => sessionBelongsTo(session, currentParent))) {
+    return;
+  }
+
+  for (const session of liveSessions) {
+    if (session.parent.kind === "project") {
+      if (!get(projects).some((project) => project.id === session.parent.id)) continue;
+      selectedProjectId.set(session.parent.id);
+      selectedWorktreeId.set(null);
+      activeSessionId.set(session.id);
+      return;
+    }
+
+    const worktree = allWorktrees.find((item) => item.id === session.parent.id);
+    if (!worktree) continue;
+    selectedProjectId.set(worktree.project_id);
+    selectedWorktreeId.set(worktree.id);
+    activeSessionId.set(session.id);
+    return;
+  }
+}
 async function refreshSnapshotAfterConnect(): Promise<void> {
   try {
-    await refreshAll();
+    await refreshAll({ restoreLiveSessionSelection: true });
   } catch (err) {
     error.set(toMessage(err));
   }
@@ -777,7 +807,9 @@ function openSessionOutput(sessionId: Id): void {
     subscribers.get(sessionId)?.onData(ringFor(sessionId).bytesSince(offsetBefore));
   };
   channels.set(sessionId, channel);
-  void invoke("register_session_output", { sessionId, channel });
+  void Promise.resolve(invoke("register_session_output", { sessionId, channel })).catch(() => {
+    if (channels.get(sessionId) === channel) channels.delete(sessionId);
+  });
 }
 
 // Tear down a session's output: drop the ring + channel and tell Tauri to stop
@@ -787,8 +819,19 @@ function closeSessionOutput(sessionId: Id): void {
   channels.delete(sessionId);
   // A closing session must not have a trailing resize fire against its dead PTY.
   clearResizeDebounce(sessionId);
-  void invoke("unregister_session_output", { sessionId });
+  void Promise.resolve(invoke("unregister_session_output", { sessionId })).catch(() => {});
 }
+
+function reconcileSessionOutputs(liveSessions: Session[]): void {
+  const liveIds = new Set(liveSessions.map((session) => session.id));
+  for (const sessionId of Array.from(channels.keys())) {
+    if (!liveIds.has(sessionId)) closeSessionOutput(sessionId);
+  }
+  for (const session of liveSessions) {
+    if (!channels.has(session.id)) openSessionOutput(session.id);
+  }
+}
+
 
 export function applyHitchEvent(event: HitchEvent): void {
   if (event.type === "project-updated") {
@@ -1031,6 +1074,10 @@ export function disposeDaemon(): void {
   for (const id of Array.from(dismissibleTabTimers.keys())) {
     clearDismissibleTabTimer(id);
   }
+  for (const sessionId of Array.from(channels.keys())) {
+    closeSessionOutput(sessionId);
+  }
+  rings.clear();
   booted = false;
 }
 
