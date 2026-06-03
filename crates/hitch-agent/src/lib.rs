@@ -356,17 +356,44 @@ fn hook_command(
     state: Option<AgentState>,
 ) -> String {
     let style = command_arg_style_for_path(helper_path);
-    let mut command = format!(
-        "{} --agent {} --event {}",
-        platform_command_arg(&helper_path.to_string_lossy(), style),
-        agent.id(),
-        platform_command_arg(event, style)
-    );
+    // Each agent evaluates hook commands with a different shell, so the command
+    // must be written in that shell's language:
+    // - Claude Code runs hooks through Git Bash on Windows and `sh` elsewhere; a
+    //   double-quoted (Windows) or single-quoted (POSIX) path invokes directly.
+    // - Codex runs hooks through the platform default shell — PowerShell on
+    //   Windows (`powershell -Command <string>`). There a quoted path is a string
+    //   EXPRESSION, not an invocation: `"C:\...\hitch-hook.exe" --agent codex`
+    //   is a parse error, the helper never spawns, and Codex reports the hook as
+    //   failed. PowerShell needs the call operator and a single-quoted path:
+    //   `& 'C:\...\hitch-hook.exe' --agent codex ...`. Single quotes also keep
+    //   the string free of `"` characters, which would otherwise be mangled by
+    //   the Rust-side argv quoting Codex uses to pass the command to PowerShell.
+    let mut command = if agent == AgentKind::Codex && style == CommandArgStyle::Windows {
+        format!(
+            "& {} --agent {} --event {}",
+            powershell_command_arg(&helper_path.to_string_lossy()),
+            agent.id(),
+            event
+        )
+    } else {
+        format!(
+            "{} --agent {} --event {}",
+            platform_command_arg(&helper_path.to_string_lossy(), style),
+            agent.id(),
+            platform_command_arg(event, style)
+        )
+    };
     if let Some(state) = state {
         command.push_str(" --state ");
         command.push_str(state_arg(state));
     }
     command
+}
+
+/// Quote `value` as a PowerShell single-quoted literal: no interpolation, and
+/// embedded single quotes escape by doubling.
+fn powershell_command_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn state_arg(state: AgentState) -> &'static str {
@@ -783,7 +810,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_hook_command_quotes_windows_helper_path_and_keeps_explicit_state() {
+    fn codex_windows_hook_command_is_a_powershell_invocation() {
+        // Codex evaluates hook commands with PowerShell on Windows, where a
+        // double-quoted path is a string expression rather than an invocation.
+        // The command must use the call operator and a single-quoted path or the
+        // helper never spawns (Codex shows "hook: <event> Failed").
         let helper = Path::new(r"C:\Program Files\Hitch Tools\hitch-hook.exe");
 
         let entry = codex_hook_entry(helper, "user-prompt-submit", AgentState::Running);
@@ -791,7 +822,20 @@ mod tests {
 
         assert_eq!(
             command,
-            r#""C:\Program Files\Hitch Tools\hitch-hook.exe" --agent codex --event user-prompt-submit --state running"#
+            r"& 'C:\Program Files\Hitch Tools\hitch-hook.exe' --agent codex --event user-prompt-submit --state running"
+        );
+    }
+
+    #[test]
+    fn codex_windows_hook_command_escapes_single_quotes_in_helper_path() {
+        let helper = Path::new(r"C:\Users\o'brien\hitch\hitch-hook.exe");
+
+        let entry = codex_hook_entry(helper, "stop", AgentState::Waiting);
+        let command = entry["hooks"][0]["command"].as_str().unwrap();
+
+        assert_eq!(
+            command,
+            r"& 'C:\Users\o''brien\hitch\hitch-hook.exe' --agent codex --event stop --state waiting"
         );
     }
 

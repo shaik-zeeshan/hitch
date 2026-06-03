@@ -3,16 +3,21 @@
 
 use std::fmt;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use hitch_core::{AgentState, SessionId, SESSION_ID_ENV};
-use hitch_proto::transport::DaemonClient;
+use hitch_proto::transport::{DaemonClient, DaemonStream};
 use hitch_proto::{ControlMessage, KnownAgent, Request};
 
 fn main() {
     if let Err(err) = real_main(std::env::args().skip(1), &mut io::stdin()) {
+        // Reporting agent state is strictly best-effort. A non-zero exit makes the
+        // agent (Claude Code / Codex) treat its own hook as failed — surfacing an
+        // error to the user and, depending on the event, interrupting the turn.
+        // Nothing this helper can hit (a malformed invocation, an extra argument
+        // the agent appended, an absent or busy daemon) is worth breaking the
+        // agent over, so every failure degrades to a logged no-op with exit 0.
         eprintln!("hitch-hook: {err}");
-        std::process::exit(1);
     }
 }
 
@@ -23,6 +28,20 @@ where
     R: Read,
 {
     run(args, stdin, hooks_suppressed())
+}
+
+/// TEMP diagnostic: append a line to a debug log so we can see what the hook
+/// receives when an agent runs it. Best-effort; ignores all I/O errors.
+fn debug_log(message: &str) {
+    use std::io::Write as _;
+    let path = std::env::temp_dir().join("hitch-hook-debug.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "[pid {}] {message}", std::process::id());
+    }
 }
 
 /// True when Hitch is suppressing agent-state reports for this invocation.
@@ -44,9 +63,21 @@ where
     // the worktree. Bail before touching the socket so draft generation never
     // disturbs unrelated sessions.
     if suppressed {
+        debug_log("suppressed=true; skipping");
         return Ok(());
     }
     let args = HookArgs::parse(args)?;
+    debug_log(&format!(
+        "parsed agent={:?} event={:?} state_arg={:?} session_id_env={} HITCH_SOCKET={:?} socket={}",
+        args.agent,
+        args.event,
+        args.state,
+        std::env::var("HITCH_SESSION_ID")
+            .map(|v| format!("present({v})"))
+            .unwrap_or_else(|_| "ABSENT".into()),
+        std::env::var("HITCH_SOCKET").ok(),
+        args.socket_path.display(),
+    ));
     let mut payload = String::new();
     stdin.read_to_string(&mut payload)?;
     if payload.is_empty() {
@@ -131,12 +162,12 @@ impl HookArgs {
                 other if !other.starts_with('-') && payload.is_none() => {
                     payload = Some(other.to_owned());
                 }
-                other => {
-                    return Err(HookError::Usage(format!(
-                        "unknown argument: {other}\n{}",
-                        usage()
-                    )))
-                }
+                // Unrecognized arguments are ignored rather than rejected. An agent
+                // may append its own context (an event name, a JSON blob, extra
+                // flags) to the configured hook command; failing on those would
+                // break the agent's hook (see `main`). Skipping them keeps the
+                // known flags — which carry the state report — fully effective.
+                _ => {}
             }
         }
 
@@ -166,17 +197,14 @@ struct HookReport {
 }
 
 fn send_report(report: HookReport) -> Result<(), HookError> {
-    let mut client = match DaemonClient::connect(&report.socket_path) {
-        Ok(client) => client,
-        // The daemon is GUI-supervised and frequently absent — a bare terminal
-        // session has no Hitch GUI running. Per ADR 0012 a missing daemon leaves
-        // no artifact and surfaces as FILE_NOT_FOUND on Windows / ENOENT or
-        // ECONNREFUSED on Unix. State reporting is best-effort: with nothing
-        // listening there is no session to update, so exit quietly instead of
-        // failing the agent's hook with a spurious error.
-        Err(err) if daemon_unavailable(&err) => return Ok(()),
-        Err(err) => return Err(HookError::Io(err)),
+    let Some(mut client) = connect_to_daemon(&report.socket_path)? else {
+        debug_log("connect: no daemon (unavailable); report not sent");
+        return Ok(());
     };
+    debug_log(&format!(
+        "connect OK; sending agent={:?} state={:?} session_id={:?}",
+        report.agent, report.state, report.session_id
+    ));
     let detail = report
         .detail
         .or(report.event.map(|event| format!("event: {event}")));
@@ -193,7 +221,81 @@ fn send_report(report: HookReport) -> Result<(), HookError> {
             },
         ))
         .map_err(|err| HookError::Transport(err.to_string()))?;
+
+    debug_log("sent; waiting for ack");
+    wait_for_ack(client.into_connection());
+    debug_log("done");
     Ok(())
+}
+
+/// Connect to the daemon, returning `Ok(None)` when there is simply nothing to
+/// report to. Connecting is best-effort by design (see `main`): a missing daemon
+/// is the common case for a bare terminal session, and a momentarily busy one is
+/// transient. Only a connect error that is neither — an unexpected transport
+/// fault — propagates, and even that is downgraded to a no-op by `main`.
+fn connect_to_daemon(socket_path: &Path) -> Result<Option<DaemonClient>, HookError> {
+    use std::time::{Duration, Instant};
+
+    // On Windows a named-pipe server serves a bounded set of instances; while the
+    // daemon is between accept polls every instance can be momentarily occupied,
+    // and a connecting client gets `ERROR_PIPE_BUSY` instead of connecting. That
+    // is transient — the daemon frees an instance as it loops — so retry briefly
+    // rather than dropping the report. Capped tight so a hook never stalls long.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match DaemonClient::connect(socket_path) {
+            Ok(client) => return Ok(Some(client)),
+            // Nothing is listening at all: no session to update, give up quietly.
+            Err(err) if daemon_unavailable(&err) => return Ok(None),
+            // Up at the endpoint but not accepting yet (busy pipe / not-yet-armed
+            // instance): wait for the next poll and try again until the deadline.
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // Out of retries: treat as unavailable rather than a hard error so the
+            // agent's hook is never failed by a daemon that would not accept.
+            Err(_) => return Ok(None),
+        }
+    }
+}
+
+/// Block until the daemon replies to the report just sent, then return.
+///
+/// This wait is what makes state reporting work on Windows. The daemon services
+/// its socket with a *non-blocking* accept loop that polls on an interval; a hook
+/// that writes its report and disconnects immediately is gone before the next
+/// poll, so the connection — and the buffered report — are silently dropped and
+/// no agent state ever updates. (Unix never hit this: the kernel queues the
+/// connection and its bytes for `accept`, so a fire-and-forget write survives.)
+/// Holding the socket open until the daemon answers keeps it present across the
+/// poll, which both lets the daemon accept and read the request and confirms it
+/// landed. We can't bound the read with `set_nonblocking` because the connected
+/// named-pipe client rejects it (`ERROR_PIPE_BUSY`), so a watchdog thread caps
+/// the wait instead: the report is already written, so a slow or wedged daemon
+/// must never freeze the hook (and with it the agent that ran it).
+fn wait_for_ack(mut connection: DaemonStream) {
+    spawn_ack_watchdog();
+    // Returns as soon as the daemon answers (normally within one accept poll),
+    // or when it closes the connection. The watchdog covers the case where it
+    // does neither. The reply itself is discarded — we only needed to wait for
+    // it. A read error means the connection is already gone; nothing to do.
+    let _ = connection.read_control_messages();
+}
+
+/// Time the helper's exit can be delayed waiting for the daemon's acknowledgement
+/// (see [`wait_for_ack`]). A live daemon answers in tens of milliseconds; this is
+/// only the ceiling for a daemon that accepted the connection but then stalled.
+const ACK_WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Force a clean exit if the acknowledgement read in [`wait_for_ack`] outlives
+/// [`ACK_WATCHDOG_TIMEOUT`]. The report has already been written, so giving up on
+/// the confirmation is harmless; exiting `0` keeps the agent's hook from blocking
+/// on an unresponsive daemon.
+fn spawn_ack_watchdog() {
+    std::thread::spawn(|| {
+        std::thread::sleep(ACK_WATCHDOG_TIMEOUT);
+        std::process::exit(0);
+    });
 }
 
 /// True when a connect error means "no daemon is listening" rather than a real
@@ -388,6 +490,30 @@ mod tests {
         assert_eq!(args.event.as_deref(), Some("notification"));
         assert_eq!(args.state, Some(Some(AgentState::NeedsApproval)));
         assert_eq!(args.socket_path, PathBuf::from("/tmp/hitch.sock"));
+    }
+
+    #[test]
+    fn unknown_arguments_are_ignored_so_the_report_still_parses() {
+        // An agent may append its own context (extra flags, an event name, a JSON
+        // blob) after the configured hook command. Those must not fail parsing —
+        // a non-zero exit would make the agent treat its own hook as failed — and
+        // the known flags carrying the state report must still take effect.
+        let args = HookArgs::parse([
+            "--agent",
+            "codex",
+            "--event",
+            "user-prompt-submit",
+            "--state",
+            "running",
+            "--hook-name",
+            "UserPromptSubmit",
+            "--unexpected-flag",
+            r#"{"appended":"json"}"#,
+        ])
+        .unwrap();
+        assert_eq!(args.agent, KnownAgent::Codex);
+        assert_eq!(args.event.as_deref(), Some("user-prompt-submit"));
+        assert_eq!(args.state, Some(Some(AgentState::Running)));
     }
 
     #[test]

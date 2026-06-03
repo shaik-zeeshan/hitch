@@ -764,6 +764,18 @@ fn restore_layout(
         if !session.cwd.is_dir() {
             continue;
         }
+        // Restored sessions must reinstall agent hooks just like freshly opened
+        // ones (`open_session`): the hook configs live on disk in the worktree
+        // and can be deleted between runs (the agent rewriting its config dir, a
+        // clean checkout, manual cleanup). Without this, a restored session runs
+        // agents that never report state until the user happens to open a new
+        // session in the same worktree. Best-effort for the same reason as every
+        // other install site: a broken config must not block restoring terminals.
+        if let SessionParent::Worktree(worktree_id) = session.parent {
+            if let Err(err) = install_agent_hooks_for_worktree_id(state, worktree_id) {
+                eprintln!("hitch-daemon: {}", err.message);
+            }
+        }
         // ADR 0003: across a daemon restart the live PTY processes are gone, so
         // each saved session reopens as a FRESH terminal. We deliberately do NOT
         // replay the previous run's persisted scrollback. The respawned shell
