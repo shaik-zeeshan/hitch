@@ -13,6 +13,12 @@
   } from "../daemon";
   import { commandOpen } from "../overlays";
   import { currentDesktopPlatform, shortcutLabel } from "../desktopPlatform";
+  import WindowControls from "./WindowControls.svelte";
+
+  // Title-bar integration differs per OS (ADR 0006): macOS reserves space for
+  // the native Overlay traffic lights on the left; Windows is frameless and
+  // draws its own caption controls on the right.
+  const platform = currentDesktopPlatform();
 
   let {
     rightCollapsed = false,
@@ -55,7 +61,12 @@
   }
 </script>
 
-<nav class="topnav" data-tauri-drag-region>
+<nav
+  class="topnav"
+  class:mac={platform === "macos"}
+  class:win={platform === "windows"}
+  data-tauri-drag-region
+>
   <button class="iconbtn" title="Toggle sidebar" aria-label="Toggle sidebar" onclick={onToggleLeft}>
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
       ><rect x="1.5" y="2.5" width="13" height="11" rx="2" /><line x1="6" y1="2.5" x2="6" y2="13.5" /></svg
@@ -130,12 +141,13 @@
       </button>
     {/if}
   </div>
+
+  {#if platform === "windows"}
+    <WindowControls />
+  {/if}
 </nav>
 
 <style>
-  /* macOS traffic lights are inset to x 16 / y 23 in tauri.conf.json so their
-     centers sit on the 44px top-nav row, level with the sidebar toggle icon;
-     this reserves their horizontal room. */
   .topnav {
     display: flex;
     align-items: center;
@@ -143,8 +155,19 @@
     height: 100%;
     background: var(--bg-2);
     border-bottom: 1px solid var(--line);
-    padding: 0 12px 0 78px;
+    padding: 0 12px;
     user-select: none;
+  }
+  /* macOS traffic lights are inset to x 16 / y 23 in tauri.conf.json so their
+     centers sit on the 44px top-nav row, level with the sidebar toggle icon;
+     this reserves their horizontal room. */
+  .topnav.mac {
+    padding-left: 78px;
+  }
+  /* Windows is frameless: the caption controls (WindowControls) sit flush in
+     the top-right corner, so the nav gives up its right padding there. */
+  .topnav.win {
+    padding-right: 0;
   }
 
   .nav-grow {

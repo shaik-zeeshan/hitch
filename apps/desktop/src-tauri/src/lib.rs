@@ -4,6 +4,8 @@
 //! socket connection, starts the daemon when needed, and relays `hitch-proto`
 //! requests/responses/events to Tauri IPC.
 
+mod window_chrome;
+
 use hitch_proto::transport::{connect_daemon as connect_transport, DaemonStream};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -2150,6 +2152,14 @@ fn unregister_session_output(
     Ok(())
 }
 
+/// Report the maximize button's physical-pixel rectangle so the Windows window
+/// subclass can hit-test it as the native caption max button (driving Snap
+/// Layouts). A no-op off Windows; the frontend only calls it there.
+#[tauri::command]
+fn set_max_button_rect(left: i32, top: i32, right: i32, bottom: i32) {
+    window_chrome::set_max_button_rect(left, top, right, bottom);
+}
+
 /// Menu-bar status line mirroring the four-state Daemon Status (ADR 0009). The
 /// daemon keeps running after the window closes, so this is the honest signal
 /// that Hitch has a background presence (ADR 0003). Always word + state, never
@@ -3233,6 +3243,12 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title("Hitch (dev)");
             }
+            // Frameless Windows window draws its own caption controls; subclass
+            // the window proc so the maximize button still drives Snap Layouts.
+            // No-op on macOS (native Overlay title bar) and Linux.
+            if let Some(window) = app.get_webview_window("main") {
+                window_chrome::install(&window);
+            }
             build_tray(app)?;
             start_daemon_connection_on_launch(app);
             Ok(())
@@ -3254,7 +3270,8 @@ pub fn run() {
             unregister_session_output,
             get_daemon_status,
             get_daemon_log_tail,
-            restart_daemon_command
+            restart_daemon_command,
+            set_max_button_rect
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
