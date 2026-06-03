@@ -330,6 +330,16 @@ fn run_headless_provider(
     prompt: String,
     cancel: Option<&crate::JobControl>,
 ) -> Result<String, ProtocolError> {
+    // git diffs can carry interior NUL bytes (a tracked file with embedded
+    // NULs, or content git emits verbatim), and the prompt is handed straight
+    // to `Command::arg`. The Unix spawn path converts args to CString and
+    // rejects any interior NUL ("nul byte found in provided data"), so strip
+    // them — they carry no meaningful text for the provider anyway.
+    let prompt = if prompt.contains('\0') {
+        prompt.replace('\0', "")
+    } else {
+        prompt
+    };
     let mut command = match config.kind {
         DraftProviderKind::Stub => unreachable!("stub provider does not spawn a CLI"),
         DraftProviderKind::Claude => {
@@ -1040,6 +1050,47 @@ mod tests {
         .unwrap();
         assert_eq!(draft.title, "Generated PR");
         assert!(draft.body.contains("## Testing"));
+        let _ = fs::remove_file(script);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn provider_tolerates_nul_bytes_in_diff() {
+        // Regression: git diffs can carry interior NUL bytes (a tracked file
+        // with embedded NULs, or content git emits verbatim). The prompt built
+        // from that diff was passed straight to `Command::arg`, and the Unix
+        // spawn path converts args to CString — rejecting any interior NUL with
+        // "nul byte found in provided data". Generation must survive it.
+        let script = temp_file("nul-provider", "sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"title\":\"Generated PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}'\n",
+        )
+        .unwrap();
+        make_executable(&script);
+        let cwd = temp_dir("nul-provider-cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Codex,
+            claude: PathBuf::from("claude"),
+            codex: script.clone(),
+            timeout: Duration::from_secs(2),
+            model: None,
+        };
+        let draft = generate_pull_request_draft(
+            &config,
+            PullRequestDraftInput {
+                worktree_path: cwd.clone(),
+                branch: "feature/drafts".into(),
+                base: "main".into(),
+                commits: vec!["add drafts".into()],
+                changed_paths: vec![PathBuf::from("tracked.bin")],
+                diff: "+binary\0content\0here".into(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(draft.title, "Generated PR");
         let _ = fs::remove_file(script);
         let _ = fs::remove_dir_all(cwd);
     }
