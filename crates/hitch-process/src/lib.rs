@@ -8,6 +8,68 @@
 #[cfg(windows)]
 pub use job_object::JobHandle;
 pub use process_tree::ProcessTree;
+pub use registration::ProcessTreeRegistration;
+
+/// RAII guard that registers a spawned [`ProcessTree`] with an external
+/// canceller and disarms it exactly once — either explicitly via
+/// [`ProcessTreeRegistration::disarm`] or on drop.
+///
+/// Both the daemon's draft provider runner and `hitch-git::run_command`
+/// orchestrate a cancellable child through a shared `ProcessTree`: they hand the
+/// tree to a cancel registry on spawn so a concurrent cancel can call
+/// `tree.terminate()`, then must clear that registration *before* they drain the
+/// child's pipe readers.
+///
+/// ## The recycled-pgid race this guards against
+///
+/// Once the child (the process-group leader on Unix) is reaped, the registered
+/// tree's `terminate()` is no longer safe to call from a concurrent cancel: on
+/// Unix it is `kill(-pgid)`, and the leader's pgid can be recycled to an
+/// unrelated group as soon as the group empties. Disarming the registration
+/// before joining the readers — which is where the thread may park while the
+/// child exits — closes the window where a late cancel could signal a recycled
+/// process group. A cancel-before-exit path that already terminated the tree
+/// while the group was alive loses no intended kill by disarming afterward.
+///
+/// The guard owns no `ProcessTree`; it only invokes a caller-supplied disarm
+/// closure (typically `set_process_tree(None)` on a cancel handle). Keeping it
+/// closure-generic lets `hitch-process` stay a leaf crate (ADR 0005) while both
+/// `hitch-git` and the daemon share one disarm-before-drain discipline.
+mod registration {
+    /// See [`crate::ProcessTreeRegistration`].
+    pub struct ProcessTreeRegistration<F: FnMut()> {
+        disarm: F,
+        armed: bool,
+    }
+
+    impl<F: FnMut()> ProcessTreeRegistration<F> {
+        /// Build an armed registration. `arm` runs immediately (register the
+        /// tree); `disarm` runs once later, either via [`Self::disarm`] or on
+        /// drop (clear the registration).
+        pub fn new(mut arm: impl FnMut(), disarm: F) -> Self {
+            arm();
+            Self {
+                disarm,
+                armed: true,
+            }
+        }
+
+        /// Disarm now (clear the registration) rather than waiting for drop.
+        /// Idempotent: a subsequent [`Self::disarm`] or drop does nothing.
+        pub fn disarm(&mut self) {
+            if self.armed {
+                self.armed = false;
+                (self.disarm)();
+            }
+        }
+    }
+
+    impl<F: FnMut()> Drop for ProcessTreeRegistration<F> {
+        fn drop(&mut self) {
+            self.disarm();
+        }
+    }
+}
 
 /// Shared Win32 Job Object plumbing used by both Windows process-tree wrappers.
 ///

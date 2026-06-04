@@ -1,14 +1,20 @@
 //! Regression test for the hook's fire-and-forget delivery against a daemon that
 //! services its socket with a *non-blocking polling* accept loop.
 //!
-//! The real daemon accepts connections with a non-blocking accept that polls on
-//! an interval (it must stay responsive to its shutdown flag). On Windows a hook
-//! that connected, wrote its report, and disconnected immediately was gone before
-//! the next poll, so the daemon never accepted the connection and the report —
-//! and every agent-state update — was silently dropped. The fix makes the hook
-//! wait for the daemon's reply before closing, holding the socket open across the
-//! poll. This test reproduces that exact shape: it runs the real `hitch-hook`
-//! binary against a listener that only polls, and asserts the report still lands.
+//! The current daemon no longer polls — it parks a dedicated thread in a blocking
+//! `accept()` (see `hitch-daemon`'s accept thread and ADR 0012), which closes the
+//! poll-gap window at the source. But the hook's ack-wait must survive regardless,
+//! because a newer hook can talk to an OLDER, stale daemon that still polls (this
+//! repo bundles daemon sidecars by copy, and `Hello` only checks the protocol
+//! version). This test pins that stale-daemon compatibility: it stands up a
+//! listener that ONLY polls (the old daemon shape) and asserts the real
+//! `hitch-hook` binary's report still lands across the poll.
+//!
+//! The historical failure it guards: on Windows a hook that connected, wrote its
+//! report, and disconnected immediately was gone before the next poll, so a
+//! polling daemon never accepted the connection and the report — and every
+//! agent-state update — was silently dropped. The hook's fix waits for the
+//! daemon's reply before closing, holding the socket open across the poll.
 //!
 //! On Unix the kernel queues the connection and its bytes for `accept`, so the
 //! report survived a fire-and-forget write even before the fix; the test still

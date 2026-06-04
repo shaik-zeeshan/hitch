@@ -235,9 +235,11 @@ pub fn connect_daemon(path: impl AsRef<Path>) -> io::Result<DaemonStream> {
 ///
 /// A successful connect obviously means "accepting". On Windows a connect can
 /// also fail with `ERROR_PIPE_BUSY` when every pipe instance is momentarily
-/// occupied between the daemon's nonblocking accept polls; that is a *live*
-/// daemon, not an absent one, so it counts as "accepting" too. Any other connect
-/// error (NotFound / refused) means nothing is listening.
+/// occupied — in the narrow window while the daemon's accept thread re-arms a
+/// fresh instance after the previous accept (ADR 0012), or against a stale daemon
+/// that still polls. Either way that is a *live* daemon, not an absent one, so it
+/// counts as "accepting" too. Any other connect error (NotFound / refused) means
+/// nothing is listening.
 pub fn endpoint_accepts_connections(path: &Path) -> bool {
     match connect_daemon(path) {
         Ok(_) => true,
@@ -247,9 +249,11 @@ pub fn endpoint_accepts_connections(path: &Path) -> bool {
 
 /// True when a connect error means the endpoint exists and is bound but every
 /// pipe instance is momentarily busy (`ERROR_PIPE_BUSY`, 231). This is a
-/// transient "all instances occupied" state on a live Windows named-pipe server,
-/// distinct from a NotFound/refused error that means nothing is listening. Always
-/// false off Windows, where a Unix socket has no equivalent busy state.
+/// transient "all instances occupied" state on a live Windows named-pipe server —
+/// the daemon's accept thread re-arming between connections, or a stale polling
+/// daemon between polls (ADR 0012) — distinct from a NotFound/refused error that
+/// means nothing is listening. Always false off Windows, where a Unix socket has
+/// no equivalent busy state.
 pub fn is_endpoint_busy(err: &io::Error) -> bool {
     #[cfg(windows)]
     {

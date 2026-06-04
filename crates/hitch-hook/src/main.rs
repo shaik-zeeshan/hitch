@@ -152,7 +152,7 @@ impl HookArgs {
         let mut detail = None;
         let mut payload = None;
 
-        let mut iter = args.into_iter().map(Into::into);
+        let mut iter = args.into_iter().map(Into::into).peekable();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--socket" => socket_path = PathBuf::from(required_value(&mut iter, "--socket")?),
@@ -172,11 +172,29 @@ impl HookArgs {
                 other if !other.starts_with('-') && payload.is_none() => {
                     payload = Some(other.to_owned());
                 }
-                // Unrecognized arguments are ignored rather than rejected. An agent
+                // Unrecognized FLAGS are ignored rather than rejected. An agent
                 // may append its own context (an event name, a JSON blob, extra
                 // flags) to the configured hook command; failing on those would
                 // break the agent's hook (see `main`). Skipping them keeps the
                 // known flags — which carry the state report — fully effective.
+                //
+                // Treat an unknown flag as value-taking: every flag this tool
+                // defines consumes one value via `next()`, so the likely shape of
+                // an unknown flag is `--something value`. If we skipped only the
+                // flag, its value (e.g. `cli` after `--session-source cli`) would
+                // fall through to the positional-payload arm above and be captured
+                // as the human-facing detail string. So swallow one following
+                // non-dash token along with the flag. (An unknown *boolean* flag
+                // immediately before a legit positional payload would then swallow
+                // the payload — but the positional is only a stdin-empty fallback,
+                // and a stray value masquerading as detail is the worse outcome.)
+                unknown if unknown.starts_with('-') => {
+                    if iter.peek().is_some_and(|next| !next.starts_with('-')) {
+                        iter.next();
+                    }
+                }
+                // A non-dash token when a payload was already captured: ignore it
+                // (extra appended context) rather than reject.
                 _ => {}
             }
         }
@@ -333,18 +351,7 @@ fn daemon_unavailable(err: &io::Error) -> bool {
 /// daemon-unavailable for a best-effort hook report.
 fn daemon_transiently_unavailable(err: &io::Error) -> bool {
     matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
-        || is_windows_pipe_busy(err)
-}
-
-#[cfg(windows)]
-fn is_windows_pipe_busy(err: &io::Error) -> bool {
-    // ERROR_PIPE_BUSY: all pipe instances are busy.
-    err.raw_os_error() == Some(231)
-}
-
-#[cfg(not(windows))]
-fn is_windows_pipe_busy(_: &io::Error) -> bool {
-    false
+        || hitch_proto::transport::is_endpoint_busy(err)
 }
 
 fn state_from_event(agent: KnownAgent, event: Option<&str>) -> Option<Option<AgentState>> {
@@ -582,6 +589,57 @@ mod tests {
         .unwrap();
         assert_eq!(args.agent, KnownAgent::Codex);
         assert_eq!(args.event.as_deref(), Some("user-prompt-submit"));
+        assert_eq!(args.state, Some(Some(AgentState::Running)));
+    }
+
+    #[test]
+    fn unknown_value_flag_does_not_leak_its_value_as_the_payload() {
+        // An unknown flag that takes a value (the shape of every flag this tool
+        // defines) must consume its value too — otherwise the value falls through
+        // to the positional-payload arm and surfaces as the session's detail text.
+        let args = HookArgs::parse([
+            "--agent",
+            "claude-code",
+            "--state",
+            "running",
+            "--session-source",
+            "cli",
+        ])
+        .unwrap();
+        assert_eq!(args.agent, KnownAgent::ClaudeCode);
+        assert_eq!(args.state, Some(Some(AgentState::Running)));
+        // `cli` was the unknown flag's value, not a positional payload.
+        assert_eq!(args.payload, None);
+    }
+
+    #[test]
+    fn unknown_flag_alone_is_ignored() {
+        let args = HookArgs::parse([
+            "--agent",
+            "codex",
+            "--state",
+            "running",
+            "--standalone-flag",
+        ])
+        .unwrap();
+        assert_eq!(args.agent, KnownAgent::Codex);
+        assert_eq!(args.state, Some(Some(AgentState::Running)));
+        assert_eq!(args.payload, None);
+    }
+
+    #[test]
+    fn unknown_value_flag_before_a_known_flag_does_not_swallow_it() {
+        // The token after the unknown flag is a dash-prefixed known flag, so it
+        // must NOT be consumed as the unknown flag's value.
+        let args = HookArgs::parse([
+            "--agent",
+            "claude-code",
+            "--unknown-flag",
+            "--state",
+            "running",
+        ])
+        .unwrap();
+        assert_eq!(args.agent, KnownAgent::ClaudeCode);
         assert_eq!(args.state, Some(Some(AgentState::Running)));
     }
 

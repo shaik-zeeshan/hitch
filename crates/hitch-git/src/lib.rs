@@ -11,7 +11,7 @@
 
 use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
 use hitch_core::{ProjectId, Worktree};
-use hitch_process::ProcessTree;
+use hitch_process::{ProcessTree, ProcessTreeRegistration};
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -1659,7 +1659,10 @@ fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let (mut child, tree) = ProcessTree::spawn(&mut command)?;
-    let registration = ProcessTreeRegistration::new(control, tree.clone());
+    let registration = ProcessTreeRegistration::new(
+        || control.set_process_tree(Some(tree.clone())),
+        || control.set_process_tree(None),
+    );
     let stdout_reader = spawn_pipe_reader(
         child
             .stdout
@@ -1715,23 +1718,6 @@ fn run_command(
                 stderr
             },
         ))
-    }
-}
-
-struct ProcessTreeRegistration<'a> {
-    control: &'a dyn CommandControl,
-}
-
-impl<'a> ProcessTreeRegistration<'a> {
-    fn new(control: &'a dyn CommandControl, tree: ProcessTree) -> Self {
-        control.set_process_tree(Some(tree));
-        Self { control }
-    }
-}
-
-impl Drop for ProcessTreeRegistration<'_> {
-    fn drop(&mut self) {
-        self.control.set_process_tree(None);
     }
 }
 

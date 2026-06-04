@@ -34,7 +34,7 @@ use hitch_git::{
 };
 use hitch_proto::{
     encode_control_message, encode_pty_frame,
-    transport::{DaemonListener, DaemonStream},
+    transport::{connect_daemon, DaemonListener, DaemonStream},
     ChangedFile, CommitDraft, ControlMessage, DraftGenerationSettings, DraftProvider, ErrorCode,
     Event, FileDiff, FileStatus, GitStatus, JobRequest, JobStatus, KnownAgent, PrInfo,
     ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode, WorktreePr,
@@ -355,7 +355,10 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     fs::create_dir_all(&config.managed_root)?;
 
     let listener = DaemonListener::bind(&config.socket_path)?;
-    listener.set_nonblocking(true)?;
+    // The listener stays in blocking mode: a dedicated accept thread parks in
+    // `accept()` so no poll gap exists in which a connect-write-close client is
+    // dropped (see the accept thread below and ADR 0012). The old nonblocking
+    // poll loop is gone, not cfg-switched.
     #[cfg(unix)]
     let pid_lock = {
         // Record our pid beside the socket so the GUI can force-kill us even when it
@@ -401,34 +404,119 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     spawn_command_poller(Arc::clone(&state), Arc::clone(&shutdown));
     spawn_dirty_poller(Arc::clone(&state), Arc::clone(&shutdown));
 
-    while !shutdown.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok(stream) => {
-                stream.set_nonblocking(false)?;
-                let client_id = register_client(&state, &stream)?;
-                let state = Arc::clone(&state);
-                let shutdown = Arc::clone(&shutdown);
-                let channels = DispatchChannels {
-                    pty_tx: pty_tx.clone(),
-                    dispatch_tx: dispatch_tx.clone(),
-                };
-                thread::Builder::new()
-                    .name(format!("hitch-client-{client_id}"))
-                    .spawn(move || handle_client(client_id, stream, state, shutdown, channels))
-                    .map_err(io::Error::other)?;
+    // A dedicated thread parks in the blocking `accept()` and forwards each
+    // accepted stream over this channel. Parking (rather than polling a
+    // nonblocking listener) removes the poll-gap window in which a Windows
+    // named-pipe client that connects, writes, and closes between polls was
+    // silently dropped — there is always an armed accept waiting. The accept
+    // thread re-checks `shutdown` after every `accept()` return and exits when it
+    // is set; `ShutdownDaemon` wakes the parked accept with a best-effort
+    // self-connect to its own endpoint (see the handler). A residual re-arm gap
+    // remains between an `accept()` returning and the next one being issued, so a
+    // concurrent connect can still see `ERROR_PIPE_BUSY` — clients keep their
+    // busy-retry for that, and the hook keeps its ack-wait for stale daemons that
+    // still poll (ADR 0012).
+    let (accept_tx, accept_rx) = mpsc::channel::<DaemonStream>();
+    let accept_shutdown = Arc::clone(&shutdown);
+    let accept_thread = thread::Builder::new()
+        .name("hitch-accept".to_string())
+        .spawn(move || loop {
+            match listener.accept() {
+                Ok(stream) => {
+                    if accept_shutdown.load(Ordering::SeqCst) {
+                        // A shutdown self-connect (or a real client racing the
+                        // flag) unparked us; stop arming new accepts.
+                        break;
+                    }
+                    // The sole receiver is the main loop below; if it has gone
+                    // (daemon already tearing down) the send fails and we exit.
+                    if accept_tx.send(stream).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    if accept_shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // A per-accept failure (e.g. a transient named-pipe error)
+                    // must not kill the daemon. Log and re-arm; a hard, persistent
+                    // failure would spin, but `accept()` on a bound listener does
+                    // not fail persistently short of the process losing its
+                    // endpoint, at which point shutdown is already underway.
+                    eprintln!("hitch-daemon: accept failed: {err}");
+                }
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(err) => return Err(err),
+        })
+        .map_err(io::Error::other)?;
+
+    for stream in &accept_rx {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
         }
+        // Each accepted stream is switched to blocking for its per-client thread.
+        // A failure here is per-connection (e.g. a Windows named-pipe handle
+        // transiently rejecting the mode switch) and MUST NOT propagate out of
+        // the accept loop — doing so would tear down the entire daemon (every PTY
+        // session and all agent-state tracking) over one bad client. Log and drop
+        // just this connection instead.
+        if let Err(err) = stream.set_nonblocking(false) {
+            eprintln!("hitch-daemon: dropping client, set_nonblocking failed: {err}");
+            continue;
+        }
+        let client_id = register_client(&state, &stream)?;
+        let state = Arc::clone(&state);
+        let shutdown = Arc::clone(&shutdown);
+        let channels = DispatchChannels {
+            pty_tx: pty_tx.clone(),
+            dispatch_tx: dispatch_tx.clone(),
+        };
+        thread::Builder::new()
+            .name(format!("hitch-client-{client_id}"))
+            .spawn(move || handle_client(client_id, stream, state, shutdown, channels))
+            .map_err(io::Error::other)?;
     }
+
+    // The accept thread observes the same `shutdown` flag and exits after its
+    // current parked `accept()` is woken by the self-connect. Join it so a clean
+    // shutdown does not race the listener's drop; detaching would also be safe
+    // since the process exits, but joining keeps the lifecycle explicit.
+    let _ = accept_thread.join();
 
     cancel_active_jobs(&state);
     wait_for_jobs_to_finish(&state);
     kill_all_sessions(&state);
     // Unix pidfile + socket are removed by `DaemonFileGuard` as it drops on return.
     Ok(())
+}
+
+/// Unblock the parked accept thread after the shutdown flag is set.
+///
+/// The accept thread sits in a blocking `accept()`; flipping `shutdown` is
+/// invisible to it until a connection completes the pending accept. We complete
+/// it ourselves with a best-effort connect to our own endpoint, then drop the
+/// stream immediately. The accept thread wakes, re-reads `shutdown`, sees it set,
+/// and exits without arming another accept. Failures are ignored: if the connect
+/// loses a race with the listener already tearing down, the thread is exiting
+/// anyway, and the daemon process exit reclaims the pipe regardless.
+fn wake_accept_thread(socket_path: &Path) {
+    // A few short attempts: the accept thread re-arms a fresh pipe instance after
+    // each accepted connection, so a momentary `ERROR_PIPE_BUSY` (no armed
+    // instance at this instant) clears as soon as it loops back into `accept()`.
+    // Bounded so a daemon that already lost its endpoint never spins here.
+    for _ in 0..10 {
+        match connect_daemon(socket_path) {
+            Ok(stream) => {
+                drop(stream);
+                return;
+            }
+            Err(err) if hitch_proto::transport::is_endpoint_busy(&err) => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            // NotFound / refused: the listener is already gone, so the accept
+            // thread has already unblocked and exited. Nothing to wake.
+            Err(_) => return,
+        }
+    }
 }
 
 /// Removes Unix daemon files whenever `run_daemon` returns — by normal shutdown
@@ -1255,7 +1343,14 @@ fn handle_request<R: Read>(
         }
         Request::ShutdownDaemon => {
             send_response(state, client_id, request_id, Response::Ack)?;
+            // Resolve the endpoint before flipping the flag so the wake connect
+            // below targets our own listener.
+            let socket_path = {
+                let guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+                guard.config.socket_path.clone()
+            };
             shutdown.store(true, Ordering::SeqCst);
+            wake_accept_thread(&socket_path);
         }
     }
 

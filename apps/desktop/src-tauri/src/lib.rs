@@ -977,7 +977,19 @@ impl HitchClient {
             // fall through to the Hello attempt (with its own HANDSHAKE_TIMEOUT)
             // and let the slow accept complete.
             match connect_transport_bounded(&self.0.socket_path, Duration::from_millis(500)) {
-                Ok(_) => {}
+                Ok(_probe_stream) => {
+                    // The probe connected, so the daemon is reachable even if the
+                    // upcoming Hello times out. On Windows the cached pipe-server
+                    // pid is the *only* handle on a wedged daemon (no pidfile,
+                    // ADR 0012), so capture it now from the connected handle —
+                    // otherwise a daemon that accepts connections but never
+                    // answers Hello leaves the pid None and `restart_daemon`'s
+                    // force-kill dead-ends with "cached daemon pid is unknown".
+                    #[cfg(windows)]
+                    if let Ok(pid) = _probe_stream.connected_pipe_server_pid() {
+                        self.set_windows_daemon_pid(Some(pid));
+                    }
+                }
                 Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
                 Err(_) => {
                     self.record_spawn_attempt(app)?;

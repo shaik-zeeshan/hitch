@@ -47,6 +47,48 @@ a system service" model intact.
   `interprocess` crate's blocking local-socket abstraction (Unix socket on Unix,
   named pipe on Windows); the framing/decoders are untouched.
 
+#### Accept model — a blocking accept thread, not a nonblocking poll
+
+The listener stays in **blocking** mode. The daemon dedicates one thread
+(`hitch-accept`) that parks in `accept()` and forwards each accepted stream over
+an mpsc channel to the main thread, which switches it to blocking and spawns the
+per-client handler as before. This replaces an earlier nonblocking-poll loop
+(nonblocking listener + 25 ms sleep, re-checking the shutdown flag each tick).
+
+The poll loop had a real defect on Windows named pipes: between two polls there
+is no armed pipe instance, so a client that connected, wrote, and closed inside
+that window was never accepted and its bytes were silently dropped — fatal for
+fire-and-forget hook reports. A parked blocking `accept()` always has an armed
+instance, eliminating that dominant gap.
+
+- **Shutdown wake.** A blocking `accept()` cannot see the shutdown flag while
+  parked. The `ShutdownDaemon` handler therefore sets the flag and then makes a
+  best-effort connect to the daemon's own endpoint (immediately dropped). That
+  connect completes the pending `ConnectNamedPipe`, unblocking the accept thread,
+  which re-reads the flag, sees it set, and exits without arming another accept.
+  The connect retries briefly past a transient `ERROR_PIPE_BUSY` (the thread
+  re-arms a fresh instance between connections) and gives up on NotFound/refused
+  (the listener is already gone). The main loop joins the accept thread on the
+  way out.
+- **Residual `ERROR_PIPE_BUSY` re-arm gap.** A *narrow* window remains between an
+  `accept()` returning and the next `accept()` being issued, during which a
+  concurrent connect can still observe `ERROR_PIPE_BUSY` (231). This is far
+  smaller than the old poll gap (microseconds of re-arm vs. up to 25 ms of sleep)
+  but it is not zero, so it is a transient "all instances busy" state on a *live*
+  server, not an absent one.
+- **Why client ack-wait and busy-retry stay.** Two reasons, both deliberate:
+  1. *Re-arm gap.* Because the busy gap above survives, every client keeps the
+     `ERROR_PIPE_BUSY` retry (`is_endpoint_busy`, `endpoint_accepts_connections`):
+     a busy endpoint means a live daemon to reconnect to, not a dead one.
+  2. *Stale-daemon compatibility.* A newer hook can talk to an **older** daemon
+     that still runs the nonblocking poll loop — Hitch bundles daemon sidecars by
+     copy and `Hello` only checks the protocol version, so a stale daemon binary
+     can be the one actually serving. The hook therefore keeps holding the pipe
+     open and waiting for the daemon's ack (with its watchdog) regardless of which
+     accept model the current source uses; that ack-wait is what made delivery
+     survive a polling daemon in the first place and must not be removed on the
+     strength of this change.
+
 ### Discovery, restart, and termination — no socket file, no pidfile lock, no signals
 
 - **Discovery is the logical socket path itself.** It is derived deterministically

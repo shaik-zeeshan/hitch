@@ -4,7 +4,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hitch_process::ProcessTree;
+use hitch_process::{ProcessTree, ProcessTreeRegistration};
 use hitch_proto::{
     CommitDraft, DraftGenerationSettings, DraftProvider, ErrorCode, ProtocolError, PullRequestDraft,
 };
@@ -483,10 +483,23 @@ fn run_provider_command(
     let stderr_reader = read_pipe(stderr);
 
     // Register this child's process tree so a `CancelJob` can terminate the
-    // provider and any grandchildren it spawned.
-    if let Some(control) = cancel {
-        control.set_process_tree(Some(process_tree.clone()));
-    }
+    // provider and any grandchildren it spawned. The RAII guard clears the
+    // registration on drop, and every exit branch disarms it *before* draining
+    // the reader/writer threads — see `ProcessTreeRegistration`'s pgid-recycle
+    // note. This mirrors `hitch-git::run_command`; both share the guard from
+    // `hitch-process`. With no canceller registered the closures are no-ops.
+    let mut registration = ProcessTreeRegistration::new(
+        || {
+            if let Some(control) = cancel {
+                control.set_process_tree(Some(process_tree.clone()));
+            }
+        },
+        || {
+            if let Some(control) = cancel {
+                control.set_process_tree(None);
+            }
+        },
+    );
 
     let deadline = Instant::now() + config.timeout;
     let status = loop {
@@ -498,6 +511,11 @@ fn run_provider_command(
             Ok(None) if cancel.is_some_and(|control| control.is_cancelled()) => {
                 terminate_process_tree(&process_tree, &mut child);
                 let _ = child.wait();
+                // Disarm the external canceller before draining the threads: the
+                // child is now reaped, so a concurrent cancel calling
+                // `tree.terminate()` would target a possibly-recycled pgid (see
+                // `ProcessTreeRegistration`). We already terminated the tree above.
+                registration.disarm();
                 // Don't join the stdin writer on the abort path: its result is
                 // unused here, and a `write_all` parked on a full pipe could
                 // otherwise wedge cancellation/timeout if a descendant that
@@ -507,9 +525,6 @@ fn run_provider_command(
                 drop(stdin_writer);
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                if let Some(control) = cancel {
-                    control.set_process_tree(None);
-                }
                 return Err(provider_error(format!(
                     "{} draft provider cancelled",
                     config.kind.label()
@@ -519,6 +534,11 @@ fn run_provider_command(
             Ok(None) if Instant::now() >= deadline => {
                 terminate_process_tree(&process_tree, &mut child);
                 let _ = child.wait();
+                // Disarm before draining, same as the cancel branch: the child
+                // is reaped, so a concurrent cancel calling `tree.terminate()`
+                // would target a possibly-recycled pgid (see
+                // `ProcessTreeRegistration`). We already terminated the tree.
+                registration.disarm();
                 // Don't join the stdin writer on the abort path: its result is
                 // unused here, and a `write_all` parked on a full pipe could
                 // otherwise wedge cancellation/timeout if a descendant that
@@ -528,9 +548,6 @@ fn run_provider_command(
                 drop(stdin_writer);
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                if let Some(control) = cancel {
-                    control.set_process_tree(None);
-                }
                 return Err(provider_error(format!(
                     "{} draft provider timed out after {}s",
                     config.kind.label(),
@@ -543,13 +560,13 @@ fn run_provider_command(
         }
     };
 
-    // Child exited on its own; it can no longer be the cancel target. Any
-    // descendant still holding one of our captured pipe handles is no longer
-    // useful to this completed provider run, and can otherwise keep reader
-    // joins or a stdin write parked forever.
-    if let Some(control) = cancel {
-        control.set_process_tree(None);
-    }
+    // Child exited on its own; it can no longer be the cancel target. Disarm
+    // before draining so a concurrent cancel can't `terminate()` a reaped,
+    // possibly-recycled pgid (see `ProcessTreeRegistration`). Any descendant
+    // still holding one of our captured pipe handles is no longer useful to this
+    // completed provider run, and can otherwise keep reader joins or a stdin
+    // write parked forever.
+    registration.disarm();
     if !stdout_reader.is_finished()
         || !stderr_reader.is_finished()
         || stdin_writer

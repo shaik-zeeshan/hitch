@@ -30,8 +30,8 @@ mod imp {
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::ptr::{null, null_mut};
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
-    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
 
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
@@ -51,13 +51,21 @@ mod imp {
 
     /// Maximize-button rectangle in *physical* pixels relative to the client
     /// (webview) origin — which, on a frameless window, is the parent's
-    /// top-left, so it doubles as the child overlay's position. Reported by the
-    /// frontend on layout/DPI changes.
-    static RECT_LEFT: AtomicI32 = AtomicI32::new(0);
-    static RECT_TOP: AtomicI32 = AtomicI32::new(0);
-    static RECT_RIGHT: AtomicI32 = AtomicI32::new(0);
-    static RECT_BOTTOM: AtomicI32 = AtomicI32::new(0);
-    static HAS_RECT: AtomicBool = AtomicBool::new(false);
+    /// top-left, so it doubles as the child overlay's position.
+    #[derive(Clone, Copy)]
+    struct MaxButtonRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    /// The latest rectangle reported by the frontend on layout/DPI changes.
+    /// Written from the IPC thread, read from the Win32 message thread, so the
+    /// four fields move as one unit behind a `Mutex` — per-field atomics let a
+    /// reader observe a torn rect (new left, old right) and misposition the
+    /// overlay for a frame. `None` until the frontend reports a rect.
+    static MAX_BUTTON_RECT: Mutex<Option<MaxButtonRect>> = Mutex::new(None);
     /// The transparent hit-test overlay child window.
     static OVERLAY_HWND: AtomicIsize = AtomicIsize::new(0);
     /// Pointer hover / press state, tracked so we emit only on transitions.
@@ -74,11 +82,14 @@ mod imp {
     ];
 
     pub fn set_max_button_rect(left: i32, top: i32, right: i32, bottom: i32) {
-        RECT_LEFT.store(left, Ordering::Relaxed);
-        RECT_TOP.store(top, Ordering::Relaxed);
-        RECT_RIGHT.store(right, Ordering::Relaxed);
-        RECT_BOTTOM.store(bottom, Ordering::Relaxed);
-        HAS_RECT.store(true, Ordering::Relaxed);
+        if let Ok(mut rect) = MAX_BUTTON_RECT.lock() {
+            *rect = Some(MaxButtonRect {
+                left,
+                top,
+                right,
+                bottom,
+            });
+        }
         update_overlay_position();
     }
 
@@ -92,17 +103,20 @@ mod imp {
     /// `SWP_ASYNCWINDOWPOS` so it is safe to call from the IPC thread (the
     /// request is posted to the window's message queue, not run cross-thread).
     fn update_overlay_position() {
-        if !HAS_RECT.load(Ordering::Relaxed) {
+        // Copy the rect out and drop the guard before any Win32 call — this
+        // runs inside the parent wndproc, so a `SetWindowPos` here could
+        // re-enter it; holding the lock across that would risk a deadlock.
+        let Some(rect) = MAX_BUTTON_RECT.lock().ok().and_then(|r| *r) else {
             return;
-        }
+        };
         let overlay = OVERLAY_HWND.load(Ordering::Relaxed);
         if overlay == 0 {
             return;
         }
-        let left = RECT_LEFT.load(Ordering::Relaxed);
-        let top = RECT_TOP.load(Ordering::Relaxed);
-        let width = (RECT_RIGHT.load(Ordering::Relaxed) - left).max(0);
-        let height = (RECT_BOTTOM.load(Ordering::Relaxed) - top).max(0);
+        let left = rect.left;
+        let top = rect.top;
+        let width = (rect.right - left).max(0);
+        let height = (rect.bottom - top).max(0);
         // SAFETY: `overlay` is our live child HWND; flags are valid.
         unsafe {
             SetWindowPos(
