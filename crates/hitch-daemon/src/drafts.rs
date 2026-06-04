@@ -350,16 +350,21 @@ fn run_headless_provider(
     cancel: Option<&crate::JobControl>,
 ) -> Result<String, ProtocolError> {
     // git diffs can carry interior NUL bytes (a tracked file with embedded
-    // NULs, or content git emits verbatim), and Claude receives the prompt as
-    // a process argument. Strip them before building the command line; they
-    // carry no meaningful text for the provider anyway.
+    // NULs, or content git emits verbatim). The prompt reaches the provider over
+    // stdin, but a NUL still carries no meaningful text; strip them so the
+    // provider never sees a truncated or rejected payload.
     let prompt = if prompt.contains('\0') {
         prompt.replace('\0', "")
     } else {
         prompt
     };
-    let mut stdin_input = None;
-    let mut command = match config.kind {
+    // Every provider receives the prompt over stdin: Windows caps the
+    // CreateProcess command line at 32 KiB and draft prompts intentionally
+    // include truncated diffs up to 48 KiB, so a prompt argument would truncate
+    // or fail to spawn. Both CLIs accept a stdin-backed prompt (`claude -p` reads
+    // stdin when no prompt argument follows; `codex exec -` uses `-` as the
+    // explicit sentinel).
+    let (mut command, stdin_input) = match config.kind {
         DraftProviderKind::Stub => unreachable!("stub provider does not spawn a CLI"),
         DraftProviderKind::Claude => {
             let mut command = Command::new(&config.claude);
@@ -377,8 +382,8 @@ fn run_headless_provider(
             // emits free-form text the parser can't reliably unwrap. The
             // nested-unwrap on the "result" key handles this shape.
             command.arg("--output-format").arg("json");
-            command.arg("-p").arg(prompt);
-            command
+            command.arg("-p");
+            (command, Some(prompt))
         }
         DraftProviderKind::Codex => {
             let mut command = Command::new(&config.codex);
@@ -391,13 +396,8 @@ fn run_headless_provider(
             if let Some(model) = config.model.as_deref() {
                 command.arg("--model").arg(model);
             }
-            // Windows caps the CreateProcess command line at 32 KiB. Draft
-            // prompts intentionally include truncated diffs up to 48 KiB, so
-            // pass Codex's prompt through stdin and use `-` as the explicit
-            // prompt sentinel accepted by `codex exec`.
             command.arg("-");
-            stdin_input = Some(prompt);
-            command
+            (command, Some(prompt))
         }
     };
     run_provider_command(&mut command, cwd, config, cancel, stdin_input)
@@ -1099,7 +1099,7 @@ mod tests {
         let script = temp_file("claude-provider", "sh");
         fs::write(
             &script,
-            "#!/bin/sh\n[ \"$1\" = \"--model\" ] || exit 12\n[ \"$2\" = \"sonnet\" ] || exit 13\n[ \"$3\" = \"--tools\" ] || exit 14\n[ \"$4\" = \"\" ] || exit 15\n[ \"$5\" = \"--output-format\" ] || exit 16\n[ \"$6\" = \"json\" ] || exit 17\n[ \"$7\" = \"-p\" ] || exit 18\nprintf '%s\n' '{\"type\":\"result\",\"result\":\"{\\\"subject\\\":\\\"feat: generated\\\",\\\"body\\\":\\\"Generated body\\\"}\"}'\n",
+            "#!/bin/sh\n[ \"$1\" = \"--model\" ] || exit 12\n[ \"$2\" = \"sonnet\" ] || exit 13\n[ \"$3\" = \"--tools\" ] || exit 14\n[ \"$4\" = \"\" ] || exit 15\n[ \"$5\" = \"--output-format\" ] || exit 16\n[ \"$6\" = \"json\" ] || exit 17\n[ \"$7\" = \"-p\" ] || exit 18\n[ \"$#\" -eq 7 ] || exit 19\nprompt=$(cat)\n[ -n \"$prompt\" ] || exit 20\nprintf '%s\n' '{\"type\":\"result\",\"result\":\"{\\\"subject\\\":\\\"feat: generated\\\",\\\"body\\\":\\\"Generated body\\\"}\"}'\n",
         )
         .unwrap();
         make_executable(&script);
@@ -1172,11 +1172,15 @@ mod tests {
         let (dir, script) = windows_rust_provider_stub(
             "claude provider path with spaces",
             r###"
-use std::{env, process};
+use std::{
+    env,
+    io::{self, Read},
+    process,
+};
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.len() < 7 { process::exit(11); }
+    if args.len() != 7 { process::exit(11); }
     if args[0] != "--model" { process::exit(12); }
     if args[1] != "sonnet" { process::exit(13); }
     if args[2] != "--tools" { process::exit(14); }
@@ -1184,6 +1188,9 @@ fn main() {
     if args[4] != "--output-format" { process::exit(16); }
     if args[5] != "json" { process::exit(17); }
     if args[6] != "-p" { process::exit(18); }
+    let mut prompt = String::new();
+    io::stdin().read_to_string(&mut prompt).unwrap();
+    if prompt.is_empty() { process::exit(19); }
     println!("{}", "{\"subject\":\"feat: windows claude\",\"body\":\"Generated body\"}");
 }
 "###,
@@ -1327,6 +1334,65 @@ fn main() {
         let _ = fs::remove_dir_all(cwd);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn claude_provider_reads_long_prompt_from_stdin_on_windows() {
+        let (dir, script) = windows_rust_provider_stub(
+            "claude long prompt provider",
+            r###"
+use std::{
+    env,
+    io::{self, Read},
+    process,
+};
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.len() != 5 { process::exit(11); }
+    if args[0] != "--tools" { process::exit(12); }
+    if !args[1].is_empty() { process::exit(13); }
+    if args[2] != "--output-format" { process::exit(14); }
+    if args[3] != "json" { process::exit(15); }
+    if args[4] != "-p" { process::exit(16); }
+    let mut prompt = String::new();
+    io::stdin().read_to_string(&mut prompt).unwrap();
+    if prompt.len() < 33_000 { process::exit(17); }
+    if !prompt.contains("WINDOWS-LONG-PROMPT-MARKER") { process::exit(18); }
+    println!("{}", "{\"title\":\"Generated Long Prompt PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}");
+}
+"###,
+        );
+        let cwd = temp_dir("claude long prompt cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Claude,
+            claude: script.clone(),
+            codex: PathBuf::from("codex"),
+            timeout: Duration::from_secs(2),
+            model: None,
+        };
+        let draft = generate_pull_request_draft(
+            &config,
+            PullRequestDraftInput {
+                worktree_path: cwd.clone(),
+                branch: "feature/windows-long-claude".into(),
+                base: "main".into(),
+                commits: vec!["add windows long claude drafts".into()],
+                changed_paths: vec![PathBuf::from("tracked.txt")],
+                diff: format!(
+                    "WINDOWS-LONG-PROMPT-MARKER\n{}",
+                    "+changed line\n".repeat(40_000)
+                ),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(draft.title, "Generated Long Prompt PR");
+        assert!(draft.body.contains("## Testing"));
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
     #[cfg(unix)]
     #[test]
     fn claude_provider_tolerates_nul_bytes_in_diff() {
@@ -1370,7 +1436,10 @@ fn main() {
         let (dir, script) = windows_rust_provider_stub(
             "nul claude provider",
             r###"
-use std::env;
+use std::{
+    env,
+    io::{self, Read},
+};
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -1379,7 +1448,10 @@ fn main() {
     assert_eq!(args[2], "--output-format");
     assert_eq!(args[3], "json");
     assert_eq!(args[4], "-p");
-    assert!(!args[5].contains('\0'));
+    assert_eq!(args.len(), 5);
+    let mut prompt = String::new();
+    io::stdin().read_to_string(&mut prompt).unwrap();
+    assert!(!prompt.contains('\0'));
     println!("{}", "{\"title\":\"Generated Windows PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}");
 }
 "###,

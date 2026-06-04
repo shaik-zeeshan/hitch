@@ -1675,9 +1675,17 @@ fn run_command(
             None => thread::sleep(Duration::from_millis(25)),
         }
     };
+    // Disarm the external canceller before draining the pipe readers. Once the
+    // child (the process-group leader) is reaped, the registered tree's
+    // `terminate()` is no longer safe to call from a concurrent cancel: on Unix
+    // it is `kill(-pgid)`, and the leader's pgid can be recycled to an unrelated
+    // group as soon as the group empties. The cancel-before-exit branch above
+    // already terminated the tree itself while the group was alive, so clearing
+    // the registration here loses no intended kill — it only closes the window
+    // where a late cancel could signal a recycled process group.
+    drop(registration);
     let stdout_result = join_pipe_reader(stdout_reader);
     let stderr_result = join_pipe_reader(stderr_reader);
-    drop(registration);
 
     let stdout = String::from_utf8(stdout_result?)?;
     let stderr = String::from_utf8(stderr_result?)?;
@@ -2936,6 +2944,84 @@ mod tests {
         let registrations = control.registrations.lock().unwrap();
         assert_eq!(registrations.first().copied(), Some(true));
         assert_eq!(registrations.last().copied(), Some(false));
+    }
+
+    /// Regression: the external cancellation handle must be disarmed
+    /// (`set_process_tree(None)`) *before* the stdout/stderr pipe readers are
+    /// joined, not after. Otherwise a concurrent cancel arriving during the
+    /// drain calls `tree.terminate()` on a child that has already been reaped;
+    /// on Unix that is `kill(-pgid)` against a process group whose pgid the OS
+    /// may have recycled.
+    ///
+    /// The recycled-pgid race itself depends on OS pid reuse timing and cannot
+    /// be triggered deterministically, so this test instead pins the ordering
+    /// the fix guarantees. A signalling control creates a sentinel file the
+    /// moment the tree is disarmed; the child writes one line, then blocks until
+    /// that sentinel exists before exiting (keeping its stdout pipe open). If the
+    /// disarm runs before the join (correct), the sentinel appears, the child
+    /// exits, the pipe closes, and the join completes. If the disarm ran only
+    /// after the join (the pre-fix ordering), the join would wait on the child
+    /// while the child waits on the sentinel — a deadlock the watchdog catches.
+    #[cfg(unix)]
+    #[test]
+    fn run_command_disarms_cancel_handle_before_joining_pipe_readers() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        struct SignalOnDisarm {
+            sentinel: PathBuf,
+        }
+        impl CommandControl for SignalOnDisarm {
+            fn is_cancelled(&self) -> bool {
+                false
+            }
+            fn set_process_tree(&self, tree: Option<ProcessTree>) {
+                if tree.is_none() {
+                    // Disarm: release the child blocking on this sentinel.
+                    let _ = fs::write(&self.sentinel, b"go");
+                }
+            }
+        }
+
+        let temp = TempDir::new().unwrap();
+        let sentinel = temp.path().join("disarm-sentinel");
+        let script = temp.path().join("git-blocks-until-disarm");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf 'done'\nwhile [ ! -e {sentinel} ]; do sleep 0.01; done\n",
+                sentinel = shell_quote(&sentinel),
+            ),
+        )
+        .unwrap();
+        make_executable(&script);
+
+        let control = Arc::new(SignalOnDisarm {
+            sentinel: sentinel.clone(),
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = {
+            let control = Arc::clone(&control);
+            let script = script.clone();
+            let cwd = temp.path().to_path_buf();
+            thread::spawn(move || {
+                let result = run_command(&script, &cwd, Vec::new(), Some(control.as_ref()));
+                let _ = tx.send(());
+                result
+            })
+        };
+
+        // Watchdog: a disarm-after-join ordering deadlocks here.
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("run_command deadlocked: cancel handle was not disarmed before pipe join");
+
+        let output = runner.join().unwrap().unwrap();
+        assert_eq!(output.stdout, "done");
+        assert!(
+            sentinel.exists(),
+            "disarm should have created the sentinel that releases the child"
+        );
     }
 
     #[cfg(unix)]

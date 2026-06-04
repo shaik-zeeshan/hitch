@@ -358,8 +358,9 @@ fn hook_command(
     let style = command_arg_style_for_path(helper_path);
     // Each agent evaluates hook commands with a different shell, so the command
     // must be written in that shell's language:
-    // - Claude Code runs hooks through Git Bash on Windows and `sh` elsewhere; a
-    //   double-quoted (Windows) or single-quoted (POSIX) path invokes directly.
+    // - Claude Code runs hooks through Git Bash on Windows and `sh` elsewhere —
+    //   a POSIX shell either way, so a single-quoted path invokes directly and
+    //   stays free of `$`/backtick expansion (see `windows_command_arg`).
     // - Codex runs hooks through the platform default shell — PowerShell on
     //   Windows (`powershell -Command <string>`). There a quoted path is a string
     //   EXPRESSION, not an invocation: `"C:\...\hitch-hook.exe" --agent codex`
@@ -674,47 +675,25 @@ fn posix_command_arg(value: &str) -> String {
 }
 
 fn windows_command_arg(value: &str) -> String {
-    // Quote when the value contains a backslash as well as the usual whitespace /
-    // quote cases. Claude Code (and Codex) run hook commands through Git Bash,
-    // where an unquoted backslash escapes the next character — so a spaceless
-    // Windows path like `C:\...\hitch-hook.exe` would be mangled into
-    // `C:...hitch-hook.exe` and fail with "command not found". Double-quoting
-    // preserves the backslashes under both bash and cmd. Quoting only on spaces
-    // (the previous behavior) is why `Program Files` installs worked but spaceless
-    // `target\debug` dev/CI paths did not. Bare identifiers like event names have
-    // no backslash and stay unquoted.
+    // This style is only ever reached for Claude Code on Windows, which evaluates
+    // hook commands through Git Bash (a POSIX `sh`) — Codex's PowerShell path is
+    // handled separately in `hook_command`. So quote for bash, not cmd.
+    //
+    // Single quotes, not double. Inside bash double quotes `$` and backtick still
+    // expand and `\` still escapes them, so a helper path containing `$`/backtick
+    // (e.g. `C:\Users\$env\hitch-hook.exe`) would be mangled by variable/command
+    // substitution. Single quotes are fully literal in POSIX shells: every
+    // character — including the Windows path backslashes — is preserved verbatim,
+    // with no expansion. (An embedded `'` ends the quote and re-enters via the
+    // `'\''` idiom; Windows paths can't contain `'` but the helper handles it for
+    // safety.) Bare identifiers like event names have nothing to escape and stay
+    // unquoted so the common command reads cleanly.
     if value.is_empty()
-        || value
-            .bytes()
-            .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\\'))
+        || value.bytes().any(|byte| {
+            matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'\\' | b'$' | b'`')
+        })
     {
-        let mut quoted = String::with_capacity(value.len() + 2);
-        quoted.push('"');
-        let mut backslashes = 0;
-        for ch in value.chars() {
-            match ch {
-                '\\' => backslashes += 1,
-                '"' => {
-                    for _ in 0..(backslashes * 2 + 1) {
-                        quoted.push('\\');
-                    }
-                    quoted.push('"');
-                    backslashes = 0;
-                }
-                _ => {
-                    for _ in 0..backslashes {
-                        quoted.push('\\');
-                    }
-                    backslashes = 0;
-                    quoted.push(ch);
-                }
-            }
-        }
-        for _ in 0..(backslashes * 2) {
-            quoted.push('\\');
-        }
-        quoted.push('"');
-        quoted
+        posix_command_arg(value)
     } else {
         value.to_owned()
     }
@@ -803,9 +782,12 @@ mod tests {
         let entry = claude_hook_entry(helper, "notification", AgentState::NeedsApproval);
         let command = entry["hooks"][0]["command"].as_str().unwrap();
 
+        // Claude Code runs hooks via Git Bash (POSIX sh). The path is single-quoted
+        // so backslashes stay literal AND `$`/backtick in a path can't expand;
+        // double quotes (the old behavior) would have permitted that expansion.
         assert_eq!(
             command,
-            r#""C:\Program Files\Hitch Tools\hitch-hook.exe" --agent claude-code --event notification --state needs-approval"#
+            r"'C:\Program Files\Hitch Tools\hitch-hook.exe' --agent claude-code --event notification --state needs-approval"
         );
     }
 
@@ -843,7 +825,8 @@ mod tests {
     fn windows_command_quotes_spaceless_path_so_bash_keeps_backslashes() {
         // Regression: Claude Code runs hooks via Git Bash, which strips unquoted
         // backslashes. A spaceless `target\debug` path must still be quoted, or it
-        // mangles to `C:Code...hitch-hook.exe` -> "command not found".
+        // mangles to `C:Code...hitch-hook.exe` -> "command not found". Single
+        // quotes keep every backslash literal (and block `$`/backtick expansion).
         let helper =
             Path::new(r"C:\Code\worktrees\hitch\round-thrush\hitch\target\debug\hitch-hook.exe");
 
@@ -852,18 +835,36 @@ mod tests {
 
         assert!(
             command.starts_with(
-                r#""C:\Code\worktrees\hitch\round-thrush\hitch\target\debug\hitch-hook.exe""#
+                r"'C:\Code\worktrees\hitch\round-thrush\hitch\target\debug\hitch-hook.exe'"
             ),
-            "spaceless Windows helper path must be double-quoted: {command}"
+            "spaceless Windows helper path must be single-quoted for Git Bash: {command}"
+        );
+    }
+
+    #[test]
+    fn windows_claude_hook_command_does_not_expand_dollar_or_backtick_in_path() {
+        // A helper path containing `$` or a backtick must not be subject to
+        // variable/command substitution under Git Bash. Double quotes (the old
+        // behavior) would expand `$env` and run the backtick as a command; single
+        // quotes keep the path verbatim.
+        let helper = Path::new(r"C:\Users\$env`whoami`\hitch-hook.exe");
+
+        let entry = claude_hook_entry(helper, "notification", AgentState::NeedsApproval);
+        let command = entry["hooks"][0]["command"].as_str().unwrap();
+
+        assert!(
+            command.starts_with(r"'C:\Users\$env`whoami`\hitch-hook.exe'"),
+            "path with $ / backtick must be single-quoted verbatim: {command}"
         );
     }
 
     #[test]
     fn windows_command_argument_quotes_backslash_paths_but_not_bare_identifiers() {
-        // Backslash paths must be quoted so bash keeps the separators...
+        // Backslash paths must be single-quoted so Git Bash keeps the separators
+        // and performs no `$`/backtick expansion...
         assert_eq!(
             platform_command_arg(r"C:\a\b.exe", CommandArgStyle::Windows),
-            r#""C:\a\b.exe""#
+            r"'C:\a\b.exe'"
         );
         // ...while safe identifiers (event names) stay bare.
         assert_eq!(

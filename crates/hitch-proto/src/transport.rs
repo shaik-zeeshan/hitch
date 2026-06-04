@@ -389,13 +389,34 @@ fn logical_socket_name(path: &Path) -> String {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x00000100000001b3;
 
-    let path = path.as_os_str().to_string_lossy();
+    // Windows paths are case-insensitive and accept both separators, so the same
+    // endpoint can reach this helper spelled several ways: `C:\foo`, `c:\foo`, and
+    // `C:/foo` are one path but hash to three different pipe names. The daemon, the
+    // GUI, and the hook each derive their socket path independently (default,
+    // `--socket`, or `HITCH_SOCKET`), so a differently-spelled override would land
+    // them on mismatched pipes. Normalize the spelling — separators to `\`,
+    // everything lowercased — before hashing so equivalent paths rendezvous.
+    let path = normalize_socket_spelling(path);
     let mut hash = FNV_OFFSET;
     for byte in path.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     format!("hitch-{hash:016x}")
+}
+
+/// Normalize the *spelling* of a Windows path so case- and separator-equivalent
+/// paths produce identical bytes. This is a pure string transform: it does not
+/// touch the filesystem, resolve symlinks, or canonicalize `.`/`..`, so it stays
+/// correct for sockets that do not exist yet and never blocks on I/O.
+#[cfg(windows)]
+fn normalize_socket_spelling(path: &Path) -> String {
+    path.as_os_str()
+        .to_string_lossy()
+        .chars()
+        .map(|ch| if ch == '/' { '\\' } else { ch })
+        .collect::<String>()
+        .to_lowercase()
 }
 
 #[cfg(unix)]
@@ -492,6 +513,33 @@ mod tests {
 
         drop(client);
         server.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn logical_socket_name_is_stable_across_equivalent_spellings() {
+        // Case- and separator-equivalent spellings of one Windows path must hash
+        // to the same pipe name, or a daemon and a client that derived their
+        // socket path from differently-spelled overrides would never rendezvous.
+        let canonical = logical_socket_name(Path::new(r"C:\Users\pc\AppData\Local\Hitch\daemon.sock"));
+
+        for variant in [
+            r"c:\users\pc\appdata\local\hitch\daemon.sock", // lowercased drive + path
+            r"C:/Users/pc/AppData/Local/Hitch/daemon.sock", // forward slashes
+            r"C:\Users\PC\AppData\Local\Hitch\Daemon.sock", // mixed case
+        ] {
+            assert_eq!(
+                logical_socket_name(Path::new(variant)),
+                canonical,
+                "spelling {variant:?} should hash to the same pipe name",
+            );
+        }
+
+        // Genuinely different paths must still produce different names.
+        assert_ne!(
+            logical_socket_name(Path::new(r"C:\Users\pc\AppData\Local\Hitch\daemon.sock")),
+            logical_socket_name(Path::new(r"C:\Users\pc\AppData\Local\Hitch\other.sock")),
+        );
     }
 
     fn test_socket_path() -> PathBuf {

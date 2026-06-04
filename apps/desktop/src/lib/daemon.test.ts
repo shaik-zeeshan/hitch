@@ -713,6 +713,87 @@ describe("connect snapshot refresh failures", () => {
     expect(get(activeSessionId)).toBe("s-worktree");
   });
 
+  it("keeps the current selection on reconnect when it has no live session", async () => {
+    // The user is looking at worktree w2, which has no live session; the only
+    // live session belongs to a different worktree (w1). The reconnect snapshot
+    // must not yank the selection over to w1.
+    //
+    // Seed the project/worktree stores the way a live window already holds them
+    // before reconnect; otherwise the selection-fixup subscription transiently
+    // clears `selectedWorktreeId` when `refreshAll` re-sets `projects` ahead of
+    // `worktrees`, which would mask the behavior under test.
+    const liveWorktrees = [
+      {
+        id: "w1",
+        project_id: "p1",
+        path: "C:/repo",
+        branch: "main",
+        is_main: true,
+        is_hitch_managed: false,
+      },
+      {
+        id: "w2",
+        project_id: "p1",
+        path: "C:/repo/feature",
+        branch: "feature",
+        is_main: false,
+        is_hitch_managed: true,
+      },
+    ];
+    projects.set([{ id: "p1", name: "Repo", root: "C:/repo", kind: "git-backed" } as never]);
+    worktrees.set(liveWorktrees as never);
+    selectedProjectId.set("p1");
+    selectedWorktreeId.set("w2");
+    activeSessionId.set(null);
+
+    const session = {
+      id: "s-on-w1",
+      name: "shell",
+      parent: { kind: "worktree", id: "w1" },
+      cwd: "C:/repo",
+    };
+
+    invokeMock.mockImplementation(async (invokedCommand: string, payload?: { request?: { type: string } }) => {
+      if (invokedCommand === "connect_daemon" || invokedCommand === "register_session_output") {
+        return undefined;
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-projects") {
+        return {
+          type: "projects",
+          projects: [{ id: "p1", name: "Repo", root: "C:/repo", kind: "git-backed" }],
+        };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-worktrees") {
+        return { type: "worktrees", worktrees: liveWorktrees };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-sessions") {
+        return { type: "sessions", sessions: [session] };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "git-status") {
+        return {
+          type: "git-status",
+          status: {
+            worktree_id: (payload.request as unknown as { worktree_id: string }).worktree_id,
+            branch: "feature",
+            dirty: false,
+            ahead: 0,
+            behind: 0,
+            additions: 0,
+            deletions: 0,
+            files: [],
+          },
+        };
+      }
+      throw new Error(`unexpected invoke ${invokedCommand}`);
+    });
+
+    await reconnect();
+
+    expect(get(selectedProjectId)).toBe("p1");
+    expect(get(selectedWorktreeId)).toBe("w2");
+    expect(get(activeSessionId)).toBeNull();
+  });
+
 
   it("does not reset an output channel already registered by a session-opened replay", async () => {
     const session = {

@@ -6,6 +6,7 @@
 //! the socket API consumed by the desktop client and `hitch-hook`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 #[cfg(unix)]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
@@ -1994,10 +1995,6 @@ fn remove_git_worktree_bounded(
     force: bool,
     delete_branch: Option<&str>,
 ) -> Result<(), ProtocolError> {
-    if let Some(branch) = delete_branch {
-        ensure_branch_merged_for_delete(git_path, repo_root, branch)?;
-    }
-
     if force {
         remove_worktree_dir_after_forced_session_close(worktree_path)?;
         run_git_with_timeout(
@@ -2014,7 +2011,10 @@ fn remove_git_worktree_bounded(
         let args = [
             OsArg::Borrowed("worktree"),
             OsArg::Borrowed("remove"),
-            OsArg::Owned(worktree_path.as_os_str().to_string_lossy().into_owned()),
+            // Pass the path as an OsString so a non-UTF-8 path on Unix reaches
+            // git verbatim; a lossy String conversion would corrupt it and make
+            // `git worktree remove` fail to find the worktree.
+            OsArg::OwnedOs(worktree_path.as_os_str().to_owned()),
         ];
         match run_git_with_timeout(git_path, repo_root, args, Duration::from_secs(10)) {
             Ok(()) => {}
@@ -2025,6 +2025,11 @@ fn remove_git_worktree_bounded(
     }
 
     if let Some(branch) = delete_branch {
+        // Let `git branch -d` perform its own merged-safety check. It refuses to
+        // delete an unmerged branch and surfaces a descriptive error, while also
+        // honoring git's full safety semantics (merged into HEAD *or* its
+        // upstream) — broader than a local `merge-base --is-ancestor HEAD`
+        // preflight, which would reject deletions git itself allows.
         run_git_with_timeout(
             git_path,
             repo_root,
@@ -2037,32 +2042,6 @@ fn remove_git_worktree_bounded(
         )?;
     }
     Ok(())
-}
-
-fn ensure_branch_merged_for_delete(
-    git_path: &Path,
-    repo_root: &Path,
-    branch: &str,
-) -> Result<(), ProtocolError> {
-    let merged = run_git_status_with_timeout(
-        git_path,
-        repo_root,
-        [
-            OsArg::Borrowed("merge-base"),
-            OsArg::Borrowed("--is-ancestor"),
-            OsArg::Borrowed(branch),
-            OsArg::Borrowed("HEAD"),
-        ],
-        Duration::from_secs(5),
-    )?;
-    if merged {
-        Ok(())
-    } else {
-        Err(ProtocolError::new(
-            ErrorCode::GitFailed,
-            format!("branch {branch:?} is not merged into HEAD"),
-        ))
-    }
 }
 
 fn remove_worktree_dir_after_forced_session_close(
@@ -2097,53 +2076,7 @@ fn remove_worktree_dir_after_forced_session_close(
 
 enum OsArg<'a> {
     Borrowed(&'a str),
-    Owned(String),
-}
-
-fn run_git_status_with_timeout<'a, I>(
-    git_path: &Path,
-    repo_root: &Path,
-    args: I,
-    timeout: Duration,
-) -> Result<bool, ProtocolError>
-where
-    I: IntoIterator<Item = OsArg<'a>>,
-{
-    let mut command = Command::new(git_path);
-    command.current_dir(repo_root).stdin(Stdio::null());
-    for arg in args {
-        match arg {
-            OsArg::Borrowed(arg) => {
-                command.arg(arg);
-            }
-            OsArg::Owned(arg) => {
-                command.arg(arg);
-            }
-        };
-    }
-    let mut child = command
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| ProtocolError::new(ErrorCode::GitFailed, err.to_string()))?;
-    let started = std::time::Instant::now();
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|err| ProtocolError::new(ErrorCode::GitFailed, err.to_string()))?
-        {
-            return Ok(status.success());
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(ProtocolError::new(
-                ErrorCode::GitFailed,
-                "git branch merge check timed out",
-            ));
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
+    OwnedOs(OsString),
 }
 
 fn run_git_with_timeout<'a, I>(
@@ -2162,7 +2095,7 @@ where
             OsArg::Borrowed(arg) => {
                 command.arg(arg);
             }
-            OsArg::Owned(arg) => {
+            OsArg::OwnedOs(arg) => {
                 command.arg(arg);
             }
         };

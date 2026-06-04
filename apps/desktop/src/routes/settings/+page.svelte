@@ -45,7 +45,6 @@
   let modelLoadSeq = 0;
   let lastDraftProvider: DraftProvider = DEFAULT_DRAFT_PROVIDER;
   let draftsHydrated = false;
-  let draftProviderChanged = false;
   let saved = $state(false);
   let draftSaved = $state(false);
   let selectableModels = $derived(
@@ -69,7 +68,6 @@
 
   $effect(() => {
     if (draftsHydrated && draftProviderValue !== lastDraftProvider) {
-      draftProviderChanged = true;
       selectedDraftModel = DEFAULT_MODEL_VALUE;
       lastDraftProvider = draftProviderValue;
     }
@@ -127,12 +125,32 @@
   }
 
   function commitDraftSettings() {
-    if (draftProviderChanged || $draftProvider !== null) {
-      draftProvider.set(draftProviderValue);
-    }
-    draftModel.set(selectedDraftModel === DEFAULT_MODEL_VALUE ? DEFAULT_DRAFT_MODEL : selectedDraftModel);
-    draftClaudePath.set(claudePath.trim());
-    draftCodexPath.set(codexPath.trim());
+    const model = selectedDraftModel === DEFAULT_MODEL_VALUE ? DEFAULT_DRAFT_MODEL : selectedDraftModel;
+    const claude = claudePath.trim();
+    const codex = codexPath.trim();
+
+    // The provider store is `null` while the user has never explicitly chosen a
+    // provider, which tells draft requests to omit the override and let the
+    // daemon use its own configured default (settings.ts). The select can't show
+    // that "unset" state, so it always carries a concrete value (default: stub).
+    //
+    // Persist an explicit provider only when the user actually expresses intent:
+    // they picked a non-default provider, a provider was already stored, or they
+    // supplied a concrete model/executable path. Model and path are meaningless
+    // to the daemon while the provider is unset (draftGenerationSettings returns
+    // null and ignores them), so a concrete model/path is itself evidence the
+    // user means to pin the shown provider — otherwise those values would be
+    // saved but silently dead. When none of that holds (everything at defaults),
+    // we leave the provider unset rather than writing back "stub", which would
+    // override the daemon default.
+    const hasExplicitModelOrPath = model !== DEFAULT_DRAFT_MODEL || claude !== "" || codex !== "";
+    const wantExplicitProvider =
+      draftProviderValue !== DEFAULT_DRAFT_PROVIDER || $draftProvider !== null || hasExplicitModelOrPath;
+    draftProvider.set(wantExplicitProvider ? draftProviderValue : null);
+
+    draftModel.set(model);
+    draftClaudePath.set(claude);
+    draftCodexPath.set(codex);
     draftSaved = true;
     void loadModels(draftProviderValue);
     setTimeout(() => (draftSaved = false), 1600);

@@ -687,8 +687,11 @@ export async function refreshAll(
 }
 
 function restoreLiveSessionSelection(liveSessions: Session[], allWorktrees: Worktree[]): void {
-  const currentParent = get(selectedParent);
-  if (currentParent && liveSessions.some((session) => sessionBelongsTo(session, currentParent))) {
+  // The user already has a project/worktree selected — keep it. Whether or not
+  // that selection currently has a live session, stay put rather than yanking
+  // the user to an unrelated project/worktree. Only a fresh window with no
+  // selection auto-jumps to the first live session below.
+  if (get(selectedParent)) {
     return;
   }
 

@@ -21,14 +21,9 @@
   } from "../daemon";
   import { AGENT_LABEL, type Session, type SessionParent } from "../types";
   import { sessionTabKind, sessionTabTitle } from "../sessionDisplay";
-  import { currentDesktopPlatform, shortcutLabel } from "../desktopPlatform";
-
   let { parent }: { parent: SessionParent } = $props();
 
   const diffName = $derived($diffPath?.split("/").pop() ?? "diff");
-  const closeSessionShortcut = shortcutLabel(currentDesktopPlatform(), "W");
-
-
 
   function select(session: Session) {
     diffActive.set(false);
@@ -106,7 +101,7 @@
             <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
               ><path d="M4 4l8 8M12 4l-8 8" /></svg
             >
-            Close session<span class="mi-k">{closeSessionShortcut}</span>
+            Close session
           </ContextMenu.Item>
         </ContextMenu.Content>
       </ContextMenu.Portal>

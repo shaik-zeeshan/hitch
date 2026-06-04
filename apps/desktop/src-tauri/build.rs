@@ -7,6 +7,8 @@ fn main() {
     // be built first: `cargo build -p hitch-daemon -p hitch-hook [--release]`.
     let profile = std::env::var("PROFILE").unwrap_or_default();
     let target = std::env::var("TARGET").expect("TARGET not set");
+    let host = std::env::var("HOST").expect("HOST not set");
+    let cross_compiling = target != host;
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
     let workspace_root = manifest_dir
@@ -38,13 +40,23 @@ fn main() {
         let file_name = format!("{binary}{exe_suffix}");
         let host_artifact = target_dir.join(&profile).join(&file_name);
         let target_artifact = target_dir.join(&target).join(&profile).join(&file_name);
-        // Pick whichever artifact was built most recently. A fixed preference
-        // order resurrects stale binaries: a one-off `--target <triple>` build
-        // leaves an old artifact in `target/<triple>/<profile>/` that would
-        // shadow every fresh host build in `target/<profile>/` from then on —
-        // and Tauri copies the chosen sidecar back over `target/<profile>/`,
-        // so the stale binary ends up bundled in installers.
-        let candidates = [target_artifact, host_artifact];
+        // When cross-compiling, only the target-triple artifact has the right
+        // architecture. `target/<profile>/` holds a host-arch binary, so it must
+        // never be a candidate — mtime selection there could copy a fresher host
+        // build into a target installer.
+        //
+        // When host == target, Cargo writes host builds to `target/<profile>/`,
+        // but a one-off `--target <triple>` build also leaves an artifact in
+        // `target/<triple>/<profile>/`. A fixed preference order would resurrect
+        // that stale binary and shadow every fresh host build from then on — and
+        // Tauri copies the chosen sidecar back over `target/<profile>/`, so the
+        // stale binary ends up bundled. Picking the most recently built artifact
+        // avoids that.
+        let candidates: Vec<PathBuf> = if cross_compiling {
+            vec![target_artifact]
+        } else {
+            vec![target_artifact, host_artifact]
+        };
         if let Some(src) = candidates
             .iter()
             .filter(|path| path.exists())
@@ -65,10 +77,18 @@ fn main() {
             } else {
                 ""
             };
+            let searched = candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" or ");
+            let target_flag = if cross_compiling {
+                format!(" --target {target}")
+            } else {
+                String::new()
+            };
             println!(
-                "cargo:warning={binary} not found at {} or {}; run `cargo build -p hitch-daemon -p hitch-hook{build_flag}` first",
-                candidates[0].display(),
-                candidates[1].display()
+                "cargo:warning={binary} not found at {searched}; run `cargo build -p hitch-daemon -p hitch-hook{build_flag}{target_flag}` first"
             );
         }
     }

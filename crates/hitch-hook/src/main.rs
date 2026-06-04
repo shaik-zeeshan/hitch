@@ -30,10 +30,20 @@ where
     run(args, stdin, hooks_suppressed())
 }
 
-/// TEMP diagnostic: append a line to a debug log so we can see what the hook
-/// receives when an agent runs it. Best-effort; ignores all I/O errors.
+/// Env var that opts a hook invocation into the temp-dir debug log. Off by
+/// default: the log records session IDs and socket paths, so writing it
+/// unconditionally both leaks that metadata and litters the temp dir on every
+/// agent event. Set `HITCH_HOOK_DEBUG=1` (any value) to turn it back on.
+const HOOK_DEBUG_ENV: &str = "HITCH_HOOK_DEBUG";
+
+/// Diagnostic: append a line to a debug log so we can see what the hook receives
+/// when an agent runs it. Gated behind [`HOOK_DEBUG_ENV`] (default off) because
+/// the lines carry session/socket metadata. Best-effort; ignores all I/O errors.
 fn debug_log(message: &str) {
     use std::io::Write as _;
+    if std::env::var_os(HOOK_DEBUG_ENV).is_none() {
+        return;
+    }
     let path = std::env::temp_dir().join("hitch-hook-debug.log");
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
@@ -501,6 +511,37 @@ mod tests {
 
     static SOCKET_NONCE: AtomicU64 = AtomicU64::new(0);
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    #[test]
+    fn debug_log_is_off_unless_env_var_is_set() {
+        // The debug log records session IDs and socket paths, so it must stay off
+        // by default and only write when HITCH_HOOK_DEBUG is set.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let path = std::env::temp_dir().join("hitch-hook-debug.log");
+        let _ = std::fs::remove_file(&path);
+
+        let previous = std::env::var_os(HOOK_DEBUG_ENV);
+        std::env::remove_var(HOOK_DEBUG_ENV);
+        debug_log("must-not-be-written");
+        assert!(
+            !path.exists(),
+            "debug log must not be written when {HOOK_DEBUG_ENV} is unset"
+        );
+
+        std::env::set_var(HOOK_DEBUG_ENV, "1");
+        debug_log("written-when-enabled");
+        let wrote = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            wrote.contains("written-when-enabled"),
+            "debug log must be written when {HOOK_DEBUG_ENV} is set; got {wrote:?}"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var(HOOK_DEBUG_ENV, value),
+            None => std::env::remove_var(HOOK_DEBUG_ENV),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn explicit_state_args_parse() {
         let args = HookArgs::parse([

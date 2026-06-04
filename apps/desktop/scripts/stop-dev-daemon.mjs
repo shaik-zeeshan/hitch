@@ -27,9 +27,14 @@ function isMain() {
 /**
  * @param {string} root
  * @param {NodeJS.Platform} platform
+ * @param {string | undefined} [cargoTargetDir]
  */
-export function debugDaemonPath(root, platform) {
-  return resolve(root, "target", "debug", platform === "win32" ? "hitch-daemon.exe" : "hitch-daemon");
+export function debugDaemonPath(root, platform, cargoTargetDir = process.env.CARGO_TARGET_DIR) {
+  // Mirror build.rs: honor CARGO_TARGET_DIR (absolute, or relative to the
+  // workspace root) so a custom target dir is still found and stopped before
+  // a rebuild reuses the in-use exe. Falls back to the default `target/`.
+  const targetDir = cargoTargetDir && cargoTargetDir.length > 0 ? resolve(root, cargoTargetDir) : resolve(root, "target");
+  return resolve(targetDir, "debug", platform === "win32" ? "hitch-daemon.exe" : "hitch-daemon");
 }
 
 /**

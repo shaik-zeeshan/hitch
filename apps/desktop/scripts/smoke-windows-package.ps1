@@ -111,7 +111,12 @@ try {
     $appInfo.FileName = $appExe.FullName
     $appInfo.UseShellExecute = $false
     $appInfo.Environment['HITCH_PACKAGED_SMOKE_TEST'] = '1'
-    $appInfo.Environment['HITCH_INSTANCE'] = 'ci-smoke'
+    # Unique per run so a stale daemon from a previous smoke run (older binary)
+    # can never be reused via its socket; this forces the freshly bundled
+    # sidecar to spawn and handshake. The smoke run shuts this daemon down on
+    # completion, so no extra cleanup is required.
+    $smokeInstance = "ci-smoke-$PID-$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
+    $appInfo.Environment['HITCH_INSTANCE'] = $smokeInstance
 
     $appProcess = [System.Diagnostics.Process]::Start($appInfo)
     if ($null -eq $appProcess) {

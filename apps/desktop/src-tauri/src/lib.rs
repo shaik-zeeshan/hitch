@@ -337,25 +337,88 @@ enum ProbeError {
     Disconnected,
 }
 
+/// Tracks how many probe worker threads are still blocked after their caller
+/// gave up waiting (i.e. timed out). A blocked thread holds its `work` closure
+/// — typically a `connect_transport` call against a slow Windows pipe — and
+/// cannot be cancelled, so it lingers until the underlying connect unblocks.
+/// We don't try to kill it; we only refuse to pile on. Keyed by probe name so a
+/// crash-looping recovery cycle cannot accumulate an unbounded fan of blocked
+/// connect/hello/shutdown threads: at most one leaked worker per name may exist
+/// at a time, and the next same-name probe waits for it to drain before
+/// spawning a replacement.
+static PROBE_INFLIGHT: Mutex<Option<HashMap<&'static str, mpsc::Receiver<()>>>> =
+    Mutex::new(None);
+
+/// Park the receiver half of a still-blocked probe worker so the next same-name
+/// probe can detect it (and wait it out) instead of spawning a second thread.
+fn park_inflight_probe(name: &'static str, done: mpsc::Receiver<()>) {
+    if let Ok(mut guard) = PROBE_INFLIGHT.lock() {
+        guard.get_or_insert_with(HashMap::new).insert(name, done);
+    }
+}
+
+/// If a previous same-name probe worker is still blocked, take its completion
+/// receiver so we can wait for it to drain. Returns `None` when no worker is
+/// outstanding for `name`.
+fn take_inflight_probe(name: &'static str) -> Option<mpsc::Receiver<()>> {
+    PROBE_INFLIGHT
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.as_mut().and_then(|map| map.remove(name)))
+}
+
 /// Run `work` on a named probe thread and wait up to `timeout` for its result.
 /// Centralizes the spawn + channel + recv_timeout boilerplate shared by the
 /// bounded connect / hello / shutdown probes; callers map `ProbeError` to their
 /// own error type and messages.
-fn run_probe<T, F>(name: &str, timeout: Duration, work: F) -> Result<T, ProbeError>
+///
+/// On timeout the worker thread is abandoned (its `work` closure may still be
+/// blocked in a slow connect). To keep such leaks from accumulating across
+/// recovery loops, we park the abandoned worker's completion signal under
+/// `name`: a later same-name probe first drains that parked worker (within its
+/// own `timeout`) before spawning a fresh thread, so at most one leaked worker
+/// per name can be outstanding at any moment.
+fn run_probe<T, F>(name: &'static str, timeout: Duration, work: F) -> Result<T, ProbeError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    // Drain any worker abandoned by a previous timed-out probe of this name
+    // before spawning another, bounding leaked threads to one per name.
+    if let Some(prev_done) = take_inflight_probe(name) {
+        match prev_done.recv_timeout(timeout) {
+            // Previous worker is still blocked: re-park it and refuse to spawn a
+            // second thread for this name. The caller sees a timeout, exactly as
+            // if its own probe had timed out.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                park_inflight_probe(name, prev_done);
+                return Err(ProbeError::Timeout);
+            }
+            // Worker finished (sent or dropped) — slot is free again.
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+    }
+
     let (tx, rx) = mpsc::channel();
+    // A separate signal that fires (via drop) when the worker returns, even if
+    // the result `tx` was already dropped; used to detect drain of a leaked
+    // worker without depending on `T`.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
     thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
+            let _done = done_tx;
             let _ = tx.send(work());
         })
         .map_err(ProbeError::Spawn)?;
     match rx.recv_timeout(timeout) {
         Ok(value) => Ok(value),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(ProbeError::Timeout),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Abandon the still-running worker but remember it so the next
+            // same-name probe waits for it instead of stacking another thread.
+            park_inflight_probe(name, done_rx);
+            Err(ProbeError::Timeout)
+        }
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(ProbeError::Disconnected),
     }
 }
@@ -385,8 +448,16 @@ fn connect_transport_bounded(path: &Path, timeout: Duration) -> io::Result<Daemo
 fn wait_for_socket_release(path: &Path, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if connect_transport_bounded(path, Duration::from_millis(250)).is_err() {
-            return Ok(());
+        match connect_transport_bounded(path, Duration::from_millis(250)) {
+            // Connect actively failed (NotFound / refused / aborted): the
+            // endpoint is gone, so the socket has been released.
+            Err(err) if err.kind() != io::ErrorKind::TimedOut => return Ok(()),
+            // Either a live connection (`Ok`) or a timed-out probe. A timeout
+            // does NOT mean release: a slow Windows daemon whose polling accept
+            // loop hasn't serviced us yet is still alive, and treating it as
+            // released would let a replacement daemon race the live one. Keep
+            // waiting and re-probe until the endpoint truly disappears.
+            Ok(_) | Err(_) => {}
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -891,18 +962,30 @@ impl HitchClient {
 
         let mut last_err = String::new();
         for attempt in 0..MAX_HANDSHAKE_ATTEMPTS {
-            if connect_transport_bounded(&self.0.socket_path, Duration::from_millis(500)).is_err() {
-                self.record_spawn_attempt(app)?;
-                self.set_status(app, DaemonStatus::Starting, None);
-                self.spawn_daemon()
-                    .map_err(|err| self.record_startup_failure(app, err))?;
-                // Wait for the freshly spawned daemon to start accepting
-                // connections before attempting Hello; otherwise the not-yet-ready
-                // endpoint is mistaken for an incompatible daemon and force-killed,
-                // double-spawning on every cold start.
-                let _ = self
-                    .wait_for_daemon()
-                    .map_err(|err| self.record_startup_failure(app, err))?;
+            // Distinguish "endpoint absent" from "endpoint slow". A genuine
+            // connect failure (NotFound / refused) means no daemon is listening,
+            // so we must (re)spawn one. A *timeout* means the probe couldn't be
+            // serviced in time — on Windows the daemon's polling accept loop can
+            // be slow, so the daemon is likely alive. Respawning on timeout would
+            // double-spawn a live daemon and burn crash-loop budget; instead we
+            // fall through to the Hello attempt (with its own HANDSHAKE_TIMEOUT)
+            // and let the slow accept complete.
+            match connect_transport_bounded(&self.0.socket_path, Duration::from_millis(500)) {
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
+                Err(_) => {
+                    self.record_spawn_attempt(app)?;
+                    self.set_status(app, DaemonStatus::Starting, None);
+                    self.spawn_daemon()
+                        .map_err(|err| self.record_startup_failure(app, err))?;
+                    // Wait for the freshly spawned daemon to start accepting
+                    // connections before attempting Hello; otherwise the not-yet-ready
+                    // endpoint is mistaken for an incompatible daemon and force-killed,
+                    // double-spawning on every cold start.
+                    let _ = self
+                        .wait_for_daemon()
+                        .map_err(|err| self.record_startup_failure(app, err))?;
+                }
             }
 
             let request_id = self.0.next_request_id.fetch_add(1, Ordering::SeqCst);
@@ -2437,9 +2520,9 @@ mod tests {
     use super::{
         build_editor_launch_spec, describe_handshake_failure, encode_control_message,
         parse_spawned_daemon_pid, read_control_message, read_log_tail, recovery_mode_for_loss,
-        should_force_kill_daemon, tray_status_text, ControlMessage, CrashLoopGuard, DaemonStatus,
-        ErrorCode, HitchClient, OutputRouter, ProtocolError, RecoveryMode, Request, Response,
-        CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
+        run_probe, should_force_kill_daemon, tray_status_text, ControlMessage, CrashLoopGuard,
+        DaemonStatus, ErrorCode, HitchClient, OutputRouter, ProbeError, ProtocolError, RecoveryMode,
+        Request, Response, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
     };
     #[cfg(windows)]
     use super::{
@@ -3039,6 +3122,71 @@ mod tests {
         server.join().unwrap();
         #[cfg(unix)]
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_probe_returns_worker_value_within_timeout() {
+        let got = run_probe("hitch-test-probe-fast", Duration::from_secs(5), || 7).ok();
+        assert_eq!(got, Some(7));
+    }
+
+    #[test]
+    fn run_probe_reports_timeout_when_worker_outlasts_deadline() {
+        // Worker blocks well past the caller's deadline.
+        let res = run_probe("hitch-test-probe-timeout", Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(400));
+            1u8
+        });
+        assert!(matches!(res, Err(ProbeError::Timeout)));
+    }
+
+    #[test]
+    fn run_probe_bounds_leaked_workers_to_one_per_name() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // A worker that signals when it actually starts running, so the test can
+        // tell whether a *second* thread was spawned while the first is blocked.
+        static STARTS: AtomicUsize = AtomicUsize::new(0);
+        STARTS.store(0, Ordering::SeqCst);
+
+        let release = Arc::new(Mutex::new(()));
+        // Hold the lock so the first worker blocks inside `work`.
+        let held = release.lock().unwrap();
+
+        let name = "hitch-test-probe-leak-bound";
+        let release_1 = Arc::clone(&release);
+        // First probe: worker starts, increments STARTS, then blocks on the
+        // mutex the test is holding. Caller times out and parks the worker.
+        let first = run_probe(name, Duration::from_millis(80), move || {
+            STARTS.fetch_add(1, Ordering::SeqCst);
+            let _block = release_1.lock().unwrap();
+            0u8
+        });
+        assert!(matches!(first, Err(ProbeError::Timeout)));
+        assert_eq!(STARTS.load(Ordering::SeqCst), 1, "first worker should run");
+
+        // Second probe with the same name while the first is still blocked: it
+        // must NOT spawn another worker (STARTS stays 1) and must report timeout
+        // by waiting on the parked worker.
+        let release_2 = Arc::clone(&release);
+        let second = run_probe(name, Duration::from_millis(80), move || {
+            STARTS.fetch_add(1, Ordering::SeqCst);
+            let _block = release_2.lock().unwrap();
+            0u8
+        });
+        assert!(matches!(second, Err(ProbeError::Timeout)));
+        assert_eq!(
+            STARTS.load(Ordering::SeqCst),
+            1,
+            "second same-name probe must not spawn a second worker while the first is blocked",
+        );
+
+        // Release the blocked worker and let it drain so we don't leak across
+        // other tests sharing the process.
+        drop(held);
+        // Drain the parked worker: a fresh probe of the same name now waits for
+        // the previous one to finish, then runs its own work.
+        let third = run_probe(name, Duration::from_secs(5), || 9u8);
+        assert_eq!(third.ok(), Some(9));
     }
 
     #[test]

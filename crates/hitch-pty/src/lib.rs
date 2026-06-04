@@ -467,6 +467,15 @@ fn configure_powershell_display_cwd(
         let command = command + 1;
         let existing = argv[command].to_string_lossy().into_owned();
         argv[command] = format!("{set_location}; {existing}").into();
+    } else if argv
+        .iter()
+        .skip(1)
+        .any(|arg| arg.to_str().is_some_and(powershell_arg_is_encoded_command))
+    {
+        // PowerShell rejects an invocation that carries both `-EncodedCommand`
+        // and `-Command` ("a command is already specified"), so we cannot append
+        // our `Set-Location`. Leave the command untouched; the OS-level verbatim
+        // cwd we already set still applies.
     } else if !argv.iter().skip(1).any(|arg| {
         arg.to_str()
             .is_some_and(|arg| arg.eq_ignore_ascii_case("-File"))
@@ -475,6 +484,26 @@ fn configure_powershell_display_cwd(
         argv.push("-Command".into());
         argv.push(set_location.into());
     }
+}
+
+/// Returns whether `arg` is a `-EncodedCommand` switch (or any of the
+/// abbreviations PowerShell resolves to it, e.g. `-e`, `-ec`, `-enc`).
+///
+/// PowerShell binds `-EncodedCommand` by leading prefix (`-e`, `-en`, ...) and
+/// additionally exposes the documented `-ec` alias, which is not a literal
+/// prefix of `encodedcommand`. We accept both forms, plus the `/`-prefixed
+/// spelling PowerShell tolerates. Erring broad is safe: the only consequence is
+/// skipping the cwd injection, which we must do for any encoded-command shell.
+#[cfg(windows)]
+fn powershell_arg_is_encoded_command(arg: &str) -> bool {
+    let Some(name) = arg.strip_prefix('-').or_else(|| arg.strip_prefix('/')) else {
+        return false;
+    };
+    if name.is_empty() {
+        return false;
+    }
+    let name = name.to_ascii_lowercase();
+    name == "ec" || (name.len() <= "encodedcommand".len() && "encodedcommand".starts_with(&name))
 }
 
 #[cfg(not(windows))]
@@ -530,14 +559,77 @@ fn powershell_display_cwd(cwd: &Path) -> std::borrow::Cow<'_, Path> {
     let rest = wide.collect::<Vec<_>>();
     let rest = rest.as_slice();
 
-    if let Some(unc) = rest.strip_prefix(DEVICE_UNC_PREFIX) {
+    let display = if let Some(unc) = rest.strip_prefix(DEVICE_UNC_PREFIX) {
         let mut display = Vec::with_capacity(2 + unc.len());
         display.extend_from_slice(&[SEP, SEP]);
         display.extend_from_slice(unc);
-        return std::borrow::Cow::Owned(PathBuf::from(OsString::from_wide(&display)));
+        display
+    } else {
+        rest.to_vec()
+    };
+
+    // The `\\?\` prefix disables Win32 path normalization, so it is the only way
+    // to reach paths that the Win32 layer cannot otherwise represent (longer than
+    // MAX_PATH without long-path opt-in, or components ending in a dot/space or
+    // matching a reserved device name). Stripping it for display would change or
+    // break `Set-Location` for such paths, so keep the verbatim form instead and
+    // let the caller skip the cwd injection.
+    if !display_path_is_representable_without_verbatim(&display) {
+        return std::borrow::Cow::Borrowed(cwd);
     }
 
-    std::borrow::Cow::Owned(PathBuf::from(OsString::from_wide(rest)))
+    std::borrow::Cow::Owned(PathBuf::from(OsString::from_wide(&display)))
+}
+
+/// Returns whether a wide path is safely representable to the Win32 layer without
+/// the `\\?\` verbatim prefix (i.e. shorter than `MAX_PATH` and free of components
+/// that Win32 normalization would mangle).
+#[cfg(windows)]
+fn display_path_is_representable_without_verbatim(wide: &[u16]) -> bool {
+    // MAX_PATH including the terminating NUL.
+    const MAX_PATH: usize = 260;
+    if wide.len() >= MAX_PATH {
+        return false;
+    }
+
+    const SEP: u16 = b'\\' as u16;
+    const ALT_SEP: u16 = b'/' as u16;
+    wide.split(|&c| c == SEP || c == ALT_SEP)
+        .all(component_is_win32_safe)
+}
+
+/// Returns whether a single path component survives Win32 path normalization
+/// unchanged. Components ending in a dot or space are silently trimmed, and
+/// reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9) are intercepted.
+#[cfg(windows)]
+fn component_is_win32_safe(component: &[u16]) -> bool {
+    if let Some(&last) = component.last() {
+        if last == b'.' as u16 || last == b' ' as u16 {
+            return false;
+        }
+    }
+
+    // Compare the stem (before any extension) case-insensitively against the
+    // reserved device names.
+    let stem: Vec<u8> = component
+        .split(|&c| c == b'.' as u16)
+        .next()
+        .unwrap_or(component)
+        .iter()
+        .map(|&c| (c as u8).to_ascii_uppercase())
+        .collect();
+    const RESERVED: &[&[u8]] = &[b"CON", b"PRN", b"AUX", b"NUL"];
+    if RESERVED.contains(&stem.as_slice()) {
+        return false;
+    }
+    if (stem.starts_with(b"COM") || stem.starts_with(b"LPT")) && stem.len() == 4 {
+        if let Some(&digit) = stem.get(3) {
+            if digit.is_ascii_digit() && digit != b'0' {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[cfg(windows)]
@@ -898,6 +990,111 @@ mod tests {
         assert_eq!(
             builder.get_cwd().map(|cwd| cwd.as_os_str()),
             Some(cwd.as_os_str())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_cwd_keeps_verbatim_form_for_unrepresentable_extended_path() {
+        // A reserved device name component cannot survive Win32 normalization, so
+        // the `\\?\` prefix must be preserved rather than stripped for display.
+        let cwd = Path::new(r"\\?\C:\Code\COM1\hitch");
+        assert_eq!(powershell_display_cwd(cwd).as_ref(), cwd);
+
+        // A path at/above MAX_PATH likewise requires the verbatim prefix.
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        let long = Path::new(&long);
+        assert_eq!(powershell_display_cwd(long).as_ref(), long);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_cwd_strips_verbatim_form_for_representable_extended_path() {
+        assert_eq!(
+            powershell_display_cwd(Path::new(r"\\?\C:\Code\hitch")).as_ref(),
+            Path::new(r"C:\Code\hitch")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_arg_is_encoded_command_matches_switch_and_abbreviations() {
+        for arg in [
+            "-EncodedCommand",
+            "-encodedcommand",
+            "-EC",
+            "-ec",
+            "-e",
+            "-enc",
+            "/EncodedCommand",
+        ] {
+            assert!(powershell_arg_is_encoded_command(arg), "{arg}");
+        }
+        for arg in [
+            "-Command",
+            "-c",
+            "-File",
+            "-ExecutionPolicy",
+            "-NoProfile",
+            "encodedcommand",
+            "-",
+            "-encodedcommandx",
+        ] {
+            assert!(!powershell_arg_is_encoded_command(arg), "{arg}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_cwd_injection_skipped_for_encoded_command() {
+        // PowerShell rejects `-EncodedCommand` together with `-Command`, so the
+        // cwd injection must leave an `-EncodedCommand` invocation untouched.
+        let cwd = Path::new(r"\\?\C:\Code\hitch");
+        let command = Some(vec![
+            "powershell.exe".into(),
+            "-NoProfile".into(),
+            "-EncodedCommand".into(),
+            "ZQBjAGgAbwAgAGgAaQA=".into(),
+        ]);
+        let builder = build_command(&SessionId::new(), &command, cwd);
+
+        let argv: Vec<String> = builder
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            vec![
+                "powershell.exe".to_string(),
+                "-NoProfile".to_string(),
+                "-EncodedCommand".to_string(),
+                "ZQBjAGgAbwAgAGgAaQA=".to_string(),
+            ],
+        );
+        assert!(
+            !argv.iter().any(|arg| arg.eq_ignore_ascii_case("-Command")),
+            "must not append a conflicting -Command: {argv:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_cwd_injection_skipped_for_encoded_command_abbreviation() {
+        let cwd = Path::new(r"\\?\C:\Code\hitch");
+        let command = Some(vec![
+            "powershell.exe".into(),
+            "-ec".into(),
+            "ZQBjAGgAbwAgAGgAaQA=".into(),
+        ]);
+        let builder = build_command(&SessionId::new(), &command, cwd);
+
+        assert!(
+            !builder
+                .get_argv()
+                .iter()
+                .any(|arg| arg.to_str().is_some_and(|a| a.eq_ignore_ascii_case("-Command"))),
+            "must not append -Command alongside -ec",
         );
     }
 

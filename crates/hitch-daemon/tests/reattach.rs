@@ -2199,14 +2199,25 @@ fn write_windows_success_codex_stub() -> PathBuf {
     std::fs::write(
         &source_path,
         r###"
-use std::{env, process, thread, time::Duration};
+use std::{
+    env,
+    io::{self, Read},
+    process, thread,
+    time::Duration,
+};
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.len() < 4 { process::exit(11); }
+    if args.len() != 4 { process::exit(11); }
     if args[0] != "exec" { process::exit(13); }
     if args[1] != "--sandbox" { process::exit(14); }
     if args[2] != "read-only" { process::exit(15); }
+    // The daemon must pass the prompt through stdin with `-` as the explicit
+    // sentinel so large diffs never hit the 32 KiB Windows command-line cap.
+    if args[3] != "-" { process::exit(16); }
+    let mut prompt = String::new();
+    io::stdin().read_to_string(&mut prompt).unwrap();
+    if prompt.is_empty() { process::exit(17); }
     thread::sleep(Duration::from_millis(250));
     println!("{}", "{\"subject\":\"test: windows job draft\",\"body\":\"Generated through job\"}");
 }

@@ -102,7 +102,12 @@ mod process_tree {
 
         #[derive(Clone, Debug)]
         pub(super) struct ProcessTree {
-            job: Arc<JobHandle>,
+            // `None` when the child could not be assigned to a Job Object (e.g. a
+            // parent job that forbids nesting / breakaway, or pre-Windows-8 where
+            // a process already in a job cannot join another). The spawn still
+            // succeeds in that case; cancellation degrades to direct child kill,
+            // which every caller already pairs with `terminate()`.
+            job: Option<Arc<JobHandle>>,
         }
 
         #[derive(Debug)]
@@ -125,23 +130,37 @@ mod process_tree {
                 command.creation_flags(CREATE_SUSPENDED);
                 let mut child = command.spawn()?;
                 let process = child.as_raw_handle() as HANDLE;
+                // On Windows 8+ a process that inherited a parent job can still be
+                // nested into this fresh job, so assignment normally succeeds. It
+                // can legitimately fail when the parent job forbids nesting (e.g.
+                // it was created with `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`) or on
+                // pre-Win8 systems. Treat that as a soft failure: drop the job and
+                // keep the child rather than killing every spawn under such a
+                // parent. The job only existed to reach *descendants* on kill;
+                // without it `terminate` falls back to the caller's direct child
+                // kill, so the process is still cancellable.
                 let assigned = unsafe { AssignProcessToJobObject(job.0, process) };
-                if assigned == 0 {
-                    let error = io::Error::last_os_error();
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error);
-                }
+                let job = if assigned == 0 {
+                    None
+                } else {
+                    Some(Arc::new(job))
+                };
                 if let Err(error) = resume_process(process) {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(error);
                 }
-                Ok((child, Self { job: Arc::new(job) }))
+                Ok((child, Self { job }))
             }
 
             pub(super) fn terminate(&self) -> io::Result<()> {
-                let result = unsafe { TerminateJobObject(self.job.0, 1) };
+                // No job means assignment failed at spawn time; the caller pairs
+                // `terminate` with a direct child kill, so report success and let
+                // that path reap the process.
+                let Some(job) = self.job.as_ref() else {
+                    return Ok(());
+                };
+                let result = unsafe { TerminateJobObject(job.0, 1) };
                 if result == 0 {
                     Err(io::Error::last_os_error())
                 } else {
