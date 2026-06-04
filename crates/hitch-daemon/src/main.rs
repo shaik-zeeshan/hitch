@@ -13,6 +13,8 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -230,9 +232,24 @@ impl From<Args> for DaemonConfig {
     }
 }
 
+/// `CREATE_NO_WINDOW` (windows-sys / Win32 `CreateProcess` flag): run a console
+/// process with an invisible console instead of materializing a console window.
+/// Declared locally because this is the daemon's only Win32 constant; not worth
+/// a `windows-sys` dependency.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 fn detach_spawn(args: &Args) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let mut child = Command::new(exe);
+    // Keep the detached daemon's console invisible no matter who launched this
+    // `--detach` shim. The GUI client already spawns the shim with
+    // CREATE_NO_WINDOW, but a stale or manually launched shim could carry a
+    // visible console — and the daemon would inherit it and pin the window open
+    // for its whole lifetime. Giving the daemon its own hidden console here
+    // also keeps its console children (git, draft providers) windowless.
+    #[cfg(windows)]
+    child.creation_flags(CREATE_NO_WINDOW);
     child
         .arg("--socket")
         .arg(&args.socket_path)

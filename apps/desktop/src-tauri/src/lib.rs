@@ -21,9 +21,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(feature = "packaged-smoke")]
 use std::{env, fs};
 #[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
 #[cfg(windows)]
-use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, TerminateProcess, CREATE_NO_WINDOW, PROCESS_TERMINATE,
+};
 
 use hitch_core::SessionId;
 #[cfg(feature = "packaged-smoke")]
@@ -167,6 +171,14 @@ fn parse_spawned_daemon_pid(stdout: &[u8]) -> Option<u32> {
 }
 
 fn run_detach_command(mut command: Command, label: &str) -> Result<u32, String> {
+    // The daemon launcher is a console-subsystem binary. Spawned plainly from
+    // the windowed GUI it would get a brand-new *visible* console, and the
+    // detached daemon inherits that console and keeps the window open for its
+    // entire lifetime. CREATE_NO_WINDOW gives the launcher an invisible console
+    // instead; the daemon — and every console child it spawns (git, draft
+    // providers) — inherits that hidden console, so nothing flashes either.
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2257,6 +2269,10 @@ fn spawn_windows_command_shim(spec: &EditorLaunchSpec) -> Result<(), String> {
         .arg("/c")
         .arg(&spec.program)
         .args(&spec.args)
+        // The shim only exists to run `.cmd`/`.bat` editor launchers (e.g.
+        // VS Code's `code.cmd`), which hand off to a GUI process; without this
+        // flag the GUI parent would flash a visible cmd.exe console.
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map(|_| ())
         .map_err(|err| format!("failed to open editor {:?}: {err}", spec.program))

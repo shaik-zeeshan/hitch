@@ -265,7 +265,7 @@ mod process_tree {
         use std::sync::Arc;
 
         use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, HANDLE, NTSTATUS};
-        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
 
         use crate::job_object::JobHandle;
 
@@ -287,7 +287,12 @@ mod process_tree {
         impl ProcessTree {
             pub(super) fn spawn(command: &mut Command) -> io::Result<(Child, Self)> {
                 let job = JobHandle::create_kill_on_close()?;
-                command.creation_flags(CREATE_SUSPENDED);
+                // CREATE_NO_WINDOW: every ProcessTree child is a non-interactive
+                // console process with piped/null stdio (git, draft providers).
+                // Without it, a child spawned from a console-less parent (the
+                // hidden-console daemon, or a GUI process) would materialize a
+                // visible console window.
+                command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
                 let mut child = command.spawn()?;
                 let process = child.as_raw_handle();
                 // On Windows 8+ a process that inherited a parent job can still be
