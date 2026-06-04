@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/hitch-core",
+    "crates/hitch-process",
     "crates/hitch-proto",
     "crates/hitch-git",
     "crates/hitch-pty",
@@ -24,6 +25,7 @@ authors = ["Hitch"]
 # path; the DAG is enforced by which crates list which (ADR 0005).
 [workspace.dependencies]
 hitch-core = { path = "crates/hitch-core" }
+hitch-process = { path = "crates/hitch-process" }
 hitch-proto = { path = "crates/hitch-proto" }
 hitch-git = { path = "crates/hitch-git" }
 hitch-pty = { path = "crates/hitch-pty" }

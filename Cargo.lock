@@ -1541,11 +1541,9 @@ dependencies = [
 name = "hitch-core"
 version = "0.1.0"
 dependencies = [
- "libc",
  "serde",
  "serde_json",
  "uuid",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1555,6 +1553,7 @@ dependencies = [
  "hitch-agent",
  "hitch-core",
  "hitch-git",
+ "hitch-process",
  "hitch-proto",
  "hitch-pty",
  "hitch-store",
@@ -1587,6 +1586,7 @@ version = "0.1.0"
 dependencies = [
  "git2",
  "hitch-core",
+ "hitch-process",
  "serde_json",
  "tempfile",
 ]
@@ -1601,6 +1601,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hitch-process"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "hitch-proto"
 version = "0.1.0"
 dependencies = [
@@ -1608,6 +1616,7 @@ dependencies = [
  "interprocess",
  "serde",
  "serde_json",
+ "widestring",
 ]
 
 [[package]]
@@ -1616,9 +1625,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hitch-core",
+ "hitch-process",
  "libc",
  "portable-pty",
- "windows-sys 0.60.2",
 ]
 
 [[package]]

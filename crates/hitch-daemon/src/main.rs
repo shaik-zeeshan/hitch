@@ -25,8 +25,8 @@ mod drafts;
 use drafts::{CommitDraftInput, DraftProviderConfig, PullRequestDraftInput};
 use hitch_agent::HookInstallOptions;
 use hitch_core::{
-    AgentState, JobId, ProcessTree, Project, ProjectId, ProjectKind, Session, SessionId,
-    SessionParent, Worktree, WorktreeId,
+    AgentState, JobId, Project, ProjectId, ProjectKind, Session, SessionId, SessionParent,
+    Worktree, WorktreeId,
 };
 use hitch_git::{
     staged_diff, CommandControl, CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState,
@@ -40,7 +40,10 @@ use hitch_proto::{
     ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode, WorktreePr,
     MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
-use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY};
+use hitch_process::ProcessTree;
+use hitch_pty::{
+    ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY,
+};
 use hitch_store::Store;
 
 fn main() {
@@ -4501,7 +4504,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn job_control_cancel_kills_registered_child_process_group() {
-        use hitch_core::ProcessTree;
+        use hitch_process::ProcessTree;
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
 
@@ -4539,7 +4542,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn job_control_cancel_kills_registered_windows_process_tree() {
-        use hitch_core::ProcessTree;
+        use hitch_process::ProcessTree;
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
 

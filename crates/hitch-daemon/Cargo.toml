@@ -15,6 +15,7 @@ path = "src/main.rs"
 # the wiring lands in slice 7.
 [dependencies]
 hitch-core.workspace = true
+hitch-process.workspace = true
 hitch-proto.workspace = true
 hitch-git.workspace = true
 hitch-pty.workspace = true

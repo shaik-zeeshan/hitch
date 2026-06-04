@@ -10,7 +10,8 @@
 //! crate.
 
 use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
-use hitch_core::{ProcessTree, ProjectId, Worktree};
+use hitch_core::{ProjectId, Worktree};
+use hitch_process::ProcessTree;
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -1257,8 +1258,11 @@ pub fn discover_worktrees(repo_path: impl AsRef<Path>) -> Result<Vec<DiscoveredW
             continue;
         };
         let path = worktree.path().to_path_buf();
-        // Skip linked worktrees whose directory is gone (prunable but not pruned).
-        if !path.is_dir() {
+        // Skip linked worktrees whose directory is gone (prunable but not
+        // pruned). Probe via the extended-length form so a deep managed-worktree
+        // path isn't wrongly treated as missing under MAX_PATH on Windows. The
+        // normal `path` is what we store and hand back to callers/GUI.
+        if !path_is_dir_fs(&path) {
             continue;
         }
         let branch = Repository::open(&path)
@@ -1295,7 +1299,11 @@ fn create_worktree_with_client(
 ) -> Result<Worktree> {
     let target = request.target_path();
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
+        // Filesystem access goes through the extended-length (`\\?\`) form on
+        // Windows so a deep managed-worktree root can't trip MAX_PATH; the
+        // normal `target` is still what's handed to the git CLI and returned to
+        // callers below (ADR 0012).
+        fs::create_dir_all(fs_path(parent)?)?;
     }
 
     let mut args = vec![os("worktree"), os("add")];
@@ -1357,7 +1365,10 @@ fn remove_worktree_with_client(
 }
 
 fn already_removed_worktree(err: &GitError, path: &Path) -> bool {
-    !path.exists()
+    // Probe existence through the extended-length form on Windows: a managed
+    // worktree path long enough to trip MAX_PATH must not be misread as "already
+    // gone" and silently swallow a real removal failure.
+    !path_exists_fs(path)
         && matches!(
             err,
             GitError::CommandFailed { stderr, .. } if stderr.contains("is not a working tree")
@@ -1890,16 +1901,14 @@ fn is_windows_reserved_device_name(value: &str) -> bool {
     )
 }
 
+/// Stable, collision-resistant suffix for a sanitized worktree directory name.
+///
+/// Hashes the *original* (pre-sanitization) value so two branches that sanitize
+/// to the same on-disk component still land in distinct directories. Uses the
+/// shared leaf-crate FNV-1a so the suffix stays byte-for-byte stable across
+/// builds — existing managed worktrees must keep resolving to the same path.
 fn stable_path_hash(value: &str) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001b3;
-
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+    hitch_core::fnv1a_64(value.as_bytes())
 }
 
 fn os(value: impl AsRef<OsStr>) -> OsString {
@@ -1908,6 +1917,109 @@ fn os(value: impl AsRef<OsStr>) -> OsString {
 
 fn path_os(path: impl AsRef<Path>) -> OsString {
     path.as_ref().as_os_str().to_os_string()
+}
+
+/// Return the path to hand to std::fs / libgit2 for managed-worktree lifecycle
+/// filesystem access.
+///
+/// On Windows the std `CreateFileW`-backed APIs are still subject to the legacy
+/// MAX_PATH (260) limit unless the path is given in extended-length (`\\?\`)
+/// form. Managed worktrees live deep under `%LOCALAPPDATA%\Hitch\worktrees\…`
+/// (ADR 0012), so a long project/branch can push a checkout past 260 even though
+/// each component is already capped (ADR 0001). Prefixing the *filesystem* path
+/// with `\\?\` opts that single call out of MAX_PATH regardless of the OS
+/// `LongPathsEnabled` policy. The normal form is kept everywhere else — git CLI
+/// arguments, display strings, and paths stored / sent to the GUI — so only the
+/// raw filesystem syscall sees the prefix.
+///
+/// Returns a clear error (rather than a silently truncated path) when the
+/// absolute path still can't be represented in extended-length form.
+#[cfg(windows)]
+fn fs_path(path: &Path) -> Result<Cow<'_, Path>> {
+    extended_length_path(path)
+}
+
+/// On non-Windows targets there is no MAX_PATH and no `\\?\` form; the path is
+/// used verbatim.
+#[cfg(not(windows))]
+fn fs_path(path: &Path) -> Result<Cow<'_, Path>> {
+    Ok(Cow::Borrowed(path))
+}
+
+/// `Path::exists` but routed through [`fs_path`] so a managed-worktree path past
+/// MAX_PATH is probed correctly on Windows. Falls back to the normal form if the
+/// extended-length conversion isn't possible (e.g. a relative path), so the
+/// answer is never worse than `Path::exists`.
+fn path_exists_fs(path: &Path) -> bool {
+    match fs_path(path) {
+        Ok(probe) => probe.exists(),
+        Err(_) => path.exists(),
+    }
+}
+
+/// `Path::is_dir` routed through [`fs_path`] (see [`path_exists_fs`]).
+fn path_is_dir_fs(path: &Path) -> bool {
+    match fs_path(path) {
+        Ok(probe) => probe.is_dir(),
+        Err(_) => path.is_dir(),
+    }
+}
+
+/// Convert an absolute Windows path to its extended-length (`\\?\`) form,
+/// mapping UNC paths (`\\server\share\…`) to `\\?\UNC\server\share\…`.
+///
+/// Paths already in extended-length form (e.g. anything that came back from
+/// `std::fs::canonicalize`, which returns `\\?\` paths on Windows) are returned
+/// unchanged. A relative path can't be prefixed safely (`\\?\` disables the
+/// `.`/`..` and drive-relative resolution that would be needed), so callers must
+/// pass an absolute path; a non-absolute or otherwise non-representable path is
+/// reported as a clear error instead of being truncated.
+#[cfg(windows)]
+fn extended_length_path(path: &Path) -> Result<Cow<'_, Path>> {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    match components.next() {
+        // Already `\\?\…` (verbatim) — including what canonicalize() returns.
+        Some(Component::Prefix(prefix))
+            if matches!(
+                prefix.kind(),
+                Prefix::VerbatimDisk(_) | Prefix::Verbatim(_) | Prefix::VerbatimUNC(_, _)
+            ) =>
+        {
+            Ok(Cow::Borrowed(path))
+        }
+        // `C:\…` → `\\?\C:\…`. The `\\?\` namespace does *not* accept forward
+        // slashes (it skips path normalization), and libgit2 hands back
+        // forward-slash paths on Windows, so the separators are normalized to
+        // backslashes first.
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_)) => {
+            let raw = path.as_os_str().to_string_lossy().replace('/', "\\");
+            Ok(Cow::Owned(PathBuf::from(format!(r"\\?\{raw}"))))
+        }
+        // `\\server\share\…` → `\\?\UNC\server\share\…` (separators normalized to
+        // backslashes, as the `\\?\` namespace requires).
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::UNC(_, _)) => {
+            let raw = path.as_os_str().to_string_lossy().replace('/', "\\");
+            let rest = raw.strip_prefix(r"\\").ok_or_else(|| {
+                GitError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("cannot form extended-length path for {}", path.display()),
+                ))
+            })?;
+            Ok(Cow::Owned(PathBuf::from(format!(r"\\?\UNC\{rest}"))))
+        }
+        // No drive/UNC prefix — a relative or drive-relative path can't be made
+        // extended-length without resolution. Surface a clear error (ADR 0012)
+        // rather than hand a path that MAX_PATH might truncate.
+        _ => Err(GitError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "managed worktree path must be absolute to use the extended-length form: {}",
+                path.display()
+            ),
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -2800,6 +2912,33 @@ mod tests {
                 | "LPT8"
                 | "LPT9"
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extended_length_path_prefixes_only_real_drive_and_unc_paths() {
+        // Drive path gains the verbatim prefix.
+        let drive = extended_length_path(Path::new(r"C:\Users\me\.hitch\worktrees\p\b")).unwrap();
+        assert_eq!(drive.as_os_str(), r"\\?\C:\Users\me\.hitch\worktrees\p\b");
+
+        // UNC path maps to the \\?\UNC\ form.
+        let unc = extended_length_path(Path::new(r"\\server\share\worktrees\p")).unwrap();
+        assert_eq!(unc.as_os_str(), r"\\?\UNC\server\share\worktrees\p");
+
+        // An already-extended path (what canonicalize returns) is untouched.
+        let already = Path::new(r"\\?\C:\already\verbatim");
+        assert_eq!(
+            extended_length_path(already).unwrap().as_os_str(),
+            already.as_os_str()
+        );
+        let already_unc = Path::new(r"\\?\UNC\server\share\x");
+        assert_eq!(
+            extended_length_path(already_unc).unwrap().as_os_str(),
+            already_unc.as_os_str()
+        );
+
+        // A relative path can't be made extended-length: clear error, not truncation.
+        assert!(extended_length_path(Path::new(r"worktrees\p\b")).is_err());
     }
 
     struct RepoFixture {

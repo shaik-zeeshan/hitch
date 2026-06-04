@@ -3,7 +3,8 @@
 //! This crate owns the OS-facing PTY primitive used by the daemon spike:
 //! spawn a child process inside a pseudo-terminal, stream output into a bounded
 //! scrollback buffer, accept input/resize requests, and terminate the child on
-//! demand. It intentionally depends only on `hitch-core` plus PTY plumbing.
+//! demand. It intentionally depends only on the leaf crates (`hitch-core`,
+//! `hitch-process`) plus PTY plumbing.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -14,15 +15,6 @@ use std::thread;
 
 use hitch_core::{SessionId, SESSION_ID_ENV};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-#[cfg(windows)]
-use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE},
-    System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    },
-};
 
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 40;
@@ -271,6 +263,12 @@ impl ManagedPty {
     }
 
     /// Return a best-effort foreground command when the PTY backend exposes one.
+    ///
+    /// Always `None` on Windows: ConPTY exposes no foreground process group, so the
+    /// ADR 0011 dirty-exit backstop (the daemon's foreground-command poller that
+    /// clears Agent State when an agent dies without firing `SessionEnd`) is
+    /// unavailable here. On Windows, Agent State relies on the agent's own hooks
+    /// plus session-exit cleanup — see ADR 0011's "Windows note".
     #[cfg(not(unix))]
     pub fn foreground_command(&self) -> Option<String> {
         None
@@ -333,16 +331,17 @@ fn spawn_reader_thread(
         .expect("failed to spawn PTY reader thread");
 }
 
+/// Job-object wrapper for a `portable-pty` ConPTY session child.
+///
+/// Unlike `hitch_process::ProcessTree`, the PTY child is already running by the
+/// time we get a handle to it (portable-pty spawns it, not us), so this path
+/// cannot use `CREATE_SUSPENDED`; it simply assigns the live child to a
+/// kill-on-close job. All job-object lifecycle (create / set limits / terminate
+/// / close) is shared with `ProcessTree` via [`hitch_process::JobHandle`].
 #[cfg(windows)]
 struct WindowsJobObject {
-    handle: HANDLE,
+    job: hitch_process::JobHandle,
 }
-
-#[cfg(windows)]
-unsafe impl Send for WindowsJobObject {}
-
-#[cfg(windows)]
-unsafe impl Sync for WindowsJobObject {}
 
 #[cfg(windows)]
 impl WindowsJobObject {
@@ -354,58 +353,20 @@ impl WindowsJobObject {
             ))
         })?;
 
-        // SAFETY: Passing null security attributes and name requests a new unnamed
-        // job object. On failure Windows returns a null handle, converted below.
-        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if handle.is_null() {
-            return Err(PtyError::Io(io::Error::last_os_error()));
-        }
-
-        let job = Self { handle };
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-
-        // SAFETY: `job.handle` is a live job handle owned by `job`, `limits` points
-        // to a properly initialized JOBOBJECT_EXTENDED_LIMIT_INFORMATION, and the
-        // byte count matches that structure.
-        let configured = unsafe {
-            SetInformationJobObject(
-                job.handle,
-                JobObjectExtendedLimitInformation,
-                std::ptr::addr_of!(limits).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if configured == 0 {
-            return Err(PtyError::Io(io::Error::last_os_error()));
-        }
+        let job = hitch_process::JobHandle::create_kill_on_close().map_err(PtyError::Io)?;
 
         // SAFETY: `process` is the process handle exposed by portable-pty for the
-        // spawned child, and `job.handle` is configured to kill members on close.
-        let assigned = unsafe { AssignProcessToJobObject(job.handle, process.cast()) };
-        if assigned == 0 {
+        // spawned child; `job` is a live kill-on-close job. Assignment failure here
+        // is fatal — the PTY child must be reachable on kill.
+        if !unsafe { job.assign_process(process.cast()) } {
             return Err(PtyError::Io(io::Error::last_os_error()));
         }
 
-        Ok(job)
+        Ok(Self { job })
     }
 
     fn terminate(&self) -> Result<(), PtyError> {
-        // SAFETY: `self.handle` is a live job handle for this PTY until Drop.
-        if unsafe { TerminateJobObject(self.handle, 1) } == 0 {
-            return Err(PtyError::Io(io::Error::last_os_error()));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WindowsJobObject {
-    fn drop(&mut self) {
-        // SAFETY: `handle` is owned by this wrapper and closed exactly once here.
-        unsafe {
-            CloseHandle(self.handle);
-        }
+        self.job.terminate().map_err(PtyError::Io)
     }
 }
 

@@ -19,6 +19,9 @@ use interprocess::{
         prelude::*, GenericNamespaced, ListenerNonblockingMode, ListenerOptions,
         Name as LocalSocketName,
     },
+    os::windows::{
+        local_socket::ListenerOptionsExt, security_descriptor::SecurityDescriptor,
+    },
     TryClone as _,
 };
 
@@ -169,6 +172,11 @@ impl DaemonListener {
         #[cfg(windows)]
         let listener = ListenerOptions::new()
             .name(windows_socket_name(&path)?)
+            // Restrict the named pipe to its creating user — the named-pipe
+            // equivalent of a 0700 socket (ADR 0012). Without this the pipe is
+            // created with the default DACL, which is permissive enough for
+            // other local users to attach. See `owner_only_security_descriptor`.
+            .security_descriptor(owner_only_security_descriptor()?)
             .create_sync()?;
         Ok(Self { listener, path })
     }
@@ -224,8 +232,35 @@ pub fn connect_daemon(path: impl AsRef<Path>) -> io::Result<DaemonStream> {
 }
 
 /// Return whether a daemon endpoint currently accepts connections.
+///
+/// A successful connect obviously means "accepting". On Windows a connect can
+/// also fail with `ERROR_PIPE_BUSY` when every pipe instance is momentarily
+/// occupied between the daemon's nonblocking accept polls; that is a *live*
+/// daemon, not an absent one, so it counts as "accepting" too. Any other connect
+/// error (NotFound / refused) means nothing is listening.
 pub fn endpoint_accepts_connections(path: &Path) -> bool {
-    connect_daemon(path).is_ok()
+    match connect_daemon(path) {
+        Ok(_) => true,
+        Err(err) => is_endpoint_busy(&err),
+    }
+}
+
+/// True when a connect error means the endpoint exists and is bound but every
+/// pipe instance is momentarily busy (`ERROR_PIPE_BUSY`, 231). This is a
+/// transient "all instances occupied" state on a live Windows named-pipe server,
+/// distinct from a NotFound/refused error that means nothing is listening. Always
+/// false off Windows, where a Unix socket has no equivalent busy state.
+pub fn is_endpoint_busy(err: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        // ERROR_PIPE_BUSY: all pipe instances are busy.
+        err.raw_os_error() == Some(231)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = err;
+        false
+    }
 }
 
 /// A single connected daemon socket with incremental control and PTY decoders.
@@ -309,6 +344,11 @@ impl DaemonStream {
 
     #[cfg(windows)]
     pub fn connected_pipe_server_pid(&self) -> io::Result<u32> {
+        // ADR 0012 names `GetNamedPipeServerProcessId` for server-pid discovery.
+        // interprocess's `peer_creds().pid()` is the safe wrapper over exactly
+        // that Win32 call (it dispatches to `GetNamedPipeServerProcessId` for a
+        // client-side pipe handle), so this is the ADR's primitive by another
+        // name — no manual handle juggling needed.
         self.stream.peer_creds()?.pid().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -379,6 +419,32 @@ impl From<FrameError> for TransportError {
     }
 }
 
+/// SDDL for the daemon pipe's DACL: a *protected* (`P`, inheritance-blocking)
+/// DACL whose single ACE grants `GenericAll` (`GA`) to the object's creator
+/// owner (`OW`) — the user that bound the listener.
+///
+/// A non-null DACL with no ACE for a principal denies that principal entirely,
+/// so this is allow-owner / deny-everyone-else: the named-pipe equivalent of a
+/// `0700` Unix socket promised by ADR 0012. We deliberately do *not* add ACEs
+/// for SYSTEM or Administrators: the daemon and all its clients (GUI, hook) run
+/// as the same interactive user, so owner-only is both sufficient and the
+/// tightest grant. We use `OW` rather than the bound user's literal SID so the
+/// descriptor is a fixed string with no runtime SID lookup; Windows resolves
+/// `OW` to the creating process's owner when the pipe instance is created.
+#[cfg(windows)]
+const DAEMON_PIPE_SDDL: &str = "D:P(A;;GA;;;OW)";
+
+/// Build the owner-restricted security descriptor applied to the daemon pipe.
+///
+/// Deserializes [`DAEMON_PIPE_SDDL`] via interprocess's
+/// `SecurityDescriptor::deserialize`, which wraps `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
+#[cfg(windows)]
+fn owner_only_security_descriptor() -> io::Result<SecurityDescriptor> {
+    let sddl = widestring::U16CString::from_str(DAEMON_PIPE_SDDL)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    SecurityDescriptor::deserialize(&sddl)
+}
+
 #[cfg(windows)]
 fn windows_socket_name(path: &Path) -> io::Result<LocalSocketName<'static>> {
     logical_socket_name(path).to_ns_name::<GenericNamespaced>()
@@ -386,9 +452,6 @@ fn windows_socket_name(path: &Path) -> io::Result<LocalSocketName<'static>> {
 
 #[cfg(windows)]
 fn logical_socket_name(path: &Path) -> String {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001b3;
-
     // Windows paths are case-insensitive and accept both separators, so the same
     // endpoint can reach this helper spelled several ways: `C:\foo`, `c:\foo`, and
     // `C:/foo` are one path but hash to three different pipe names. The daemon, the
@@ -397,11 +460,9 @@ fn logical_socket_name(path: &Path) -> String {
     // them on mismatched pipes. Normalize the spelling — separators to `\`,
     // everything lowercased — before hashing so equivalent paths rendezvous.
     let path = normalize_socket_spelling(path);
-    let mut hash = FNV_OFFSET;
-    for byte in path.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
+    // FNV-1a over the normalized spelling's bytes (the shared leaf-crate hash, so
+    // pipe names stay byte-for-byte stable across crates and builds).
+    let hash = hitch_core::fnv1a_64(path.as_bytes());
     format!("hitch-{hash:016x}")
 }
 
@@ -513,6 +574,35 @@ mod tests {
 
         drop(client);
         server.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_only_security_descriptor_builds_and_listener_accepts_same_user_client() {
+        // The owner-restricted SDDL must deserialize into a valid descriptor...
+        owner_only_security_descriptor()
+            .expect("owner-only security descriptor should deserialize from SDDL");
+
+        // ...and a listener bound with it must still accept a connection from the
+        // same user (the only principal granted GenericAll). This guards against
+        // an over-tight descriptor that would lock the daemon out of its own pipe.
+        let path = test_socket_path();
+        let listener = DaemonListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let _conn = listener.accept().unwrap();
+        });
+        let _client = DaemonClient::connect(&path).expect("same-user client should attach");
+        server.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn busy_endpoint_is_not_mistaken_for_a_released_one() {
+        // ERROR_PIPE_BUSY (231) is a live, momentarily-saturated pipe server, so
+        // `is_endpoint_busy` must recognize it; a NotFound is a genuinely absent
+        // endpoint and must not.
+        assert!(is_endpoint_busy(&io::Error::from_raw_os_error(231)));
+        assert!(!is_endpoint_busy(&io::Error::from(io::ErrorKind::NotFound)));
     }
 
     #[cfg(windows)]

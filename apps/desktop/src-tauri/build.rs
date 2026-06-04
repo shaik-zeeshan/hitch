@@ -93,7 +93,16 @@ fn main() {
         }
     }
 
-    tauri_build::build()
+    // Embed a long-path-aware application manifest on Windows. tauri-build only
+    // applies `app_manifest` to the Windows resource; on other targets the
+    // attribute is ignored. The manifest starts from Tauri's default
+    // (Common-Controls v6) and adds `<longPathAware>true</longPathAware>` so deep
+    // managed-worktree paths under %LOCALAPPDATA%\Hitch aren't capped at MAX_PATH
+    // (ADR 0012). Falls back to the default build if the manifest can't be read.
+    let windows = tauri_build::WindowsAttributes::new()
+        .app_manifest(include_str!("windows-app-manifest.xml"));
+    let attributes = tauri_build::Attributes::new().windows_attributes(windows);
+    tauri_build::try_build(attributes).expect("failed to run tauri-build");
 }
 
 fn target_dir_from_out_dir(target: &str, profile: &str) -> Option<PathBuf> {

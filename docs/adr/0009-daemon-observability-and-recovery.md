@@ -56,3 +56,14 @@ GUI-supervised detached child — explicitly NOT a system service (reaffirming
   *failed* daemon means the product surface is down by design — so the failure is
   surfaced honestly with a reason and one-click restart, rather than papered over
   with a daemon-independent fallback terminal (explicitly rejected).
+
+## Amendment (2026-06-04): restored sessions reinstall agent hooks
+
+When the daemon restarts and `restore_layout` reopens each saved session as a
+fresh terminal (ADR 0003), it now reinstalls that worktree's agent hook config —
+the same `install_agent_hooks_for_worktree_id` step `open_session` runs. The hook
+configs live on disk in the worktree and can vanish between runs (the agent
+rewriting its config dir, a clean checkout, manual cleanup); without reinstalling,
+a session that survived a daemon restart would silently stop reporting Agent State
+until the user happened to open a new session in the same worktree. The install is
+best-effort — a broken config is logged and never blocks restoring terminals.

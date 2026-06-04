@@ -33,7 +33,14 @@ a system service" model intact.
   unchanged.
 - The named-pipe endpoint created by the transport is per-user — the named-pipe
   equivalent of a `0700` socket — so other local users cannot attach to another
-  user's Sessions.
+  user's Sessions. This is not the default DACL: the transport binds the listener
+  through `interprocess`' `ListenerOptionsExt::security_descriptor` with an
+  owner-only descriptor deserialized from the SDDL `D:P(A;;GA;;;OW)` — a protected
+  DACL granting `GenericAll` to the creator-owner SID and, because a non-null DACL
+  denies every unlisted principal, nothing to anyone else. The creating user is
+  the daemon's user, and all clients (GUI, hook) run as that same user, so
+  owner-only is both the tightest and the sufficient grant; SYSTEM/Administrators
+  ACEs are deliberately omitted.
 - `hitch-proto::transport` gains a `#[cfg(windows)]` connection type beside the
   existing `#[cfg(unix)]` `UnixSocket*`. To keep one connection-lifecycle path
   (reader thread + heartbeat + cloned writer half, as today), we adopt the
@@ -56,7 +63,11 @@ a system service" model intact.
   non-cooperative termination. For an incompatible daemon that responds but does
   not complete `Hello`, the client may call `GetNamedPipeServerProcessId` only
   after a response has been received; calling it during attach can block before
-  the server accepts the pipe and leave the GUI stuck in *starting*.
+  the server accepts the pipe and leave the GUI stuck in *starting*. In the
+  implementation the client obtains this server pid through `interprocess`'
+  `peer_creds().pid()` on the connected client-side stream, which is the safe
+  wrapper over `GetNamedPipeServerProcessId` — the same primitive named here, by
+  another name.
 - **Termination** uses `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess`
   in place of `kill(pid, SIGKILL)`. Graceful shutdown is unchanged: the existing
   `ShutdownDaemon` control message travels over the pipe, so no `SIGTERM` analog
@@ -144,10 +155,12 @@ a system service" model intact.
   the Windows recovery path uses `GetNamedPipeServerProcessId` + `TerminateProcess`
   while preserving ADR 0009's four-state **Daemon Status**, crash-loop guard, and
   heartbeat.
-- `hitch-pty` grows a `#[cfg(windows)]` Job-Object wrapper around spawned
-  children; cancellable **Jobs** (ADR 0008) and Session shutdown cancel via
-  `TerminateJobObject` instead of signalling a process group. The
-  forced-repaint path (ADR 0010) stays Unix-only.
+- A `#[cfg(windows)]` Job-Object wrapper wraps spawned children; cancellable
+  **Jobs** (ADR 0008) and Session shutdown cancel via `TerminateJobObject`
+  instead of signalling a process group. The forced-repaint path (ADR 0010)
+  stays Unix-only. *(Amended 2026-06-04: the wrapper was originally placed in
+  `hitch-pty`, but `hitch-git`'s cancellable git commands need it too, so it
+  lives in the leaf crate `hitch-process` — see ADR 0005's amendment.)*
 - Data moves to `%LOCALAPPDATA%\Hitch` on Windows (vs `~/.hitch` on Unix), with
   namespaced debug/custom children and a documented `\\?\` long-path mitigation
   for managed worktrees (ADR 0001).

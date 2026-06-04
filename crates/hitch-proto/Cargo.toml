@@ -13,3 +13,7 @@ serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 interprocess = "2.4.2"
+# For building the named-pipe security descriptor from an SDDL string. Pinned to
+# the same 1.x line interprocess already depends on, so `U16CString` matches the
+# `&U16CStr` that `SecurityDescriptor::deserialize` expects.
+widestring = "1"

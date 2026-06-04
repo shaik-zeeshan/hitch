@@ -14,3 +14,7 @@ Hitch will support non-interactive draft generation for commit messages, commit 
 - The daemon composes git context and draft providers; `src-tauri` remains a thin IPC client.
 - The desktop Settings UI selects provider/model and sends that selection on draft-generation IPC requests; Codex models come from `codex debug models`, while Claude uses documented aliases/latest-known IDs.
 - A deterministic stub provider remains available for tests and fallback, while Claude/Codex run as headless CLIs outside Agent Sessions.
+
+## Amendment (2026-06-04): user-configurable provider binary paths (protocol v18)
+
+Protocol v18 adds `claude_path` / `codex_path` to `DraftGenerationSettings`, letting the user point the Draft Generator at the actual provider binaries. This is needed on Windows, where `claude` / `codex` are not reliably on the daemon service's PATH. The daemon defaults each provider to a bare command name (`claude` / `codex`, resolved via PATH, or the `HITCH_CLAUDE_PATH` / `HITCH_CODEX_PATH` env overrides); a path supplied in settings is trimmed and applied only when non-empty (a blank/whitespace value is ignored, so the default still wins). There is no pre-flight existence check: if the resolved binary cannot be spawned, generation fails with an actionable error ("… binary not found (`<path>`); install it or set HITCH_CLAUDE_PATH") rather than silently. This stays inside the Draft Generator boundary — these paths configure a headless Job, never an Agent Session, and produce no Agent State.

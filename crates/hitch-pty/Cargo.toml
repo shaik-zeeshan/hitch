@@ -8,9 +8,7 @@ description = "PTY spawn + scrollback buffering (placeholder, slice 3)."
 
 [dependencies]
 hitch-core.workspace = true
+hitch-process.workspace = true
 anyhow = "1"
 libc = "0.2"
 portable-pty = "0.8"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

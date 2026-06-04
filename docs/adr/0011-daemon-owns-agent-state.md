@@ -60,3 +60,23 @@ does not unblock it); `waiting` and `error` are dismiss-on-seen.
   state is never shown for Codex — an accepted gap for now.
 - Agent State is ephemeral daemon memory; it does not survive a daemon restart,
   consistent with Sessions and Jobs.
+
+## Windows note — no foreground-command backstop
+
+The dirty-exit backstop above (the daemon's foreground-command poller clearing
+Agent State when an agent dies without firing `SessionEnd`) is **unavailable on
+Windows**. It relies on resolving the PTY's foreground process group leader, but
+the Windows PTY backend is ConPTY (ADR 0012), which exposes no foreground
+process group — `hitch_pty::ManagedPty::foreground_command()` returns `None`
+unconditionally there. We **document this gap rather than implement** an
+equivalent: ConPTY offers no reliable, supported API for the currently-focused
+child, and the cases the poller covers are already largely handled elsewhere.
+
+Consequently, on Windows Agent State relies on (a) the agent's own hooks —
+notably `SessionEnd` for a clean exit — and (b) session-exit cleanup, which
+clears state to `None` when the PTY/session itself goes away (including the
+Job-Object tree-kill on Session close, ADR 0012). The uncovered residue is a
+dirty agent-process exit that leaves the surrounding shell session alive; on
+Windows such state may linger until the next hook report or until the session
+closes. This is an accepted limitation, consistent with the Codex `error`-state
+gap already noted above.

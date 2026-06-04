@@ -6,7 +6,7 @@
 
 mod window_chrome;
 
-use hitch_proto::transport::{connect_daemon as connect_transport, DaemonStream};
+use hitch_proto::transport::{connect_daemon as connect_transport, is_endpoint_busy, DaemonStream};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -449,6 +449,12 @@ fn wait_for_socket_release(path: &Path, timeout: Duration) -> Result<(), String>
     let deadline = Instant::now() + timeout;
     loop {
         match connect_transport_bounded(path, Duration::from_millis(250)) {
+            // A busy pipe (ERROR_PIPE_BUSY: all instances occupied) is a *live*
+            // daemon between accept polls, NOT a released endpoint. The probe
+            // connects for real, so a fast connect/close can land while every
+            // instance is momentarily busy; misreading that as released would let
+            // a replacement daemon race the live one. Keep waiting.
+            Err(ref err) if is_endpoint_busy(err) => {}
             // Connect actively failed (NotFound / refused / aborted): the
             // endpoint is gone, so the socket has been released.
             Err(err) if err.kind() != io::ErrorKind::TimedOut => return Ok(()),
