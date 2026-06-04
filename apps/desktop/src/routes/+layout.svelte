@@ -26,6 +26,7 @@
   import { initFileDrop } from "$lib/fileDrop";
   import { commandOpen } from "$lib/overlays";
   import { currentDesktopPlatform, isShortcutModifier } from "$lib/desktopPlatform";
+  import WindowControls from "$lib/components/WindowControls.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import AddProjectDialog from "$lib/components/AddProjectDialog.svelte";
   import CloneProjectDialog from "$lib/components/CloneProjectDialog.svelte";
@@ -119,6 +120,16 @@
 </div>
 
 {@render children()}
+
+<!-- Windows is frameless (decorations:false). The caption controls live here,
+     OUTSIDE the `.window` shell, so they stay visible on full-window routes that
+     hide the shell with display:none (currently /settings) — otherwise Windows
+     users would lose every minimize/maximize/close button there. Rendered once
+     (a fixed top-right layer) to keep the single native Snap-Layouts overlay
+     parked over one max-button rectangle. -->
+{#if desktopPlatform === "windows"}
+  <WindowControls />
+{/if}
 
 <div class="wk-keepalive" aria-hidden="true" style="opacity:{hbOpacity}"></div>
 

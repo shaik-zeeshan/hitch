@@ -197,6 +197,24 @@ mod process_tree {
         pub fn terminate(&self) -> std::io::Result<()> {
             self.inner.terminate()
         }
+
+        /// Terminate descendants once the tree's *leader* has already been reaped.
+        ///
+        /// [`Self::terminate`] is only safe while the leader is alive: on Unix it
+        /// is `kill(-pgid)`, and once the leader (the process-group leader) is
+        /// reaped and the group empties, that pgid can be recycled to an unrelated
+        /// group — signaling it would hit the wrong process group (the
+        /// recycled-pgid race [`ProcessTreeRegistration`] guards against). This
+        /// variant is the post-reap-safe form: on Unix it does nothing rather than
+        /// signal a possibly-recycled pgid; on Windows the Job Object is referenced
+        /// by an owned handle, so `TerminateJobObject` still reaches whatever
+        /// descendants remain assigned without any pid/group reuse hazard.
+        ///
+        /// Use this only after the leader is known reaped (e.g. `try_wait`/`wait`
+        /// returned its status); use [`Self::terminate`] while it is still alive.
+        pub fn terminate_after_leader_reaped(&self) -> std::io::Result<()> {
+            self.inner.terminate_after_leader_reaped()
+        }
     }
 
     #[cfg(unix)]
@@ -225,6 +243,15 @@ mod process_tree {
                 } else {
                     Err(std::io::Error::last_os_error())
                 }
+            }
+
+            pub(super) fn terminate_after_leader_reaped(&self) -> std::io::Result<()> {
+                // The leader is reaped, so its pgid can be recycled to an unrelated
+                // group; `kill(-pgid)` would risk signaling that group. A
+                // descendant that left the group is unreachable by a group kill
+                // anyway, and one that stayed shared the now-empty leader's fate.
+                // Skip the group signal rather than chance a recycled pgid.
+                Ok(())
             }
         }
     }
@@ -297,6 +324,14 @@ mod process_tree {
                 };
                 job.terminate()
             }
+
+            pub(super) fn terminate_after_leader_reaped(&self) -> io::Result<()> {
+                // The Job Object is held alive by an owned handle, so terminating
+                // it after the leader is reaped reaches any still-assigned
+                // descendant with no pid/handle reuse hazard — unlike Unix's pgid
+                // signal. Identical to `terminate` here.
+                self.terminate()
+            }
         }
 
         fn resume_process(process: HANDLE) -> io::Result<()> {
@@ -328,6 +363,10 @@ mod process_tree {
             }
 
             pub(super) fn terminate(&self) -> std::io::Result<()> {
+                Ok(())
+            }
+
+            pub(super) fn terminate_after_leader_reaped(&self) -> std::io::Result<()> {
                 Ok(())
             }
         }

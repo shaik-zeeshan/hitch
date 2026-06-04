@@ -936,6 +936,15 @@ impl HitchClient {
                 Err(err) if err.kind() == io::ErrorKind::TimedOut => {
                     return Err(format!("timed out connecting to live daemon: {err}"));
                 }
+                // A busy endpoint (`ERROR_PIPE_BUSY`: every pipe instance is
+                // momentarily occupied while the daemon re-arms a fresh accept
+                // instance, ADR 0012) is a *live* daemon, not an absent socket —
+                // the same classification `wait_for_socket_release` already uses.
+                // Spawning a replacement here would race the live daemon, so
+                // surface a retryable error instead and let the caller re-probe.
+                Err(ref err) if is_endpoint_busy(err) => {
+                    return Err(format!("daemon endpoint momentarily busy: {err}"));
+                }
                 Err(_) => {
                     // Socket absent: we must (re)spawn. Guard against a crash loop —
                     // a daemon that dies on startup (corrupt store, bind failure)
@@ -991,6 +1000,15 @@ impl HitchClient {
                     }
                 }
                 Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
+                // A busy endpoint (`ERROR_PIPE_BUSY`: every pipe instance is
+                // momentarily occupied while the daemon's accept loop re-arms a
+                // fresh instance, ADR 0012) is a *live* daemon, not an absent
+                // one — exactly as `wait_for_socket_release`/`is_endpoint_busy`
+                // classify it. Spawning here would burn crash-loop budget over a
+                // healthy daemon, and a subsequent force-restart (line below)
+                // would kill it. Fall through to the Hello attempt and let its
+                // own bounded connect retry once an instance frees up.
+                Err(ref err) if is_endpoint_busy(err) => {}
                 Err(_) => {
                     self.record_spawn_attempt(app)?;
                     self.set_status(app, DaemonStatus::Starting, None);

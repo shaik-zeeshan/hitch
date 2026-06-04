@@ -13,7 +13,6 @@
   } from "../daemon";
   import { commandOpen } from "../overlays";
   import { currentDesktopPlatform, shortcutLabel } from "../desktopPlatform";
-  import WindowControls from "./WindowControls.svelte";
 
   // Title-bar integration differs per OS (ADR 0006): macOS reserves space for
   // the native Overlay traffic lights on the left; Windows is frameless and
@@ -141,10 +140,6 @@
       </button>
     {/if}
   </div>
-
-  {#if platform === "windows"}
-    <WindowControls />
-  {/if}
 </nav>
 
 <style>
@@ -164,10 +159,12 @@
   .topnav.mac {
     padding-left: 78px;
   }
-  /* Windows is frameless: the caption controls (WindowControls) sit flush in
-     the top-right corner, so the nav gives up its right padding there. */
+  /* Windows is frameless: the caption controls (WindowControls) are rendered as
+     a fixed top-right layer at the layout level (so they stay visible on routes
+     that hide the shell, e.g. /settings). The nav reserves their width on the
+     right (3 × 46px) so its own content never slides under the controls. */
   .topnav.win {
-    padding-right: 0;
+    padding-right: 138px;
   }
 
   .nav-grow {

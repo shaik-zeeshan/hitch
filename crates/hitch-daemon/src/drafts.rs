@@ -573,7 +573,15 @@ fn run_provider_command(
             .as_ref()
             .is_some_and(|writer| !writer.is_finished())
     {
-        terminate_process_tree(&process_tree, &mut child);
+        // The leader was reaped by the `try_wait` above, so a plain
+        // `terminate()` here would be the recycled-pgid hazard the cancel/timeout
+        // branches and `ProcessTreeRegistration` guard against: on Unix it is
+        // `kill(-pgid)`, and the reaped leader's pgid can already belong to an
+        // unrelated group. Use the post-reap-safe form, which skips the Unix
+        // group signal but still tears down a Windows Job Object holding a
+        // detached descendant that inherited one of our captured pipes.
+        let _ = process_tree.terminate_after_leader_reaped();
+        let _ = child.kill();
     }
 
     let stdout = join_reader(stdout_reader)?;

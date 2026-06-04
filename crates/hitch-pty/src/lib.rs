@@ -340,7 +340,13 @@ fn spawn_reader_thread(
 /// / close) is shared with `ProcessTree` via [`hitch_process::JobHandle`].
 #[cfg(windows)]
 struct WindowsJobObject {
-    job: hitch_process::JobHandle,
+    // `None` when the live child could not be assigned to the job (e.g. a parent
+    // job that forbids nesting / breakaway, or pre-Windows-8 where a process
+    // already in a job cannot join another). The session still opens in that
+    // case; `kill` degrades to the direct child kill it already performs, which
+    // remains a usable fallback. Mirrors `hitch_process::ProcessTree`, which
+    // treats the same assignment failure as a soft failure.
+    job: Option<hitch_process::JobHandle>,
 }
 
 #[cfg(windows)]
@@ -356,17 +362,28 @@ impl WindowsJobObject {
         let job = hitch_process::JobHandle::create_kill_on_close().map_err(PtyError::Io)?;
 
         // SAFETY: `process` is the process handle exposed by portable-pty for the
-        // spawned child; `job` is a live kill-on-close job. Assignment failure here
-        // is fatal — the PTY child must be reachable on kill.
-        if !unsafe { job.assign_process(process.cast()) } {
-            return Err(PtyError::Io(io::Error::last_os_error()));
-        }
+        // spawned child; `job` is a live kill-on-close job. Assignment can
+        // legitimately fail under a launcher whose parent job forbids nesting /
+        // breakaway (or on pre-Win8). The job only existed to reach *descendants*
+        // on kill; without it `kill` still reaps the shell via its direct child
+        // kill, so we degrade to no job rather than failing the spawn.
+        let job = if unsafe { job.assign_process(process.cast()) } {
+            Some(job)
+        } else {
+            None
+        };
 
         Ok(Self { job })
     }
 
     fn terminate(&self) -> Result<(), PtyError> {
-        self.job.terminate().map_err(PtyError::Io)
+        // No job means assignment failed at spawn time; `kill` pairs `terminate`
+        // with a direct child kill, so report success and let that path reap the
+        // shell.
+        let Some(job) = self.job.as_ref() else {
+            return Ok(());
+        };
+        job.terminate().map_err(PtyError::Io)
     }
 }
 

@@ -121,12 +121,19 @@
 </div>
 
 <style>
-  /* Flush to the top-right corner; the nav drops its right padding on Windows
-     so the buttons reach the window edge (Fitts's-law corner, like native). */
+  /* Flush to the top-right corner of the window. Fixed (not in the nav flow) so
+     the controls stay visible on full-window routes that hide the 3-pane shell
+     — e.g. /settings — where the nav itself is display:none. The nav reserves
+     matching right padding on Windows so its content never slides under here.
+     z-index sits above route content; the native Snap-Layouts overlay tracks
+     the max button via getBoundingClientRect, so fixed positioning is fine. */
   .caption {
+    position: fixed;
+    top: 0;
+    right: 0;
+    z-index: 50;
+    height: 44px;
     display: flex;
-    align-self: stretch;
-    margin-left: 4px;
   }
   .cap {
     width: 46px;
