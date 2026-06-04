@@ -67,21 +67,44 @@ pub fn instance_dir_name() -> String {
     format!(".hitch{}", instance_infix())
 }
 
-/// Per-user data directory for Windows builds. Release uses `%LOCALAPPDATA%\Hitch`;
-/// debug/custom instances live under a namespace child so store, logs, and pipe
-/// rendezvous stay isolated without drifting across crates.
-#[cfg(windows)]
+/// Per-user data directory for the current build namespace. This is the single
+/// canonical resolver: the daemon (store, managed worktrees, log) and the GUI
+/// (log tail) both call it so they can never drift onto different roots.
+///
+/// Unix keeps the historical `$HOME/.hitch*` layout, falling back through
+/// `HOME` → `USERPROFILE` → the system temp dir so a process with a stripped
+/// environment still lands somewhere writable. Windows uses
+/// `%LOCALAPPDATA%\Hitch`, with a namespace child for dev or custom instances
+/// so store, logs, and pipe rendezvous stay isolated.
 pub fn default_data_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Hitch");
-    let namespace = instance_namespace();
-    if namespace.is_empty() {
-        base
-    } else {
-        base.join(namespace)
+    #[cfg(unix)]
+    {
+        unix_home_dir().join(instance_dir_name())
     }
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Hitch");
+        let namespace = instance_namespace();
+        if namespace.is_empty() {
+            base
+        } else {
+            base.join(namespace)
+        }
+    }
+}
+
+/// Resolve the user's home directory on Unix, falling back HOME → USERPROFILE →
+/// temp. Kept here so the data-root layout is owned by one crate; the daemon and
+/// GUI must not re-derive it independently (they drifted when they did).
+#[cfg(unix)]
+fn unix_home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// Default daemon socket path for the current user and build namespace.
@@ -634,6 +657,26 @@ mod tests {
             logical_socket_name(Path::new(r"C:\Users\pc\AppData\Local\Hitch\daemon.sock")),
             logical_socket_name(Path::new(r"C:\Users\pc\AppData\Local\Hitch\other.sock")),
         );
+    }
+
+    #[test]
+    fn default_data_dir_ends_with_instance_dir_name() {
+        // The shared resolver the daemon and GUI both call must land both of them
+        // on the same per-instance root. On Unix the leaf is the historical
+        // `.hitch*` dir name; on Windows it is the `Hitch` (plus namespace) tree.
+        let dir = default_data_dir();
+        #[cfg(unix)]
+        {
+            let leaf = dir.file_name().unwrap().to_string_lossy().into_owned();
+            assert_eq!(leaf, instance_dir_name());
+        }
+        #[cfg(windows)]
+        {
+            assert!(
+                dir.to_string_lossy().contains("Hitch"),
+                "windows data dir {dir:?} should live under a Hitch tree",
+            );
+        }
     }
 
     fn test_socket_path() -> PathBuf {

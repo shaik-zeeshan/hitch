@@ -24,9 +24,15 @@ use std::{env, fs};
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
+// `CREATE_NO_WINDOW` is taken from windows-sys here rather than the canonical
+// `hitch_process::configure_windowless` helper because this crate already depends
+// on windows-sys for its process-identity Win32 calls (OpenProcess etc.) but does
+// NOT depend on hitch-process, and one console flag does not justify adding that
+// dependency. Keep the windowless-spawn rationale in sync with that helper's docs.
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, TerminateProcess, CREATE_NO_WINDOW, PROCESS_TERMINATE,
+    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, CREATE_NO_WINDOW,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
 use hitch_core::SessionId;
@@ -283,8 +289,73 @@ fn daemon_pid_for_force_kill(socket_path: &Path, cached_pid: Option<u32>) -> Opt
     cached_pid.or_else(|| read_daemon_pidfile(socket_path))
 }
 
+/// The image file name we expect any daemon process to carry. Every binary we
+/// spawn or bundle is named `hitch-daemon…` (plain `hitch-daemon.exe`, or a
+/// target-suffixed sidecar like `hitch-daemon-x86_64-pc-windows-msvc.exe`), so a
+/// case-insensitive `hitch-daemon` prefix on the file stem identifies our daemon
+/// without needing to know which build flavour is on disk.
+#[cfg(windows)]
+const DAEMON_IMAGE_PREFIX: &str = "hitch-daemon";
+
+/// Resolve a live pid to its process image file name (the final path component),
+/// or `None` if the process is gone or its image can't be read. Used to confirm
+/// identity before a force-kill so a recycled pid never lets us terminate an
+/// unrelated process.
+#[cfg(windows)]
+fn process_image_file_name(pid: u32) -> Option<String> {
+    // SAFETY: query-only handle; closed on every path below after a successful
+    // OpenProcess. PROCESS_QUERY_LIMITED_INFORMATION is the least-privileged
+    // right that QueryFullProcessImageNameW accepts.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: `handle` is a live process handle; `buf`/`len` describe a valid
+    // writable buffer and its capacity in WCHARs. dwFlags `0` (PROCESS_NAME_WIN32)
+    // asks for the Win32 path form.
+    let ok =
+        unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) } != 0;
+    // SAFETY: close the handle acquired above exactly once.
+    unsafe {
+        CloseHandle(handle);
+    }
+    if !ok {
+        return None;
+    }
+    let full = String::from_utf16_lossy(&buf[..len as usize]);
+    // Take the final path component as the file name; the path uses backslashes
+    // on Windows but accept either separator defensively.
+    let file_name = full.rsplit(['\\', '/']).next().unwrap_or(&full);
+    Some(file_name.to_string())
+}
+
+/// Whether the image at `pid` looks like one of our daemon binaries. A reused pid
+/// (the daemon died and Windows handed its number to an unrelated process before
+/// our force-kill fired) fails this and must not be terminated.
+#[cfg(windows)]
+fn process_is_daemon(pid: u32) -> bool {
+    process_image_file_name(pid).is_some_and(|name| {
+        name.to_ascii_lowercase()
+            .starts_with(DAEMON_IMAGE_PREFIX)
+    })
+}
+
 #[cfg(windows)]
 fn terminate_process(pid: u32) -> Result<(), String> {
+    // The pid handed to us was cached at the last successful Hello and is *not*
+    // re-validated by the recovery path before we get here. If the daemon died and
+    // Windows recycled its pid before our force-kill fired, this number now names
+    // an unrelated process — TerminateProcess would kill the wrong thing. The Unix
+    // path guards the same hazard with the pidfile's advisory lock
+    // (`pidfile_is_stale`); Windows has no such lock, so we confirm the target's
+    // image is one of our daemon binaries before killing. A pid that no longer
+    // exists (or whose image we can't read) is treated as "already gone": there's
+    // nothing of ours to kill, so report success.
+    if !process_is_daemon(pid) {
+        return Ok(());
+    }
     // SAFETY: Win32 process handle lifecycle is bounded to this function. The
     // handle is opened only with PROCESS_TERMINATE and is closed on every path
     // after a successful OpenProcess.
@@ -647,50 +718,55 @@ struct HitchClientInner {
 /// The tray's stable id, used to look it up for tooltip updates.
 const TRAY_ID: &str = "hitch-tray";
 
-fn connect_and_hello_over_new_connection(
-    socket_path: &Path,
+/// Write the Hello request on an already-connected `stream` and block until the
+/// matching response arrives, returning the writer half plus the reader (whose
+/// buffer may already hold daemon frames sent right after the Hello). Pure
+/// blocking I/O with no timeout of its own — callers run this inside `run_probe`
+/// so the worker can be abandoned on deadline.
+fn hello_exchange(
+    mut stream: DaemonStream,
     request_id: RequestId,
-    timeout: Duration,
 ) -> Result<(DaemonStream, BufReader<DaemonStream>, Response), String> {
-    let socket_path = socket_path.to_path_buf();
-    match run_probe("hitch-daemon-hello-probe", timeout, move || {
-        (|| -> Result<(DaemonStream, BufReader<DaemonStream>, Response), String> {
-            let mut stream = connect_transport(&socket_path)
-                .map_err(|err| format!("failed to connect for daemon hello: {err}"))?;
-            let mut reader = BufReader::new(
-                stream
-                    .try_clone()
-                    .map_err(|err| format!("failed to clone daemon hello stream: {err}"))?,
-            );
-            let bytes = encode_control_message(&ControlMessage::request(
-                request_id,
-                Request::Hello {
-                    client_name: "hitch-desktop".into(),
-                    protocol_version: PROTOCOL_VERSION,
-                },
-            ))
-            .map_err(|err| err.to_string())?;
-            stream
-                .write_all(&bytes)
-                .map_err(|err| format!("failed to send daemon hello: {err}"))?;
-            stream
-                .flush()
-                .map_err(|err| format!("failed to flush daemon hello: {err}"))?;
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|err| format!("failed to clone daemon hello stream: {err}"))?,
+    );
+    let bytes = encode_control_message(&ControlMessage::request(
+        request_id,
+        Request::Hello {
+            client_name: "hitch-desktop".into(),
+            protocol_version: PROTOCOL_VERSION,
+        },
+    ))
+    .map_err(|err| err.to_string())?;
+    stream
+        .write_all(&bytes)
+        .map_err(|err| format!("failed to send daemon hello: {err}"))?;
+    stream
+        .flush()
+        .map_err(|err| format!("failed to flush daemon hello: {err}"))?;
 
-            loop {
-                match read_control_message(&mut reader) {
-                    Ok(Some(ControlMessage::Response { id, response })) if id == request_id => {
-                        return Ok((stream, reader, response));
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        return Err("daemon closed hello connection before response".to_string());
-                    }
-                    Err(err) => return Err(format!("failed to read daemon hello: {err}")),
-                }
+    loop {
+        match read_control_message(&mut reader) {
+            Ok(Some(ControlMessage::Response { id, response })) if id == request_id => {
+                return Ok((stream, reader, response));
             }
-        })()
-    }) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err("daemon closed hello connection before response".to_string());
+            }
+            Err(err) => return Err(format!("failed to read daemon hello: {err}")),
+        }
+    }
+}
+
+/// Map a `run_probe` outcome for the Hello exchange to the handshake error
+/// strings the caller expects.
+fn finish_hello_probe(
+    result: Result<Result<(DaemonStream, BufReader<DaemonStream>, Response), String>, ProbeError>,
+) -> Result<(DaemonStream, BufReader<DaemonStream>, Response), String> {
+    match result {
         Ok(result) => result,
         Err(ProbeError::Spawn(err)) => Err(format!("failed to spawn daemon hello probe: {err}")),
         Err(ProbeError::Timeout) => Err(DAEMON_RESPONSE_TIMEOUT_REASON.to_string()),
@@ -698,6 +774,34 @@ fn connect_and_hello_over_new_connection(
             Err("daemon hello probe exited without a result".to_string())
         }
     }
+}
+
+/// Run the Hello exchange on an already-connected `stream` under `timeout`,
+/// reusing a connection a prior reachability probe opened. The connect-probe in
+/// `connect_and_handshake` already paid for this socket on the happy path, so
+/// carrying it forward avoids a second pipe connect (and a second probe thread)
+/// per attempt. The probe wrote nothing, so the stream is at protocol start.
+fn hello_over_connection(
+    stream: DaemonStream,
+    request_id: RequestId,
+    timeout: Duration,
+) -> Result<(DaemonStream, BufReader<DaemonStream>, Response), String> {
+    finish_hello_probe(run_probe("hitch-daemon-hello-probe", timeout, move || {
+        hello_exchange(stream, request_id)
+    }))
+}
+
+fn connect_and_hello_over_new_connection(
+    socket_path: &Path,
+    request_id: RequestId,
+    timeout: Duration,
+) -> Result<(DaemonStream, BufReader<DaemonStream>, Response), String> {
+    let socket_path = socket_path.to_path_buf();
+    finish_hello_probe(run_probe("hitch-daemon-hello-probe", timeout, move || {
+        let stream = connect_transport(&socket_path)
+            .map_err(|err| format!("failed to connect for daemon hello: {err}"))?;
+        hello_exchange(stream, request_id)
+    }))
 }
 
 impl HitchClient {
@@ -997,8 +1101,16 @@ impl HitchClient {
             // double-spawn a live daemon and burn crash-loop budget; instead we
             // fall through to the Hello attempt (with its own HANDSHAKE_TIMEOUT)
             // and let the slow accept complete.
-            match connect_transport_bounded(&self.0.socket_path, Duration::from_millis(500)) {
-                Ok(_probe_stream) => {
+            // On the happy path the probe stream is carried forward to the Hello
+            // so the attempt makes a single pipe connect instead of two (the
+            // probe wrote nothing, so the connection is at protocol start). Any
+            // non-`Ok` classification leaves no reusable connection — and the
+            // spawn arm starts a *fresh* daemon — so those paths connect anew.
+            let reusable = match connect_transport_bounded(
+                &self.0.socket_path,
+                Duration::from_millis(500),
+            ) {
+                Ok(probe_stream) => {
                     // The probe connected, so the daemon is reachable even if the
                     // upcoming Hello times out. On Windows the cached pipe-server
                     // pid is the *only* handle on a wedged daemon (no pidfile,
@@ -1007,11 +1119,12 @@ impl HitchClient {
                     // answers Hello leaves the pid None and `restart_daemon`'s
                     // force-kill dead-ends with "cached daemon pid is unknown".
                     #[cfg(windows)]
-                    if let Ok(pid) = _probe_stream.connected_pipe_server_pid() {
+                    if let Ok(pid) = probe_stream.connected_pipe_server_pid() {
                         self.set_windows_daemon_pid(Some(pid));
                     }
+                    Some(probe_stream)
                 }
-                Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
+                Err(err) if err.kind() == io::ErrorKind::TimedOut => None,
                 // A busy endpoint (`ERROR_PIPE_BUSY`: every pipe instance is
                 // momentarily occupied while the daemon's accept loop re-arms a
                 // fresh instance, ADR 0012) is a *live* daemon, not an absent
@@ -1020,7 +1133,7 @@ impl HitchClient {
                 // healthy daemon, and a subsequent force-restart (line below)
                 // would kill it. Fall through to the Hello attempt and let its
                 // own bounded connect retry once an instance frees up.
-                Err(ref err) if is_endpoint_busy(err) => {}
+                Err(ref err) if is_endpoint_busy(err) => None,
                 Err(_) => {
                     self.record_spawn_attempt(app)?;
                     self.set_status(app, DaemonStatus::Starting, None);
@@ -1033,15 +1146,20 @@ impl HitchClient {
                     let _ = self
                         .wait_for_daemon()
                         .map_err(|err| self.record_startup_failure(app, err))?;
+                    None
                 }
-            }
+            };
 
             let request_id = self.0.next_request_id.fetch_add(1, Ordering::SeqCst);
-            match connect_and_hello_over_new_connection(
-                &self.0.socket_path,
-                request_id,
-                HANDSHAKE_TIMEOUT,
-            ) {
+            let hello_result = match reusable {
+                Some(stream) => hello_over_connection(stream, request_id, HANDSHAKE_TIMEOUT),
+                None => connect_and_hello_over_new_connection(
+                    &self.0.socket_path,
+                    request_id,
+                    HANDSHAKE_TIMEOUT,
+                ),
+            };
+            match hello_result {
                 Ok((stream, reader, Response::Hello { daemon_pid, .. })) => {
                     self.attach_with_reader(app, stream, reader)?;
                     self.set_daemon_pid(Some(daemon_pid));
@@ -1898,22 +2016,13 @@ struct DisconnectedPayload {
     reason: String,
 }
 
-/// Path to the daemon's log. MUST match the daemon's own `daemon_log_path` so
-/// the GUI tails the file the daemon writes — never derived from the endpoint
-/// parent, to avoid drift. Unix keeps the existing `$HOME/.hitch*` layout;
-/// Windows uses the transport-owned `%LOCALAPPDATA%\Hitch\<namespace>` layout.
-#[cfg(windows)]
+/// Path to the daemon's log. The data root is owned by
+/// [`hitch_proto::transport::default_data_dir`] — the same resolver the daemon's
+/// `data_dir` uses — so the GUI tails the exact file the daemon writes and the
+/// two can never drift onto different roots. Never derived from the endpoint
+/// parent.
 fn daemon_log_path() -> PathBuf {
     hitch_proto::transport::default_data_dir().join("daemon.log")
-}
-
-#[cfg(not(windows))]
-fn daemon_log_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(hitch_proto::transport::instance_dir_name())
-        .join("daemon.log")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2093,7 +2202,19 @@ fn windows_editor_candidates_from_dirs(
             );
             candidates.push(OsString::from("zed"));
         }
-        _ => {}
+        // Unknown editor: the table has no install-dir mapping, so fall back to
+        // treating the configured name itself as a bare-name PATH candidate. This
+        // routes through the same `resolve_windows_path_candidate` machinery the
+        // known bare-name entries use (which tries `.exe`/`.cmd` and applies the
+        // cmd-shim), so any editor resolvable on PATH works instead of dead-ending.
+        // Candidates that carry path components are left out here because
+        // `configured_executable` already handles absolute/relative paths, and
+        // `resolve_windows_path_candidate` only accepts bare names anyway.
+        _ => {
+            if !windows_candidate_has_path_components(&OsString::from(editor)) {
+                candidates.push(OsString::from(editor));
+            }
+        }
     }
 
     candidates
@@ -2223,6 +2344,10 @@ fn build_editor_launch_spec(editor: &str, path: &Path) -> Option<EditorLaunchSpe
         return Some(EditorLaunchSpec::new(executable.into_os_string(), path));
     }
 
+    // Windows resolution order: explicit configured path (handled above) → known
+    // install dirs + the editor's canonical bare name → the bare configured name
+    // on PATH (the table's `_` fallback). If nothing resolves we return None and
+    // the caller opens the path with the default viewer.
     #[cfg(windows)]
     {
         let candidates = windows_editor_candidates(editor);
@@ -2665,6 +2790,59 @@ mod tests {
                 .into_os_string()
         ));
         assert!(notepad.contains(&std::ffi::OsString::from("notepad++")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unknown_editor_falls_back_to_bare_name_on_path() {
+        let local = std::path::Path::new(r"C:\Users\Ada\AppData\Local");
+        let program_files = std::path::Path::new(r"C:\Program Files");
+        let program_files_x86 = std::path::Path::new(r"C:\Program Files (x86)");
+
+        // An editor with no match arm should still yield its bare configured name
+        // as a candidate so PATH resolution can find it (instead of an empty list
+        // that dead-ends to None).
+        let helix = windows_editor_candidates_from_dirs(
+            "helix",
+            Some(local),
+            Some(program_files),
+            Some(program_files_x86),
+        );
+        assert_eq!(helix, vec![std::ffi::OsString::from("helix")]);
+
+        // A configured name carrying path components is not added as a bare-name
+        // candidate (those are handled by `configured_executable`).
+        let with_path = windows_editor_candidates_from_dirs(
+            r"tools\helix",
+            Some(local),
+            Some(program_files),
+            Some(program_files_x86),
+        );
+        assert!(with_path.is_empty());
+
+        // And that bare name resolves through the normal PATH machinery, picking
+        // up a `.exe` from a PATH dir.
+        let dir = std::env::temp_dir().join(format!(
+            "hitch-editor-test-{}-{}",
+            std::process::id(),
+            "unknown-path-fallback"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("helix.exe");
+        std::fs::write(&exe, b"").unwrap();
+
+        assert_eq!(
+            resolve_windows_path_candidate_from_dirs(
+                &std::ffi::OsString::from("helix"),
+                &[dir.clone()],
+            ),
+            Some(WindowsEditorProgram::executable(
+                exe.as_os_str().to_os_string()
+            ))
+        );
+
+        std::fs::remove_file(exe).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[cfg(windows)]

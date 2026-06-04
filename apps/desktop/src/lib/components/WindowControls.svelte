@@ -15,20 +15,15 @@
   // has been reported. We report that rectangle so the overlay can track the
   // button, but only AFTER those listeners are live (see onMount).
   import { onMount } from "svelte";
-  import { listen } from "@tauri-apps/api/event";
   import {
     closeWindow,
     minimizeWindow,
+    onMaxButtonClick,
+    onMaxButtonHover,
     reportMaxButtonRect,
     toggleMaximizeWindow,
     watchMaximized,
   } from "../windowChrome";
-
-  // Native Snap-Layouts bridge events (src-tauri/src/window_chrome.rs). Kept in
-  // sync with windowChrome.ts's onMaxButton* helpers; registered directly here
-  // so the initial `reportMaxButtonRect` can wait for the listeners to be live.
-  const MAX_HOVER_EVENT = "hitch-max-button-hover";
-  const MAX_CLICK_EVENT = "hitch-max-button-click";
 
   let maximized = $state(false);
   let maxHovered = $state(false);
@@ -36,7 +31,6 @@
 
   onMount(() => {
     let disposed = false;
-    const unlisten: Array<() => void> = [];
     let observer: ResizeObserver | undefined;
 
     // Keep the native overlay aligned with the button's real position across
@@ -49,23 +43,17 @@
     // async initial sync can't drop a click.
     const stopMax = watchMaximized((m) => (maximized = m));
 
-    // The native hover/click listeners' `listen()` registrations are async. We
-    // must install them BEFORE reporting the button rect: reporting parks the
+    // The native hover/click subscriptions register asynchronously. We must
+    // have them live BEFORE reporting the button rect: reporting parks the
     // transparent overlay over the button, after which the webview no longer
     // sees DOM hover/clicks there. The native side emits hover/click directly
     // (Tauri events are not buffered for late subscribers), so parking before
     // the listeners are live would silently drop the first maximize click or
-    // hover. Register both, then park.
-    void Promise.all([
-      listen<boolean>(MAX_HOVER_EVENT, (e) => (maxHovered = e.payload)),
-      listen(MAX_CLICK_EVENT, () => void toggleMaximizeWindow()),
-    ]).then(([offHover, offClick]) => {
-      if (disposed) {
-        offHover();
-        offClick();
-        return;
-      }
-      unlisten.push(offHover, offClick);
+    // hover. Wait for both registrations (`ready`), then park.
+    const hover = onMaxButtonHover((h) => (maxHovered = h));
+    const click = onMaxButtonClick(() => void toggleMaximizeWindow());
+    void Promise.all([hover.ready, click.ready]).then(() => {
+      if (disposed) return;
       report();
       observer = new ResizeObserver(report);
       if (maxButton) observer.observe(maxButton);
@@ -75,7 +63,8 @@
     return () => {
       disposed = true;
       stopMax();
-      for (const off of unlisten) off();
+      hover.off();
+      click.off();
       observer?.disconnect();
       window.removeEventListener("resize", report);
     };

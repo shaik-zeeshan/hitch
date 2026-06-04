@@ -7,8 +7,10 @@
 
 #[cfg(windows)]
 pub use job_object::JobHandle;
+pub use pipe_reader::{DrainOutcome, PipeReader};
 pub use process_tree::ProcessTree;
 pub use registration::ProcessTreeRegistration;
+pub use windowless::configure_windowless;
 
 /// RAII guard that registers a spawned [`ProcessTree`] with an external
 /// canceller and disarms it exactly once — either explicitly via
@@ -375,5 +377,262 @@ mod process_tree {
                 Ok(())
             }
         }
+    }
+}
+
+/// Windowless console-child spawn flag, shared so the magic number lives in one
+/// place.
+///
+/// On Windows every console process Hitch spawns (git, gh, draft providers, the
+/// daemon detach shim) is non-interactive with redirected/null stdio. Without
+/// `CREATE_NO_WINDOW`, a child spawned from a console-less parent (the
+/// hidden-console daemon, a GUI process) — or from a console-attached parent (the
+/// CLI, tests, a stale shim) — materializes a visible console window that flashes
+/// on screen. Routing every plain console spawn through [`configure_windowless`]
+/// keeps that flag opt-out-free so new spawn sites cannot silently re-acquire the
+/// flash bug.
+///
+/// [`ProcessTree::spawn`] keeps its own `CREATE_SUSPENDED | CREATE_NO_WINDOW`
+/// because it additionally needs the suspended start to assign a Job Object before
+/// the child runs; it references the same windows-sys constant, so there is still
+/// one source of truth for the value.
+mod windowless {
+    /// Configure `cmd` so a spawned console child runs with an invisible console
+    /// instead of materializing a window. No-op off Windows. See the module docs
+    /// for why every plain console spawn should go through this.
+    #[cfg(windows)]
+    pub fn configure_windowless(cmd: &mut std::process::Command) {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    /// No-op on non-Windows platforms: there is no console window to suppress.
+    #[cfg(not(windows))]
+    pub fn configure_windowless(_cmd: &mut std::process::Command) {}
+}
+
+/// Bounded, detachable byte-collecting reader for a cancellable child's pipe.
+///
+/// Both the daemon's draft-provider runner and `hitch-git::run_command` capture a
+/// [`ProcessTree`] child's stdout/stderr on dedicated threads and must be able to
+/// *give up* on a reader that never reaches EOF without losing the bytes it
+/// already saw. This is the one place that chunk-loop / channel / grace logic
+/// lives; the two call sites wrap it with their own payload type (`Vec<u8>` vs a
+/// lossy `String`) and error surface.
+///
+/// ## Why a *bounded* drain, and the recycled-pgid tie-in
+///
+/// On the normal-exit path the child exited on its own, so its pipes are at EOF
+/// and the reader finishes immediately — the fast path returns the complete
+/// output exactly as a plain join would. But a same-group descendant can inherit
+/// the captured write end and outlive the child, and once the leader is reaped we
+/// cannot group-kill that descendant on Unix to force EOF: its pgid may already
+/// have been recycled to an unrelated group (the hazard
+/// [`ProcessTree::terminate_after_leader_reaped`] and [`ProcessTreeRegistration`]
+/// guard against). So the reader appends to a shared buffer chunk-by-chunk — never
+/// `read_to_end` — and signals completion over a oneshot-style channel. The
+/// `done` receiver lets a [`PipeReader::drain_bounded`] wait for true EOF with a
+/// deadline and detach the still-parked thread, recovering whatever bytes the
+/// command already wrote.
+mod pipe_reader {
+    use std::io::{self, Read};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    /// A child stdout/stderr reader thread plus the channels needed to drain it
+    /// without blocking forever. See the module docs for the rationale.
+    pub struct PipeReader {
+        handle: thread::JoinHandle<io::Result<()>>,
+        buffer: Arc<Mutex<Vec<u8>>>,
+        done: mpsc::Receiver<()>,
+    }
+
+    /// Outcome of a bounded reader drain on the normal-exit path.
+    ///
+    /// The distinction matters when the collected bytes *are* the result (a
+    /// successful command's stdout): a `Drained` value is the complete output and
+    /// safe to consume, while a `TimedOut` value is only the bytes collected
+    /// before the grace elapsed — possibly truncated — so the caller must decide
+    /// whether partial output is acceptable rather than treating it as complete.
+    pub enum DrainOutcome {
+        /// The reader reached EOF (or a read error) within the grace period; the
+        /// bytes are the complete output.
+        Drained(Vec<u8>),
+        /// The grace elapsed with the reader still parked (a descendant held the
+        /// captured write end open). The bytes are whatever arrived so far and may
+        /// be truncated.
+        TimedOut(Vec<u8>),
+    }
+
+    impl PipeReader {
+        /// Spawn a reader thread that drains `pipe` chunk-by-chunk into a shared
+        /// buffer until EOF or a read error.
+        pub fn spawn<R: Read + Send + 'static>(mut pipe: R) -> Self {
+            let buffer = Arc::new(Mutex::new(Vec::new()));
+            let (done_tx, done) = mpsc::channel();
+            let thread_buffer = Arc::clone(&buffer);
+            let handle = thread::spawn(move || {
+                // Read in chunks (rather than `read_to_end`) so the shared buffer
+                // holds the bytes seen so far even if the pipe never reaches EOF
+                // and this thread ends up detached.
+                let mut chunk = [0u8; 8 * 1024];
+                let result = loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break Ok(()),
+                        Ok(n) => thread_buffer.lock().unwrap().extend_from_slice(&chunk[..n]),
+                        Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(err) => break Err(err),
+                    }
+                };
+                // Signal EOF/error to the bounded drain. A send failure just means
+                // the caller already stopped waiting, which is fine.
+                let _ = done_tx.send(());
+                result
+            });
+            Self {
+                handle,
+                buffer,
+                done,
+            }
+        }
+
+        /// Whether the reader thread has finished (reached EOF or errored).
+        pub fn is_finished(&self) -> bool {
+            self.handle.is_finished()
+        }
+
+        /// Snapshot the bytes read so far. Used when a stuck reader is detached so
+        /// partial command output still survives.
+        pub fn collected(&self) -> Vec<u8> {
+            self.buffer.lock().unwrap().clone()
+        }
+
+        /// Join a reader whose thread is known to be (or about to be) finished —
+        /// e.g. a cancel path killed the tree while the leader was alive, so the
+        /// reader gets EOF and this returns the complete output. Returns the read
+        /// thread's `io::Error` if the read loop failed, or an "output reader
+        /// panicked" error if the thread panicked.
+        pub fn join(self) -> io::Result<Vec<u8>> {
+            let Self { handle, buffer, .. } = self;
+            match handle.join() {
+                Ok(result) => result?,
+                Err(_) => return Err(io::Error::other("command output reader panicked")),
+            }
+            Ok(Arc::try_unwrap(buffer)
+                .map(|mutex| mutex.into_inner().unwrap())
+                .unwrap_or_else(|shared| shared.lock().unwrap().clone()))
+        }
+
+        /// Drain a reader on the NORMAL-EXIT path with a bounded wait.
+        ///
+        /// The command exited on its own, so its pipes *should* be at EOF and the
+        /// reader already finished — that fast path joins the thread and returns
+        /// the complete output as [`DrainOutcome::Drained`]. But a same-group
+        /// descendant can inherit the captured write end and outlive the command,
+        /// and once the leader is reaped we cannot group-kill that descendant on
+        /// Unix to force EOF (the recycled-pgid hazard — see the module docs and
+        /// [`crate::ProcessTree::terminate_after_leader_reaped`]). Rather than
+        /// block forever, wait for EOF with `grace`; if it never comes, detach the
+        /// parked thread and return the bytes collected so far as
+        /// [`DrainOutcome::TimedOut`].
+        pub fn drain_bounded(self, grace: Duration) -> io::Result<DrainOutcome> {
+            match self.done.recv_timeout(grace) {
+                // EOF (or read error) reached: the thread is done, so join it to
+                // surface any error and return the complete output.
+                Ok(()) => self.join().map(DrainOutcome::Drained),
+                // No EOF within the grace period: a descendant still holds the
+                // write end. Return whatever the command already wrote, tagged as
+                // possibly truncated.
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Ok(DrainOutcome::TimedOut(self.collected()))
+                }
+                // The sender dropped without signalling (thread panicked before the
+                // send); fall back to the collected bytes rather than blocking on a
+                // join. The panic means the read loop aborted, so treat this as a
+                // completed (if possibly short) read rather than a still-parked
+                // reader.
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Ok(DrainOutcome::Drained(self.collected()))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pipe_reader_tests {
+    use std::io::{self, Read};
+    use std::time::Duration;
+
+    use crate::{DrainOutcome, PipeReader};
+
+    /// A reader over an in-memory cursor reaches EOF, so a bounded drain returns
+    /// the complete bytes as `Drained`.
+    #[test]
+    fn drain_bounded_returns_drained_on_eof() {
+        let reader = PipeReader::spawn(io::Cursor::new(b"hello world".to_vec()));
+        match reader.drain_bounded(Duration::from_secs(5)).unwrap() {
+            DrainOutcome::Drained(bytes) => assert_eq!(bytes, b"hello world"),
+            DrainOutcome::TimedOut(_) => panic!("expected Drained on EOF"),
+        }
+    }
+
+    /// Joining a finished reader returns the complete output.
+    #[test]
+    fn join_returns_complete_output() {
+        let reader = PipeReader::spawn(io::Cursor::new(b"payload".to_vec()));
+        assert_eq!(reader.join().unwrap(), b"payload");
+    }
+
+    /// A reader whose pipe never reaches EOF times out, and the bounded drain
+    /// returns whatever bytes arrived so far as `TimedOut` rather than blocking.
+    #[test]
+    fn drain_bounded_times_out_on_stuck_pipe() {
+        // A pipe that yields a chunk then blocks forever (never EOF) models a
+        // descendant that inherited the write end and never closed it.
+        struct StuckPipe {
+            sent: bool,
+        }
+        impl Read for StuckPipe {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if !self.sent {
+                    self.sent = true;
+                    let data = b"partial";
+                    buf[..data.len()].copy_from_slice(data);
+                    return Ok(data.len());
+                }
+                // Block "forever" relative to the test grace; long enough that the
+                // drain times out first, short enough not to hang the suite.
+                std::thread::sleep(Duration::from_secs(30));
+                Ok(0)
+            }
+        }
+
+        let reader = PipeReader::spawn(StuckPipe { sent: false });
+        // Give the reader a moment to read the first chunk before draining.
+        std::thread::sleep(Duration::from_millis(100));
+        match reader.drain_bounded(Duration::from_millis(200)).unwrap() {
+            DrainOutcome::TimedOut(bytes) => assert_eq!(bytes, b"partial"),
+            DrainOutcome::Drained(_) => panic!("expected TimedOut on a stuck pipe"),
+        }
+    }
+
+    /// `is_finished` flips true once the reader reaches EOF.
+    #[test]
+    fn is_finished_reflects_eof() {
+        let reader = PipeReader::spawn(io::Cursor::new(b"x".to_vec()));
+        // Poll briefly for the thread to finish reading the tiny buffer.
+        for _ in 0..50 {
+            if reader.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reader.is_finished());
+        assert_eq!(reader.collected(), b"x");
     }
 }

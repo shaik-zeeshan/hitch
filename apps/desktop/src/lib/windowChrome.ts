@@ -60,27 +60,40 @@ export async function reportMaxButtonRect(el: HTMLElement): Promise<void> {
   });
 }
 
+/// A live event subscription. `off()` unsubscribes; `ready` resolves once the
+/// underlying `listen()` registration has completed (or the subscription was
+/// disposed before then). Await `ready` when registration order matters — e.g.
+/// the Snap-Layouts listeners must be live before `reportMaxButtonRect` parks
+/// the overlay, since the native side emits unbuffered events.
+export interface Subscription {
+  readonly ready: Promise<void>;
+  off(): void;
+}
+
 /// The maximize button is covered by a transparent native overlay (for Snap
 /// Layouts), so the webview never sees `:hover` or clicks over it. The native
 /// side forwards both instead: `onMaxButtonHover` drives the highlight and
-/// `onMaxButtonClick` toggles maximize. Each returns an unsubscribe function.
-export function onMaxButtonHover(onChange: (hovered: boolean) => void): () => void {
+/// `onMaxButtonClick` toggles maximize. Each returns a `Subscription`.
+export function onMaxButtonHover(onChange: (hovered: boolean) => void): Subscription {
   return subscribe<boolean>("hitch-max-button-hover", onChange);
 }
 
-export function onMaxButtonClick(onClick: () => void): () => void {
+export function onMaxButtonClick(onClick: () => void): Subscription {
   return subscribe<boolean>("hitch-max-button-click", () => onClick());
 }
 
-function subscribe<T>(event: string, onEvent: (payload: T) => void): () => void {
+function subscribe<T>(event: string, onEvent: (payload: T) => void): Subscription {
   let unlisten: (() => void) | undefined;
   let disposed = false;
-  void listen<T>(event, (e) => onEvent(e.payload)).then((u) => {
+  const ready = listen<T>(event, (e) => onEvent(e.payload)).then((u) => {
     if (disposed) u();
     else unlisten = u;
   });
-  return () => {
-    disposed = true;
-    unlisten?.();
+  return {
+    ready,
+    off() {
+      disposed = true;
+      unlisten?.();
+    },
   };
 }

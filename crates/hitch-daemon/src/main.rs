@@ -13,8 +13,6 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -232,24 +230,16 @@ impl From<Args> for DaemonConfig {
     }
 }
 
-/// `CREATE_NO_WINDOW` (windows-sys / Win32 `CreateProcess` flag): run a console
-/// process with an invisible console instead of materializing a console window.
-/// Declared locally because this is the daemon's only Win32 constant; not worth
-/// a `windows-sys` dependency.
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
 fn detach_spawn(args: &Args) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let mut child = Command::new(exe);
     // Keep the detached daemon's console invisible no matter who launched this
-    // `--detach` shim. The GUI client already spawns the shim with
-    // CREATE_NO_WINDOW, but a stale or manually launched shim could carry a
-    // visible console — and the daemon would inherit it and pin the window open
-    // for its whole lifetime. Giving the daemon its own hidden console here
-    // also keeps its console children (git, draft providers) windowless.
-    #[cfg(windows)]
-    child.creation_flags(CREATE_NO_WINDOW);
+    // `--detach` shim. The GUI client already spawns the shim windowless, but a
+    // stale or manually launched shim could carry a visible console — and the
+    // daemon would inherit it and pin the window open for its whole lifetime.
+    // Giving the daemon its own hidden console here also keeps its console
+    // children (git, draft providers) windowless.
+    hitch_process::configure_windowless(&mut child);
     child
         .arg("--socket")
         .arg(&args.socket_path)
@@ -299,7 +289,7 @@ fn detach_spawn(args: &Args) -> io::Result<()> {
 }
 
 /// Path to the daemon's log, beside the socket and store. Computed from the same
-/// `home_dir()` the store/managed-root defaults use so the Tauri client's
+/// [`data_dir`] the store/managed-root defaults use so the Tauri client's
 /// `read_daemon_log_tail` and this writer never drift onto different files
 /// (ADR 0009).
 fn daemon_log_path() -> PathBuf {
@@ -418,6 +408,13 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
 
     restore_layout(&state, &pty_tx).map_err(|err| io::Error::other(err.message))?;
     spawn_pty_dispatcher(Arc::clone(&state), dispatch_rx, Arc::clone(&shutdown));
+    // Unix-only: the command poller drives the ADR 0011 dirty-exit backstop via
+    // ManagedPty::foreground_command(), which is hard-coded to `None` on Windows
+    // (ConPTY exposes no foreground process group — see hitch-pty and ADR 0011's
+    // "Windows note"). With no resolvable command the poller can only re-broadcast
+    // the same `None` already delivered on attach, while clear_stale_agent_state
+    // returns early. Don't spawn the per-second no-op there.
+    #[cfg(unix)]
     spawn_command_poller(Arc::clone(&state), Arc::clone(&shutdown));
     spawn_dirty_poller(Arc::clone(&state), Arc::clone(&shutdown));
 
@@ -437,30 +434,47 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     let accept_shutdown = Arc::clone(&shutdown);
     let accept_thread = thread::Builder::new()
         .name("hitch-accept".to_string())
-        .spawn(move || loop {
-            match listener.accept() {
-                Ok(stream) => {
-                    if accept_shutdown.load(Ordering::SeqCst) {
-                        // A shutdown self-connect (or a real client racing the
-                        // flag) unparked us; stop arming new accepts.
-                        break;
+        .spawn(move || {
+            // Exponential backoff for the error path: a hard, persistent failure
+            // (e.g. fd/handle exhaustion — EMFILE/ENFILE/ERROR_NO_SYSTEM_RESOURCES)
+            // leaves the listener handle valid and the shutdown flag unset, so
+            // re-arming immediately would peg a CPU core and flood the log. Start
+            // small, grow to a 1s ceiling, and reset on the next successful accept.
+            const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(25);
+            const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+            let mut backoff = ACCEPT_BACKOFF_MIN;
+            loop {
+                match listener.accept() {
+                    Ok(stream) => {
+                        backoff = ACCEPT_BACKOFF_MIN;
+                        if accept_shutdown.load(Ordering::SeqCst) {
+                            // A shutdown self-connect (or a real client racing the
+                            // flag) unparked us; stop arming new accepts.
+                            break;
+                        }
+                        // The sole receiver is the main loop below; if it has gone
+                        // (daemon already tearing down) the send fails and we exit.
+                        if accept_tx.send(stream).is_err() {
+                            break;
+                        }
                     }
-                    // The sole receiver is the main loop below; if it has gone
-                    // (daemon already tearing down) the send fails and we exit.
-                    if accept_tx.send(stream).is_err() {
-                        break;
+                    Err(err) => {
+                        if accept_shutdown.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        // A per-accept failure (e.g. a transient named-pipe error)
+                        // must not kill the daemon. Log and re-arm after a backoff
+                        // sleep so a persistent failure (handle exhaustion) cannot
+                        // spin a busy loop. Re-check shutdown after the sleep so a
+                        // concurrent `ShutdownDaemon` is honored within one backoff
+                        // interval rather than blocked behind it.
+                        eprintln!("hitch-daemon: accept failed: {err}");
+                        thread::sleep(backoff);
+                        if accept_shutdown.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
                     }
-                }
-                Err(err) => {
-                    if accept_shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    // A per-accept failure (e.g. a transient named-pipe error)
-                    // must not kill the daemon. Log and re-arm; a hard, persistent
-                    // failure would spin, but `accept()` on a bound listener does
-                    // not fail persistently short of the process losing its
-                    // endpoint, at which point shutdown is already underway.
-                    eprintln!("hitch-daemon: accept failed: {err}");
                 }
             }
         })
@@ -2205,6 +2219,9 @@ where
 {
     let mut command = Command::new(git_path);
     command.current_dir(repo_root).stdin(Stdio::null());
+    // This git invocation does not go through `ProcessTree::spawn`, so suppress
+    // the console window explicitly. See `hitch_process::configure_windowless`.
+    hitch_process::configure_windowless(&mut command);
     for arg in args {
         match arg {
             OsArg::Borrowed(arg) => {
@@ -2702,6 +2719,12 @@ fn spawn_dirty_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>)
 /// keeps idle terminals quiet. Agent-state exit detection is deliberately
 /// conservative: tools spawned by an agent can become the foreground process,
 /// so only returning to an interactive shell is treated as "agent gone".
+///
+/// Unix-only: ManagedPty::foreground_command() always returns `None` on Windows
+/// (ConPTY exposes no foreground process group — see hitch-pty and ADR 0011's
+/// "Windows note"), so this poller would be a per-second no-op there and is not
+/// spawned on non-Unix platforms.
+#[cfg(unix)]
 fn spawn_command_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>) {
     thread::Builder::new()
         .name("hitch-cmd-poll".into())
@@ -2968,6 +2991,9 @@ fn store_agent_report(
     }
 }
 
+// Only the Unix command poller calls this (the ADR 0011 dirty-exit backstop).
+// On Windows foreground_command() is always `None`, so the poller is not spawned.
+#[cfg(unix)]
 fn clear_stale_agent_state(
     state: &Arc<Mutex<DaemonState>>,
     session_id: SessionId,
@@ -2997,6 +3023,8 @@ fn clear_stale_agent_state(
     })
 }
 
+// Used by the Unix-only clear_stale_agent_state and by tests on all platforms.
+#[cfg(any(unix, test))]
 fn agent_command_matches(agent: KnownAgent, command: &str) -> bool {
     let executable = command.split_whitespace().next().unwrap_or(command);
     let executable = Path::new(executable)
@@ -3008,6 +3036,8 @@ fn agent_command_matches(agent: KnownAgent, command: &str) -> bool {
         KnownAgent::Codex => executable == "codex",
     }
 }
+// Used by the Unix-only clear_stale_agent_state and by tests on all platforms.
+#[cfg(any(unix, test))]
 fn foreground_command_is_shell(command: &str) -> bool {
     let executable = command.split_whitespace().next().unwrap_or(command);
     let executable = Path::new(executable)
@@ -3882,21 +3912,11 @@ fn kill_all_sessions(state: &Arc<Mutex<DaemonState>>) {
     }
 }
 
-/// Per-instance data directory. Unix keeps the historical `$HOME/.hitch*`
-/// layout; Windows uses `%LOCALAPPDATA%\Hitch` with a namespace child for dev
-/// or custom instances.
+/// Per-instance data directory. The cross-platform layout is owned by
+/// [`hitch_proto::transport::default_data_dir`] so the daemon and the GUI's
+/// `daemon_log_path` never drift onto different roots.
 fn data_dir() -> PathBuf {
-    platform_data_dir()
-}
-
-#[cfg(windows)]
-fn platform_data_dir() -> PathBuf {
     hitch_proto::transport::default_data_dir()
-}
-
-#[cfg(not(windows))]
-fn platform_data_dir() -> PathBuf {
-    home_dir().join(hitch_proto::transport::instance_dir_name())
 }
 
 fn default_store_path() -> PathBuf {
@@ -3923,14 +3943,6 @@ fn hook_helper_path_for_daemon_exe(exe: &Path) -> PathBuf {
     };
     let suffix = file_name.strip_prefix("hitch-daemon").unwrap_or_default();
     parent.join(format!("hitch-hook{suffix}"))
-}
-
-#[cfg(not(windows))]
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir)
 }
 
 fn store_error(err: hitch_store::StoreError) -> ProtocolError {
