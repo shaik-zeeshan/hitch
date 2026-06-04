@@ -1,6 +1,8 @@
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,6 +15,14 @@ use serde_json::Value;
 const DEFAULT_TIMEOUT_SECS: u64 = 90;
 const MAX_DIFF_CHARS: usize = 48_000;
 const MAX_STDERR_CHARS: usize = 4_000;
+
+/// Grace period for draining a provider's stdout/stderr reader on the normal-exit
+/// path before detaching a reader still parked on an inherited pipe. The provider
+/// already exited, so its own pipes are at EOF and the readers finish well within
+/// this window; the bound only caps the wait when a same-group descendant kept a
+/// captured write end open (see `drain_reader_bounded`). Kept short and on the
+/// same order as the `try_wait` poll interval so a completed run returns promptly.
+const READER_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 /// Standalone sanity bound on a draft provider timeout (ten minutes). Draft
 /// generation now runs as an async **Job** (ADR 0008), so it is no longer
@@ -523,8 +533,8 @@ fn run_provider_command(
                 // thread exits on its own once the killed tree drops that end.
                 // (The readers below are bounded by EOF, which the kill delivers.)
                 drop(stdin_writer);
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+                let _ = stdout_reader.handle.join();
+                let _ = stderr_reader.handle.join();
                 return Err(provider_error(format!(
                     "{} draft provider cancelled",
                     config.kind.label()
@@ -546,8 +556,8 @@ fn run_provider_command(
                 // thread exits on its own once the killed tree drops that end.
                 // (The readers below are bounded by EOF, which the kill delivers.)
                 drop(stdin_writer);
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+                let _ = stdout_reader.handle.join();
+                let _ = stderr_reader.handle.join();
                 return Err(provider_error(format!(
                     "{} draft provider timed out after {}s",
                     config.kind.label(),
@@ -584,8 +594,15 @@ fn run_provider_command(
         let _ = child.kill();
     }
 
-    let stdout = join_reader(stdout_reader)?;
-    let stderr = join_reader(stderr_reader)?;
+    // Drain the readers with a bounded wait. Normally the provider's pipes are
+    // already at EOF (readers finished), so this returns the complete output
+    // immediately. When a same-group descendant inherited a captured write end and
+    // outlives the provider, `terminate_after_leader_reaped` cannot force EOF on
+    // Unix (the recycled-pgid no-op above), so without a bound `join_reader` would
+    // block until that descendant exits. The grace period lets a slightly-late EOF
+    // land while still detaching a truly stuck reader and using its partial output.
+    let stdout = drain_reader_bounded(stdout_reader, READER_DRAIN_GRACE)?;
+    let stderr = drain_reader_bounded(stderr_reader, READER_DRAIN_GRACE)?;
 
     if !status.success() {
         // The provider's exit status is authoritative on failure. Do not wait
@@ -621,15 +638,72 @@ fn terminate_process_tree(process_tree: &ProcessTree, child: &mut std::process::
     let _ = child.kill();
 }
 
-fn read_pipe<T>(mut pipe: T) -> thread::JoinHandle<io::Result<String>>
+/// A provider stdout/stderr reader thread plus the channels needed to drain it
+/// without blocking forever.
+///
+/// The reader appends to a shared buffer chunk-by-chunk and signals completion
+/// over a oneshot-style channel. The shared buffer lets a *bounded* post-reap
+/// drain recover whatever bytes the provider already wrote even when the thread
+/// is still parked: on the normal-exit path a same-group descendant can inherit
+/// the captured write end and never close it, and on Unix we cannot group-kill it
+/// once the leader is reaped (the recycled-pgid hazard — see
+/// `terminate_after_leader_reaped` / `ProcessTreeRegistration`). The `done`
+/// receiver lets us wait for true EOF with a deadline (mirroring the bounded
+/// `recv_timeout` drain in `hitch-pty::collect_output`) and detach if it never
+/// comes.
+struct PipeReader {
+    handle: thread::JoinHandle<io::Result<()>>,
+    buffer: Arc<Mutex<Vec<u8>>>,
+    done: mpsc::Receiver<()>,
+}
+
+impl PipeReader {
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    /// Snapshot the bytes read so far as a lossy UTF-8 string. Used when a stuck
+    /// reader is detached so partial provider output still survives.
+    fn collected(&self) -> String {
+        buffer_to_string(&self.buffer)
+    }
+}
+
+fn buffer_to_string(buffer: &Mutex<Vec<u8>>) -> String {
+    let bytes = buffer.lock().unwrap();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn read_pipe<T>(mut pipe: T) -> PipeReader
 where
     T: Read + Send + 'static,
 {
-    thread::spawn(move || {
-        let mut output = String::new();
-        pipe.read_to_string(&mut output)?;
-        Ok(output)
-    })
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (done_tx, done) = mpsc::channel();
+    let thread_buffer = Arc::clone(&buffer);
+    let handle = thread::spawn(move || {
+        // Read in chunks (rather than `read_to_string`) so the shared buffer holds
+        // the bytes seen so far even if the pipe never reaches EOF and this thread
+        // ends up detached.
+        let mut chunk = [0u8; 8 * 1024];
+        let result = loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break Ok(()),
+                Ok(n) => thread_buffer.lock().unwrap().extend_from_slice(&chunk[..n]),
+                Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => break Err(err),
+            }
+        };
+        // Signal EOF/error to the bounded drain. A send failure just means the
+        // caller already stopped waiting, which is fine.
+        let _ = done_tx.send(());
+        result
+    });
+    PipeReader {
+        handle,
+        buffer,
+        done,
+    }
 }
 
 fn write_pipe<T>(mut pipe: T, input: String) -> thread::JoinHandle<io::Result<()>>
@@ -661,11 +735,41 @@ fn join_writer_if_finished(handle: thread::JoinHandle<io::Result<()>>) -> Option
     }
 }
 
-fn join_reader(handle: thread::JoinHandle<io::Result<String>>) -> Result<String, ProtocolError> {
+/// Join a reader whose thread is known to be (or about to be) finished — the
+/// cancel/timeout paths kill the tree while the leader is alive, so the readers
+/// get EOF and this returns the complete output.
+fn join_reader(reader: PipeReader) -> Result<String, ProtocolError> {
+    let PipeReader { handle, buffer, .. } = reader;
     handle
         .join()
         .map_err(|_| provider_error("draft provider output reader panicked"))?
-        .map_err(|err| provider_error(format!("failed reading draft provider output: {err}")))
+        .map_err(|err| provider_error(format!("failed reading draft provider output: {err}")))?;
+    Ok(buffer_to_string(&buffer))
+}
+
+/// Drain a reader on the NORMAL-EXIT path with a bounded wait.
+///
+/// The provider exited on its own, so its pipes *should* be at EOF and the reader
+/// already finished — that fast path returns the complete output exactly as a
+/// plain join would. But a same-group descendant can inherit the captured write
+/// end and outlive the provider, and once the leader is reaped we cannot
+/// group-kill that descendant on Unix to force EOF (the recycled-pgid hazard —
+/// `terminate_after_leader_reaped` is a deliberate no-op there). Rather than block
+/// forever, wait for EOF with a short grace period (the bounded `recv_timeout`
+/// idiom from `hitch-pty::collect_output`); if it never comes, detach the thread
+/// and return the bytes collected so far, mirroring `join_writer_if_finished`.
+fn drain_reader_bounded(reader: PipeReader, grace: Duration) -> Result<String, ProtocolError> {
+    match reader.done.recv_timeout(grace) {
+        // EOF (or read error) reached: the thread is done, so join it to surface
+        // any error and return the complete output.
+        Ok(()) => join_reader(reader),
+        // No EOF within the grace period: a descendant still holds the write end.
+        // Detach the parked thread and use whatever the provider already wrote.
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(reader.collected()),
+        // The sender dropped without signalling (thread panicked before the send);
+        // fall back to the collected bytes rather than blocking on a join.
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(reader.collected()),
+    }
 }
 
 fn parse_codex_models(output: &str) -> Vec<String> {
@@ -1637,6 +1741,46 @@ fn main() {
         assert!(
             elapsed < Duration::from_secs(10),
             "timeout path blocked for {elapsed:?}; process-tree termination should free the inherited pipe promptly"
+        );
+        let _ = fs::remove_file(script);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_provider_does_not_wait_for_grandchild_holding_stdout() {
+        // Regression: a provider that exits 0 on its own (the NORMAL-EXIT path)
+        // after backgrounding a child that inherited stdout must not keep the
+        // reader join blocked until that child exits. The post-reap drain cannot
+        // group-kill on Unix (recycled-pgid hazard — `terminate_after_leader_reaped`
+        // is a deliberate no-op there), so the reader gets no EOF; the bounded
+        // post-reap wait must detach the stuck reader and return the output the
+        // provider already printed.
+        let script = temp_file("successful-provider-inherited-stdout", "sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\n# Background child inherits stdout (fd 1) and holds it open past our wait.\nsleep 30 &\nprintf '%s\n' '{\"title\":\"Generated PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}'\n",
+        )
+        .unwrap();
+        make_executable(&script);
+        let cwd = temp_dir("successful-provider-inherited-stdout-cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Codex,
+            claude: PathBuf::from("claude"),
+            codex: script.clone(),
+            timeout: Duration::from_secs(5),
+            model: None,
+        };
+        let mut command = Command::new(&config.codex);
+        let started = Instant::now();
+        let result = run_provider_command(&mut command, &cwd, &config, None, None).unwrap();
+        let elapsed = started.elapsed();
+        assert!(result.contains("Generated PR"));
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "successful provider blocked on inherited stdout pipe for {elapsed:?}; \
+             the post-reap reader drain should be bounded"
         );
         let _ = fs::remove_file(script);
         let _ = fs::remove_dir_all(cwd);

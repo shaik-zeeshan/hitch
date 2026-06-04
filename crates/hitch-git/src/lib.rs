@@ -19,6 +19,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tempfile::NamedTempFile;
@@ -1614,6 +1616,15 @@ fn branch_target_oid(branch: &git2::Branch<'_>) -> Result<Oid> {
         .ok_or_else(|| GitError::Git(git2::Error::from_str("branch has no direct target")))
 }
 
+/// Grace period for draining a command's stdout/stderr reader on the normal-exit
+/// path before detaching a reader still parked on an inherited pipe. The command
+/// already exited, so its own pipes are at EOF and the readers finish well within
+/// this window; the bound only caps the wait when a same-group descendant kept a
+/// captured write end open (see `drain_pipe_reader_bounded`). Kept short and on
+/// the same order as the `try_wait` poll interval so a completed run returns
+/// promptly.
+const READER_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
 fn run_command(
     program: &Path,
     cwd: &Path,
@@ -1698,8 +1709,34 @@ fn run_command(
     // the registration here loses no intended kill — it only closes the window
     // where a late cancel could signal a recycled process group.
     drop(registration);
-    let stdout_result = join_pipe_reader(stdout_reader);
-    let stderr_result = join_pipe_reader(stderr_reader);
+
+    let (stdout_result, stderr_result) = if cancelled {
+        // The cancel branch group-killed the tree while the leader was still
+        // alive, so the captured pipes get EOF and the readers finish on their
+        // own. Join them unconditionally to collect the partial output.
+        (
+            join_pipe_reader(stdout_reader),
+            join_pipe_reader(stderr_reader),
+        )
+    } else {
+        // NORMAL-EXIT path: the child exited on its own. If a same-group
+        // descendant inherited a captured write end and outlives it, the readers
+        // never see EOF, and once the leader is reaped we cannot group-kill that
+        // descendant on Unix to force it (the recycled-pgid hazard —
+        // `terminate_after_leader_reaped` is a deliberate no-op there; on Windows
+        // the owned Job Object handle still tears down the descendant and closes
+        // the pipe). Use the post-reap-safe teardown, then drain with a bounded
+        // wait so a slightly-late EOF still lands while a truly stuck reader is
+        // detached with whatever the command already wrote.
+        if !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+            let _ = tree.terminate_after_leader_reaped();
+            let _ = child.kill();
+        }
+        (
+            drain_pipe_reader_bounded(stdout_reader, READER_DRAIN_GRACE),
+            drain_pipe_reader_bounded(stderr_reader, READER_DRAIN_GRACE),
+        )
+    };
 
     let stdout = String::from_utf8(stdout_result?)?;
     let stderr = String::from_utf8(stderr_result?)?;
@@ -1721,22 +1758,102 @@ fn run_command(
     }
 }
 
-fn spawn_pipe_reader<R: Read + Send + 'static>(
-    mut pipe: R,
-) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
-    thread::spawn(move || {
-        let mut output = Vec::new();
-        pipe.read_to_end(&mut output)?;
-        Ok(output)
-    })
+/// A command stdout/stderr reader thread plus the channels needed to drain it
+/// without blocking forever.
+///
+/// The reader appends to a shared buffer chunk-by-chunk and signals completion
+/// over a oneshot-style channel. The shared buffer lets a *bounded* post-reap
+/// drain recover whatever bytes the command already wrote even when the thread is
+/// still parked: on the normal-exit path a same-group descendant can inherit the
+/// captured write end and never close it, and on Unix we cannot group-kill it
+/// once the leader is reaped (the recycled-pgid hazard — see
+/// `ProcessTree::terminate_after_leader_reaped` / `ProcessTreeRegistration`). The
+/// `done` receiver lets us wait for true EOF with a deadline and detach if it
+/// never comes. (Mirrors `hitch-daemon::drafts`'s `PipeReader`; kept local rather
+/// than shared because the two differ in payload type — `Vec<u8>` here vs
+/// `String` there — and error surface.)
+struct PipeReader {
+    handle: thread::JoinHandle<std::io::Result<()>>,
+    buffer: Arc<Mutex<Vec<u8>>>,
+    done: mpsc::Receiver<()>,
 }
 
-fn join_pipe_reader(
-    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
-) -> std::io::Result<Vec<u8>> {
+impl PipeReader {
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    /// Snapshot the bytes read so far. Used when a stuck reader is detached so
+    /// partial command output still survives.
+    fn collected(&self) -> Vec<u8> {
+        self.buffer.lock().unwrap().clone()
+    }
+}
+
+fn spawn_pipe_reader<R: Read + Send + 'static>(mut pipe: R) -> PipeReader {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (done_tx, done) = mpsc::channel();
+    let thread_buffer = Arc::clone(&buffer);
+    let handle = thread::spawn(move || {
+        // Read in chunks (rather than `read_to_end`) so the shared buffer holds
+        // the bytes seen so far even if the pipe never reaches EOF and this thread
+        // ends up detached.
+        let mut chunk = [0u8; 8 * 1024];
+        let result = loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break Ok(()),
+                Ok(n) => thread_buffer.lock().unwrap().extend_from_slice(&chunk[..n]),
+                Err(ref err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => break Err(err),
+            }
+        };
+        // Signal EOF/error to the bounded drain. A send failure just means the
+        // caller already stopped waiting, which is fine.
+        let _ = done_tx.send(());
+        result
+    });
+    PipeReader {
+        handle,
+        buffer,
+        done,
+    }
+}
+
+/// Join a reader whose thread is known to be (or about to be) finished — the
+/// cancel path kills the tree while the leader is alive, so the readers get EOF
+/// and this returns the complete output.
+fn join_pipe_reader(reader: PipeReader) -> std::io::Result<Vec<u8>> {
+    let PipeReader { handle, buffer, .. } = reader;
     match handle.join() {
-        Ok(result) => result,
-        Err(_) => Err(std::io::Error::other("command output reader panicked")),
+        Ok(result) => result?,
+        Err(_) => return Err(std::io::Error::other("command output reader panicked")),
+    }
+    Ok(Arc::try_unwrap(buffer)
+        .map(|mutex| mutex.into_inner().unwrap())
+        .unwrap_or_else(|shared| shared.lock().unwrap().clone()))
+}
+
+/// Drain a reader on the NORMAL-EXIT path with a bounded wait.
+///
+/// The command exited on its own, so its pipes *should* be at EOF and the reader
+/// already finished — that fast path returns the complete output exactly as a
+/// plain join would. But a same-group descendant can inherit the captured write
+/// end and outlive the command, and once the leader is reaped we cannot
+/// group-kill that descendant on Unix to force EOF (the recycled-pgid hazard —
+/// `terminate_after_leader_reaped` is a deliberate no-op there). Rather than block
+/// forever, wait for EOF with a short grace period; if it never comes, detach the
+/// thread and return the bytes collected so far.
+fn drain_pipe_reader_bounded(reader: PipeReader, grace: Duration) -> std::io::Result<Vec<u8>> {
+    match reader.done.recv_timeout(grace) {
+        // EOF (or read error) reached: the thread is done, so join it to surface
+        // any error and return the complete output.
+        Ok(()) => join_pipe_reader(reader),
+        // No EOF within the grace period: a descendant still holds the write end.
+        // Detach the parked thread and use whatever the command already wrote.
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(reader.collected()),
+        // The sender dropped without signalling (thread panicked before the send);
+        // fall back to the collected bytes rather than blocking on a join.
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(reader.collected()),
     }
 }
 
@@ -3069,6 +3186,42 @@ mod tests {
         let registrations = control.registrations.lock().unwrap();
         assert_eq!(registrations.first().copied(), Some(true));
         assert_eq!(registrations.last().copied(), Some(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_does_not_wait_for_grandchild_holding_stdout() {
+        use std::time::Instant;
+
+        // Regression: a command that exits 0 on its own (the NORMAL-EXIT path)
+        // after backgrounding a child that inherited stdout must not keep the
+        // reader join blocked until that child exits. The post-reap drain cannot
+        // group-kill on Unix (recycled-pgid hazard — `terminate_after_leader_reaped`
+        // is a deliberate no-op there), so the reader gets no EOF; the bounded
+        // post-reap wait must detach the stuck reader and return the output the
+        // command already printed.
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("git-backgrounds-child");
+        fs::write(
+            &script,
+            "#!/bin/sh\n# Background child inherits stdout (fd 1) and holds it open past our wait.\nsleep 30 &\nprintf 'done'\n",
+        )
+        .unwrap();
+        make_executable(&script);
+
+        // A live control routes run_command through the spawn/pipe-reader path
+        // (the `None` path uses `Command::output`, which never has this hazard).
+        let control = TestControl::new(false);
+        let started = Instant::now();
+        let output = run_command(&script, temp.path(), Vec::new(), Some(&control)).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(output.stdout, "done");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "run_command blocked on inherited stdout pipe for {elapsed:?}; \
+             the post-reap reader drain should be bounded"
+        );
     }
 
     /// Regression: the external cancellation handle must be disarmed
