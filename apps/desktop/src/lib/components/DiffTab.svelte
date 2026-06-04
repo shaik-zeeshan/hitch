@@ -93,12 +93,14 @@
     word-break: break-word;
   }
   .dl .gut {
+    box-sizing: content-box;
     display: inline-block;
-    width: 30px;
+    width: 4ch;
     color: oklch(48% 0.01 265);
     user-select: none;
     text-align: right;
     padding-right: 12px;
+    white-space: nowrap;
   }
   .dl.hunk {
     color: var(--ac-bright);

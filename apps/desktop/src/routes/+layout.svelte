@@ -23,6 +23,7 @@
   import { onMount } from "svelte";
   import { page } from "$app/state";
   import { disposeDaemon, initDaemon } from "$lib/daemon";
+  import { initFileDrop } from "$lib/fileDrop";
   import { commandOpen } from "$lib/overlays";
   import { currentDesktopPlatform, isShortcutModifier } from "$lib/desktopPlatform";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
@@ -69,6 +70,14 @@
   onMount(() => {
     void initDaemon();
     window.addEventListener("keydown", onKeydown);
+    // App-wide OS-file-drop listener: drops onto a terminal insert the dropped
+    // paths at its prompt (see fileDrop.ts for why this is window-global rather
+    // than a per-terminal DOM handler). Registration is async; stash the
+    // unlisten so teardown removes it even if the promise resolves after unmount.
+    let unlistenDrop: (() => void) | null = null;
+    void initFileDrop().then((unlisten) => {
+      unlistenDrop = unlisten;
+    });
     // Keep the macOS WKWebView from going dormant. When the page has no
     // scheduled work (no terminal mounted, or the only terminal is unfocused so
     // xterm's cursor-blink timer is paused), the webview stops flushing frames:
@@ -82,6 +91,7 @@
     return () => {
       clearInterval(heartbeat);
       window.removeEventListener("keydown", onKeydown);
+      unlistenDrop?.();
       disposeDaemon();
     };
   });

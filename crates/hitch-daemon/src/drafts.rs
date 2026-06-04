@@ -349,6 +349,15 @@ fn run_headless_provider(
     prompt: String,
     cancel: Option<&crate::JobControl>,
 ) -> Result<String, ProtocolError> {
+    // git diffs can carry interior NUL bytes (a tracked file with embedded
+    // NULs, or content git emits verbatim), and Claude receives the prompt as
+    // a process argument. Strip them before building the command line; they
+    // carry no meaningful text for the provider anyway.
+    let prompt = if prompt.contains('\0') {
+        prompt.replace('\0', "")
+    } else {
+        prompt
+    };
     let mut stdin_input = None;
     let mut command = match config.kind {
         DraftProviderKind::Stub => unreachable!("stub provider does not spawn a CLI"),
@@ -1318,6 +1327,89 @@ fn main() {
         let _ = fs::remove_dir_all(cwd);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn claude_provider_tolerates_nul_bytes_in_diff() {
+        let script = temp_file("nul-claude-provider", "sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"title\":\"Generated PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}'\n",
+        )
+        .unwrap();
+        make_executable(&script);
+        let cwd = temp_dir("nul-claude-provider-cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Claude,
+            claude: script.clone(),
+            codex: PathBuf::from("codex"),
+            timeout: Duration::from_secs(2),
+            model: None,
+        };
+        let draft = generate_pull_request_draft(
+            &config,
+            PullRequestDraftInput {
+                worktree_path: cwd.clone(),
+                branch: "feature/drafts".into(),
+                base: "main".into(),
+                commits: vec!["add drafts".into()],
+                changed_paths: vec![PathBuf::from("tracked.bin")],
+                diff: "+binary\0content\0here".into(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(draft.title, "Generated PR");
+        let _ = fs::remove_file(script);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn claude_provider_tolerates_nul_bytes_in_diff() {
+        let (dir, script) = windows_rust_provider_stub(
+            "nul claude provider",
+            r###"
+use std::env;
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    assert_eq!(args[0], "--tools");
+    assert_eq!(args[1], "");
+    assert_eq!(args[2], "--output-format");
+    assert_eq!(args[3], "json");
+    assert_eq!(args[4], "-p");
+    assert!(!args[5].contains('\0'));
+    println!("{}", "{\"title\":\"Generated Windows PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}");
+}
+"###,
+        );
+        let cwd = temp_dir("nul claude provider cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Claude,
+            claude: script.clone(),
+            codex: PathBuf::from("codex"),
+            timeout: Duration::from_secs(2),
+            model: None,
+        };
+        let draft = generate_pull_request_draft(
+            &config,
+            PullRequestDraftInput {
+                worktree_path: cwd.clone(),
+                branch: "feature/windows-drafts".into(),
+                base: "main".into(),
+                commits: vec!["add windows drafts".into()],
+                changed_paths: vec![PathBuf::from("tracked.bin")],
+                diff: "+binary\0content\0here".into(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(draft.title, "Generated Windows PR");
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(cwd);
+    }
 
     #[cfg(unix)]
     #[test]
