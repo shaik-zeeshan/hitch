@@ -249,12 +249,16 @@ fn connect_to_daemon(socket_path: &Path) -> Result<Option<DaemonClient>, HookErr
             Err(err) if daemon_unavailable(&err) => return Ok(None),
             // Up at the endpoint but not accepting yet (busy pipe / not-yet-armed
             // instance): wait for the next poll and try again until the deadline.
-            Err(_) if Instant::now() < deadline => {
+            Err(err) if daemon_transiently_unavailable(&err) && Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            // Out of retries: treat as unavailable rather than a hard error so the
-            // agent's hook is never failed by a daemon that would not accept.
-            Err(_) => return Ok(None),
+            // Out of retries for a transient absence: no session can currently
+            // accept the report, so give up quietly.
+            Err(err) if daemon_transiently_unavailable(&err) => return Ok(None),
+            // Real transport faults (permission denied, malformed endpoint, etc.)
+            // are not "no daemon"; surface them to the caller's best-effort
+            // downgrade path instead of silently dropping the report.
+            Err(err) => return Err(err.into()),
         }
     }
 }
@@ -274,12 +278,15 @@ fn connect_to_daemon(socket_path: &Path) -> Result<Option<DaemonClient>, HookErr
 /// the wait instead: the report is already written, so a slow or wedged daemon
 /// must never freeze the hook (and with it the agent that ran it).
 fn wait_for_ack(mut connection: DaemonStream) {
-    spawn_ack_watchdog();
+    let (cancel_watchdog, watchdog_cancelled) = std::sync::mpsc::channel();
+    let watchdog = spawn_ack_watchdog(watchdog_cancelled);
     // Returns as soon as the daemon answers (normally within one accept poll),
     // or when it closes the connection. The watchdog covers the case where it
     // does neither. The reply itself is discarded — we only needed to wait for
     // it. A read error means the connection is already gone; nothing to do.
     let _ = connection.read_control_messages();
+    let _ = cancel_watchdog.send(());
+    let _ = watchdog.join();
 }
 
 /// Time the helper's exit can be delayed waiting for the daemon's acknowledgement
@@ -291,11 +298,12 @@ const ACK_WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// [`ACK_WATCHDOG_TIMEOUT`]. The report has already been written, so giving up on
 /// the confirmation is harmless; exiting `0` keeps the agent's hook from blocking
 /// on an unresponsive daemon.
-fn spawn_ack_watchdog() {
-    std::thread::spawn(|| {
-        std::thread::sleep(ACK_WATCHDOG_TIMEOUT);
-        std::process::exit(0);
-    });
+fn spawn_ack_watchdog(cancelled: std::sync::mpsc::Receiver<()>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        if cancelled.recv_timeout(ACK_WATCHDOG_TIMEOUT).is_err() {
+            std::process::exit(0);
+        }
+    })
 }
 
 /// True when a connect error means "no daemon is listening" rather than a real
@@ -307,6 +315,26 @@ fn daemon_unavailable(err: &io::Error) -> bool {
         err.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
     )
+}
+
+/// True when a connect error means the daemon endpoint exists but cannot accept a
+/// client right now. Windows named pipes report this while all pipe instances are
+/// occupied or not yet armed; after the retry deadline it is equivalent to
+/// daemon-unavailable for a best-effort hook report.
+fn daemon_transiently_unavailable(err: &io::Error) -> bool {
+    matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+        || is_windows_pipe_busy(err)
+}
+
+#[cfg(windows)]
+fn is_windows_pipe_busy(err: &io::Error) -> bool {
+    // ERROR_PIPE_BUSY: all pipe instances are busy.
+    err.raw_os_error() == Some(231)
+}
+
+#[cfg(not(windows))]
+fn is_windows_pipe_busy(_: &io::Error) -> bool {
+    false
 }
 
 fn state_from_event(agent: KnownAgent, event: Option<&str>) -> Option<Option<AgentState>> {

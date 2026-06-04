@@ -21,16 +21,19 @@ a system service" model intact.
 
 ## Decision
 
-### Transport — a per-user named pipe
+### Transport — a per-user local socket endpoint
 
-- The Daemon serves a named pipe `\\.\pipe\hitch<-dev>-<user>` (the
-  `<-dev>` infix mirrors `instance_namespace()`, so a debug build and an installed
-  release build stay fully isolated, exactly as on Unix). The **GUI** and the
-  **hook helper** (`hitch-hook`) both dial this one name; control and PTY frames
-  multiplex over it unchanged.
-- The pipe is created with an SDDL security descriptor that grants access to the
-  owning user only — the named-pipe equivalent of a `0700` socket — so other
-  local users cannot attach to another user's Sessions.
+- The Daemon and its clients use `hitch-proto::transport::default_socket_path()` as
+  the stable logical endpoint. On Windows this is a path under the per-instance
+  Local AppData root (for example `%LOCALAPPDATA%\Hitch\daemon.sock`), but no
+  socket file is created there: the transport hashes that logical path and asks
+  `interprocess` for a generic namespaced local socket, which is backed by a
+  Windows named pipe. The **GUI** and the **hook helper** (`hitch-hook`) both pass
+  the same logical path to the transport; control and PTY frames multiplex over it
+  unchanged.
+- The named-pipe endpoint created by the transport is per-user — the named-pipe
+  equivalent of a `0700` socket — so other local users cannot attach to another
+  user's Sessions.
 - `hitch-proto::transport` gains a `#[cfg(windows)]` connection type beside the
   existing `#[cfg(unix)]` `UnixSocket*`. To keep one connection-lifecycle path
   (reader thread + heartbeat + cloned writer half, as today), we adopt the
@@ -39,13 +42,15 @@ a system service" model intact.
 
 ### Discovery, restart, and termination — no socket file, no pidfile lock, no signals
 
-- **Discovery is the pipe name itself.** It is derived deterministically from
-  user + namespace, so there is no `$TMPDIR` socket file and no rendezvous/port
-  file to find, stale-check, or clean up. A dead daemon leaves *no* artifact: the
-  kernel reclaims the pipe's server instances when the process exits, so
-  connecting either succeeds (daemon alive) or fails with `FILE_NOT_FOUND`
-  (no daemon). The Unix `remove_stale_socket` path and its stale-socket race
-  simply do not exist on Windows.
+- **Discovery is the logical socket path itself.** It is derived deterministically
+  from the per-instance Local AppData root, then translated by
+  `hitch-proto::transport` into the actual local-socket/named-pipe endpoint. There
+  is no `$TMPDIR` socket file and no rendezvous/port file to find, stale-check, or
+  clean up. A dead daemon leaves no client-visible filesystem socket artifact: the
+  kernel reclaims the pipe's server instances when the process exits, so connecting
+  either succeeds (daemon alive) or fails (no daemon). The Unix
+  `remove_stale_socket` path and its stale-socket race simply do not exist on
+  Windows.
 - **Liveness** drops the `flock`-on-pidfile probe. After a successful `Hello`,
   the client caches the daemon pid returned by the protocol and uses that pid for
   non-cooperative termination. For an incompatible daemon that responds but does
@@ -56,9 +61,9 @@ a system service" model intact.
   in place of `kill(pid, SIGKILL)`. Graceful shutdown is unchanged: the existing
   `ShutdownDaemon` control message travels over the pipe, so no `SIGTERM` analog
   is needed.
-- **Restart** keeps ADR 0009's shape — terminate, wait for the pipe name to stop
-  accepting connections, then re-spawn the detached daemon — with
-  `wait_for_socket_release` reimplemented as a pipe-availability poll. The
+- **Restart** keeps ADR 0009's shape — terminate, wait for the logical endpoint to
+  stop accepting connections, then re-spawn the detached daemon — with
+  `wait_for_socket_release` reimplemented as an endpoint-availability poll. The
   four-state **Daemon Status** model, crash-loop guard, and `Ping`/`Pong`
   heartbeat are preserved verbatim; only the liveness primitive changes.
 
@@ -80,20 +85,21 @@ a system service" model intact.
 
 ### Data locations — `%LOCALAPPDATA%\Hitch`
 
-- The Windows data root is `%LOCALAPPDATA%\Hitch` (`Hitch-dev` for the debug
-  namespace) via `dirs::data_local_dir()` — **Local**, not Roaming, because the
-  store and managed worktrees are large and machine-local; roaming them would sync
-  git checkouts across machines. This replaces `~/.hitch`.
-  - **Store** (SQLite): `%LOCALAPPDATA%\Hitch\store.sqlite`.
-  - **Managed Worktrees**: `%LOCALAPPDATA%\Hitch\worktrees\<project>\<branch>\`,
-    honoring ADR [0001](0001-managed-worktree-location.md)'s managed-global-dir
-    decision with a Windows-appropriate root.
-  - **Logs**: `%LOCALAPPDATA%\Hitch\logs\daemon.log` (+ `daemon.log.prev`),
-    keeping ADR 0009's rotate-on-start scheme.
-  - **Per-instance state**: the namespace (`dev`/release) is applied to both the
-    pipe name and the data-dir suffix, so builds never share a daemon, store, or
-    worktree set. The Unix socket/pidfile-in-`$TMPDIR` concepts retire — there is
-    no filesystem rendezvous on Windows.
+- The Windows data root is `%LOCALAPPDATA%\Hitch` via the transport-owned
+  default data-dir helper — **Local**, not Roaming, because the store and managed
+  worktrees are large and machine-local; roaming them would sync git checkouts
+  across machines. Release uses the root directly; debug/custom namespaces use a
+  child directory such as `%LOCALAPPDATA%\Hitch\dev`. This replaces `~/.hitch`.
+  - **Store** (SQLite): `<data-root>\hitch.sqlite`.
+  - **Managed Worktrees**: `<data-root>\worktrees\<project>\<branch>\`, honoring
+    ADR [0001](0001-managed-worktree-location.md)'s managed-global-dir decision
+    with a Windows-appropriate root.
+  - **Logs**: `<data-root>\daemon.log` (+ `daemon.log.prev`), keeping ADR 0009's
+    rotate-on-start scheme.
+  - **Per-instance state**: the namespace (`dev`/release) is applied to the
+    logical socket path and the data directory, so builds never share a daemon,
+    store, or worktree set. The Unix socket/pidfile-in-`$TMPDIR` concepts retire —
+    there is no filesystem rendezvous on Windows.
 - **MAX_PATH (260) is a real risk** for deep worktrees under a long
   `%LOCALAPPDATA%` root. Mitigation: prefix managed-worktree filesystem access
   with the extended-length `\\?\` form and ship a long-path-aware app manifest;
@@ -102,11 +108,13 @@ a system service" model intact.
 
 ## Considered Options
 
-- **Named pipes** (chosen) — the native Windows analog of a Unix socket: a stable
-  well-known name (no port/rendezvous file), per-user ACLs via SDDL, server-pid
-  discovery via `GetNamedPipeServerProcessId` (retires the pidfile + advisory
-  lock), and no stale filesystem artifact on death. Reuses the transport-neutral
-  framing with only a new connection type.
+- **Named pipes through `interprocess` local sockets** (chosen) — the native
+  Windows analog of a Unix socket: clients share a stable logical path under Local
+  AppData, while the transport translates that path into the actual per-user
+  namespaced endpoint. This avoids a port/rendezvous file, keeps server-pid
+  discovery via `GetNamedPipeServerProcessId` (retiring the pidfile + advisory
+  lock), and leaves no stale filesystem artifact on death. Reuses the
+  transport-neutral framing with only a new connection type.
 - **localhost TCP** — rejected: an ephemeral port reintroduces the
   discovery-file problem we just eliminated, the port is reachable by any local
   process/user without an added auth token, it can trip Windows Firewall prompts,
@@ -127,10 +135,11 @@ a system service" model intact.
 ## Consequences
 
 - `hitch-proto::transport` becomes platform-split: the `#[cfg(unix)]`
-  `os::unix::net` types are joined by a `#[cfg(windows)]` named-pipe type behind
-  the `interprocess` local-socket abstraction; framing (ADR 0005) and the message
-  enum are untouched, so the daemon, `src-tauri`, and `hitch-hook` keep one wire
-  contract.
+  `os::unix::net` types are joined by a `#[cfg(windows)]` local-socket type behind
+  the `interprocess` abstraction. Windows callers pass the same logical socket
+  path as the daemon; the transport owns the hash/translation to the named-pipe
+  endpoint. Framing (ADR 0005) and the message enum are untouched, so the daemon,
+  `src-tauri`, and `hitch-hook` keep one wire contract.
 - The pidfile, its `flock` advisory lock, and `remove_stale_socket` are Unix-only;
   the Windows recovery path uses `GetNamedPipeServerProcessId` + `TerminateProcess`
   while preserving ADR 0009's four-state **Daemon Status**, crash-loop guard, and
@@ -139,9 +148,10 @@ a system service" model intact.
   children; cancellable **Jobs** (ADR 0008) and Session shutdown cancel via
   `TerminateJobObject` instead of signalling a process group. The
   forced-repaint path (ADR 0010) stays Unix-only.
-- Data moves to `%LOCALAPPDATA%\Hitch` on Windows (vs `~/.hitch` on Unix), with a
-  documented `\\?\` long-path mitigation for managed worktrees (ADR 0001).
-- The **hook helper** dials the same per-user pipe name; its `HITCH_SESSION_ID`
+- Data moves to `%LOCALAPPDATA%\Hitch` on Windows (vs `~/.hitch` on Unix), with
+  namespaced debug/custom children and a documented `\\?\` long-path mitigation
+  for managed worktrees (ADR 0001).
+- The **hook helper** dials the same logical socket path; its `HITCH_SESSION_ID`
   resolution (CONTEXT.md) is transport-independent and unchanged.
 - "Detached GUI-supervised child, not a system service," no survival across
   reboot, and recovery driven by a GUI attaching (ADR 0003/0009) all hold on

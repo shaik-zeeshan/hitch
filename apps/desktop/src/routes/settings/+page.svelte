@@ -45,6 +45,7 @@
   let modelLoadSeq = 0;
   let lastDraftProvider: DraftProvider = DEFAULT_DRAFT_PROVIDER;
   let draftsHydrated = false;
+  let draftProviderChanged = false;
   let saved = $state(false);
   let draftSaved = $state(false);
   let selectableModels = $derived(
@@ -56,8 +57,8 @@
   onMount(() => {
     editor = $editorApp;
     // `$draftProvider` is null until the user explicitly picks one; show the
-    // default as the editable starting point. Saving it writes a concrete,
-    // explicit choice (see settings.ts).
+    // default as the editable starting point without turning an unchanged save
+    // into a concrete provider override.
     draftProviderValue = $draftProvider ?? DEFAULT_DRAFT_PROVIDER;
     selectedDraftModel = $draftModel || DEFAULT_MODEL_VALUE;
     claudePath = $draftClaudePath;
@@ -68,6 +69,7 @@
 
   $effect(() => {
     if (draftsHydrated && draftProviderValue !== lastDraftProvider) {
+      draftProviderChanged = true;
       selectedDraftModel = DEFAULT_MODEL_VALUE;
       lastDraftProvider = draftProviderValue;
     }
@@ -125,7 +127,9 @@
   }
 
   function commitDraftSettings() {
-    draftProvider.set(draftProviderValue);
+    if (draftProviderChanged || $draftProvider !== null) {
+      draftProvider.set(draftProviderValue);
+    }
     draftModel.set(selectedDraftModel === DEFAULT_MODEL_VALUE ? DEFAULT_DRAFT_MODEL : selectedDraftModel);
     draftClaudePath.set(claudePath.trim());
     draftCodexPath.set(codexPath.trim());

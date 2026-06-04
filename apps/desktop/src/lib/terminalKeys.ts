@@ -35,14 +35,18 @@ export function classifyTerminalKey(
     return e.type === "keydown" ? "newline" : "suppress";
   }
   // Shortcuts are intercepted on keydown only. macOS uses Cmd/meta; Windows,
-  // Linux, and other desktop platforms use Ctrl. Ctrl+C is still classified as
-  // copy off macOS; Terminal.svelte only performs copy when xterm has a
-  // selection and otherwise returns true so the child can receive Ctrl+C.
+  // Linux, and other desktop platforms use Ctrl. Plain Ctrl+C/Ctrl+F must pass
+  // through off macOS so they can reach the child process; Ctrl+Shift+C and
+  // Ctrl+Shift+F are the non-mac terminal copy/search shortcuts.
   if (e.type !== "keydown") return "pass";
   const shortcutHeld = isShortcutModifier(e, platform);
   if (!shortcutHeld) return "pass";
-  if (e.key === "c") return "copy";
-  if (e.key === "f") return "search";
+  if (e.key === "c" || e.key === "C") {
+    return platform === "macos" || e.shiftKey ? "copy" : "pass";
+  }
+  if (e.key === "f" || e.key === "F") {
+    return platform === "macos" || e.shiftKey ? "search" : "pass";
+  }
   // Paste shortcuts are intentionally NOT special: they pass through to native
   // xterm paste.
   return "pass";

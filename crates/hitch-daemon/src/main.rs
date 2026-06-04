@@ -1855,52 +1855,79 @@ fn remove_worktree(
             Err(err) => return Err(err),
         }
     }
-    let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
-    let racing_ids = state
-        .sessions
-        .values()
-        .filter(|session| session.session.parent == SessionParent::Worktree(worktree_id))
-        .map(|session| session.session.id)
-        .collect::<Vec<_>>();
-    if !force && !racing_ids.is_empty() {
-        return Err(ProtocolError::new(
-            ErrorCode::LiveSessions,
-            "worktree has live sessions; retry with force to kill them",
-        ));
-    }
-    let orphans = racing_ids
-        .into_iter()
-        .filter_map(|id| state.sessions.remove(&id).map(|session| (id, session)))
-        .collect::<Vec<_>>();
-    for (session_id, _) in &orphans {
-        state
-            .store
-            .delete_session(*session_id)
-            .map_err(store_error)?;
-    }
+    let orphans = {
+        let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        let racing_ids = state
+            .sessions
+            .values()
+            .filter(|session| session.session.parent == SessionParent::Worktree(worktree_id))
+            .map(|session| session.session.id)
+            .collect::<Vec<_>>();
+        if !force && !racing_ids.is_empty() {
+            return Err(ProtocolError::new(
+                ErrorCode::LiveSessions,
+                "worktree has live sessions; retry with force to kill them",
+            ));
+        }
+        let orphans = racing_ids
+            .into_iter()
+            .filter_map(|id| state.sessions.remove(&id).map(|session| (id, session)))
+            .collect::<Vec<_>>();
+        for (session_id, _) in &orphans {
+            state
+                .store
+                .delete_session(*session_id)
+                .map_err(store_error)?;
+        }
+        // Hide the worktree from new OpenSession requests while the bounded git
+        // removal runs without the global state mutex. The persistent row is
+        // deleted only after git succeeds so a failed removal can be restored.
+        state.worktrees.remove(&worktree_id);
+        orphans
+    };
     for (_, session) in &orphans {
         let _ = session.pty.kill();
     }
-    if force && (!closed_session_ids.is_empty() || !orphans.is_empty()) {
+    for (session_id, _) in &orphans {
+        closed_session_ids.push(*session_id);
+    }
+    if force && !closed_session_ids.is_empty() {
         thread::sleep(Duration::from_millis(500));
     }
 
-    remove_git_worktree_bounded(
+    if let Err(err) = remove_git_worktree_bounded(
         &git_path,
         &project.root,
         &worktree.path,
         force,
         delete_branch.then_some(worktree.branch.as_str()),
-    )?;
+    ) {
+        let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        state.worktrees.entry(worktree_id).or_insert(worktree);
+        return Err(err);
+    }
 
-    state
-        .store
-        .delete_worktree(worktree_id)
-        .map_err(store_error)?;
-    state.worktrees.remove(&worktree_id);
-    drop(state);
+    let post_remove_orphans = {
+        let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        let racing_ids = state
+            .sessions
+            .values()
+            .filter(|session| session.session.parent == SessionParent::Worktree(worktree_id))
+            .map(|session| session.session.id)
+            .collect::<Vec<_>>();
+        state
+            .store
+            .delete_worktree(worktree_id)
+            .map_err(store_error)?;
+        state.worktrees.remove(&worktree_id);
+        racing_ids
+            .into_iter()
+            .filter_map(|id| state.sessions.remove(&id).map(|session| (id, session)))
+            .collect::<Vec<_>>()
+    };
 
-    for (session_id, _) in orphans {
+    for (session_id, session) in post_remove_orphans {
+        let _ = session.pty.kill();
         closed_session_ids.push(session_id);
     }
     Ok(closed_session_ids)
@@ -1976,7 +2003,11 @@ fn remove_git_worktree_bounded(
         run_git_with_timeout(
             git_path,
             repo_root,
-            [OsArg::Borrowed("worktree"), OsArg::Borrowed("prune")],
+            [
+                OsArg::Borrowed("worktree"),
+                OsArg::Borrowed("prune"),
+                OsArg::Borrowed("--expire=now"),
+            ],
             Duration::from_secs(5),
         )?;
     } else {

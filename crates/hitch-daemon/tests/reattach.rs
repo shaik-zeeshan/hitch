@@ -81,10 +81,10 @@ fn windows_default_shell_session_accepts_input_resize_and_kills_descendants() {
     client.close_session(6, session.id, true);
     client.read_session_closed(session.id, Duration::from_secs(5));
 
-    thread::sleep(Duration::from_secs(5));
     assert!(
-        !orphan_marker.exists(),
-        "closing a Windows PTY session left a shell descendant running"
+        !wait_for_file_result(&orphan_marker, Duration::from_secs(7)),
+        "closing a Windows PTY session left a shell descendant running long enough to write {}",
+        orphan_marker.display()
     );
 }
 
@@ -109,7 +109,7 @@ fn windows_agent_state_reports_store_broadcast_replay_and_clear_by_session_id() 
     let worktree = client
         .list_worktrees(3, project.id)
         .into_iter()
-        .find(|worktree| worktree.path == project_root)
+        .find(|worktree| same_path(&worktree.path, &project_root))
         .expect("main worktree");
     let session = client.open_default_session(4, SessionParent::Worktree(worktree.id));
 

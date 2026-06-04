@@ -402,7 +402,7 @@
     });
     term.loadAddon(webLinks);
 
-    // In-terminal search (Cmd+F on macOS, Ctrl+F elsewhere).
+    // In-terminal search (Cmd+F on macOS, Ctrl+Shift+F elsewhere).
     searchAddon = new SearchAddon();
     term.loadAddon(searchAddon);
 
@@ -420,7 +420,8 @@
       if (!atBottom) showNewOutput = true;
     });
 
-    // Platform terminal shortcuts. macOS uses Cmd/meta; Windows/Linux use Ctrl.
+    // Platform terminal shortcuts. macOS uses Cmd/meta; Windows/Linux use
+    // Ctrl+Shift for copy/search.
     // Returning false consumes the event; true lets xterm/the child handle it as
     // usual. The intent classification lives in the pure `classifyTerminalKey`
     // (unit-tested) so the routing — crucially that paste shortcuts are NOT

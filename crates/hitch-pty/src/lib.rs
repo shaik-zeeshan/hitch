@@ -429,23 +429,60 @@ fn build_command(
     };
     builder.env("TERM", "xterm-256color");
     builder.env(SESSION_ID_ENV, session_id.to_string());
-    set_command_cwd(&mut builder, cwd, uses_powershell_cwd);
+    set_command_cwd(&mut builder, cwd);
+    configure_powershell_display_cwd(&mut builder, cwd, uses_powershell_cwd);
     builder
 }
 
+fn set_command_cwd(builder: &mut CommandBuilder, cwd: &Path) {
+    builder.cwd(cwd);
+}
+
 #[cfg(windows)]
-fn set_command_cwd(builder: &mut CommandBuilder, cwd: &Path, use_powershell_display_path: bool) {
-    if use_powershell_display_path {
-        let cwd = powershell_display_cwd(cwd);
-        builder.cwd(cwd.as_ref());
-    } else {
-        builder.cwd(cwd);
+fn configure_powershell_display_cwd(
+    builder: &mut CommandBuilder,
+    cwd: &Path,
+    is_powershell: bool,
+) {
+    if !is_powershell {
+        return;
+    }
+    let display_cwd = powershell_display_cwd(cwd);
+    if display_cwd.as_ref() == cwd {
+        return;
+    }
+
+    let set_location = format!(
+        "Set-Location -LiteralPath {}",
+        powershell_single_quoted_literal(&display_cwd.to_string_lossy())
+    );
+    let argv = builder.get_argv_mut();
+    if let Some(command) = argv.windows(2).position(|args| {
+        args[0]
+            .to_str()
+            .is_some_and(|arg| {
+                arg.eq_ignore_ascii_case("-Command") || arg.eq_ignore_ascii_case("-c")
+            })
+    }) {
+        let command = command + 1;
+        let existing = argv[command].to_string_lossy().into_owned();
+        argv[command] = format!("{set_location}; {existing}").into();
+    } else if !argv.iter().skip(1).any(|arg| {
+        arg.to_str()
+            .is_some_and(|arg| arg.eq_ignore_ascii_case("-File"))
+    }) {
+        argv.push("-NoExit".into());
+        argv.push("-Command".into());
+        argv.push(set_location.into());
     }
 }
 
 #[cfg(not(windows))]
-fn set_command_cwd(builder: &mut CommandBuilder, cwd: &Path, _use_powershell_display_path: bool) {
-    builder.cwd(cwd);
+fn configure_powershell_display_cwd(
+    _builder: &mut CommandBuilder,
+    _cwd: &Path,
+    _is_powershell: bool,
+) {
 }
 
 #[cfg(windows)]
@@ -468,6 +505,11 @@ fn command_name_is_powershell(command: &str) -> bool {
         .is_some_and(|name| {
             name.eq_ignore_ascii_case("powershell") || name.eq_ignore_ascii_case("pwsh")
         })
+}
+
+#[cfg(windows)]
+fn powershell_single_quoted_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(windows)]
@@ -843,6 +885,19 @@ mod tests {
         assert_eq!(
             powershell_display_cwd(Path::new(r"\\?\UNC\server\share\hitch")).as_ref(),
             Path::new(r"\\server\share\hitch")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_command_builder_preserves_verbatim_extended_cwd() {
+        let cwd = Path::new(r"\\?\C:\Code\hitch");
+        let command = Some(vec!["powershell.exe".into(), "-NoProfile".into()]);
+        let builder = build_command(&SessionId::new(), &command, cwd);
+
+        assert_eq!(
+            builder.get_cwd().map(|cwd| cwd.as_os_str()),
+            Some(cwd.as_os_str())
         );
     }
 

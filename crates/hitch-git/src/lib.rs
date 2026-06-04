@@ -1648,7 +1648,7 @@ fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let (mut child, tree) = ProcessTree::spawn(&mut command)?;
-    control.set_process_tree(Some(tree.clone()));
+    let registration = ProcessTreeRegistration::new(control, tree.clone());
     let stdout_reader = spawn_pipe_reader(
         child
             .stdout
@@ -1675,10 +1675,12 @@ fn run_command(
             None => thread::sleep(Duration::from_millis(25)),
         }
     };
-    control.set_process_tree(None);
+    let stdout_result = join_pipe_reader(stdout_reader);
+    let stderr_result = join_pipe_reader(stderr_reader);
+    drop(registration);
 
-    let stdout = String::from_utf8(join_pipe_reader(stdout_reader)?)?;
-    let stderr = String::from_utf8(join_pipe_reader(stderr_reader)?)?;
+    let stdout = String::from_utf8(stdout_result?)?;
+    let stderr = String::from_utf8(stderr_result?)?;
     if status.success() && !cancelled {
         Ok(CommandOutput { stdout, stderr })
     } else {
@@ -1694,6 +1696,23 @@ fn run_command(
                 stderr
             },
         ))
+    }
+}
+
+struct ProcessTreeRegistration<'a> {
+    control: &'a dyn CommandControl,
+}
+
+impl<'a> ProcessTreeRegistration<'a> {
+    fn new(control: &'a dyn CommandControl, tree: ProcessTree) -> Self {
+        control.set_process_tree(Some(tree));
+        Self { control }
+    }
+}
+
+impl Drop for ProcessTreeRegistration<'_> {
+    fn drop(&mut self) {
+        self.control.set_process_tree(None);
     }
 }
 

@@ -33,12 +33,32 @@ describe("classifyTerminalKey", () => {
     expect(classify("macos", { metaKey: true, key: "f" })).toBe("search");
   });
 
-  it("classifies Windows Ctrl+C as copy (caller still gates on hasSelection)", () => {
-    expect(classify("windows", { ctrlKey: true, key: "c" })).toBe("copy");
+  it("passes plain non-mac Ctrl+C through so it interrupts the PTY", () => {
+    expect(classify("windows", { ctrlKey: true, key: "c" })).toBe("pass");
+    expect(classify("linux", { ctrlKey: true, key: "c" })).toBe("pass");
   });
 
-  it("classifies Windows Ctrl+F as search", () => {
-    expect(classify("windows", { ctrlKey: true, key: "f" })).toBe("search");
+  it("classifies non-mac Ctrl+Shift+C as copy", () => {
+    expect(classify("windows", { ctrlKey: true, shiftKey: true, key: "C" })).toBe(
+      "copy",
+    );
+    expect(classify("linux", { ctrlKey: true, shiftKey: true, key: "C" })).toBe(
+      "copy",
+    );
+  });
+
+  it("passes plain non-mac Ctrl+F through to the PTY", () => {
+    expect(classify("windows", { ctrlKey: true, key: "f" })).toBe("pass");
+    expect(classify("linux", { ctrlKey: true, key: "f" })).toBe("pass");
+  });
+
+  it("classifies non-mac Ctrl+Shift+F as search", () => {
+    expect(classify("windows", { ctrlKey: true, shiftKey: true, key: "F" })).toBe(
+      "search",
+    );
+    expect(classify("linux", { ctrlKey: true, shiftKey: true, key: "F" })).toBe(
+      "search",
+    );
   });
 
   it("does not treat Windows Meta/Cmd as the shortcut modifier", () => {

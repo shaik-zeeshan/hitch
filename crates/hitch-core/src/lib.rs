@@ -81,15 +81,24 @@ mod process_tree {
     mod imp {
         use std::io;
         use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
         use std::process::{Child, Command};
         use std::sync::Arc;
 
-        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, RtlNtStatusToDosError, HANDLE, NTSTATUS,
+        };
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
             SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn NtResumeProcess(process_handle: HANDLE) -> NTSTATUS;
+        }
 
         #[derive(Clone, Debug)]
         pub(super) struct ProcessTree {
@@ -113,11 +122,17 @@ mod process_tree {
         impl ProcessTree {
             pub(super) fn spawn(command: &mut Command) -> io::Result<(Child, Self)> {
                 let job = create_kill_on_close_job()?;
+                command.creation_flags(CREATE_SUSPENDED);
                 let mut child = command.spawn()?;
                 let process = child.as_raw_handle() as HANDLE;
                 let assigned = unsafe { AssignProcessToJobObject(job.0, process) };
                 if assigned == 0 {
                     let error = io::Error::last_os_error();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+                if let Err(error) = resume_process(process) {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(error);
@@ -132,6 +147,16 @@ mod process_tree {
                 } else {
                     Ok(())
                 }
+            }
+        }
+
+        fn resume_process(process: HANDLE) -> io::Result<()> {
+            let status = unsafe { NtResumeProcess(process) };
+            if status >= 0 {
+                Ok(())
+            } else {
+                let error = unsafe { RtlNtStatusToDosError(status) };
+                Err(io::Error::from_raw_os_error(error as i32))
             }
         }
 

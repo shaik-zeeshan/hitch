@@ -956,6 +956,9 @@ impl HitchClient {
                 " (the debug hitch-daemon binary may be stale — rebuild with `cargo build -p hitch-daemon -p hitch-hook`)",
             );
         }
+        if self.is_connected() {
+            self.mark_disconnected(app, last_err.clone());
+        }
         Err(last_err)
     }
 
@@ -1786,6 +1789,8 @@ fn daemon_log_path() -> PathBuf {
 struct EditorLaunchSpec {
     program: OsString,
     args: Vec<OsString>,
+    #[cfg(windows)]
+    command_processor_shim: bool,
 }
 
 impl EditorLaunchSpec {
@@ -1793,6 +1798,17 @@ impl EditorLaunchSpec {
         Self {
             program: program.into(),
             args: vec![path.as_os_str().to_os_string()],
+            #[cfg(windows)]
+            command_processor_shim: false,
+        }
+    }
+
+    #[cfg(windows)]
+    fn command_shim(program: impl Into<OsString>, path: &Path) -> Self {
+        Self {
+            program: program.into(),
+            args: vec![path.as_os_str().to_os_string()],
+            command_processor_shim: true,
         }
     }
 }
@@ -1965,16 +1981,106 @@ fn windows_editor_candidates(editor: &str) -> Vec<OsString> {
 }
 
 #[cfg(windows)]
-fn first_available_windows_candidate(candidates: &[OsString]) -> Option<OsString> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsEditorProgram {
+    program: OsString,
+    command_processor_shim: bool,
+}
+
+#[cfg(windows)]
+impl WindowsEditorProgram {
+    fn executable(program: impl Into<OsString>) -> Self {
+        Self {
+            program: program.into(),
+            command_processor_shim: false,
+        }
+    }
+
+    fn command_shim(program: impl Into<OsString>) -> Self {
+        Self {
+            program: program.into(),
+            command_processor_shim: true,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_candidate_has_path_components(candidate: &OsString) -> bool {
+    let path = Path::new(candidate);
+    path.parent()
+        .is_some_and(|parent| parent != Path::new(""))
+        || path.file_name().is_none()
+}
+
+#[cfg(windows)]
+fn windows_candidate_names(candidate: &OsString) -> Vec<OsString> {
+    if Path::new(candidate).extension().is_some() {
+        return vec![candidate.clone()];
+    }
+
+    let mut exe = candidate.clone();
+    exe.push(".exe");
+    let mut cmd = candidate.clone();
+    cmd.push(".cmd");
+    vec![exe, cmd]
+}
+
+#[cfg(windows)]
+fn windows_editor_program_from_path(path: PathBuf) -> WindowsEditorProgram {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
+    {
+        WindowsEditorProgram::command_shim(path.into_os_string())
+    } else {
+        WindowsEditorProgram::executable(path.into_os_string())
+    }
+}
+
+#[cfg(windows)]
+fn resolve_windows_path_candidate_from_dirs(
+    candidate: &OsString,
+    path_dirs: &[PathBuf],
+) -> Option<WindowsEditorProgram> {
+    if windows_candidate_has_path_components(candidate) {
+        return None;
+    }
+
+    let names = windows_candidate_names(candidate);
+
+    for dir in path_dirs {
+        for name in &names {
+            let path = dir.join(name);
+            if path.is_file() {
+                return Some(windows_editor_program_from_path(path));
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn resolve_windows_path_candidate(candidate: &OsString) -> Option<WindowsEditorProgram> {
+    let path_dirs = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    resolve_windows_path_candidate_from_dirs(candidate, &path_dirs)
+}
+
+#[cfg(windows)]
+fn first_available_windows_candidate(candidates: &[OsString]) -> Option<WindowsEditorProgram> {
     candidates
         .iter()
         .find(|candidate| Path::new(candidate).is_file())
+        .map(|candidate| WindowsEditorProgram::executable(candidate.clone()))
         .or_else(|| {
             candidates
                 .iter()
-                .find(|candidate| !Path::new(candidate).is_absolute())
+                .filter(|candidate| !Path::new(candidate).is_absolute())
+                .find_map(resolve_windows_path_candidate)
         })
-        .cloned()
 }
 
 fn build_editor_launch_spec(editor: &str, path: &Path) -> Option<EditorLaunchSpec> {
@@ -1990,7 +2096,13 @@ fn build_editor_launch_spec(editor: &str, path: &Path) -> Option<EditorLaunchSpe
     {
         let candidates = windows_editor_candidates(editor);
         if let Some(program) = first_available_windows_candidate(&candidates) {
-            return Some(EditorLaunchSpec::new(program, path));
+            if program.command_processor_shim {
+                return Some(EditorLaunchSpec::command_shim(program.program, path));
+            }
+            return Some(EditorLaunchSpec::new(program.program, path));
+        }
+        if !candidates.is_empty() {
+            return None;
         }
     }
 
@@ -2010,7 +2122,33 @@ fn build_editor_launch_spec(editor: &str, path: &Path) -> Option<EditorLaunchSpe
     Some(EditorLaunchSpec::new(editor, path))
 }
 
+#[cfg(windows)]
+fn windows_command_processor() -> OsString {
+    std::env::var_os("SystemRoot")
+        .map(|root| Path::new(&root).join(r"System32\cmd.exe"))
+        .filter(|path| path.is_file())
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|| OsString::from("cmd.exe"))
+}
+
+#[cfg(windows)]
+fn spawn_windows_command_shim(spec: &EditorLaunchSpec) -> Result<(), String> {
+    Command::new(windows_command_processor())
+        .arg("/d")
+        .arg("/c")
+        .arg(&spec.program)
+        .args(&spec.args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("failed to open editor {:?}: {err}", spec.program))
+}
+
 fn spawn_editor(spec: EditorLaunchSpec) -> Result<(), String> {
+    #[cfg(windows)]
+    if spec.command_processor_shim {
+        return spawn_windows_command_shim(&spec);
+    }
+
     Command::new(&spec.program)
         .args(&spec.args)
         .spawn()
@@ -2304,10 +2442,14 @@ mod tests {
         CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
     };
     #[cfg(windows)]
-    use super::{first_available_windows_candidate, windows_editor_candidates_from_dirs};
+    use super::{
+        first_available_windows_candidate, resolve_windows_path_candidate_from_dirs,
+        windows_editor_candidates_from_dirs, WindowsEditorProgram,
+    };
     #[cfg(unix)]
     use super::{read_pty_payload, wait_for_socket_release};
     use hitch_core::SessionId;
+    use hitch_proto::transport::{connect_daemon, DaemonListener};
     #[cfg(unix)]
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::{Arc, Mutex};
@@ -2408,10 +2550,38 @@ mod tests {
 
         assert_eq!(
             first_available_windows_candidate(&candidates),
-            Some(editor.as_os_str().to_os_string())
+            Some(WindowsEditorProgram::executable(
+                editor.as_os_str().to_os_string()
+            ))
         );
 
         std::fs::remove_file(editor).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_fallback_resolves_cmd_shim_before_launch() {
+        let dir = std::env::temp_dir().join(format!(
+            "hitch-editor-test-{}-{}",
+            std::process::id(),
+            "path-cmd-shim"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("code.cmd");
+        std::fs::write(&shim, b"").unwrap();
+
+        assert_eq!(
+            resolve_windows_path_candidate_from_dirs(
+                &std::ffi::OsString::from("code"),
+                &[dir.clone()],
+            ),
+            Some(WindowsEditorProgram::command_shim(
+                shim.as_os_str().to_os_string()
+            ))
+        );
+
+        std::fs::remove_file(shim).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -2903,6 +3073,50 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn final_handshake_failure_clears_attached_connection_state() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hitch-final-handshake-failure-{}-{nonce}.sock",
+            std::process::id()
+        ));
+        let listener = DaemonListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || listener.accept().unwrap());
+        let writer = connect_daemon(&path).unwrap();
+        let server_stream = server.join().unwrap();
+
+        let client = HitchClient::new();
+        client
+            .0
+            .connected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *client.0.writer.lock().unwrap() = Some(writer);
+        assert!(client.is_connected());
+
+        client.clear_connection_state(
+            "daemon hello failed after restart: unsupported protocol",
+            true,
+        );
+
+        assert!(
+            !client.is_connected(),
+            "failed final Hello must not leave the client treating a stale writer as connected"
+        );
+        assert!(
+            client.0.writer.lock().unwrap().is_none(),
+            "failed final Hello must drop the attached writer so the next call reconnects"
+        );
+
+        drop(server_stream);
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(unix)]

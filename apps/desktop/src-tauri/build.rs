@@ -22,6 +22,13 @@ fn main() {
 
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                target_dir_from_out_dir(&target, &profile).unwrap_or_else(|| workspace_root.join(path))
+            }
+        })
         .unwrap_or_else(|| workspace_root.join("target"));
     let exe_suffix = std::env::var("CARGO_CFG_TARGET_OS")
         .map(|os| if os == "windows" { ".exe" } else { "" })
@@ -29,11 +36,20 @@ fn main() {
     let binaries_dir = manifest_dir.join("binaries");
     for binary in ["hitch-daemon", "hitch-hook"] {
         let file_name = format!("{binary}{exe_suffix}");
-        let candidates = [
-            target_dir.join(&target).join(&profile).join(&file_name),
-            target_dir.join(&profile).join(&file_name),
-        ];
-        if let Some(src) = candidates.iter().find(|path| path.exists()) {
+        let host_artifact = target_dir.join(&profile).join(&file_name);
+        let target_artifact = target_dir.join(&target).join(&profile).join(&file_name);
+        // Pick whichever artifact was built most recently. A fixed preference
+        // order resurrects stale binaries: a one-off `--target <triple>` build
+        // leaves an old artifact in `target/<triple>/<profile>/` that would
+        // shadow every fresh host build in `target/<profile>/` from then on —
+        // and Tauri copies the chosen sidecar back over `target/<profile>/`,
+        // so the stale binary ends up bundled in installers.
+        let candidates = [target_artifact, host_artifact];
+        if let Some(src) = candidates
+            .iter()
+            .filter(|path| path.exists())
+            .max_by_key(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
+        {
             std::fs::create_dir_all(&binaries_dir).unwrap();
             let dst = binaries_dir.join(format!("{binary}-{target}{exe_suffix}"));
             std::fs::copy(src, &dst).unwrap_or_else(|err| {
@@ -58,4 +74,20 @@ fn main() {
     }
 
     tauri_build::build()
+}
+
+fn target_dir_from_out_dir(target: &str, profile: &str) -> Option<PathBuf> {
+    let mut path = PathBuf::from(std::env::var_os("OUT_DIR")?);
+    path.pop();
+    path.pop();
+    path.pop();
+    if path.file_name()? != profile {
+        return None;
+    }
+
+    path.pop();
+    if path.file_name()? == std::ffi::OsStr::new(target) {
+        path.pop();
+    }
+    Some(path)
 }

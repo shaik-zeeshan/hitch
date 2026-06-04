@@ -534,28 +534,45 @@ fn run_provider_command(
         }
     };
 
-    // Child exited on its own; it can no longer be the cancel target.
+    // Child exited on its own; it can no longer be the cancel target. Any
+    // descendant still holding one of our captured pipe handles is no longer
+    // useful to this completed provider run, and can otherwise keep reader
+    // joins or a stdin write parked forever.
     if let Some(control) = cancel {
         control.set_process_tree(None);
     }
+    if !stdout_reader.is_finished()
+        || !stderr_reader.is_finished()
+        || stdin_writer
+            .as_ref()
+            .is_some_and(|writer| !writer.is_finished())
+    {
+        terminate_process_tree(&process_tree, &mut child);
+    }
 
-    let stdin_result = stdin_writer.map(join_writer);
     let stdout = join_reader(stdout_reader)?;
     let stderr = join_reader(stderr_reader)?;
 
     if !status.success() {
+        // The provider's exit status is authoritative on failure. Do not wait
+        // for the stdin writer: a descendant may have inherited the pipe read
+        // end, and the nonzero provider result already carries the failure.
+        drop(stdin_writer);
         return Err(nonzero_provider_error(config.kind.label(), status, &stderr).retryable(true));
     }
-    if let Some(Err(err)) = stdin_result {
-        // The command succeeded, so the child got the input it needed. A
-        // `BrokenPipe` here just means the child closed its stdin after
-        // consuming enough (e.g. codex exits 0 without draining the whole
-        // prompt); that must not turn a successful run into a failure. Other
-        // write errors are genuine and still surfaced.
-        if err.kind() != io::ErrorKind::BrokenPipe {
-            return Err(provider_error(format!(
-                "failed writing draft provider input: {err}"
-            )));
+    if let Some(writer) = stdin_writer {
+        if let Some(Err(err)) = join_writer_if_finished(writer) {
+            // The command succeeded, so the child got the input it needed. A
+            // `BrokenPipe` here just means the child closed its stdin after
+            // consuming enough (e.g. codex exits 0 without draining the whole
+            // prompt); that must not turn a successful run into a failure. Other
+            // write errors are genuine and still surfaced when the writer has
+            // already completed.
+            if err.kind() != io::ErrorKind::BrokenPipe {
+                return Err(provider_error(format!(
+                    "failed writing draft provider input: {err}"
+                )));
+            }
         }
     }
     Ok(stdout)
@@ -597,6 +614,17 @@ fn join_writer(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
     handle
         .join()
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "draft provider input writer panicked"))?
+}
+
+fn join_writer_if_finished(handle: thread::JoinHandle<io::Result<()>>) -> Option<io::Result<()>> {
+    if handle.is_finished() {
+        Some(join_writer(handle))
+    } else {
+        // A successful provider exit is sufficient evidence that the input it
+        // needed was accepted. Leaving this handle detached avoids hanging on a
+        // write blocked by inherited pipe handles that outlived the provider.
+        None
+    }
 }
 
 fn join_reader(handle: thread::JoinHandle<io::Result<String>>) -> Result<String, ProtocolError> {
@@ -1290,6 +1318,104 @@ fn main() {
         let _ = fs::remove_dir_all(cwd);
     }
 
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_provider_does_not_wait_for_blocked_stdin_writer() {
+        let script = temp_file("successful-provider-inherited-stdin", "sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\n# Background child inherits stdin but never reads it.\nsleep 30 <&0 >/dev/null 2>/dev/null &\nprintf '%s\n' '{\"title\":\"Generated PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}'\n",
+        )
+        .unwrap();
+        make_executable(&script);
+        let cwd = temp_dir("successful-provider-inherited-stdin-cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Codex,
+            claude: PathBuf::from("claude"),
+            codex: script.clone(),
+            timeout: Duration::from_secs(5),
+            model: None,
+        };
+        let mut command = Command::new(&config.codex);
+        let started = Instant::now();
+        let result = run_provider_command(
+            &mut command,
+            &cwd,
+            &config,
+            None,
+            Some("large prompt\n".repeat(1_000_000)),
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert!(result.contains("Generated PR"));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "successful provider blocked on inherited stdin pipe for {elapsed:?}"
+        );
+        let _ = fs::remove_file(script);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn successful_provider_does_not_wait_for_blocked_stdin_writer() {
+        let (dir, script) = windows_rust_provider_stub(
+            "successful provider inherited stdin",
+            r###"
+use std::{
+    env,
+    process::{self, Command, Stdio},
+    thread,
+    time::Duration,
+};
+
+fn main() {
+    if env::args().nth(1).as_deref() == Some("child") {
+        thread::sleep(Duration::from_secs(30));
+        return;
+    }
+    Command::new(env::current_exe().unwrap())
+        .arg("child")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    println!("{}", "{\"title\":\"Generated PR\",\"body\":\"## Summary\\n\\n- Done\\n\\n## Testing\\n\\n- [ ] Not run\"}");
+    process::exit(0);
+}
+"###,
+        );
+        let cwd = temp_dir("successful provider inherited stdin cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Codex,
+            claude: PathBuf::from("claude"),
+            codex: script.clone(),
+            timeout: Duration::from_secs(5),
+            model: None,
+        };
+        let mut command = Command::new(&config.codex);
+        let started = Instant::now();
+        let result = run_provider_command(
+            &mut command,
+            &cwd,
+            &config,
+            None,
+            Some("large prompt\r\n".repeat(1_000_000)),
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert!(result.contains("Generated PR"));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "successful provider blocked on inherited stdin pipe for {elapsed:?}"
+        );
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(cwd);
+    }
     #[cfg(unix)]
     #[test]
     fn provider_timeout_does_not_block_on_grandchild_holding_the_pipe() {
