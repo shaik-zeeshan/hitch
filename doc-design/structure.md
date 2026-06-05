@@ -241,7 +241,7 @@ diff chrome (backgrounds, gutters, add/del tints, fonts) is bridged across the
 shadow boundary so the diff follows the **per-mode terminal theme** the same way
 the terminal surface does. Full recipe and the token bridge are in
 [components.md](components.md#diff-view-difftab); colors in
-[colors.md](colors.md#syntax-highlighted-diff--pierrediffs).
+[colors.md](colors.md#syntax-highlighted-diff-pierrediffs).
 
 ## Right rail — Changes
 
@@ -261,8 +261,9 @@ Directly under the header, its own bottom hairline. Two rows:
   (weight 600) + `from {base}` (`--ink-2`) + **right-aligned ahead instrument**
   (`.ahead`, `margin-left: auto`, mono weight 600 tabular, `--st-ok`): `↑3`
   meaning N commits ahead of origin.
-- **PR row (`.pr`):** git-pull-request icon + open dot + `open` + `PR #142` +
-  optional title fragment. Square chip, hairline, `--paper-2` fill.
+- **PR row (`.pr`):** git-pull-request icon + `PR #142` + optional title
+  fragment. Square chip, hairline, PR-state tint; the state word lives in the
+  `title` tooltip, not as an in-chip dot or `open` label.
 
 ### Git action (`.actions`) — the dynamic split button
 

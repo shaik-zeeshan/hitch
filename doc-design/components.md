@@ -31,7 +31,7 @@ mockup window frame itself uses `11px` (page seat only, not the shell). A
 
 One recipe everywhere. Flat rectangle, hairline border, **no bevel, no shadow**,
 tabular mono in a fixed box, baseline-nudged to sit with its label. The box is
-wider than tall (15×20 minimum) so a lone glyph reads as a keycap, not a tile.
+wider than tall (`min-width: 20px`, `height: 15px`) so a lone glyph reads as a keycap, not a tile.
 
 ```css
 kbd {
@@ -160,7 +160,7 @@ animation (disabled under reduced-motion).
 
 When a diff tab is active the center pane swaps the terminal for a
 **syntax-highlighted unified diff** (`apps/desktop/src/lib/components/DiffTab.svelte`).
-This supersedes the earlier flat, un-highlighted classified-row view (2026-06-06;
+This supersedes the earlier flat, un-highlighted classified-row view (2026-06-05;
 ADR 0006 holds the prior decision as the historical record — left intact).
 
 - **Header bar** (kept by `DiffTab`, *not* @pierre's): `±` glyph + the file path
@@ -191,7 +191,7 @@ ADR 0006 holds the prior decision as the historical record — left intact).
   `--term-line` / `--term-fg`, `--diff-add` / `--diff-del`, and `--mono`. This is
   the same `terminalSurfaceOverride` pattern the terminal uses, so the diff
   **follows the per-mode terminal theme** in both themes. See
-  [colors.md](colors.md#syntax-highlighted-diff--pierrediffs).
+  [colors.md](colors.md#syntax-highlighted-diff-pierrediffs).
 
 ## Worktree entry (`.wrow`)
 
@@ -297,7 +297,7 @@ var(--st-need-wash)`, `border: 1px solid var(--st-need-line)`, `border-radius:
 ```
 
 The label, icon, and `kbd` are state-derived (see the action ladder in
-[structure.md](structure.md#git-action-actions--the-dynamic-split-button)). In
+[structure.md](structure.md#git-action-actions-the-dynamic-split-button)). In
 production this is `bits-ui` `DropdownMenu` (already used in
 `RightRail.svelte`): the caret is the `DropdownMenu.Trigger`. When a git op is
 running, the whole split becomes one `Cancel` button.

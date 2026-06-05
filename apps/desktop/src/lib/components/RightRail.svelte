@@ -454,7 +454,7 @@
             <button
               class="group-label"
               title="View all changes as one diff"
-              aria-label="View all staged changes diff"
+              aria-label="View all staged and unstaged changes as one diff"
               onclick={() => void viewAllChanges()}
             >Staged</button><span class="ct">{staged.length}</span><span class="hr"></span>
             <button
@@ -507,7 +507,7 @@
             <button
               class="group-label"
               title="View all changes as one diff"
-              aria-label="View all unstaged changes diff"
+              aria-label="View all staged and unstaged changes as one diff"
               onclick={() => void viewAllChanges()}
             >Changes</button><span class="ct">{unstaged.length}</span><span class="hr"></span>
             <button

@@ -82,7 +82,7 @@ The per-file marks in the right-rail **Changes** list are a separate set from th
 unplugin-icons/Lucide stroke icons above: the **VS Code "Material Icon Theme"**
 glyph set, via the **`vscode-material-icons`** npm package (matejchalk's MIT
 wrapper around the material-icon-theme assets — it ships ~900 SVG files plus a
-`getIconForFilePath(path)` resolver). Added 2026-06-06 alongside the
+`getIconForFilePath(path)` resolver). Added 2026-06-05 alongside the
 syntax-highlighted diff.
 
 - **Deliberate full-colour exception.** Unlike every other icon in the shell,
@@ -90,7 +90,7 @@ syntax-highlighted diff.
   token. The Paper Terminal shell is otherwise strictly monochrome, but at the
   `16px` size of a changes row a single-ink mark is too hard to recognise at a
   glance, so we use the icons' native colours purely for instant recognition
-  (user call, 2026-06-06). They are rendered as `<img src>` (colored SVGs are not
+  (user call, 2026-06-05). They are rendered as `<img src>` (colored SVGs are not
   tintable), **not** inline `{@html}` — so the old `currentColor`/`:global(svg)`
   machinery is gone. This is the one place colour is allowed besides the harness
   marks and status dots; it is a recognition affordance, not decoration.

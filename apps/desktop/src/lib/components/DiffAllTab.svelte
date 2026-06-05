@@ -15,21 +15,26 @@
   import { fileIconUrl } from "../file-icons";
   import { theme } from "../theme";
 
-  // Collapsed sections by path. Absent / false = expanded (the default). Plain
-  // $state object to match the surrounding runes idiom; toggled on header click.
+  // Collapsed sections by row identity. Absent / false = expanded (the default).
+  // All-changes can contain the same path twice (staged + unstaged), so caches
+  // must include stagedness instead of using file.path alone.
   let collapsed = $state<Record<string, boolean>>({});
 
   type ParsedDiff = ReturnType<typeof parseDiff>;
-  const parsedByPath = new Map<string, { text: string; parsed: ParsedDiff }>();
+  const parsedByRow = new Map<string, { text: string; parsed: ParsedDiff }>();
 
-  function parsedFor(path: string, text: string | null, expanded: boolean): ParsedDiff | null {
+  function parsedFor(rowKey: string, text: string | null, expanded: boolean): ParsedDiff | null {
     if (text === null) return null;
-    const cached = parsedByPath.get(path);
+    const cached = parsedByRow.get(rowKey);
     if (cached?.text === text) return cached.parsed;
     if (!expanded) return null;
     const parsed = parseDiff(text);
-    parsedByPath.set(path, { text, parsed });
+    parsedByRow.set(rowKey, { text, parsed });
     return parsed;
+  }
+
+  function allChangesRowKey(path: string, staged: boolean): string {
+    return `${staged ? "staged" : "unstaged"}\0${path}`;
   }
 
   const options: FileDiffOptions<undefined> = {
@@ -46,8 +51,8 @@
     themeType: $theme,
   };
 
-  function toggle(path: string) {
-    collapsed[path] = !collapsed[path];
+  function toggle(rowKey: string) {
+    collapsed[rowKey] = !collapsed[rowKey];
   }
 
   // A single FileDiff per mounted (expanded, renderable) section. The Svelte
@@ -97,15 +102,16 @@
     <div class="diff-empty"><p>No changes to show.</p></div>
   {/if}
 
-  {#each $allChangesFiles as file (file.path)}
-    {@const isCollapsed = collapsed[file.path] === true}
-    {@const parsed = parsedFor(file.path, file.text, !isCollapsed)}
+  {#each $allChangesFiles as file (allChangesRowKey(file.path, file.staged))}
+    {@const rowKey = allChangesRowKey(file.path, file.staged)}
+    {@const isCollapsed = collapsed[rowKey] === true}
+    {@const parsed = parsedFor(rowKey, file.text, !isCollapsed)}
     <section class="file">
       <button
         class="file-head"
         type="button"
         aria-expanded={!isCollapsed}
-        onclick={() => toggle(file.path)}
+        onclick={() => toggle(rowKey)}
       >
         <span class="chev" aria-hidden="true">
           {#if isCollapsed}

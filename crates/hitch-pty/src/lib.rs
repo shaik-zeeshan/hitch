@@ -616,26 +616,52 @@ fn default_command() -> CommandBuilder {
 /// bundle, launchd, or a wrapper script whose environment carries a SHELL
 /// that does not match what the user actually logs in with.
 #[cfg(unix)]
+const LOGIN_SHELL_INITIAL_BUF_LEN: usize = 4096;
+#[cfg(unix)]
+const LOGIN_SHELL_MAX_BUF_LEN: usize = 1024 * 1024;
+
+#[cfg(unix)]
+fn login_shell_with_getpwuid_r<F>(mut getpwuid_r: F) -> Option<String>
+where
+    F: FnMut(&mut libc::passwd, &mut [u8], &mut *mut libc::passwd) -> libc::c_int,
+{
+    let mut buf_len = LOGIN_SHELL_INITIAL_BUF_LEN;
+
+    loop {
+        let mut buf = vec![0_u8; buf_len];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let ret = getpwuid_r(&mut pwd, &mut buf, &mut result);
+
+        if ret == libc::ERANGE {
+            if buf_len >= LOGIN_SHELL_MAX_BUF_LEN {
+                return None;
+            }
+            buf_len = buf_len.saturating_mul(2).min(LOGIN_SHELL_MAX_BUF_LEN);
+            continue;
+        }
+
+        if ret != 0 || result.is_null() || pwd.pw_shell.is_null() {
+            return None;
+        }
+        let shell = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) }
+            .to_str()
+            .ok()?;
+        return (!shell.is_empty()).then(|| shell.to_string());
+    }
+}
+
+#[cfg(unix)]
 fn login_shell() -> Option<String> {
-    let mut buf = [0_u8; 4096];
-    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut result: *mut libc::passwd = std::ptr::null_mut();
-    let ret = unsafe {
+    login_shell_with_getpwuid_r(|pwd, buf, result| unsafe {
         libc::getpwuid_r(
             libc::getuid(),
-            &mut pwd,
+            pwd,
             buf.as_mut_ptr().cast::<libc::c_char>(),
             buf.len(),
-            &mut result,
+            result,
         )
-    };
-    if ret != 0 || result.is_null() || pwd.pw_shell.is_null() {
-        return None;
-    }
-    let shell = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) }
-        .to_str()
-        .ok()?;
-    (!shell.is_empty()).then(|| shell.to_string())
+    })
 }
 
 #[cfg(unix)]
@@ -933,6 +959,28 @@ mod tests {
             shell.starts_with('/'),
             "login shell should be an absolute path; got {shell:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_retries_when_passwd_buffer_is_too_small() {
+        let mut calls = 0;
+        let shell = login_shell_with_getpwuid_r(|pwd, buf, result| {
+            calls += 1;
+            if calls == 1 {
+                return libc::ERANGE;
+            }
+
+            let shell = b"/bin/zsh\0";
+            assert!(buf.len() >= shell.len());
+            buf[..shell.len()].copy_from_slice(shell);
+            pwd.pw_shell = buf.as_mut_ptr().cast::<libc::c_char>();
+            *result = pwd;
+            0
+        });
+
+        assert_eq!(shell.as_deref(), Some("/bin/zsh"));
+        assert_eq!(calls, 2);
     }
 
     #[cfg(unix)]

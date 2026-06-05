@@ -26,7 +26,7 @@ beforeEach(() => {
   vi.resetModules();
 });
 
-describe("editorApp settings migration", () => {
+describe("editorApp settings persistence", () => {
   async function loadEditorApp(stored: string) {
     const storage = new LocalStorageStub();
     storage.values.set("hitch.editorApp", stored);
@@ -37,11 +37,11 @@ describe("editorApp settings migration", () => {
     return { storage, settings };
   }
 
-  it("normalizes the legacy Visual Studio Code default to system default", async () => {
+  it("keeps explicit Visual Studio Code selection intact", async () => {
     const { storage, settings } = await loadEditorApp("Visual Studio Code");
 
-    expect(get(settings.editorApp)).toBe(settings.SYSTEM_DEFAULT_EDITOR);
-    expect(storage.values.get("hitch.editorApp")).toBe(settings.SYSTEM_DEFAULT_EDITOR);
+    expect(get(settings.editorApp)).toBe("Visual Studio Code");
+    expect(storage.values.get("hitch.editorApp")).toBe("Visual Studio Code");
   });
 
   it("keeps explicit non-default editor values intact", async () => {

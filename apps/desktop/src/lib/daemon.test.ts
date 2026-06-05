@@ -1550,6 +1550,43 @@ describe("all-changes diff tab", () => {
     expect(get(allChangesFiles)).toEqual([]);
   });
 
+
+  it("keeps a slower previous-side single-file diff from overwriting the visible tab", async () => {
+    const pending: {
+      staged: boolean | undefined;
+      resolve: (value: { type: "git-diff"; diff: { diff: string } }) => void;
+    }[] = [];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; staged?: boolean } }) => {
+        if (request.type !== "git-diff") throw new Error(`unexpected request ${request.type}`);
+        const deferredResponse = deferred<{ type: "git-diff"; diff: { diff: string } }>();
+        pending.push({ staged: request.staged, resolve: deferredResponse.resolve });
+        return deferredResponse.promise;
+      },
+    );
+
+    const worktreePromise = viewDiff("src/a.ts", true, false);
+    await flush();
+    const stagedPromise = viewDiff("src/a.ts", true, true);
+    await flush();
+
+    expect(pending.map((request) => request.staged)).toEqual([false, true]);
+
+    pending[1]!.resolve({ type: "git-diff", diff: { diff: "staged diff" } });
+    await stagedPromise;
+    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "staged diff" }]);
+    expect(get(diffText)).toBe("staged diff");
+
+    pending[0]!.resolve({ type: "git-diff", diff: { diff: "worktree diff" } });
+    await worktreePromise;
+
+    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "staged diff" }]);
+    expect(get(diffText)).toBe("staged diff");
+  });
+
   it("keeps stale all-changes responses out of its diff cache", async () => {
     const pending: {
       path: string;
@@ -1611,6 +1648,35 @@ describe("all-changes diff tab", () => {
     ]);
 
     setStatus([{ path: "src/a.ts", status: "modified", staged: false, additions: 2 }]);
+    await flush();
+
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v2 for src/a.ts" },
+    ]);
+  });
+
+  it("auto-refreshes all-changes for a new status snapshot with unchanged counts", async () => {
+    let diffVersion = 0;
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false, additions: 1, deletions: 1 }]);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffVersion += 1;
+          return { type: "git-diff", diff: { diff: `diff v${diffVersion} for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await viewAllChanges();
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v1 for src/a.ts" },
+    ]);
+
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false, additions: 1, deletions: 1 }]);
     await flush();
 
     expect(get(allChangesFiles)).toEqual([

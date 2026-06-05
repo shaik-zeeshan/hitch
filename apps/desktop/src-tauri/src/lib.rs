@@ -45,7 +45,9 @@ use hitch_proto::{
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+#[cfg(windows)]
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+use tauri::tray::TrayIconBuilder;
 #[cfg(feature = "packaged-smoke")]
 use tauri::RunEvent;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
@@ -2185,8 +2187,9 @@ fn windows_editor_candidates_from_dirs(
         // Unknown editor: the table has no install-dir mapping, so fall back to
         // treating the configured name itself as a bare-name PATH candidate. This
         // routes through the same `resolve_windows_path_candidate` machinery the
-        // known bare-name entries use (which tries `.exe`/`.cmd` and applies the
-        // cmd-shim), so any editor resolvable on PATH works instead of dead-ending.
+        // known bare-name entries use (which tries `.exe`/`.cmd`/`.bat` and
+        // applies the cmd-shim), so any editor resolvable on PATH works instead
+        // of dead-ending.
         // Candidates that carry path components are left out here because
         // `configured_executable` already handles absolute/relative paths, and
         // `resolve_windows_path_candidate` only accepts bare names anyway.
@@ -2252,16 +2255,23 @@ fn windows_candidate_names(candidate: &OsString) -> Vec<OsString> {
     exe.push(".exe");
     let mut cmd = candidate.clone();
     cmd.push(".cmd");
-    vec![exe, cmd]
+    let mut bat = candidate.clone();
+    bat.push(".bat");
+    vec![exe, cmd, bat]
+}
+
+#[cfg(windows)]
+fn windows_editor_program_needs_command_shim(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        })
 }
 
 #[cfg(windows)]
 fn windows_editor_program_from_path(path: PathBuf) -> WindowsEditorProgram {
-    if path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
-    {
+    if windows_editor_program_needs_command_shim(&path) {
         WindowsEditorProgram::command_shim(path.into_os_string())
     } else {
         WindowsEditorProgram::executable(path.into_os_string())
@@ -2408,16 +2418,15 @@ fn env_editor_command_spec(command: &str, path: &Path) -> EditorLaunchSpec {
 
     // Windows: no POSIX shell to lean on; parse the command line with Windows
     // quote/backslash semantics (program + args) and reuse the cmd shim for
-    // `.cmd` launchers so a GUI parent doesn't flash a console window.
+    // `.cmd`/`.bat` launchers so a GUI parent doesn't flash a console window.
     #[cfg(windows)]
     {
         let mut parts = split_windows_editor_command(command).into_iter();
         let program = parts.next().expect("non-empty after trim");
         let mut args: Vec<OsString> = parts.collect();
         args.push(path.as_os_str().to_os_string());
-        let command_processor_shim = Path::new(&program)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"));
+        let command_processor_shim =
+            windows_editor_program_needs_command_shim(Path::new(&program));
         EditorLaunchSpec {
             program: OsString::from(program),
             args,
@@ -3071,6 +3080,49 @@ mod tests {
 
         std::fs::remove_file(shim).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_fallback_resolves_bat_shim_before_launch() {
+        let dir = std::env::temp_dir().join(format!(
+            "hitch-editor-test-{}-{}",
+            std::process::id(),
+            "path-bat-shim"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("code.bat");
+        std::fs::write(&shim, b"").unwrap();
+
+        assert_eq!(
+            resolve_windows_path_candidate_from_dirs(
+                &std::ffi::OsString::from("code"),
+                &[dir.clone()],
+            ),
+            Some(WindowsEditorProgram::command_shim(
+                shim.as_os_str().to_os_string()
+            ))
+        );
+
+        std::fs::remove_file(shim).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_env_editor_bat_uses_command_processor_shim() {
+        let path = std::path::Path::new(r"C:\work\repo");
+        let spec = env_editor_command_spec(r#""C:\Tools\editor.bat" --wait"#, path);
+
+        assert!(spec.command_processor_shim);
+        assert_eq!(spec.program, std::ffi::OsString::from(r"C:\Tools\editor.bat"));
+        assert_eq!(
+            spec.args,
+            vec![
+                std::ffi::OsString::from("--wait"),
+                path.as_os_str().to_os_string(),
+            ]
+        );
     }
 
     #[test]

@@ -236,6 +236,8 @@ const diffCacheKey = (worktreeId: Id, path: string, staged?: boolean) =>
   `${worktreeId}\0${diffSideKey(staged)}\0${path}`;
 const diffFreshnessKey = (worktreeId: Id, consumer: string, path: string, staged?: boolean) =>
   `${worktreeId}\0${consumer}\0${diffSideKey(staged)}\0${path}`;
+const diffTabFreshnessKey = (worktreeId: Id, path: string) =>
+  diffFreshnessKey(worktreeId, "single", path);
 
 function nextDiffRequestSeq(
   worktreeId: Id,
@@ -259,6 +261,17 @@ function writeFreshDiffCache(cacheKey: string, writeSeq: number, text: string): 
   if (diffCacheWriteSeq.get(cacheKey) !== writeSeq) return false;
   diffCache.set(cacheKey, text);
   return true;
+}
+
+let gitStatusSnapshotSeq = 0;
+const gitStatusSnapshotIds = new WeakMap<GitStatus, number>();
+
+function gitStatusSnapshotIdentity(status: GitStatus): number {
+  const existing = gitStatusSnapshotIds.get(status);
+  if (existing !== undefined) return existing;
+  const next = ++gitStatusSnapshotSeq;
+  gitStatusSnapshotIds.set(status, next);
+  return next;
 }
 let statusRequestSeq = 0;
 let statusPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -1727,8 +1740,9 @@ export async function viewDiff(path: string, activate = true, staged?: boolean):
   const worktreeId = get(gitWorktreeId);
   if (!worktreeId) return;
   const cacheKey = diffCacheKey(worktreeId, path, staged);
-  const requestSeq = nextDiffRequestSeq(worktreeId, "single", path, staged);
-  const requestKey = diffFreshnessKey(worktreeId, "single", path, staged);
+  const requestKey = diffTabFreshnessKey(worktreeId, path);
+  const requestSeq = (diffRequestSeq.get(requestKey) ?? 0) + 1;
+  diffRequestSeq.set(requestKey, requestSeq);
   const writeSeq = nextDiffCacheWriteSeq(cacheKey);
 
   const cached = diffCache.get(cacheKey) ?? null;
@@ -1746,7 +1760,7 @@ export async function viewDiff(path: string, activate = true, staged?: boolean):
     activeDiffPath.set(path);
   }
 
-  // The tab is live (still open) and this is the freshest single-file request for its side.
+  // The tab is live (still open) and this is the freshest request for the visible path.
   const isLatest = () =>
     diffRequestSeq.get(requestKey) === requestSeq &&
     get(gitWorktreeId) === worktreeId &&
@@ -1791,8 +1805,9 @@ async function fetchFileDiff(
       staged,
     };
     const response = await daemonRequest<Response & { diff: { diff: string } }>(request);
-    writeFreshDiffCache(cacheKey, writeSeq, response.diff.diff);
-    return diffRequestSeq.get(requestKey) === requestSeq ? response.diff.diff : null;
+    const wrote = writeFreshDiffCache(cacheKey, writeSeq, response.diff.diff);
+    if (diffRequestSeq.get(requestKey) !== requestSeq) return diffCache.get(cacheKey) ?? null;
+    return wrote ? response.diff.diff : diffCache.get(cacheKey) ?? null;
   } catch (err) {
     error.set(toMessage(err));
     return null;
@@ -1850,7 +1865,12 @@ export async function viewAllChanges(activate = true): Promise<void> {
       if (!isLatest()) return;
       allChangesFiles.update((rows) =>
         rows.map((row) =>
-          row.path === file.path && row.staged === file.staged ? { ...row, text } : row,
+          row.path === file.path && row.staged === file.staged
+            ? {
+                ...row,
+                text: text ?? diffCache.get(diffCacheKey(worktreeId, file.path, file.staged)) ?? row.text,
+              }
+            : row,
         ),
       );
     }),
@@ -2257,9 +2277,10 @@ sessions.subscribe(($sessions) => {
 
 // Keep the all-changes tab fresh: whenever git status changes (a poll catching
 // an agent's edits, or our own stage/commit) while that tab is open, re-fan its
-// per-file diffs without stealing focus. Compares the changed-file metadata
-// signature so line-count/status/content changes refetch, while unrelated status
-// fields (ahead/behind) don't trigger a refan.
+// per-file diffs without stealing focus. The daemon status contract does not
+// expose blob ids, so the snapshot object identity is the available content
+// freshness token: a new status snapshot can carry same path/status/counts after
+// text-only edits and must still invalidate cached hunks.
 let lastAllChangesSig: string | null = null;
 gitStatus.subscribe(($status) => {
   if (!get(diffTabs).some((tab) => tab.path === ALL_CHANGES_TAB)) {
@@ -2267,12 +2288,14 @@ gitStatus.subscribe(($status) => {
     return;
   }
   const files = $status?.files ?? [];
-  const sig = files
-    .map(
+  const snapshot = $status ? gitStatusSnapshotIdentity($status) : 0;
+  const sig = [
+    snapshot,
+    ...files.map(
       (file) =>
         `${file.staged ? "1" : "0"}\0${file.path}\0${file.status}\0${file.additions ?? 0}\0${file.deletions ?? 0}`,
-    )
-    .join("\n");
+    ),
+  ].join("\n");
   if (sig === lastAllChangesSig) return;
   const worktreeId = $status?.worktree_id;
   if (worktreeId) {

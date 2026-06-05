@@ -141,7 +141,7 @@ Two color layers:
   per-mode terminal theme** in both themes (the cool surface, the matching
   add/del tints), exactly as rule 4 below requires of the terminal.
 
-> **Mockup divergence note (2026-06-06).** The locked mockup has no
+> **Mockup divergence note (2026-06-05).** The locked mockup has no
 > syntax-highlighted diff body — the center pane only ever draws the terminal,
 > and earlier docs/ADR 0006 locked a *flat, un-highlighted classified* diff. That
 > stance is **superseded**: the shipped diff is the highlighted @pierre/diffs view
@@ -187,7 +187,7 @@ Declared in `:root` and used across components:
 
 | Token | Value | Note |
 | --- | --- | --- |
-| `--radius` | `6px` | Defined but the shell is rectangular; see the radius policy in [components.md](components.md#shape--radius-policy). |
+| `--radius` | `6px` | Defined but the shell is rectangular; see the radius policy in [components.md](components.md#shape-radius-policy). |
 | `--mono` | `"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace` | Mono stack. JetBrains Mono is bundled through `@fontsource/jetbrains-mono` (weights 400/500/600/700 + italic 400); no Google Fonts network request. |
 | `--ui` | `-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif` | UI sans stack. |
 | `--r0`..`--r4` | `.75 / .8125 / .875 / 1 / 1.125 rem` | Type scale (12 / 13 / 14 / 16 / 18 px at 16px root). |

@@ -83,9 +83,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Hitch · Paper Terminal</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
 <style>
   :root{
     /* warm paper neutrals - oklch, never #fff/#000 */
@@ -260,6 +257,7 @@
     width:300px; max-width:42vw; height:26px; padding:0 8px 0 9px;
     background:var(--paper-2); border:1px solid var(--line); border-radius:0;
     color:var(--ink-3); cursor:default;
+  }
   .palette .seek{ width:13px; height:13px; flex:0 0 13px; color:var(--ink-3); }
   .palette .ph{
     flex:1; min-width:0; font-size:var(--r0); color:var(--ink-3);
@@ -680,11 +678,14 @@
   /* reveal the menu for review when the hash includes "actions" (#actions / #dark-actions) */
   html.show-actions .act-menu{ display:block; }
   .mi{
+    width:100%; border:0; background:transparent;
     display:flex; align-items:center; gap:9px;
-    padding:7px 9px; border-radius:0; cursor:default;
-    font-family:var(--ui); font-size:var(--r1); color:var(--ink-0);
+    padding:7px 9px; border-radius:0; cursor:pointer;
+    font:inherit; font-family:var(--ui); font-size:var(--r1); color:var(--ink-0);
+    text-align:left;
   }
-  .mi:hover{ background:var(--paper-3); }
+  .mi:hover, .mi:focus-visible{ background:var(--paper-3); }
+  .mi:focus-visible{ outline:1px solid var(--iris-line); outline-offset:-1px; }
   .mi .mi-ico{ width:15px; height:15px; flex:0 0 15px; color:var(--ink-2); }
   .mi .mi-k{
     margin-left:auto; font-family:var(--mono); font-size:.625rem;
@@ -692,8 +693,8 @@
   }
   .mi.is-primary{ color:var(--iris-ink); font-weight:600; }
   .mi.is-primary .mi-ico{ color:var(--iris-ink); }
-  .mi.disabled{ opacity:.42; }
-  .mi.disabled .mi-k{ color:var(--ink-3); }
+  .mi.disabled, .mi:disabled{ opacity:.42; cursor:default; }
+  .mi.disabled .mi-k, .mi:disabled .mi-k{ color:var(--ink-3); }
   .m-sep{ height:1px; background:var(--line); margin:5px 7px; }
   /* quiet toggle row: auto-generate commit message */
   .mi.toggle{ color:var(--ink-1); }
@@ -1078,37 +1079,37 @@
           <!-- full action menu: crisp letterpress popover, no blur. The current
                primary (Commit & Push) is marked; steps that don't apply are quiet. -->
           <div class="act-menu" role="menu" aria-label="Git actions">
-            <div class="mi" role="menuitem">
+            <button class="mi" type="button" role="menuitem">
               <svg class="mi-ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-commit"/></svg>
               Commit…
-            </div>
-            <div class="mi is-primary" role="menuitem">
+            </button>
+            <button class="mi is-primary" type="button" role="menuitem">
               <svg class="mi-ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-commitpush"/></svg>
               Commit &amp; Push <span class="mi-k">⌘↵</span>
-            </div>
+            </button>
             <div class="m-sep"></div>
-            <div class="mi" role="menuitem">
+            <button class="mi" type="button" role="menuitem">
               <svg class="mi-ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-push"/></svg>
               Push <span class="mi-k">↑3</span>
-            </div>
-            <div class="mi disabled" role="menuitem" title="Up to date with remote">
+            </button>
+            <button class="mi disabled" type="button" role="menuitem" disabled aria-disabled="true" title="Up to date with remote">
               <svg class="mi-ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-pull"/></svg>
               Pull <span class="mi-k">↓0</span>
-            </div>
+            </button>
             <div class="m-sep"></div>
-            <div class="mi" role="menuitem">
+            <button class="mi" type="button" role="menuitem">
               <svg class="mi-ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-pr"/></svg>
               Open PR #142 <span class="mi-k">↗</span>
-            </div>
-            <div class="mi disabled" role="menuitem" title="A pull request already exists">
+            </button>
+            <button class="mi disabled" type="button" role="menuitem" disabled aria-disabled="true" title="A pull request already exists">
               <svg class="mi-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M12 6 V18 M6 12 H18"/></svg>
               Create PR…
-            </div>
+            </button>
             <div class="m-sep"></div>
-            <div class="mi toggle" role="menuitemcheckbox" aria-checked="true">
+            <button class="mi toggle" type="button" role="menuitemcheckbox" aria-checked="true">
               <span class="check on" aria-hidden="true">✓</span>
               auto-generate commit message
-            </div>
+            </button>
           </div>
         </div>
 

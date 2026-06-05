@@ -55,9 +55,8 @@
   // (never reordered — branches stay in daemon order). `main` is the repo's
   // anchor and is never removable; `managed` worktrees were created by Hitch and
   // are safe to remove; `external` ones were discovered/imported, so Hitch shows
-  // them but won't manage their lifecycle. The Paper Terminal shell dropped the
-  // old leading dot column; the distinction now lives in a `title` tooltip plus
-  // a faint `main` suffix on the anchor branch (the one a glance benefits from).
+  // them but won't manage their lifecycle. Keep that ownership visible as one
+  // quiet suffix beside the branch name; the row title carries the full phrase.
   type WorktreeKind = "main" | "managed" | "external";
   function worktreeKind(w: Worktree): WorktreeKind {
     if (w.is_main) return "main";
@@ -67,6 +66,10 @@
     main: "Main worktree",
     managed: "Hitch-managed worktree",
     external: "External worktree (not managed by Hitch)",
+  };
+  const KIND_CUE: Partial<Record<WorktreeKind, string>> = {
+    managed: "hitch",
+    external: "ext",
   };
 
   // The worktree row's state WORD: only the act states and the live working
@@ -328,7 +331,7 @@
                       <div class="l1">
                         <GitBranch class="branchic icon" />
                         <span class="name">{worktree.branch}</span>
-                        {#if kind === "main"}<span class="mainsuf">main</span>{/if}
+                        {#if kind === "main"}<span class="mainsuf">main</span>{:else}<span class="kindcue" title={KIND_TITLE[kind]}>{KIND_CUE[kind]}</span>{/if}
                       </div>
 
                       {#if showMeta}
@@ -646,7 +649,8 @@
   .wrow.sel .name {
     color: var(--iris-ink);
   }
-  /* a faint cue marking the repo's main anchor (replaces the old kind dot) */
+  /* faint suffixes mark worktree ownership without restoring the old dot column */
+  .kindcue,
   .mainsuf {
     flex: none;
     font-size: 0.5625rem;

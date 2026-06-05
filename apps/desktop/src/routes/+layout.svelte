@@ -74,6 +74,7 @@
       // shortcut. Toggles: from the shell it opens /settings, from /settings
       // it returns to the shell (Escape on the page does the same).
       event.preventDefault();
+      commandOpen.set(false);
       void goto(page.url.pathname === "/settings" ? "/" : "/settings");
     }
   }

@@ -31,7 +31,7 @@ The unified dark top nav the mockup draws is the title bar on every platform; ho
 - No `src-tauri` source change; only `tauri.conf.json` (titlebar) is touched there. The Rust side stayed otherwise frozen with one approved exception: `hitch-git`'s `diff_file` was emitting libgit2 line *content* without the per-line origin marker, so `FileDiff.diff` was not a valid unified diff and the diff tab could not classify add/del lines. A ~4-line fix re-prepends the `+`/`-`/` ` origin; `cargo build` and `hitch-git`'s tests still pass.
 - Canonical docs that named React ([0005](0005-monorepo-crate-structure.md), `CONTEXT.md`) are corrected to say Svelte.
 
-## Amendment (2026-06-06): the diff tab is syntax-highlighted via `@pierre/diffs`
+## Amendment (2026-06-05): the diff tab is syntax-highlighted via `@pierre/diffs`
 
 The "local unified-diff classifier, not `@pierre/diffs`" decision under **Stack**
 is **superseded**. The diff tab now renders a syntax-highlighted, word-level diff

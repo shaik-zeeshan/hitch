@@ -1017,10 +1017,24 @@ pub fn status(repo_path: impl AsRef<Path>) -> Result<StatusSummary> {
         if let Some((additions, deletions)) = line_stats.staged.get(entry.path.as_path()) {
             entry.staged_additions = *additions;
             entry.staged_deletions = *deletions;
+        } else if is_collapsed_untracked_dir(&repo, entry) {
+            let (additions, deletions) = aggregate_descendant_line_stats(
+                &line_stats.staged,
+                entry.path.as_path(),
+            );
+            entry.staged_additions = additions;
+            entry.staged_deletions = deletions;
         }
         if let Some((additions, deletions)) = line_stats.worktree.get(entry.path.as_path()) {
             entry.worktree_additions = *additions;
             entry.worktree_deletions = *deletions;
+        } else if is_collapsed_untracked_dir(&repo, entry) {
+            let (additions, deletions) = aggregate_descendant_line_stats(
+                &line_stats.worktree,
+                entry.path.as_path(),
+            );
+            entry.worktree_additions = additions;
+            entry.worktree_deletions = deletions;
         }
     }
     let additions = line_stats.additions;
@@ -1066,7 +1080,7 @@ fn diff_line_stats(repo: &Repository) -> Result<DiffLineStats> {
     let mut options = DiffOptions::new();
     options
         .include_untracked(true)
-        .recurse_untracked_dirs(false)
+        .recurse_untracked_dirs(true)
         .show_untracked_content(true);
     let index = repo.index()?;
     let mut worktree = repo.diff_index_to_workdir(Some(&index), Some(&mut options))?;
@@ -1078,6 +1092,29 @@ fn diff_line_stats(repo: &Repository) -> Result<DiffLineStats> {
     stats.worktree = worktree_per_path;
 
     Ok(stats)
+}
+
+fn is_collapsed_untracked_dir(repo: &Repository, entry: &StatusEntry) -> bool {
+    entry.index == FileState::Unmodified
+        && entry.working_tree == FileState::New
+        && repo
+            .workdir()
+            .is_some_and(|workdir| workdir.join(entry.path.as_path()).is_dir())
+}
+
+fn aggregate_descendant_line_stats(
+    per_path: &HashMap<PathBuf, (usize, usize)>,
+    dir: &Path,
+) -> (usize, usize) {
+    let mut additions = 0;
+    let mut deletions = 0;
+    for (path, (path_additions, path_deletions)) in per_path {
+        if path != dir && path.starts_with(dir) {
+            additions += path_additions;
+            deletions += path_deletions;
+        }
+    }
+    (additions, deletions)
 }
 
 fn detect_diff_renames(diff: &mut git2::Diff<'_>) -> Result<()> {
@@ -2466,7 +2503,11 @@ mod tests {
             path == "generated" || path == "generated/",
             "path was {path:?}"
         );
-        assert_eq!(summary.entries[0].working_tree, FileState::New);
+        let entry = &summary.entries[0];
+        assert_eq!(entry.working_tree, FileState::New);
+        assert_eq!((entry.worktree_additions, entry.worktree_deletions), (2, 0));
+        assert_eq!((entry.staged_additions, entry.staged_deletions), (0, 0));
+        assert_eq!((summary.additions, summary.deletions), (2, 0));
     }
 
     #[test]
