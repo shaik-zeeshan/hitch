@@ -294,11 +294,12 @@ pub enum Request {
     },
     /// Hook helper **identity announce** (ADR 0011 amendment 2026-06-05): an
     /// agent's `SessionStart` declares *which* agent now runs in a session so the
-    /// Session mark can render before the first prompt. Identity is **not** state:
-    /// this shape carries no `state` field at all, so it can never be confused
-    /// with a [`ReportAgentState`] whose `state: None` *clears* state. The
-    /// late-arrival guard (state reports dropped until the first `running`) does
-    /// not apply to announces; exit-to-`None` clears identity along with state.
+    /// Session mark can render before the first prompt. Identity is **not** a
+    /// non-null state: this shape carries no `state` field, so it can never be
+    /// confused with a [`ReportAgentState`] whose `state: None` *clears*
+    /// identity. A new identity/run id is still a process boundary; the daemon may
+    /// clear stale visible state while keeping `agent: Some(..)`. The late-arrival
+    /// guard does not block announces; exit-to-`None` clears identity with state.
     AnnounceAgent {
         agent: KnownAgent,
         session_id: Option<SessionId>,

@@ -123,9 +123,17 @@ the agent TUI starts — not at the first prompt, and not by parsing session
 titles or launch commands (hand-typed `claude` is ADR 0002's core scenario). So
 `SessionStart` now sends an **identity-only announce**: a report shape carrying
 *which* agent with **no state field at all** — it cannot reuse `state: None`,
-which means "clear". The late-arrival guard and the no-state-until-first-prompt
-invariant are untouched. Exit-to-`None` clears identity along with state,
-reverting the session's mark to shell.
+which means "clear identity". The announce never invents a non-null state;
+exit-to-`None` clears identity along with state, reverting the session's mark to
+shell.
+
+`SessionStart` also defines a **fresh process boundary**. If it announces a
+different identity or a different/new agent-native run id while the daemon still
+holds the previous process's state, the daemon clears `agent_state` /
+`agent_detail` to `None` and re-closes the late-arrival guard until the first
+fresh `running` report. This preserves the "fresh, never-prompted agent has no
+state" invariant even when a dirty agent exit is followed by an immediate
+same-agent relaunch before `SessionEnd` or the foreground-command backstop clears.
 
 The same no-confusion rule applies one layer up, on the **broadcast event**:
 the announce propagates over the shared `AgentState` event carrying the

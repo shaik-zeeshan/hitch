@@ -1417,9 +1417,10 @@ fn handle_request<R: Read>(
         } => {
             // Identity-only announce: store *which* agent runs in the session so
             // the Session mark can render before the first prompt. Bypasses the
-            // late-arrival guard and never sets/changes Agent State (ADR 0011
-            // amendment 2026-06-05). Propagate a changed identity to attached
-            // clients via the same `AgentState` event path state reports use —
+            // late-arrival guard, never invents a non-null Agent State, and
+            // clears prior visible state when the announce is a fresh process
+            // boundary (ADR 0011 amendment 2026-06-05). Propagate visible
+            // changes via the same `AgentState` event path state reports use —
             // there is no separate identity event type.
             if let Some(event) =
                 store_agent_announce(state, agent, session_id, cwd.as_deref(), agent_run_id)?
@@ -3301,20 +3302,26 @@ fn store_agent_report(
 
 /// Store an **identity-only announce** (ADR 0011 amendment 2026-06-05): the
 /// agent's `SessionStart` declares *which* agent now runs in a session so the
-/// Session mark can render before the first prompt. Identity is **not** state:
+/// Session mark can render before the first prompt. Identity is **not** a
+/// non-null state, but `SessionStart` is still a process boundary:
 ///
-/// - It records `daemon_session.agent` and the agent-native run id, and **never**
-///   touches `agent_state`, `agent_detail`, or the late-arrival guard — a fresh,
-///   never-prompted agent stays at no-state.
+/// - It records `daemon_session.agent` and the agent-native run id, and never
+///   invents `running` / `waiting` / `needs-approval` / `error`.
+/// - A changed identity or changed/new run id clears any prior `agent_state` /
+///   `agent_detail` and closes the late-arrival guard until the first fresh
+///   `running` report. This prevents a relaunched same-agent process from
+///   rendering the previous process's error or approval state while waiting for
+///   the first new state report.
 /// - It **bypasses** the late-arrival guard (`agent_report_requires_running`):
 ///   that guard governs *state* reports only; an announce always passes.
 /// - Exit-to-`None` (a `ReportAgentState` with `state: None`) clears identity
 ///   along with state, reverting the mark to shell — handled in
 ///   [`store_agent_report`], not here.
 ///
-/// Returns the stored identity if it changed (so the caller can propagate it to
-/// attached clients the same way state reports do), or `None` when the report
-/// could not resolve to a session or the identity was already current.
+/// Returns the stored identity/state if the visible value changed (so the caller
+/// can propagate it to attached clients the same way state reports do), or
+/// `None` when the report could not resolve to a session or the announce was
+/// already current.
 fn store_agent_announce(
     state: &Arc<Mutex<DaemonState>>,
     agent: KnownAgent,
@@ -3338,28 +3345,33 @@ fn store_agent_announce(
         return Ok(None);
     };
 
-    // Identity only: do not touch agent_state / agent_detail / the late-arrival
-    // guard. Every announce defines a fresh process-identity boundary: store the
-    // supplied run id when present, and clear any prior run id when absent. That
-    // prevents an identity-only same-agent announce from leaving the previous
-    // process run id behind and rejecting the next real state report.
     let identity_changed = daemon_session.agent != Some(agent);
-    daemon_session.agent_run_id = agent_run_id;
-    if !identity_changed {
+    let run_boundary = match agent_run_id.as_deref() {
+        Some(run_id) => daemon_session.agent_run_id.as_deref() != Some(run_id),
+        // Older helpers have no run id. A no-run-id announce is still the only
+        // same-agent boundary signal they can send, so clear stale visible state
+        // when one is present; otherwise duplicate no-run-id announces are no-ops.
+        None => {
+            daemon_session.agent_run_id.is_some()
+                || (daemon_session.agent_state.is_some() || daemon_session.agent_detail.is_some())
+        }
+    };
+    if !identity_changed && !run_boundary {
         return Ok(None);
     }
+
     let worktree_id = session_worktree_id(&daemon_session.session);
     daemon_session.agent = Some(agent);
+    daemon_session.agent_run_id = agent_run_id;
+    daemon_session.agent_state = None;
+    daemon_session.agent_detail = None;
+    daemon_session.agent_report_requires_running = true;
     Ok(Some(AgentStateBroadcast {
         session_id,
         worktree_id,
         agent: Some(agent),
-        // The announce carries no state; broadcast the session's *current*
-        // stored state (typically `None` pre-prompt) so an attached client
-        // learns the new identity without inventing a state. The client keys
-        // the identity clear on `agent: None`, never on this null state.
-        state: daemon_session.agent_state,
-        detail: daemon_session.agent_detail.clone(),
+        state: None,
+        detail: None,
     }))
 }
 
@@ -6094,7 +6106,10 @@ mod tests {
         {
             let guard = state.lock().unwrap();
             let s = guard.sessions.get(&session_id).unwrap();
-            assert_eq!(s.agent_run_id, None, "identity-only announce clears stale run id");
+            assert_eq!(
+                s.agent_run_id, None,
+                "identity-only announce clears stale run id"
+            );
         }
 
         let fresh_report = super::store_agent_report(

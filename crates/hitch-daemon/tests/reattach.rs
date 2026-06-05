@@ -474,7 +474,94 @@ fn reattach_replays_agent_state_report_with_run_id_and_ignores_stale_report() {
     let _ = std::fs::remove_dir_all(project_root);
 }
 
+#[cfg(unix)]
+#[test]
+fn same_agent_announce_with_new_run_id_clears_stale_state() {
+    let socket = test_socket_path("announce-clear");
+    let project_root = test_dir_path("announce-clear-project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let mut daemon = DaemonGuard::start(&socket);
 
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &project_root);
+    let session = client.open_session(
+        3,
+        SessionParent::Project(project.id),
+        vec!["/bin/sh".into(), "-lc".into(), "sleep 30".into()],
+    );
+    drop(client);
+
+    let mut reporter = TestClient::connect(&socket);
+    reporter.hello(4);
+    reporter.read_session_opened_with_agent_state(
+        session.id,
+        None,
+        None,
+        None,
+        Duration::from_secs(5),
+    );
+
+    reporter.send_request(
+        5,
+        Request::ReportAgentState {
+            agent: KnownAgent::ClaudeCode,
+            state: Some(hitch_core::AgentState::Error),
+            session_id: Some(session.id),
+            cwd: Some(project_root.clone()),
+            detail: Some("old failure".into()),
+            agent_run_id: Some("run-old".into()),
+        },
+    );
+    let old_event = reporter.read_agent_state_event(Duration::from_secs(5));
+    assert_eq!(
+        old_event,
+        Event::AgentState {
+            session_id: Some(session.id),
+            worktree_id: None,
+            agent: Some(KnownAgent::ClaudeCode),
+            state: Some(hitch_core::AgentState::Error),
+            detail: Some("old failure".into()),
+        }
+    );
+
+    reporter.send_request(
+        6,
+        Request::AnnounceAgent {
+            agent: KnownAgent::ClaudeCode,
+            session_id: Some(session.id),
+            cwd: Some(project_root.clone()),
+            agent_run_id: Some("run-new".into()),
+        },
+    );
+    let clear_event = reporter.read_agent_state_event(Duration::from_secs(1));
+    assert_eq!(
+        clear_event,
+        Event::AgentState {
+            session_id: Some(session.id),
+            worktree_id: None,
+            agent: Some(KnownAgent::ClaudeCode),
+            state: None,
+            detail: None,
+        }
+    );
+
+    {
+        let mut reattached = TestClient::connect(&socket);
+        reattached.hello(7);
+        reattached.read_session_opened_with_agent_state(
+            session.id,
+            Some(KnownAgent::ClaudeCode),
+            None,
+            None,
+            Duration::from_secs(5),
+        );
+    }
+
+    reporter.shutdown(99);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(project_root);
+}
 #[cfg(unix)]
 #[test]
 fn simulated_reboot_restores_persisted_session_layout_as_fresh_session() {
