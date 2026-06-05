@@ -225,9 +225,9 @@ html[data-theme="dark"] {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    height: 16px;
-    min-width: 16px;
-    padding: 0 4px;
+    height: 15px;
+    min-width: 20px;
+    padding: 0 5px;
     font-family: var(--mono);
     font-size: 10.5px;
     font-weight: 600;
@@ -240,6 +240,13 @@ html[data-theme="dark"] {
     border-radius: 0;
     vertical-align: baseline;
     translate: 0 1px;
+  }
+  /* Multi-key shortcut: one keycap per key in a tight row — never two glyphs
+     crammed into a single cap (⌘K renders as [⌘][K]). */
+  .keys {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
   }
   /* Variant: a keycap drawn on the iris fill inverts to a light glyph on a
      translucent hairline (components.md). */
@@ -304,11 +311,14 @@ html[data-theme="dark"] {
   .btn.primary:disabled:hover {
     filter: none;
   }
-  .btn .kbd {
+  .btn :is(kbd, .kbd, .keys) {
     margin-left: 5px;
     color: var(--ink-2);
   }
-  .btn.primary .kbd {
+  .btn .keys :is(kbd, .kbd) {
+    margin-left: 0;
+  }
+  .btn.primary :is(kbd, .kbd) {
     color: var(--iris-on);
     border-color: var(--iris-on-sc-line);
   }

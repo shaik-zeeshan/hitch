@@ -4,6 +4,7 @@ import {
   revealItemLabel,
   isShortcutModifier,
   shortcutLabel,
+  shortcutKeys,
   shellSessionShortcutLabel,
 } from "./desktopPlatform";
 
@@ -39,6 +40,14 @@ describe("shortcutLabel", () => {
     expect(shortcutLabel("macos", "K")).toBe("⌘K");
     expect(shortcutLabel("windows", "K")).toBe("Ctrl+K");
     expect(shortcutLabel("linux", "Enter")).toBe("Ctrl+Enter");
+  });
+});
+
+describe("shortcutKeys", () => {
+  it("splits the shortcut into one entry per keycap", () => {
+    expect(shortcutKeys("macos", "K")).toEqual(["⌘", "K"]);
+    expect(shortcutKeys("windows", "K")).toEqual(["Ctrl", "K"]);
+    expect(shortcutKeys("linux", "Enter")).toEqual(["Ctrl", "Enter"]);
   });
 });
 

@@ -268,20 +268,24 @@
     flex:1; min-width:0; font-size:var(--r0); color:var(--ink-3);
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
   }
-  .palette kbd{ flex:0 0 auto; translate:0 0; }
+  .palette .keys{ flex:0 0 auto; }
+  .palette kbd{ translate:0 0; }
   /* ---------- one refined letterpress keycap, used everywhere ----------
      flat rectangle, hairline border, NO bevel/shadow, tabular mono at a
-     fixed 10.5px / 16px box so every keycap shares a baseline with its
-     label. Muted ink so it never competes with the word beside it. */
+     fixed 10.5px / 15px box (wider than tall) so every keycap shares a
+     baseline with its label. Muted ink so it never competes with the word
+     beside it. Multi-key shortcuts are one keycap per key in a .keys row,
+     never two glyphs in one cap. */
   kbd{
     display:inline-flex; align-items:center; justify-content:center;
-    height:16px; min-width:16px; padding:0 4px;
+    height:15px; min-width:20px; padding:0 5px;
     font-family:var(--mono); font-size:10.5px; font-weight:600;
     font-variant-numeric:tabular-nums; letter-spacing:.02em; line-height:1;
     color:var(--ink-2); background:transparent;
     border:1px solid var(--line); border-radius:0;
     vertical-align:baseline; translate:0 1px;
   }
+  .keys{ display:inline-flex; align-items:center; gap:3px; }
   /* daemon: a standalone quiet instrument - no border/background grouping it with neighbours */
   .daemon{
     display:inline-flex; align-items:center; gap:7px;
@@ -634,8 +638,8 @@
      hairline so it reads AA against the primary without a second fill. */
   .split-main kbd{
     color:var(--iris-on); border-color:var(--iris-on-sc-line);
-    margin-left:2px;
   }
+  .split-main .keys{ margin-left:2px; }
   .split-caret{
     flex:0 0 30px; display:grid; place-items:center;
     background:var(--iris); color:var(--iris-on);
@@ -852,7 +856,7 @@
           <circle cx="10.5" cy="10.5" r="6.2"/><path d="M15.2 15.2 20 20"/>
         </svg>
         <span class="ph">Jump to worktree, session, or action…</span>
-        <kbd>⌘K</kbd>
+        <span class="keys"><kbd>⌘</kbd><kbd>K</kbd></span>
       </div>
 
       <div class="grow"></div>
@@ -1059,7 +1063,7 @@
           <div class="splitbtn">
             <button class="split-main" type="button">
               <svg class="btnic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-commitpush"/></svg>
-              Commit &amp; Push <kbd>⌘↵</kbd>
+              Commit &amp; Push <span class="keys"><kbd>⌘</kbd><kbd>↵</kbd></span>
             </button>
             <button class="split-caret" type="button" aria-label="More git actions" title="More git actions">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9 l6 6 l6-6"/></svg>
@@ -1071,7 +1075,7 @@
             <span>2 staged</span><span class="sep">·</span>
             <span><span class="arr">↑</span>3</span><span class="sep">·</span>
             <span>PR #142 open</span>
-            <span class="stash" title="Stash changes">Stash <kbd>⌘S</kbd></span>
+            <span class="stash" title="Stash changes">Stash <span class="keys"><kbd>⌘</kbd><kbd>S</kbd></span></span>
           </div>
 
           <!-- full action menu: crisp letterpress popover, no blur. The current
@@ -1148,7 +1152,7 @@
         <div class="rail-r-foot">
           <span><kbd>␣</kbd> stage</span>
           <span><kbd>↵</kbd> open diff</span>
-          <span><kbd>⌘↵</kbd> commit</span>
+          <span><span class="keys"><kbd>⌘</kbd><kbd>↵</kbd></span> commit</span>
         </div>
       </aside>
 

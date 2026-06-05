@@ -30,18 +30,27 @@ mockup window frame itself uses `11px` (page seat only, not the shell). A
 ## Keycap (`kbd`)
 
 One recipe everywhere. Flat rectangle, hairline border, **no bevel, no shadow**,
-tabular mono in a fixed box, baseline-nudged to sit with its label.
+tabular mono in a fixed box, baseline-nudged to sit with its label. The box is
+wider than tall (15×20 minimum) so a lone glyph reads as a keycap, not a tile.
 
 ```css
 kbd {
   display: inline-flex; align-items: center; justify-content: center;
-  height: 16px; min-width: 16px; padding: 0 4px;
+  height: 15px; min-width: 20px; padding: 0 5px;
   font-family: var(--mono); font-size: 10.5px; font-weight: 600;
   font-variant-numeric: tabular-nums; letter-spacing: .02em; line-height: 1;
   color: var(--ink-2); background: transparent;
   border: 1px solid var(--line); border-radius: 0;
   vertical-align: baseline; translate: 0 1px;
 }
+```
+
+**Multi-key shortcuts render one keycap per key** — never two glyphs crammed
+into a single cap. `⌘K` is `[⌘][K]`: each key in its own `kbd`, grouped by a
+`.keys` row.
+
+```css
+.keys { display: inline-flex; align-items: center; gap: 3px; }
 ```
 
 Variants:
@@ -68,8 +77,8 @@ Variants:
 
 Children: `.seek` search glyph `13px` `--ink-3`; `.ph` placeholder (`--r0`,
 `--ink-3`, single line, ellipsis) reading `Jump to worktree, session, or
-action…`; a right-aligned `⌘K` keycap. Absolutely centered to the window, not
-the flex remainder.
+action…`; a right-aligned `[⌘][K]` keycap pair (`.keys`). Absolutely centered
+to the window, not the flex remainder.
 
 ## Theme toggle (`.theme-toggle`)
 

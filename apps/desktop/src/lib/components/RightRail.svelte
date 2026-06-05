@@ -40,6 +40,7 @@
     setFilesStaged,
     viewDiff,
   } from "../daemon";
+  import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
   import { autoCommitPush } from "../settings";
   import { commitOpen, createPrOpen } from "../overlays";
   import { STATUS_GLYPH, statusGlyphClass } from "../types";
@@ -58,6 +59,12 @@
     collapsed?: boolean;
     onToggleRight: () => void;
   } = $props();
+
+  // Commit-shortcut hints. The handler (CommitDialog) is platform-aware via
+  // isShortcutModifier, so the hints must agree: ⌘ on macOS, Ctrl elsewhere.
+  const platform = currentDesktopPlatform();
+  const commitKeys = shortcutKeys(platform, "↵");
+  const commitHint = shortcutLabel(platform, "↵");
 
   const files = $derived($gitStatus?.files ?? []);
   const staged = $derived(files.filter((f) => f.staged));
@@ -333,7 +340,9 @@
             {/if}
             {primary.label}
             {#if primary.key === "commit" || primary.key === "commitpush"}
-              <kbd>⌘↵</kbd>
+              <span class="keys">
+                {#each commitKeys as k (k)}<kbd>{k}</kbd>{/each}
+              </span>
             {/if}
           </button>
           <DropdownMenu.Root>
@@ -367,7 +376,7 @@
                   onSelect={() => void handleAutoCommitPush()}
                 >
                   <ArrowUpFromLine class="mi-ico icon" />
-                  Commit &amp; Push <span class="mi-k">⌘↵</span>
+                  Commit &amp; Push <span class="mi-k">{commitHint}</span>
                 </DropdownMenu.Item>
                 <DropdownMenu.Separator class="m-sep" />
                 <DropdownMenu.Item
@@ -539,7 +548,7 @@
   <div class="rail-r-foot">
     <span><kbd>␣</kbd> stage</span>
     <span><kbd>↵</kbd> open diff</span>
-    <span><kbd>⌘↵</kbd> commit</span>
+    <span><span class="keys">{#each commitKeys as k (k)}<kbd>{k}</kbd>{/each}</span> commit</span>
   </div>
 
   <!-- Mounted once, triggerless: opened from the action menu (and the command
@@ -775,7 +784,7 @@
     flex: 0 0 14px;
     color: var(--iris-on);
   }
-  .split-main kbd {
+  .split-main .keys {
     margin-left: 2px;
   }
   .split-caret {

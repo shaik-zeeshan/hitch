@@ -19,7 +19,7 @@
     restartDaemon,
   } from "../daemon";
   import { commandOpen } from "../overlays";
-  import { currentDesktopPlatform, shortcutLabel } from "../desktopPlatform";
+  import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
   import { theme, toggleTheme } from "../theme";
   import Search from "~icons/lucide/search";
   import SettingsIcon from "~icons/lucide/settings-2";
@@ -46,7 +46,7 @@
     onToggleRight: () => void;
   } = $props();
 
-  const commandPaletteShortcut = shortcutLabel(platform, "K");
+  const commandPaletteKeys = shortcutKeys(platform, "K");
   const settingsShortcut = shortcutLabel(platform, ",");
 
   // Daemon Status indicator (ADR 0009). A standalone quiet instrument: dot +
@@ -90,7 +90,9 @@
   <button class="palette-trigger no-drag" onclick={() => commandOpen.set(true)} aria-label="Open command palette">
     <Search class="icon seek" />
     <span class="ph">Jump to worktree, session, or action…</span>
-    <kbd>{commandPaletteShortcut}</kbd>
+    <span class="keys">
+      {#each commandPaletteKeys as k (k)}<kbd>{k}</kbd>{/each}
+    </span>
   </button>
 
   <!-- Right cluster: flex spacer pushes it right; theme toggle then daemon. -->
@@ -234,7 +236,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .palette-trigger kbd {
+  .palette-trigger .keys {
     flex: none;
   }
 

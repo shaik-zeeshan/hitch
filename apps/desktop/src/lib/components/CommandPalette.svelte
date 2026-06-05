@@ -221,7 +221,7 @@
           </Command.Viewport>
         </Command.List>
         <div class="p-foot">
-          <span><b class="kbd">↑↓</b> navigate</span>
+          <span><span class="keys"><b class="kbd">↑</b><b class="kbd">↓</b></span> navigate</span>
           <span><b class="kbd">⏎</b> select</span>
           <span><b class="kbd">esc</b> dismiss</span>
         </div>
