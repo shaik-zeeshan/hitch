@@ -26,6 +26,7 @@
   import { initFileDrop } from "$lib/fileDrop";
   import { commandOpen } from "$lib/overlays";
   import { currentDesktopPlatform, isShortcutModifier } from "$lib/desktopPlatform";
+  import { initTheme } from "$lib/theme";
   import WindowControls from "$lib/components/WindowControls.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import AddProjectDialog from "$lib/components/AddProjectDialog.svelte";
@@ -67,6 +68,13 @@
       commandOpen.update((open) => !open);
     }
   }
+
+  // Apply the persisted (or default light "paper") theme to <html> and keep it
+  // in sync; see theme.ts. This runs during layout init — BEFORE any child
+  // mounts — so components that resolve token values at mount (Terminal's
+  // xterm theme reads computed colors off <html>) see the correct theme.
+  // onMount would be too late: children mount before the parent's onMount.
+  initTheme();
 
   onMount(() => {
     void initDaemon();
@@ -139,14 +147,17 @@
 <CreateWorktreeDialog />
 <RemoveProjectDialog />
 <RemoveWorktreeDialog />
+<!-- Toasts wear the letterpress chrome: paper-2 fill, ink-0 text, a hairline
+     --line border, radius 0. Tokens (var()) resolve live so toasts follow the
+     paper/dusk theme switch. The icon accent is the iris primary. -->
 <Toaster
   position="bottom-right"
   toastOptions={{
     style:
-      "background: oklch(20% 0.015 265); color: oklch(90% 0.005 265); border: 1px solid oklch(30% 0.02 265); font-size: 12px; padding: 10px 14px;",
+      "background: var(--paper-2); color: var(--ink-0); border: 1px solid var(--line); border-radius: 0; font-size: 12px; padding: 10px 14px;",
     iconTheme: {
-      primary: "oklch(62% 0.1 265)",
-      secondary: "oklch(20% 0.015 265)",
+      primary: "var(--iris)",
+      secondary: "var(--paper-2)",
     },
   }}
 />
@@ -160,8 +171,8 @@
     height: 100%;
     width: 100%;
     display: grid;
-    grid-template-rows: 44px 1fr;
-    background: var(--bg-1);
+    grid-template-rows: 42px 1fr;
+    background: var(--paper-0);
     overflow: hidden;
   }
   /* `display:none` collapses the shell out of layout entirely so a route
@@ -173,9 +184,9 @@
   }
   .body {
     display: grid;
-    grid-template-columns: var(--w-left, 250px) 1fr var(--w-right, 356px);
+    grid-template-columns: var(--w-left, 295px) 1fr var(--w-right, 330px);
     min-height: 0;
-    transition: grid-template-columns var(--t);
+    transition: grid-template-columns 0.2s ease-out;
   }
   .window.no-left .body {
     --w-left: 0px;
@@ -192,7 +203,7 @@
     left: 0;
     width: 1px;
     height: 1px;
-    background: var(--ac);
+    background: var(--iris);
     pointer-events: none;
   }
 </style>

@@ -1,11 +1,22 @@
 <script lang="ts">
-  // Right rail — Changes (mockup .rail-right). Staged / unstaged file groups
-  // with inline stage toggles, a commit box, and Push / Create-PR. Clicking a
-  // file row opens its diff (the diff tab itself lands in slice 7; here it sets
-  // the selection + loads the diff text). Branch-level +/− stats live in the
-  // tree; this panel focuses on file status and commit actions.
+  // Right rail — Changes (Paper Terminal shell). Header diffstat + branch/PR
+  // context, then ONE state-derived split button (the primary always does the
+  // next meaningful step; its caret opens the full action menu), then Staged /
+  // Changes file groups with inline stage toggles. Clicking a file row opens its
+  // diff. This is the restyle of the long-standing smart-action state machine —
+  // the ladder below mirrors that logic exactly, it is not a rewrite.
   import { DropdownMenu } from "bits-ui";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import GitBranch from "~icons/lucide/git-branch";
+  import GitPullRequest from "~icons/lucide/git-pull-request";
+  import GitCommitHorizontal from "~icons/lucide/git-commit-horizontal";
+  import ArrowUp from "~icons/lucide/arrow-up";
+  import ArrowDown from "~icons/lucide/arrow-down";
+  import ArrowUpFromLine from "~icons/lucide/arrow-up-from-line";
+  import ArrowUpRight from "~icons/lucide/arrow-up-right";
+  import Plus from "~icons/lucide/plus";
+  import ChevronDown from "~icons/lucide/chevron-down";
+  import RefreshCw from "~icons/lucide/refresh-cw";
   import {
     cancelJob,
     cancellableJobForSelectedWorktree,
@@ -36,9 +47,13 @@
   import CreatePrDialog from "./CreatePrDialog.svelte";
   import toast from "svelte-french-toast";
 
+  // `onToggleRight` is kept in the prop contract so the layout wiring stays
+  // intact, but the Paper Terminal header drops the hide/collapse toggle (the
+  // rail is part of the fixed 3-pane grid). `collapsed` likewise still drives
+  // the opacity fade if the layout ever requests it.
   let {
     collapsed = false,
-    onToggleRight,
+    onToggleRight: _onToggleRight,
   }: {
     collapsed?: boolean;
     onToggleRight: () => void;
@@ -49,6 +64,8 @@
   const unstaged = $derived(files.filter((f) => !f.staged));
   const ahead = $derived($gitStatus?.ahead ?? 0);
   const behind = $derived($gitStatus?.behind ?? 0);
+  const additions = $derived($gitStatus?.additions ?? 0);
+  const deletions = $derived($gitStatus?.deletions ?? 0);
   const isDefaultBranch = $derived(Boolean($defaultBase && $gitStatus?.branch === $defaultBase));
 
   const cancellableJob = $derived($cancellableJobForSelectedWorktree);
@@ -83,21 +100,30 @@
   // The headline action: the first applicable step in commit → pull → push →
   // create-PR → open-PR order. `null` run means nothing to do (e.g. clean +
   // synced on the default branch) and the button renders disabled.
-  type PrimaryAction = { label: string; run: (() => void) | null; mutates: boolean };
+  //
+  // `key` names which menu row is currently primary (marked .is-primary); the
+  // icon component is chosen per action for the split-button leading glyph.
+  type PrimaryKey = "commitpush" | "commit" | "pull" | "push" | "createpr" | "openpr" | "none";
+  type PrimaryAction = {
+    label: string;
+    run: (() => void) | null;
+    mutates: boolean;
+    key: PrimaryKey;
+  };
   const primary = $derived<PrimaryAction>(
     hasChanges
       ? $autoCommitPush
-        ? { label: "Commit & Push", run: () => void handleAutoCommitPush(), mutates: true }
-        : { label: "Commit…", run: openCommit, mutates: true }
+        ? { label: "Commit & Push", run: () => void handleAutoCommitPush(), mutates: true, key: "commitpush" }
+        : { label: "Commit…", run: openCommit, mutates: true, key: "commit" }
       : behind > 0
-        ? { label: `Pull ↓${behind}`, run: () => void handleManualPull(), mutates: true }
+        ? { label: `Pull ↓${behind}`, run: () => void handleManualPull(), mutates: true, key: "pull" }
         : ahead > 0
-          ? { label: `Push ↑${ahead}`, run: () => void handleManualPush(), mutates: true }
+          ? { label: `Push ↑${ahead}`, run: () => void handleManualPush(), mutates: true, key: "push" }
           : !onDefault && $gitWorktreeId && !openPr
-            ? { label: "Create PR", run: openCreatePr, mutates: true }
+            ? { label: "Create PR", run: openCreatePr, mutates: true, key: "createpr" }
             : openPr
-              ? { label: `Open PR #${openPr.number}`, run: () => void openExistingPr(), mutates: false }
-              : { label: "Up to date", run: null, mutates: false },
+              ? { label: `Open PR #${openPr.number}`, run: () => void openExistingPr(), mutates: false, key: "openpr" }
+              : { label: "Up to date", run: null, mutates: false, key: "none" },
   );
 
   // Per-step availability + the reason shown when a step is unavailable, so the
@@ -109,10 +135,27 @@
     busy ? "Git operation in progress" : onDefault ? "On the default branch" : !$gitWorktreeId ? "No worktree selected" : "",
   );
 
+  // The "why this action is primary" hint segments, derived from the same state
+  // the ladder uses: staged count · ahead/behind · PR status. Quiet, tabular.
+  const whyParts = $derived(
+    [
+      staged.length > 0 ? `${staged.length} staged` : "",
+      ahead > 0 ? `↑${ahead}` : "",
+      behind > 0 ? `↓${behind}` : "",
+      pr ? `PR #${pr.number} ${pr.draft ? "draft" : pr.state.toLowerCase()}` : "",
+    ].filter(Boolean),
+  );
+
   function shortError(err: unknown): string {
     const msg = err instanceof Error ? err.message : String(err);
     const first = msg.split("\n")[0].trim();
     return first.length > 80 ? first.slice(0, 77) + "…" : first;
+  }
+
+  // Split a path into a dimmed directory part and an emphasized filename.
+  function splitPath(path: string): { dir: string; name: string } {
+    const idx = path.lastIndexOf("/");
+    return idx === -1 ? { dir: "", name: path } : { dir: path.slice(0, idx + 1), name: path.slice(idx + 1) };
   }
 
   async function handleAutoCommitPush() {
@@ -200,73 +243,99 @@
 </script>
 
 <aside class="rail-right" class:collapsed>
-  <div class="ch-head">
-    <span class="title">Changes</span>
-    <span class="grow"></span>
-    <button
-      class="iconbtn"
-      title="Fetch remote and refresh status"
-      aria-label="Fetch remote and refresh status"
-      disabled={!$gitWorktreeId || $gitBusy}
-      onclick={() => void handleRefresh()}
-    >
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-        ><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5V5h-2.5" /></svg
-      >
-    </button>
-    <button
-      class="iconbtn"
-      title="Hide changes panel"
-      aria-label="Hide changes panel"
-      onclick={onToggleRight}
-    >
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-        ><path d="M6.5 4.5 10 8l-3.5 3.5" /></svg
-      >
-    </button>
+  <!-- Header: 38px baseline grid. CHANGES label + net diffstat. A quiet refresh
+       icon sits next to the net stat (the old header refresh/hide buttons are
+       gone; hide is dropped, refresh lives here + in the action menu's reach). -->
+  <div class="changes-head">
+    <div class="title">
+      <h2>Changes</h2>
+      <span class="head-right">
+        {#if $gitStatus}
+          <span class="net">
+            <span class="a">+{additions}</span> <span class="d">−{deletions}</span>
+          </span>
+        {/if}
+        <button
+          class="refresh"
+          title="Fetch remote and refresh status"
+          aria-label="Fetch remote and refresh status"
+          disabled={!$gitWorktreeId || $gitBusy}
+          onclick={() => void handleRefresh()}
+        >
+          <RefreshCw class="icon" />
+        </button>
+      </span>
+    </div>
   </div>
 
   {#if $gitStatus}
-    <div class="ch-branch">
-      <svg class="branch-ico" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="var(--tx-lo)" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
-        ><circle cx="4" cy="3.5" r="1.6" /><circle cx="4" cy="12.5" r="1.6" /><circle cx="12" cy="5" r="1.6" /><path
-          d="M4 5.1v5.8M12 6.6C12 9.8 8.8 11 4.6 11"
-        /></svg
-      >
-      <span class="b" title={$gitStatus.branch}>{$gitStatus.branch}</span>
-      {#if $defaultBase && $defaultBase !== $gitStatus.branch}
-        <span class="from">from {$defaultBase}</span>
-      {/if}
+    <div class="changes-ctx">
+      <div class="branchline">
+        <GitBranch class="ic icon" />
+        <span class="b" title={$gitStatus.branch}>{$gitStatus.branch}</span>
+        {#if $defaultBase && $defaultBase !== $gitStatus.branch}
+          <span class="from">from {$defaultBase}</span>
+        {/if}
+        {#if ahead > 0 || behind > 0}
+          <span
+            class="ahead"
+            title="{ahead} ahead{behind > 0 ? `, ${behind} behind` : ''} of origin"
+          >
+            {#if ahead > 0}<span class="arr">↑</span>{ahead}{/if}{#if behind > 0}<span class="arr down">↓</span>{behind}{/if}
+          </span>
+        {/if}
+      </div>
+
       {#if pr}
         <a
-          class="pr-badge {pr.draft ? 'draft' : pr.state.toLowerCase()}"
+          class="pr {pr.draft ? 'draft' : pr.state.toLowerCase()}"
           href={pr.url}
           title="{pr.draft ? 'Draft' : pr.state} pull request #{pr.number} — open on GitHub"
           onclick={(e) => {
             e.preventDefault();
             void openDisplayedPr();
           }}
-        >#{pr.number}</a>
+        >
+          <GitPullRequest class="pric icon" />
+          <span class="state"><span class="dot"></span>{pr.draft ? "draft" : pr.state.toLowerCase()}</span>
+          <span>PR</span><span class="num">#{pr.number}</span>
+        </a>
       {/if}
     </div>
 
-    <div class="ch-actions">
+    <div class="actions">
       {#if cancellableJob}
         <button
-          class="splitbtn solo cancel"
+          class="cancel"
           title="Cancel the running operation"
           onclick={() => void cancelJob(cancellableJob.id)}
         >
           Cancel
         </button>
       {:else}
-        <div class="splitbtn">
+        <div class="splitbtn" class:disabled={!primary.run}>
           <button
-            class="split-main"
+            class="split-main on-iris"
             disabled={!primary.run || (busy && primary.mutates)}
             onclick={() => primary.run?.()}
           >
+            {#if primary.key === "commitpush"}
+              <ArrowUpFromLine class="btnic icon" />
+            {:else if primary.key === "commit"}
+              <GitCommitHorizontal class="btnic icon" />
+            {:else if primary.key === "push"}
+              <ArrowUp class="btnic icon" />
+            {:else if primary.key === "pull"}
+              <ArrowDown class="btnic icon" />
+            {:else if primary.key === "createpr"}
+              <Plus class="btnic icon" />
+            {:else if primary.key === "openpr"}
+              <ArrowUpRight class="btnic icon" />
+            {/if}
             {primary.label}
+            {#if primary.key === "commit" || primary.key === "commitpush"}
+              <kbd>⌘↵</kbd>
+            {/if}
           </button>
           <DropdownMenu.Root>
             <DropdownMenu.Trigger>
@@ -277,75 +346,63 @@
                   aria-label="More git actions"
                   title="More git actions"
                 >
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
-                    ><path d="M4 6l4 4 4-4" /></svg
-                  >
+                  <ChevronDown class="icon" />
                 </button>
               {/snippet}
             </DropdownMenu.Trigger>
             <DropdownMenu.Portal>
               <DropdownMenu.Content class="menu act-menu" align="end" side="bottom" sideOffset={6}>
-                <DropdownMenu.Item class="mi" disabled={!hasChanges || busy} title={commitReason} onSelect={openCommit}>
-                  <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                    ><circle cx="8" cy="8" r="2.4" /><path d="M1.5 8h4.1M10.4 8h4.1" /></svg
-                  >
+                <DropdownMenu.Item
+                  class="mi {primary.key === 'commit' ? 'is-primary' : ''}"
+                  disabled={!hasChanges || busy}
+                  title={commitReason}
+                  onSelect={openCommit}
+                >
+                  <GitCommitHorizontal class="mi-ico icon" />
                   Commit…
                 </DropdownMenu.Item>
                 <DropdownMenu.Item
-                  class="mi"
+                  class="mi {primary.key === 'commitpush' ? 'is-primary' : ''}"
                   disabled={!hasChanges || busy}
                   title={commitReason}
                   onSelect={() => void handleAutoCommitPush()}
                 >
-                  <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                    ><circle cx="5" cy="8" r="2.2" /><path d="M7.2 8H10M10 5.5 12.5 8 10 10.5" /></svg
-                  >
-                  Commit &amp; Push
+                  <ArrowUpFromLine class="mi-ico icon" />
+                  Commit &amp; Push <span class="mi-k">⌘↵</span>
                 </DropdownMenu.Item>
                 <DropdownMenu.Separator class="m-sep" />
                 <DropdownMenu.Item
-                  class="mi"
+                  class="mi {primary.key === 'push' ? 'is-primary' : ''}"
                   disabled={ahead === 0 || busy}
                   title={pushReason}
                   onSelect={() => void handleManualPush()}
                 >
-                  <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"
-                    ><path d="M8 13V4M4.5 7.5 8 4l3.5 3.5" /></svg
-                  >
+                  <ArrowUp class="mi-ico icon" />
                   Push <span class="mi-k">↑{ahead}</span>
                 </DropdownMenu.Item>
                 <DropdownMenu.Item
-                  class="mi"
+                  class="mi {primary.key === 'pull' ? 'is-primary' : ''}"
                   disabled={behind === 0 || busy}
                   title={pullReason}
                   onSelect={() => void handleManualPull()}
                 >
-                  <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"
-                    ><path d="M8 3v9M4.5 8.5 8 12l3.5-3.5" /></svg
-                  >
+                  <ArrowDown class="mi-ico icon" />
                   Pull <span class="mi-k">↓{behind}</span>
                 </DropdownMenu.Item>
                 <DropdownMenu.Separator class="m-sep" />
                 {#if openPr}
                   <DropdownMenu.Item class="mi" onSelect={() => void openExistingPr()}>
-                    <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                      ><circle cx="4" cy="4" r="1.8" /><circle cx="4" cy="12" r="1.8" /><circle cx="12" cy="12" r="1.8" /><path
-                        d="M4 5.8v4.4M12 5.5v4.7M12 5.5c0-2-1.6-2.5-3.2-2.5H6"
-                      /></svg
-                    >
+                    <GitPullRequest class="mi-ico icon" />
                     Open PR #{openPr.number} <span class="mi-k">↗</span>
                   </DropdownMenu.Item>
                 {:else}
                   <DropdownMenu.Item
-                    class="mi"
+                    class="mi {primary.key === 'createpr' ? 'is-primary' : ''}"
                     disabled={Boolean(createPrReason)}
                     title={createPrReason}
                     onSelect={openCreatePr}
                   >
-
-                    <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"
-                      ><path d="M8 4v8M4 8h8" /></svg
-                    >
+                    <Plus class="mi-ico icon" />
                     Create PR…
                   </DropdownMenu.Item>
                 {/if}
@@ -356,110 +413,134 @@
                   onSelect={() => autoCommitPush.update((v) => !v)}
                 >
                   <span class="check" class:on={$autoCommitPush} aria-hidden="true">✓</span>
-                  Auto-generate commit message
+                  auto-generate commit message
                 </DropdownMenu.Item>
               </DropdownMenu.Content>
             </DropdownMenu.Portal>
           </DropdownMenu.Root>
         </div>
+
+        {#if whyParts.length > 0}
+          <div class="why-primary">
+            {#each whyParts as part, i (part)}
+              {#if i > 0}<span class="sep" aria-hidden="true">·</span>{/if}
+              <span>{part}</span>
+            {/each}
+          </div>
+        {/if}
       {/if}
     </div>
   {/if}
 
-  <div class="ch-list">
+  <div class="files">
     {#if !$gitWorktreeId}
       <div class="empty"><p>Select a git worktree to see its changes.</p></div>
     {:else if files.length === 0}
       <div class="empty"><p>Working tree clean.<br />Nothing to commit.</p></div>
     {:else}
       {#if staged.length > 0}
-        <div class="grp-head">
-          Staged <span class="n">{staged.length}</span>
-          <span class="acts">
+        <div class="fgroup">
+          <h3>
+            <span>Staged</span><span class="ct">{staged.length}</span><span class="hr"></span>
             <button
-              class="act"
+              class="all"
               onclick={() => void setFilesStaged(staged.map((f) => f.path), false).catch(() => {})}
-              >Unstage all</button
-            >
-          </span>
+            >unstage all</button>
+          </h3>
+          {#each staged as file (file.path)}
+            {@const parts = splitPath(file.path)}
+            <button class="frow" class:active={$diffPath === file.path} onclick={() => void viewDiff(file.path)}>
+              <span
+                class="chk on"
+                role="button"
+                tabindex="-1"
+                title="Unstage {file.path}"
+                aria-label="Unstage {file.path}"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  void setFileStaged(file.path, false).catch(() => {});
+                }}
+                onkeydown={() => {}}
+              >✓</span>
+              <span class="st {statusGlyphClass(file.status)}">{STATUS_GLYPH[file.status]}</span>
+              <span class="path">{#if parts.dir}<span class="dir">{parts.dir}</span>{/if}<b>{parts.name}</b></span>
+              <span class="fdiff">
+                {#if file.status === "added" || file.status === "untracked"}
+                  <span class="a">new</span>
+                {/if}
+              </span>
+              <span
+                class="discard"
+                role="button"
+                tabindex="-1"
+                title="Discard file"
+                aria-label="Discard changes to {file.path}"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  confirmDiscardFile(file.path);
+                }}
+                onkeydown={() => {}}
+              >×</span>
+            </button>
+          {/each}
         </div>
-        {#each staged as file (file.path)}
-          <button class="frow" class:sel={$diffPath === file.path} onclick={() => void viewDiff(file.path)}>
-            <span class="st {statusGlyphClass(file.status)}">{STATUS_GLYPH[file.status]}</span>
-            <span class="fp">{file.path}</span>
-            <span
-              class="stage"
-              role="button"
-              tabindex="-1"
-              title="Unstage"
-              aria-label="Unstage {file.path}"
-              onclick={(e) => {
-                e.stopPropagation();
-                void setFileStaged(file.path, false).catch(() => {});
-              }}
-              onkeydown={() => {}}>−</span
-            >
-            <span
-              class="stage discard"
-              role="button"
-              tabindex="-1"
-              title="Discard file"
-              aria-label="Discard changes to {file.path}"
-              onclick={(e) => {
-                e.stopPropagation();
-                confirmDiscardFile(file.path);
-              }}
-              onkeydown={() => {}}>×</span
-            >
-          </button>
-        {/each}
       {/if}
 
       {#if unstaged.length > 0}
-        <div class="grp-head">
-          Changes <span class="n">{unstaged.length}</span>
-          <span class="acts">
+        <div class="fgroup">
+          <h3>
+            <span>Changes</span><span class="ct">{unstaged.length}</span><span class="hr"></span>
             <button
-              class="act"
+              class="all"
               onclick={() => void setFilesStaged(unstaged.map((f) => f.path), true).catch(() => {})}
-              >Stage all</button
-            >
-            <span class="sep" aria-hidden="true">·</span>
-            <button class="act danger" disabled={$gitBusy} onclick={confirmDiscardAll}>Discard</button>
-          </span>
+            >stage all</button>
+            <button class="all discard-all" disabled={$gitBusy} onclick={confirmDiscardAll}>discard</button>
+          </h3>
+          {#each unstaged as file (file.path)}
+            {@const parts = splitPath(file.path)}
+            <button class="frow" class:active={$diffPath === file.path} onclick={() => void viewDiff(file.path)}>
+              <span
+                class="chk"
+                role="button"
+                tabindex="-1"
+                title="Stage {file.path}"
+                aria-label="Stage {file.path}"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  void setFileStaged(file.path, true).catch(() => {});
+                }}
+                onkeydown={() => {}}
+              ></span>
+              <span class="st {statusGlyphClass(file.status)}">{STATUS_GLYPH[file.status]}</span>
+              <span class="path">{#if parts.dir}<span class="dir">{parts.dir}</span>{/if}<b>{parts.name}</b></span>
+              <span class="fdiff">
+                {#if file.status === "added" || file.status === "untracked"}
+                  <span class="a">new</span>
+                {/if}
+              </span>
+              <span
+                class="discard"
+                role="button"
+                tabindex="-1"
+                title="Discard file"
+                aria-label="Discard changes to {file.path}"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  confirmDiscardFile(file.path);
+                }}
+                onkeydown={() => {}}
+              >×</span>
+            </button>
+          {/each}
         </div>
-        {#each unstaged as file (file.path)}
-          <button class="frow" class:sel={$diffPath === file.path} onclick={() => void viewDiff(file.path)}>
-            <span class="st {statusGlyphClass(file.status)}">{STATUS_GLYPH[file.status]}</span>
-            <span class="fp">{file.path}</span>
-            <span
-              class="stage"
-              role="button"
-              tabindex="-1"
-              title="Stage"
-              aria-label="Stage {file.path}"
-              onclick={(e) => {
-                e.stopPropagation();
-                void setFileStaged(file.path, true).catch(() => {});
-              }}
-              onkeydown={() => {}}>+</span
-            >
-            <span
-              class="stage discard"
-              role="button"
-              tabindex="-1"
-              title="Discard file"
-              aria-label="Discard changes to {file.path}"
-              onclick={(e) => {
-                e.stopPropagation();
-                confirmDiscardFile(file.path);
-              }}
-              onkeydown={() => {}}>×</span
-            >
-          </button>
-        {/each}
       {/if}
     {/if}
+  </div>
+
+  <div class="rail-r-foot">
+    <span><kbd>␣</kbd> stage</span>
+    <span><kbd>↵</kbd> open diff</span>
+    <span><kbd>⌘↵</kbd> commit</span>
   </div>
 
   <!-- Mounted once, triggerless: opened from the action menu (and the command
@@ -470,364 +551,523 @@
 
 <style>
   .rail-right {
-    background: var(--bg-2);
+    background: var(--paper-1);
     border-left: 1px solid var(--line);
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
     overflow: hidden;
-    transition: opacity var(--t);
+    transition: opacity 0.2s ease-out;
   }
   .rail-right.collapsed {
     opacity: 0;
     pointer-events: none;
   }
 
-  .ch-head {
-    flex: none;
+  /* Header — shares the 38px baseline grid with PROJECTS + the tab strip. */
+  .changes-head {
+    flex: 0 0 38px;
+    height: 38px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .changes-head .title {
+    height: 100%;
     display: flex;
     align-items: center;
-    gap: 4px;
-    padding: 9px 10px 8px 12px;
-    border-bottom: 1px solid var(--line-soft);
+    justify-content: space-between;
   }
-  .ch-head .title {
-    font-size: 12.5px;
+  .changes-head h2 {
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-2);
+    font-weight: 700;
+  }
+  .changes-head .head-right {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .changes-head .net {
+    font-family: var(--mono);
+    font-size: var(--r0);
+    font-variant-numeric: tabular-nums;
+  }
+  .changes-head .net .a {
+    color: var(--diff-add);
     font-weight: 600;
-    color: var(--tx-hi);
   }
-  .ch-head .grow {
-    flex: 1;
+  .changes-head .net .d {
+    color: var(--diff-del);
+    font-weight: 600;
+  }
+  .changes-head .refresh {
+    display: grid;
+    place-items: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+    transition: color 0.15s ease-out;
+  }
+  .changes-head .refresh :global(svg) {
+    width: 13px;
+    height: 13px;
+  }
+  .changes-head .refresh:hover:not(:disabled) {
+    color: var(--ink-1);
+  }
+  .changes-head .refresh:disabled {
+    opacity: 0.4;
+    cursor: default;
   }
 
-  /* Branch row — its own line so a long name truncates instead of crowding
-     the actions (which now live on the row below). */
-  .ch-branch {
+  /* Branch + PR context block, directly under the aligned title row. */
+  .changes-ctx {
     flex: none;
+    padding: 11px 16px 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  .branchline {
     display: flex;
     align-items: center;
     gap: 7px;
     min-width: 0;
-    padding: 7px 10px 9px 12px;
-    font-size: 11px;
-    color: var(--tx-md);
+    font-family: var(--mono);
+    font-size: var(--r1);
+    color: var(--ink-0);
   }
-  .ch-branch .branch-ico {
-    flex: none;
+  .branchline :global(.ic) {
+    width: 14px;
+    height: 14px;
+    flex: 0 0 14px;
+    color: var(--ink-2);
   }
-  .ch-branch .b {
+  .branchline .b {
     flex: 0 1 auto;
     min-width: 0;
-    font-family: var(--mono);
-    color: var(--tx-hi);
+    font-weight: 600;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .ch-branch .from {
+  .branchline .from {
     flex: none;
-    color: var(--tx-lo);
+    color: var(--ink-2);
     white-space: nowrap;
   }
-  .pr-badge {
-    flex: none;
+  .branchline .ahead {
     margin-left: auto;
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: var(--r0);
     font-weight: 600;
-    padding: 1px 6px;
-    border-radius: 99px;
-    text-decoration: none;
-    border: 1px solid var(--line);
-    background: var(--bg-3);
-    color: var(--tx-md);
-    transition: background var(--t-fast);
+    font-variant-numeric: tabular-nums;
+    color: var(--st-ok);
+    cursor: default;
   }
-  .pr-badge.open {
-    color: var(--ok);
-    border-color: oklch(62% 0.14 150 / 0.4);
+  .branchline .ahead .arr {
+    font-size: 0.8rem;
+    line-height: 1;
   }
-  .pr-badge.merged {
-    color: oklch(72% 0.13 300);
-    border-color: oklch(60% 0.14 300 / 0.4);
-  }
-  .pr-badge.closed {
-    color: var(--err);
-    border-color: oklch(58% 0.14 25 / 0.4);
-  }
-  .pr-badge.draft {
-    color: var(--tx-lo);
-  }
-  .pr-badge:hover {
-    background: var(--bg-4);
+  .branchline .ahead .arr.down {
+    margin-left: 4px;
   }
 
-  /* Action row — a state-driven split button: the primary does the next
-     meaningful step, the caret opens the full menu of granular actions. */
-  .ch-actions {
+  /* PR chip — rectangular, hairline, paper fill; state-keyed accent color. */
+  .pr {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    margin-top: 9px;
+    font-family: var(--mono);
+    font-size: var(--r0);
+    color: var(--ink-1);
+    background: var(--paper-2);
+    border: 1px solid var(--line);
+    border-radius: 0;
+    padding: 3px 10px 3px 8px;
+    text-decoration: none;
+    transition: background 0.15s ease-out;
+  }
+  .pr:hover {
+    background: var(--paper-3);
+  }
+  .pr :global(.pric) {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 13px;
+    color: var(--ink-2);
+  }
+  .pr .state {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-weight: 600;
+  }
+  .pr .state .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .pr .num {
+    color: var(--ink-0);
+    font-weight: 600;
+  }
+  /* State-color keying carried from the legacy badge, now on a rectangle. */
+  .pr.open .state {
+    color: var(--st-ok);
+  }
+  .pr.merged .state {
+    color: oklch(72% 0.13 300);
+  }
+  .pr.closed .state {
+    color: var(--st-need);
+  }
+  .pr.draft .state {
+    color: var(--ink-3);
+  }
+
+  /* ---- dynamic git action: ONE state-derived split button --------------- */
+  .actions {
     flex: none;
-    padding: 0 10px 9px 12px;
-    border-bottom: 1px solid var(--line-soft);
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+    position: relative;
   }
   .splitbtn {
     display: flex;
     align-items: stretch;
     width: 100%;
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    background: var(--bg-3);
+    border-radius: 0;
     overflow: hidden;
+    box-shadow: 0 1px 0 oklch(100% 0 0 / 0.14) inset;
   }
   .split-main {
     flex: 1;
     min-width: 0;
-    font: inherit;
-    font-size: 11.5px;
-    font-weight: 500;
-    padding: 5px 10px;
-    text-align: center;
-    color: var(--tx-hi);
-    background: transparent;
-    border: 0;
+    justify-content: center;
+    font-family: var(--ui);
+    font-size: var(--r1);
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--iris);
+    color: var(--iris-on);
+    border: 1px solid var(--iris-ink);
+    border-right: none;
     cursor: pointer;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    transition: background var(--t-fast);
+    transition: filter 0.15s ease-out;
   }
   .split-main:hover:not(:disabled) {
-    background: var(--bg-4);
+    filter: brightness(1.06);
   }
-  .split-main:disabled {
-    color: var(--tx-lo);
-    cursor: default;
+  .split-main :global(.btnic) {
+    width: 14px;
+    height: 14px;
+    flex: 0 0 14px;
+    color: var(--iris-on);
+  }
+  .split-main kbd {
+    margin-left: 2px;
   }
   .split-caret {
-    flex: none;
+    flex: 0 0 30px;
     display: grid;
     place-items: center;
-    width: 26px;
-    border: 0;
-    border-left: 1px solid var(--line);
-    background: transparent;
-    color: var(--tx-md);
+    background: var(--iris);
+    color: var(--iris-on);
+    border: 1px solid var(--iris-ink);
+    box-shadow: inset 1px 0 0 var(--iris-on-sc-line);
     cursor: pointer;
-    transition:
-      background var(--t-fast),
-      color var(--t-fast);
+    transition: filter 0.15s ease-out;
   }
   .split-caret:hover {
-    background: var(--bg-4);
-    color: var(--tx-hi);
+    filter: brightness(1.06);
   }
-  .split-caret svg {
+  .split-caret :global(svg) {
     width: 13px;
     height: 13px;
+    display: block;
   }
-  /* Cancel state replaces the whole split with one destructive button. */
-  .splitbtn.solo {
-    font: inherit;
-    font-size: 11.5px;
-    font-weight: 500;
-    padding: 5px 10px;
-    justify-content: center;
-    cursor: pointer;
-    color: oklch(80% 0.08 25);
-    border-color: oklch(58% 0.14 25 / 0.4);
-    transition:
-      background var(--t-fast),
-      color var(--t-fast);
+  /* Disabled (`Up to date`): quiet paper treatment, muted ink. */
+  .splitbtn.disabled .split-main,
+  .splitbtn.disabled .split-caret {
+    background: var(--paper-2);
+    color: var(--ink-3);
+    border-color: var(--line);
   }
-  .splitbtn.solo.cancel:hover {
-    color: var(--err);
-    background: oklch(58% 0.14 25 / 0.12);
+  .splitbtn.disabled .split-caret {
+    box-shadow: inset 1px 0 0 var(--line);
+  }
+  .split-main:disabled {
+    cursor: default;
+  }
+  .splitbtn.disabled .split-main:hover,
+  .splitbtn.disabled .split-caret:hover {
+    filter: none;
   }
 
-  /* Disabled menu items read as "unavailable, here's why" (title tooltip). */
+  /* Cancel state replaces the whole split with one quiet destructive button. */
+  .cancel {
+    width: 100%;
+    font-family: var(--ui);
+    font-size: var(--r1);
+    font-weight: 600;
+    padding: 8px 12px;
+    text-align: center;
+    border-radius: 0;
+    color: var(--st-need);
+    background: transparent;
+    border: 1px solid var(--st-need-line);
+    cursor: pointer;
+    transition: background 0.15s ease-out;
+  }
+  .cancel:hover {
+    background: var(--st-need-wash);
+  }
+
+  /* Quiet "why this action is primary" hint, faint mono, under the split. */
+  .why-primary {
+    margin-top: 8px;
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.01em;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  /* act-menu: the shared .menu/.mi/.m-sep recipe is global (app.css); add only
+     the rail-specific width, primary marking, and disabled treatment. */
+  :global(.act-menu) {
+    min-width: 230px;
+  }
+  :global([data-theme="dark"] .act-menu) {
+    box-shadow:
+      0 0 0 1px oklch(8% 0.01 72 / 0.5),
+      0 16px 34px -16px oklch(4% 0.01 72 / 0.7);
+  }
+  :global(.act-menu .mi.is-primary) {
+    color: var(--iris-ink);
+    font-weight: 600;
+  }
+  :global(.act-menu .mi.is-primary .mi-ico) {
+    color: var(--iris-ink);
+  }
   :global(.act-menu .mi[data-disabled]) {
-    opacity: 0.4;
+    opacity: 0.42;
     pointer-events: none;
   }
-  :global(.act-menu .mi .check) {
-    width: 14px;
-    flex: none;
-    text-align: center;
-    color: transparent;
+  :global(.act-menu .mi[data-disabled] .mi-k) {
+    color: var(--ink-3);
   }
-  :global(.act-menu .mi .check.on) {
-    color: var(--ok);
+  :global(.act-menu .mi.toggle) {
+    color: var(--ink-1);
   }
 
-  .ch-list {
+  /* ---- file list -------------------------------------------------------- */
+  .files {
     flex: 1;
-    overflow-y: auto;
+    overflow: auto;
     min-height: 0;
-    padding: 6px 6px 10px;
+    padding: 6px 10px 12px;
   }
   .empty {
     padding: 38px 20px;
     text-align: center;
   }
   .empty p {
-    font-size: 12px;
-    color: var(--tx-lo);
+    font-size: var(--r1);
+    color: var(--ink-3);
     line-height: 1.55;
   }
 
-  .grp-head {
+  .fgroup {
+    margin-top: 8px;
+  }
+  .fgroup h3 {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 9px 6px 5px;
-    font-size: 10.5px;
-    font-weight: 600;
+    gap: 8px;
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    letter-spacing: 0.1em;
     text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--tx-lo);
+    color: var(--ink-2);
+    font-weight: 700;
+    padding: 6px 8px 5px;
+    margin: 0;
   }
-  .grp-head .n {
-    color: var(--tx-md);
+  .fgroup h3 .ct {
+    color: var(--ink-3);
+    font-weight: 600;
   }
-  .grp-head .acts {
-    margin-left: auto;
-    display: flex;
-    align-items: center;
-    gap: 6px;
+  .fgroup h3 .hr {
+    flex: 1;
+    height: 1px;
+    background: var(--line);
   }
-  .grp-head .sep {
-    color: var(--tx-lo);
-    opacity: 0.5;
-  }
-  .grp-head .act {
-    font: inherit;
-    font-size: 10.5px;
+  .fgroup h3 .all {
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    color: var(--iris-ink);
+    font-weight: 600;
+    letter-spacing: 0.02em;
     text-transform: none;
-    letter-spacing: 0;
-    color: var(--ac);
-    cursor: pointer;
     background: transparent;
     border: 0;
     padding: 0;
-    transition: color var(--t-fast);
+    cursor: pointer;
+    transition: opacity 0.15s ease-out;
   }
-  .grp-head .act:hover {
-    color: var(--ac-bright);
+  .fgroup h3 .all:hover:not(:disabled) {
+    opacity: 0.75;
   }
-  .grp-head .act.danger {
-    color: var(--tx-lo);
+  .fgroup h3 .all.discard-all {
+    color: var(--st-need);
   }
-  .grp-head .act.danger:hover {
-    color: var(--err);
-  }
-  .grp-head .act:disabled {
+  .fgroup h3 .all:disabled {
     opacity: 0.4;
     cursor: default;
-  }
-  .grp-head .act.danger:disabled:hover {
-    color: var(--tx-lo);
   }
 
   .frow {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 9px;
     width: 100%;
     text-align: left;
-    font: inherit;
-    padding: 6px 8px;
-    border-radius: var(--radius);
-    color: var(--tx-md);
+    font-family: var(--mono);
+    font-size: var(--r1);
+    padding: 5px 8px;
+    border-radius: 0;
+    color: var(--ink-2);
     cursor: pointer;
     background: transparent;
-    border: 1px solid transparent;
-    transition: background var(--t-fast);
+    border: 0;
+    transition: background 0.15s ease-out;
   }
   .frow:hover {
-    background: var(--bg-3);
+    background: var(--paper-3);
   }
-  .frow.sel {
-    background: var(--ac-wash);
-    color: var(--tx-hi);
-    box-shadow: inset 0 0 0 1px oklch(62% 0.1 265 / 0.28);
+  .frow.active {
+    background: var(--paper-3);
+    box-shadow: inset 0 0 0 1px var(--line);
+  }
+  .frow .chk {
+    width: 14px;
+    height: 14px;
+    border-radius: 0;
+    flex: 0 0 14px;
+    border: 1px solid var(--line);
+    display: grid;
+    place-items: center;
+    font-size: 0.6rem;
+    color: var(--paper-2);
+    background: var(--paper-1);
+  }
+  .frow .chk.on {
+    background: var(--iris);
+    border-color: var(--iris-ink);
+    color: var(--iris-on);
   }
   .frow .st {
-    width: 14px;
+    width: 13px;
     text-align: center;
-    font-family: var(--mono);
-    font-size: 11px;
     font-weight: 700;
-    flex: none;
+    font-size: 0.75rem;
+    flex: 0 0 13px;
   }
   .frow .st.M {
-    color: var(--warn);
+    color: var(--st-stall);
   }
   .frow .st.A {
-    color: var(--ok);
+    color: var(--st-ok);
   }
   .frow .st.D {
-    color: var(--err);
+    color: var(--diff-del);
   }
   .frow .st.U {
-    color: var(--tx-lo);
+    color: var(--ink-3);
   }
-  .frow .fp {
+  .frow .path {
     flex: 1;
     min-width: 0;
-    font-family: var(--mono);
-    font-size: 11.5px;
+    color: var(--ink-2);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    direction: rtl;
-    text-align: left;
   }
-  .frow .stage {
-    opacity: 0;
-    width: 18px;
-    height: 18px;
-    border-radius: 4px;
+  .frow .path .dir {
+    color: var(--ink-2);
+  }
+  .frow .path b {
+    color: var(--ink-0);
+    font-weight: 500;
+  }
+  .frow .fdiff {
+    flex: 0 0 auto;
+    margin-left: auto;
+    font-size: 0.625rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .frow .fdiff .a {
+    color: var(--diff-add);
+  }
+  /* Inline discard affordance — quiet, revealed on hover/active. */
+  .frow .discard {
+    flex: none;
+    width: 16px;
+    height: 16px;
     display: grid;
     place-items: center;
-    color: var(--tx-md);
-    flex: none;
+    border-radius: 0;
+    color: var(--ink-3);
+    opacity: 0;
+    transition:
+      opacity 0.15s ease-out,
+      color 0.15s ease-out;
   }
-  .frow:hover .stage,
-  .frow.sel .stage {
+  .frow:hover .discard,
+  .frow.active .discard {
     opacity: 1;
   }
-  .frow .stage:hover {
-    background: var(--bg-4);
-    color: var(--tx-hi);
-  }
   .frow .discard:hover {
-    color: var(--err);
+    color: var(--st-need);
   }
 
-  .iconbtn {
-    width: 26px;
-    height: 26px;
-    display: grid;
-    place-items: center;
-    border-radius: var(--radius);
-    color: var(--tx-md);
-    border: 1px solid transparent;
-    background: transparent;
-    cursor: pointer;
-    transition:
-      background var(--t-fast),
-      color var(--t-fast);
+  /* ---- footer: keyboard legend ------------------------------------------ */
+  .rail-r-foot {
+    flex: none;
+    border-top: 1px solid var(--line);
+    padding: 8px 16px;
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    color: var(--ink-2);
+    display: flex;
+    align-items: center;
+    gap: 10px;
   }
-  .iconbtn:hover {
-    background: var(--bg-3);
-    color: var(--tx-hi);
-  }
-  .iconbtn:disabled {
-    opacity: 0.4;
-    cursor: default;
-  }
-  .iconbtn svg {
-    width: 15px;
-    height: 15px;
+  .rail-r-foot span {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
   }
 </style>

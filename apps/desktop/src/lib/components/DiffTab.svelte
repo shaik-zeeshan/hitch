@@ -12,9 +12,7 @@
 
 <div class="diff">
   <div class="diff-head">
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="var(--tx-lo)" stroke-width="1.3"
-      ><rect x="2.5" y="2.5" width="11" height="11" rx="2" /><line x1="2.5" y1="6.5" x2="13.5" y2="6.5" /></svg
-    >
+    <span class="glyph" aria-hidden="true">±</span>
     <span class="path">{$diffPath}</span>
     {#if parsed && !parsed.isEmpty}
       <span class="meta">
@@ -37,28 +35,36 @@
 </div>
 
 <style>
-  /* Ported verbatim from hitch-shell-mockup.html .diff block. */
+  /* The diff is the center peer of the terminal: it sits on the same edge-to-
+     edge deep-ink panel so closing it reveals the terminal seamlessly. */
   .diff {
     height: 100%;
     width: 100%;
-    background: var(--bg-0);
+    background: linear-gradient(var(--term-bg2), var(--term-bg));
     overflow-y: auto;
   }
   .diff-head {
     display: flex;
     align-items: center;
     gap: 9px;
-    padding: 9px 14px;
-    border-bottom: 1px solid var(--line);
+    padding: 9px 16px;
+    border-bottom: 1px solid var(--term-line);
     position: sticky;
     top: 0;
-    background: var(--bg-0);
+    background: var(--term-bg2);
     z-index: 1;
+  }
+  .diff-head .glyph {
+    font-family: var(--mono);
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--term-dim);
+    flex: none;
   }
   .diff-head .path {
     font-family: var(--mono);
-    font-size: 12px;
-    color: var(--tx-hi);
+    font-size: var(--r1);
+    color: var(--term-fg);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -66,29 +72,32 @@
     text-align: left;
   }
   .diff-head .meta {
-    font-size: 11px;
-    color: var(--tx-lo);
+    font-size: 0.6875rem;
+    color: var(--term-dim);
     margin-left: auto;
     font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
     flex: none;
   }
   .diff-head .add {
-    color: var(--ok);
+    color: var(--diff-add);
+    font-weight: 600;
   }
   .diff-head .del {
-    color: var(--err);
+    color: var(--diff-del);
+    font-weight: 600;
     margin-left: 4px;
   }
   .diff pre {
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: var(--r1);
     line-height: 1.5;
     padding: 0;
     margin: 0;
   }
   .dl {
     display: block;
-    padding: 0 14px;
+    padding: 0 16px;
     white-space: pre-wrap;
     word-break: break-word;
   }
@@ -96,26 +105,28 @@
     box-sizing: content-box;
     display: inline-block;
     width: 4ch;
-    color: oklch(48% 0.01 265);
+    color: var(--term-dim);
     user-select: none;
     text-align: right;
     padding-right: 12px;
     white-space: nowrap;
   }
+  /* Hunk header + add/del rows: literal in-terminal accents tuned for the deep
+     ink (same family as the terminal's ANSI greens/reds; doc-design/colors.md). */
   .dl.hunk {
-    color: var(--ac-bright);
-    background: oklch(34% 0.06 265 / 0.25);
+    color: oklch(80% 0.10 280);
+    background: oklch(80% 0.10 280 / 0.12);
   }
   .dl.add {
-    background: oklch(60% 0.12 150 / 0.1);
-    color: oklch(86% 0.06 150);
+    background: oklch(82% 0.13 150 / 0.1);
+    color: oklch(82% 0.13 150);
   }
   .dl.del {
-    background: oklch(58% 0.14 25 / 0.1);
-    color: oklch(83% 0.08 25);
+    background: oklch(78% 0.13 28 / 0.1);
+    color: oklch(78% 0.13 28);
   }
   .dl.ctx {
-    color: var(--tx-md);
+    color: var(--term-dim);
   }
 
   .diff-empty {
@@ -125,7 +136,8 @@
     padding: 24px;
   }
   .diff-empty p {
-    font-size: 12px;
-    color: var(--tx-lo);
+    font-family: var(--ui);
+    font-size: var(--r0);
+    color: var(--term-dim);
   }
 </style>

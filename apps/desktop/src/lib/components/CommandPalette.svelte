@@ -25,6 +25,8 @@
   } from "../daemon";
   import { addProjectOpen, cloneProjectOpen, commandOpen, createPrOpen, createWorktreeFor } from "../overlays";
   import { AGENT_LABEL, type Session, type Worktree } from "../types";
+  import Search from "~icons/lucide/search";
+  import Claude from "~icons/hitch/claude";
 
   const projectName = (id: string) => $projects.find((p) => p.id === id)?.name ?? "";
 
@@ -77,9 +79,7 @@
     <Dialog.Content class="palette" aria-label="Command palette" aria-describedby={undefined}>
       <Command.Root label="Search worktrees, sessions, or run a command">
         <div class="p-input">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-            ><circle cx="7" cy="7" r="4.5" /><line x1="10.5" y1="10.5" x2="14" y2="14" /></svg
-          >
+          <Search class="icon" />
           <Command.Input placeholder="Search worktrees, sessions, or run a command…" autofocus />
         </div>
         <Command.List class="p-list">
@@ -149,9 +149,7 @@
                     value="launch claude agent"
                     onSelect={() => run(() => void openSession($selectedParent!, "claude", ["claude"]))}
                   >
-                    <span class="pi-ico" style="color:var(--warn); font-size:13px; display:grid; place-items:center"
-                      >✳</span
-                    >
+                    <Claude class="pi-ico pi-claude" />
                     <span class="pi-label">Launch Claude in this worktree</span>
                   </Command.Item>
                 {/if}
@@ -216,3 +214,14 @@
     </Dialog.Content>
   </Dialog.Portal>
 </Dialog.Root>
+
+<style>
+  /* The Claude harness mark keeps its coral identity ink rather than the
+     neutral icon tint the shared .pi-ico applies. The palette is portaled out
+     of this component's subtree, so the rule must be :global. The selected
+     row's iris ink (.p-item[data-selected] .pi-ico) still wins by specificity,
+     so it inverts correctly under selection. */
+  :global(.p-item .pi-ico.pi-claude) {
+    color: var(--mark-claude);
+  }
+</style>

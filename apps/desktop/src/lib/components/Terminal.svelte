@@ -1,5 +1,6 @@
 <script lang="ts">
-  // Live PTY terminal (mockup .term). Ported from the React TerminalPane: one
+  // Live PTY terminal (Paper Terminal .terminal panel). Ported from the React
+  // TerminalPane: one
   // xterm instance per session, fed from the daemon's per-session binary output
   // channel (ADR 0007). Center.svelte keys a Terminal off EVERY session (across
   // all parents, not just the active one) and toggles visibility (the `active`
@@ -24,6 +25,7 @@
     type IDisposable,
     type ITheme,
   } from "@xterm/xterm";
+  import { theme as themeStore } from "../theme";
   import { FitAddon } from "@xterm/addon-fit";
   import { WebLinksAddon } from "@xterm/addon-web-links";
   import { SearchAddon } from "@xterm/addon-search";
@@ -154,9 +156,22 @@
     }
   }
 
-  // Resolve the design tokens (OKLCH) to rgb() via the browser so xterm's
-  // canvas parser — which doesn't speak OKLCH — gets values it can render, and
-  // the terminal palette tracks the locked theme exactly.
+  // Resolve the Paper Terminal palette for xterm. xterm's parser (esp. the WebGL
+  // renderer) doesn't speak OKLCH or CSS var(), so we resolve everything to the
+  // browser's USED rgb() string via a detached probe: setting an oklch/var()
+  // color on an element and reading getComputedStyle(el).color back returns the
+  // normalized rgb() value WebKit actually computed.
+  //
+  // Two layers (doc-design/colors.md):
+  //  - SURFACE tokens (--term-bg2/--term-fg/--term-dim) differ per theme, so we
+  //    resolve the live CSS var values — they track the active theme exactly.
+  //    Background is the FLAT --term-bg2 (the active-tab/gradient top); the
+  //    panel's CSS gradient shows in the host padding, while xterm's own grid
+  //    sits on the flat fill so the WebGL renderer stays crisp.
+  //  - In-terminal ANSI accents are the LITERAL oklch values from colors.md
+  //    ("In-terminal ANSI-ish accents"), tuned for the dark surface and read the
+  //    same in BOTH themes (the terminal is the darkest surface in either).
+  //    Cursor is the literal oklch(82% 0.10 92) from components.md.
   function resolveTheme(): ITheme {
     const probe = document.createElement("span");
     probe.style.display = "none";
@@ -166,28 +181,35 @@
       probe.style.color = color;
       return getComputedStyle(probe).color || "#d4d6da";
     };
+    // colors.md in-terminal accents (literal; same both themes).
+    const tGrn = "oklch(82% 0.13 150)";
+    const tRed = "oklch(78% 0.13 28)";
+    const tCy = "oklch(82% 0.10 195)";
+    const tYl = "oklch(86% 0.12 92)";
+    const tIris = "oklch(80% 0.10 280)";
+    const tB = "oklch(96% 0.01 90)";
     const theme: ITheme = {
-      background: rgb("var(--bg-0)"),
-      foreground: rgb("oklch(86% 0.008 265)"),
-      cursor: rgb("var(--ac)"),
-      cursorAccent: rgb("var(--bg-0)"),
-      selectionBackground: rgb("oklch(50% 0.08 265 / 0.35)"),
-      black: rgb("oklch(30% 0.008 265)"),
-      red: rgb("var(--err)"),
-      green: rgb("oklch(80% 0.14 150)"),
-      yellow: rgb("var(--warn)"),
-      blue: rgb("var(--ac-bright)"),
-      magenta: rgb("oklch(78% 0.13 320)"),
-      cyan: rgb("oklch(82% 0.10 200)"),
-      white: rgb("var(--tx-md)"),
-      brightBlack: rgb("var(--tx-lo)"),
-      brightRed: rgb("oklch(74% 0.17 25)"),
-      brightGreen: rgb("oklch(85% 0.14 150)"),
-      brightYellow: rgb("oklch(87% 0.13 75)"),
-      brightBlue: rgb("oklch(82% 0.13 265)"),
-      brightMagenta: rgb("oklch(83% 0.13 320)"),
-      brightCyan: rgb("oklch(87% 0.10 200)"),
-      brightWhite: rgb("var(--tx-hi)"),
+      background: rgb("var(--term-bg2)"),
+      foreground: rgb("var(--term-fg)"),
+      cursor: rgb("oklch(82% 0.10 92)"),
+      cursorAccent: rgb("var(--term-bg2)"),
+      selectionBackground: rgb("oklch(60% 0.10 280 / 0.32)"),
+      black: rgb("var(--term-line)"),
+      red: rgb(tRed),
+      green: rgb(tGrn),
+      yellow: rgb(tYl),
+      blue: rgb(tIris),
+      magenta: rgb(tIris),
+      cyan: rgb(tCy),
+      white: rgb(tB),
+      brightBlack: rgb("var(--term-dim)"),
+      brightRed: rgb(tRed),
+      brightGreen: rgb(tGrn),
+      brightYellow: rgb(tYl),
+      brightBlue: rgb(tIris),
+      brightMagenta: rgb(tIris),
+      brightCyan: rgb(tCy),
+      brightWhite: rgb(tB),
     };
     probe.remove();
     return theme;
@@ -383,11 +405,31 @@
     wasActive = active;
   });
 
+  // Re-resolve and reapply the xterm palette whenever the theme flips. The
+  // surface tokens (--term-bg2/--term-fg/--term-dim) differ per theme, so a
+  // light↔dark swap must repaint every mounted terminal — including hidden ones,
+  // so they're already correct when re-shown. Reading $themeStore here registers
+  // the dependency; we skip the very first run (the onMount theme is already
+  // applied) by gating on `term` being live AND a real change.
+  let lastTheme: string | null = null;
+  $effect(() => {
+    const current = $themeStore;
+    if (!term) return;
+    if (lastTheme === null) {
+      lastTheme = current;
+      return;
+    }
+    if (current === lastTheme) return;
+    lastTheme = current;
+    term.options.theme = resolveTheme();
+  });
+
   onMount(() => {
     term = new Xterm({
-      fontFamily:
-        '"Berkeley Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace',
-      fontSize: 12.5,
+      // Match the shell's --mono stack (JetBrains Mono) and the panel's
+      // 0.8125rem / 13px body type from doc-design/components.md.
+      fontFamily: '"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace',
+      fontSize: 13,
       theme: resolveTheme(),
       cursorBlink: true,
       scrollback: 5000,
@@ -539,15 +581,17 @@
   });
 </script>
 
-<!-- Outer .term provides the visual padding; the inner host is a clean
-     unpadded box so FitAddon measures the true content area and the rows it
-     computes leave the padding (incl. the bottom) intact. -->
-<div class="term">
+<!-- .terminal is the edge-to-edge panel (gradient ink, meets the column
+     dividers + window bottom). The xterm host IS .term-body and carries the
+     panel inset (14px 16px 4px): FitAddon reads the host's content-box width
+     (padding excluded) from getComputedStyle, so the grid sits inside the inset
+     and still measures correctly. -->
+<div class="terminal">
   <!-- data-session-id lets the app-wide file-drop listener hit-test a drop
        point back to this session (see fileDrop.ts); the drop-target ring shows
        where dragged paths will land before release. -->
   <div
-    class="term-host"
+    class="term-body"
     class:drop-target={$dropTargetSession === sessionId}
     data-session-id={sessionId}
     bind:this={host}
@@ -583,49 +627,62 @@
 </div>
 
 <style>
-  .term {
+  /* Edge-to-edge terminal panel: zero gutter, meets the column dividers and the
+     window bottom directly. The gradient ink shows through the host's padding
+     inset (the xterm grid sits on the flat --term-bg2 fill). */
+  .terminal {
     position: relative;
+    flex: 1;
+    min-height: 0;
     height: 100%;
     width: 100%;
-    background: var(--bg-0);
-    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    background: linear-gradient(var(--term-bg2), var(--term-bg));
+    border: none;
+    border-radius: 0;
     overflow: hidden;
+  }
+  /* The xterm host carries the panel inset. FitAddon reads the host's
+     content-box width (padding excluded), so the grid measures correctly. */
+  .term-body {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    padding: 14px 16px 4px;
   }
   /* Compact search overlay pinned to the top-right of the terminal. */
   .term-search {
     position: absolute;
-    top: 8px;
-    right: 12px;
+    top: 10px;
+    right: 14px;
     z-index: 5;
     display: flex;
     align-items: center;
-    background: var(--bg-2);
-    border: 1px solid var(--line);
-    border-radius: 6px;
+    background: var(--term-bg2);
+    border: 1px solid var(--term-line);
+    border-radius: 0;
     padding: 3px 6px;
-    box-shadow: 0 4px 14px rgb(0 0 0 / 0.35);
+    box-shadow: var(--shadow-pop);
   }
   .term-search input {
     width: 180px;
     border: none;
     outline: none;
     background: transparent;
-    color: var(--tx-hi);
-    font-family:
-      "Berkeley Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo,
-      monospace;
-    font-size: 12px;
+    color: var(--term-fg);
+    font-family: var(--mono);
+    font-size: var(--r1);
     line-height: 1.4;
   }
   .term-search input::placeholder {
-    color: var(--tx-lo);
+    color: var(--term-dim);
   }
   .term-search:focus-within {
-    border-color: var(--ac);
+    border-color: var(--iris-ink);
   }
   /* "New output ↓" nudge: compact, on-theme, pinned bottom-right above the
-     terminal. Sits inside the .term padding so it never overlaps the scrollbar
-     edge. Accent-tinted so it reads as actionable without shouting. */
+     terminal. Sits inside the panel so it never overlaps the scrollbar edge. */
   .term-new-output {
     position: absolute;
     bottom: 12px;
@@ -634,41 +691,33 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    background: var(--bg-2);
-    border: 1px solid var(--ac);
-    border-radius: 999px;
+    background: var(--term-bg2);
+    border: 1px solid var(--iris-ink);
+    border-radius: 0;
     padding: 4px 10px;
-    color: var(--tx-hi);
-    font-family:
-      "Berkeley Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo,
-      monospace;
-    font-size: 11px;
+    color: var(--term-fg);
+    font-family: var(--mono);
+    font-size: 0.6875rem;
     line-height: 1.2;
     cursor: pointer;
-    box-shadow: 0 4px 14px rgb(0 0 0 / 0.35);
+    box-shadow: var(--shadow-pop);
+    transition: color 0.15s ease-out;
   }
   .term-new-output:hover {
-    background: var(--bg-1);
-    color: var(--ac);
+    color: var(--iris-ink);
   }
-  /* Clean inner box (no padding) so fit.fit() reads an exact content size. */
-  .term-host {
+  /* Drop-target affordance: an inset iris ring while an OS file drag hovers this
+     terminal. inset box-shadow stays inside the host and doesn't shift xterm's
+     layout (no reflow/fit). */
+  .term-body.drop-target {
+    box-shadow: inset 0 0 0 2px var(--iris-ink);
+  }
+  /* xterm injects its own canvas/layout; keep its viewport on theme. */
+  .term-body :global(.xterm) {
     height: 100%;
     width: 100%;
   }
-  /* Drop-target affordance: an inset accent ring while an OS file drag hovers
-     this terminal, so it's clear the paths will land here. inset box-shadow
-     stays inside the host and doesn't shift xterm's layout (no reflow/fit). */
-  .term-host.drop-target {
-    box-shadow: inset 0 0 0 2px var(--ac);
-    border-radius: 4px;
-  }
-  /* xterm injects its own canvas/layout; keep its viewport scrollbar on theme. */
-  .term-host :global(.xterm) {
-    height: 100%;
-    width: 100%;
-  }
-  .term-host :global(.xterm-viewport) {
+  .term-body :global(.xterm-viewport) {
     background: transparent !important;
   }
 </style>

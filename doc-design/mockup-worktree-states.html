@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<!--
+  Worktree row — STATE GALLERY (companion to mockup.html)
+  Purpose: show every worktree-row state from the state vocabulary
+  (structure.md#state-vocabulary) in isolation, in BOTH themes, plus the
+  selected variant of each state and the edge cases (truncation, empty pile,
+  rollup pill, clean-tag alternate).
+  DECISION (2026-06-05): worktree rows are WORD-ONLY — the l1 state glyph
+  column is dropped; state lives solely in the colored statetag word on l2.
+  REFINED (same day): STALLED is removed from the vocabulary — if a session
+  isn't working it's simply idle, which is not a state worth labelling. The
+  state words are: AWAITING · ERROR (act) and WORKING (informs). Idle/clean
+  rows carry no state word, and with nothing else to report they collapse to
+  a single line (no l2).
+  mockup.html (the canonical full-shell mockup) is intentionally NOT updated
+  yet; it still shows the older glyph + word rows.
+  All tokens and recipes are otherwise copied verbatim from mockup.html.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hitch · Worktree row states</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+<style>
+  /* ---------- theme token sets, scoped per half (verbatim from mockup.html) ---------- */
+  .t-light{
+    --paper-0:  oklch(97.4% 0.008 80);
+    --paper-1:  oklch(96.6% 0.010 78);
+    --paper-2:  oklch(98.0% 0.008 82);
+    --paper-3:  oklch(94.0% 0.012 76);
+    --line:     oklch(88.0% 0.014 74);
+    --line-soft:oklch(91.5% 0.012 76);
+    --ink-0:    oklch(28.0% 0.020 70);
+    --ink-1:    oklch(42.0% 0.018 70);
+    --ink-2:    oklch(56.0% 0.016 72);
+    --ink-3:    oklch(66.0% 0.014 74);
+    --iris:     oklch(48.0% 0.150 275);
+    --iris-ink: oklch(40.0% 0.160 275);
+    --iris-wash:oklch(93.5% 0.030 275);
+    --iris-line:oklch(82.0% 0.060 275);
+    --st-run:   oklch(48.0% 0.090 195);
+    --st-need:  oklch(47.0% 0.150 32);
+    --st-need-wash: oklch(94.0% 0.035 32);
+    --st-need-line: oklch(83.0% 0.080 32);
+    --st-stall: oklch(52.0% 0.075 75);
+    --st-ok:    oklch(50.0% 0.095 150);
+    --diff-add: oklch(46.0% 0.095 150);
+    --diff-del: oklch(50.0% 0.130 28);
+    --mark-claude: oklch(63% 0.165 32);
+    --mark-codex:  oklch(40% 0.030 250);
+    --mark-shell:  oklch(40% 0.018 80);
+  }
+  .t-dark{
+    --paper-0:  oklch(16.5% 0.012 72);
+    --paper-1:  oklch(19.0% 0.013 72);
+    --paper-2:  oklch(22.0% 0.014 74);
+    --paper-3:  oklch(17.5% 0.012 70);
+    --line:     oklch(31.0% 0.016 74);
+    --line-soft:oklch(26.0% 0.014 72);
+    --ink-0:    oklch(91.0% 0.014 82);
+    --ink-1:    oklch(78.0% 0.014 80);
+    --ink-2:    oklch(64.0% 0.014 78);
+    --ink-3:    oklch(52.0% 0.013 76);
+    --iris:     oklch(64.0% 0.150 278);
+    --iris-ink: oklch(80.0% 0.120 280);
+    --iris-wash:oklch(28.0% 0.060 278);
+    --iris-line:oklch(42.0% 0.090 278);
+    --st-run:   oklch(74.0% 0.120 195);
+    --st-need:  oklch(72.0% 0.150 32);
+    --st-need-wash: oklch(28.0% 0.060 32);
+    --st-need-line: oklch(42.0% 0.090 32);
+    --st-stall: oklch(78.0% 0.110 78);
+    --st-ok:    oklch(74.0% 0.120 152);
+    --diff-add: oklch(76.0% 0.120 152);
+    --diff-del: oklch(74.0% 0.140 28);
+    --mark-claude: oklch(72% 0.155 34);
+    --mark-codex:  oklch(82% 0.030 250);
+    --mark-shell:  oklch(82% 0.018 80);
+  }
+
+  :root{
+    --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+    --r0:.75rem; --r1:.8125rem;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{ font-family:var(--ui); -webkit-font-smoothing:antialiased; display:flex; }
+
+  /* ---------- gallery scaffolding (not part of the shell) ---------- */
+  .half{ flex:1 1 50%; min-width:0; background:var(--paper-0); color:var(--ink-0); padding:26px 30px 34px; }
+  .half > h1{
+    font-family:var(--mono); font-size:.6875rem; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--ink-2); font-weight:700; margin-bottom:18px;
+  }
+  .card{ margin-bottom:22px; width:340px; }
+  .card > h2{
+    font-family:var(--mono); font-size:.625rem; letter-spacing:.1em; text-transform:uppercase;
+    color:var(--ink-2); font-weight:700; margin-bottom:6px;
+    display:flex; align-items:center; gap:8px;
+  }
+  .card > h2 .hr{ flex:1; height:1px; background:var(--line); }
+  .railbox{
+    width:295px; background:var(--paper-1); border:1px solid var(--line);
+    padding:6px 4px 8px;
+  }
+  .cap{
+    font-family:var(--mono); font-size:.5625rem; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--ink-3); font-weight:600; padding:8px 8px 2px 9px;
+  }
+  .cap:first-child{ padding-top:2px; }
+  .note{
+    width:340px; font-family:var(--mono); font-size:.625rem; color:var(--ink-2); line-height:1.7;
+    border-top:1px solid var(--line); padding-top:10px; margin-top:4px;
+  }
+  .note .k{ color:var(--ink-1); font-weight:600; }
+
+  /* ---------- shell recipes, verbatim from mockup.html ---------- */
+  .svgi{ display:inline-block; vertical-align:-0.18em; color:var(--ink-2); flex:0 0 auto; }
+  .svgi svg{ width:100%; height:100%; display:block; }
+
+  .proj > .row{
+    display:flex; align-items:center; gap:7px;
+    padding:6px 8px; border-radius:0; cursor:default;
+    font-family:var(--mono); font-size:var(--r1); font-weight:600;
+    color:var(--ink-0);
+  }
+  .proj > .row .tw{ font-size:.625rem; width:9px; color:var(--ink-3); }
+  .proj > .row .pkind{
+    margin-left:auto; font-family:var(--mono); font-size:.625rem;
+    color:var(--ink-3); letter-spacing:.04em;
+  }
+  .proj > .row .folder{ width:15px; height:15px; color:var(--ink-2); }
+  .rollup{
+    margin-left:auto; display:inline-flex; align-items:center; gap:5px;
+    font-family:var(--mono); font-size:.625rem; font-weight:600;
+    color:var(--st-need); background:var(--st-need-wash);
+    border:1px solid var(--st-need-line); border-radius:0; padding:1px 7px 1px 6px;
+  }
+  .rollup .g{font-size:.7rem; line-height:1;}
+
+  .wt{ list-style:none; margin:1px 0 4px; padding-left:0; margin-left:8px; border-left:1px solid var(--line-soft); }
+  .wt li{ position:relative; }
+  .wt .wrow{
+    display:grid;
+    grid-template-columns:1fr auto;
+    grid-template-areas:
+      "name pile"
+      "meta pile";
+    align-items:center; column-gap:4px;
+    min-width:0; padding:5px 6px 5px 7px; margin:1px 0; border-radius:0;
+    font-family:var(--mono); cursor:default;
+  }
+  .wt .wrow .l1{ grid-area:name; display:flex; align-items:center; gap:5px; min-width:0; }
+  /* word-only rows: no state glyph column; l1 starts at the branch icon */
+  .wt .wrow .branchic{ width:12px; height:12px; color:var(--ink-3); flex:0 0 12px; margin-right:-1px; }
+  .wt .wrow.sel .branchic{ color:var(--iris-ink); }
+  .wt .wrow .name{
+    font-size:var(--r1); font-weight:600; color:var(--ink-0);
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;
+  }
+  .wt .wrow .l2{
+    grid-area:meta; display:flex; align-items:center; gap:4px;
+    margin-top:2px; padding-left:16px; /* aligns under the name (no glyph column) */
+    font-size:.625rem; color:var(--ink-2); font-variant-numeric:tabular-nums;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .wt .wrow .l2 .sw{ letter-spacing:.02em; }
+  .wt .wrow .l2 .sep{ color:var(--ink-3); }
+  .wt .wrow .l2 .diffn .a{ color:var(--diff-add); font-weight:600; }
+  .wt .wrow .l2 .diffn .d{ color:var(--diff-del); font-weight:600; }
+  .wt .wrow .l2 .prchip{ color:var(--ink-1); display:inline-flex; align-items:center; gap:3px; }
+  .wt .wrow .l2 .prchip .svgi{ width:12px; height:12px; color:var(--ink-2); }
+  .wt .wrow.sel .l2 .prchip .svgi{ color:var(--iris-ink); }
+  .wt .wrow .l2 .statetag{
+    font-weight:700; letter-spacing:.04em; text-transform:uppercase; font-size:.5625rem;
+  }
+
+  .pile{ grid-area:pile; display:flex; align-items:center; flex:0 0 auto; padding-left:0; }
+  .pile.empty{ width:4px; }
+  .pile .h{
+    width:17px; height:17px; border-radius:50%;
+    display:grid; place-items:center; line-height:1;
+    box-shadow:0 0 0 1.75px var(--pile-ring, var(--paper-1));
+    margin-left:-8px;
+    background:var(--paper-2);
+  }
+  .pile .h:first-child{ margin-left:0; }
+  .pile .h svg{ width:12px; height:12px; display:block; }
+  .pile .h.claude{ color:var(--mark-claude); }
+  .pile .h.codex { color:var(--mark-codex); }
+  .pile .h.codex svg{ width:13px; height:13px; }
+  .pile .h.shell { color:var(--mark-shell); }
+  .pile .h.shell svg{ width:13px; height:13px; }
+  .wt .wrow.sel .pile{ --pile-ring:var(--iris-wash); }
+
+  .wt .wrow.sel{
+    background:var(--iris-wash);
+    box-shadow:inset 0 0 0 1px var(--iris-line);
+  }
+  .wt .wrow.sel .name{ color:var(--iris-ink); }
+  .wt .wrow.sel .l2{ color:var(--iris-ink); }
+  .wt .wrow.sel .l2 .sep{ color:var(--iris-line); }
+
+  .statetag.need{ color:var(--st-need); }
+  .statetag.run { color:var(--st-run); }
+</style>
+</head>
+<body>
+  <!-- inline icon library (verbatim subset from mockup.html) -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <defs>
+      <symbol id="mk-claude" viewBox="0 0 24 24">
+        <g fill="currentColor" stroke="none">
+          <path d="M12 2.2 L13 11 L12 12 L11 11 Z"/>
+          <path d="M21.8 12 L13 13 L12 12 L13 11 Z"/>
+          <path d="M12 21.8 L11 13 L12 12 L13 13 Z"/>
+          <path d="M2.2 12 L11 11 L12 12 L11 13 Z"/>
+          <path d="M18.9 5.1 L12.9 11.1 L12 12 L11.95 10.6 Z"/>
+          <path d="M18.9 18.9 L13.4 12.9 L12 12 L13.4 11.05 Z"/>
+          <path d="M5.1 18.9 L11.1 12.9 L12 12 L12.05 13.4 Z"/>
+          <path d="M5.1 5.1 L10.6 11.1 L12 12 L10.6 12.95 Z"/>
+        </g>
+      </symbol>
+      <symbol id="mk-codex" viewBox="0 0 24 24">
+        <g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 5.2 a5.6 5.6 0 0 1 5.6 5.6" transform="rotate(0 12 12)"/>
+          <path d="M12 5.2 a5.6 5.6 0 0 1 5.6 5.6" transform="rotate(60 12 12)"/>
+          <path d="M12 5.2 a5.6 5.6 0 0 1 5.6 5.6" transform="rotate(120 12 12)"/>
+          <path d="M12 5.2 a5.6 5.6 0 0 1 5.6 5.6" transform="rotate(180 12 12)"/>
+          <path d="M12 5.2 a5.6 5.6 0 0 1 5.6 5.6" transform="rotate(240 12 12)"/>
+          <path d="M12 5.2 a5.6 5.6 0 0 1 5.6 5.6" transform="rotate(300 12 12)"/>
+        </g>
+      </symbol>
+      <symbol id="mk-shell" viewBox="0 0 24 24">
+        <g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3.2" y="3.2" width="17.6" height="17.6" rx="4.4"/>
+          <path d="M8 9 l3 3 l-3 3"/>
+          <path d="M13 15 h3.2"/>
+        </g>
+      </symbol>
+      <symbol id="ic-folder" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+          d="M3 6.6 a1.8 1.8 0 0 1 1.8-1.8 h4.2 l1.8 2.2 h7.4 a1.8 1.8 0 0 1 1.8 1.8 v8.6 a1.8 1.8 0 0 1-1.8 1.8 H4.8 A1.8 1.8 0 0 1 3 17.4 Z"/>
+      </symbol>
+      <symbol id="ic-branch" viewBox="0 0 24 24">
+        <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="6.5" cy="5" r="2.2"/>
+          <circle cx="6.5" cy="19" r="2.2"/>
+          <circle cx="17.5" cy="7" r="2.2"/>
+          <path d="M6.5 7.2 v9.6"/>
+          <path d="M17.5 9.2 v1.3 a4.5 4.5 0 0 1-4.5 4.5 H10"/>
+        </g>
+      </symbol>
+      <symbol id="ic-pr" viewBox="0 0 24 24">
+        <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="6.5" cy="6" r="2.2"/>
+          <circle cx="6.5" cy="18.5" r="2.2"/>
+          <circle cx="17.5" cy="18.5" r="2.2"/>
+          <path d="M6.5 8.2 v8.1"/>
+          <path d="M17.5 16.3 V9.4 l-2.6 2.6 M17.5 9.4 l2.6 2.6" transform="translate(0 -0.2)"/>
+        </g>
+      </symbol>
+    </defs>
+  </svg>
+
+  <!-- ============ one gallery per theme; markup duplicated verbatim ============ -->
+  <!-- LIGHT -->
+  <section class="half t-light">
+    <h1>Worktree row states — light</h1>
+
+    <div class="card">
+      <h2>The four states <span class="hr"></span></h2>
+      <div class="railbox">
+        <div class="proj">
+          <div class="row">
+            <span class="tw">▾</span>
+            <svg class="folder" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-folder"/></svg>
+            <span>hitch</span>
+            <span class="pkind">git</span>
+          </div>
+          <ul class="wt">
+            <li><div class="wrow">
+              <span class="l1">
+                <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+                <span class="name">main</span>
+              </span>
+              <span class="pile empty" aria-hidden="true"></span>
+            </div></li>
+            <li><div class="wrow">
+              <span class="l1">
+                <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+                <span class="name">ai/draft-pr-gen</span>
+              </span>
+              <span class="l2">
+                <span class="statetag run">working</span>
+                <span class="sep">·</span>
+                <span class="diffn"><span class="a">+231</span> <span class="d">−58</span></span>
+              </span>
+              <span class="pile" aria-label="2 sessions">
+                <span class="h codex" title="Codex session"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-codex"/></svg></span>
+                <span class="h shell" title="Shell session"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-shell"/></svg></span>
+              </span>
+            </div></li>
+            <li><div class="wrow">
+              <span class="l1">
+                <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+                <span class="name">feature/fast-reload</span>
+              </span>
+              <span class="l2">
+                <span class="statetag need">awaiting</span>
+                <span class="sep">·</span>
+                <span class="diffn"><span class="a">+18</span> <span class="d">−4</span></span>
+                <span class="sep">·</span>
+                <span class="prchip"><span class="svgi"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-pr"/></svg></span>#142</span>
+              </span>
+              <span class="pile" aria-label="3 sessions">
+                <span class="h codex" title="Codex session"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-codex"/></svg></span>
+                <span class="h claude" title="Claude Code session"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+                <span class="h claude" title="Claude Code session"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+              </span>
+            </div></li>
+            <li><div class="wrow">
+              <span class="l1">
+                <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+                <span class="name">fix/flaky-ci</span>
+              </span>
+              <span class="l2">
+                <span class="statetag need">error</span>
+                <span class="sep">·</span>
+                <span>exit 1</span>
+              </span>
+              <span class="pile" aria-label="1 session">
+                <span class="h shell" title="Shell session"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-shell"/></svg></span>
+              </span>
+            </div></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Selected × state <span class="hr"></span></h2>
+      <div class="railbox">
+        <ul class="wt">
+          <li><div class="wrow sel">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">main</span>
+            </span>
+            <span class="pile empty" aria-hidden="true"></span>
+          </div></li>
+          <li><div class="wrow sel">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">ai/draft-pr-gen</span>
+            </span>
+            <span class="l2">
+              <span class="statetag run">working</span>
+              <span class="sep">·</span>
+              <span class="diffn"><span class="a">+231</span> <span class="d">−58</span></span>
+            </span>
+            <span class="pile" aria-label="2 sessions">
+              <span class="h codex"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-codex"/></svg></span>
+              <span class="h shell"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-shell"/></svg></span>
+            </span>
+          </div></li>
+          <li><div class="wrow sel">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">feature/fast-reload</span>
+            </span>
+            <span class="l2">
+              <span class="statetag need">awaiting</span>
+              <span class="sep">·</span>
+              <span class="diffn"><span class="a">+18</span> <span class="d">−4</span></span>
+              <span class="sep">·</span>
+              <span class="prchip"><span class="svgi"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-pr"/></svg></span>#142</span>
+            </span>
+            <span class="pile" aria-label="3 sessions">
+              <span class="h codex"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-codex"/></svg></span>
+              <span class="h claude"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+              <span class="h claude"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+            </span>
+          </div></li>
+          <li><div class="wrow sel">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">fix/flaky-ci</span>
+            </span>
+            <span class="l2">
+              <span class="statetag need">error</span>
+              <span class="sep">·</span>
+              <span>exit 1</span>
+            </span>
+            <span class="pile" aria-label="1 session">
+              <span class="h shell"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-shell"/></svg></span>
+            </span>
+          </div></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Edge cases &amp; open alternates <span class="hr"></span></h2>
+      <div class="railbox">
+        <div class="cap">long branch name — truncation</div>
+        <ul class="wt">
+          <li><div class="wrow">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">feature/incremental-virtual-scrolling-rewrite</span>
+            </span>
+            <span class="l2">
+              <span class="statetag need">awaiting</span>
+              <span class="sep">·</span>
+              <span class="diffn"><span class="a">+402</span> <span class="d">−117</span></span>
+              <span class="sep">·</span>
+              <span class="prchip"><span class="svgi"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-pr"/></svg></span>#155</span>
+            </span>
+            <span class="pile" aria-label="3 sessions">
+              <span class="h codex"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-codex"/></svg></span>
+              <span class="h claude"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+              <span class="h shell"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-shell"/></svg></span>
+            </span>
+          </div></li>
+        </ul>
+        <div class="cap">working, no sessions yet — empty pile</div>
+        <ul class="wt">
+          <li><div class="wrow">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">chore/bump-deps</span>
+            </span>
+            <span class="l2">
+              <span class="statetag run">working</span>
+              <span class="sep">·</span>
+              <span class="diffn"><span class="a">+3</span> <span class="d">−3</span></span>
+            </span>
+            <span class="pile empty" aria-hidden="true"></span>
+          </div></li>
+        </ul>
+        <div class="cap">idle, session open — no state word</div>
+        <ul class="wt">
+          <li><div class="wrow">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">fix/session-state</span>
+            </span>
+            <span class="l2">
+              <span class="diffn"><span class="a">+12</span> <span class="d">−1</span></span>
+            </span>
+            <span class="pile" aria-label="1 session">
+              <span class="h claude"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+            </span>
+          </div></li>
+        </ul>
+        <div class="cap">clean, pr open — meta without a state word</div>
+        <ul class="wt">
+          <li><div class="wrow">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">feature/settings-pane</span>
+            </span>
+            <span class="l2"><span class="prchip"><span class="svgi"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-pr"/></svg></span>#149</span></span>
+            <span class="pile empty" aria-hidden="true"></span>
+          </div></li>
+        </ul>
+        <div class="cap">collapsed project — rolled-up attention pill</div>
+        <div class="proj">
+          <div class="row">
+            <span class="tw">▸</span>
+            <svg class="folder" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-folder"/></svg>
+            <span>my-app</span>
+            <span class="rollup"><span class="g">◆</span>1 awaiting input</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="note">
+      <div><span class="k">Decided 2026-06-05:</span> word-only rows; the vocabulary is awaiting · error (act) and working (informs). Stalled is gone — not working = idle = no label. Idle/clean rows carry no state word; diffstat / PR / facepile are their only meta.</div>
+      <div><span class="k">Quiet rows:</span> an idle row with nothing to report collapses to a single line. <span class="k">Unchanged elsewhere:</span> the rollup pill and tab needdot keep their marks.</div>
+    </div>
+  </section>
+
+  <!-- DARK (markup identical, theme class differs) -->
+  <section class="half t-dark">
+    <h1>Worktree row states — dark</h1>
+
+    <div class="card">
+      <h2>The four states <span class="hr"></span></h2>
+      <div class="railbox">
+        <div class="proj">
+          <div class="row">
+            <span class="tw">▾</span>
+            <svg class="folder" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-folder"/></svg>
+            <span>hitch</span>
+            <span class="pkind">git</span>
+          </div>
+          <ul class="wt">
+            <li><div class="wrow">
+              <span class="l1">
+                <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+                <span class="name">main</span>
+              </span>
+              <span class="pile empty" aria-hidden="true"></span>
+            </div></li>
+            <li><div class="wrow">
+              <span class="l1">
+                <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+                <span class="name">ai/draft-pr-gen</span>
+              </span>
+              <span class="l2">
+                <span class="statetag run">working</span>
+                <span class="sep">·</span>
+                <span class="diffn"><span class="a">+231</span> <span class="d">−58</span></span>
+              </span>
+              <span class="pile" aria-label="2 sessions">
+                <span class="h codex"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-codex"/></svg></span>
+                <span class="h shell"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-shell"/></svg></span>
+              </span>
+            </div></li>
+            <li><div class="wrow">
+              <span class="l1">
+                <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+                <span class="name">feature/fast-reload</span>
+              </span>
+              <span class="l2">
+                <span class="statetag need">awaiting</span>
+                <span class="sep">·</span>
+                <span class="diffn"><span class="a">+18</span> <span class="d">−4</span></span>
+                <span class="sep">·</span>
+                <span class="prchip"><span class="svgi"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-pr"/></svg></span>#142</span>
+              </span>
+              <span class="pile" aria-label="3 sessions">
+                <span class="h codex"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-codex"/></svg></span>
+                <span class="h claude"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+                <span class="h claude"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+              </span>
+            </div></li>
+            <li><div class="wrow">
+              <span class="l1">
+                <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+                <span class="name">fix/flaky-ci</span>
+              </span>
+              <span class="l2">
+                <span class="statetag need">error</span>
+                <span class="sep">·</span>
+                <span>exit 1</span>
+              </span>
+              <span class="pile" aria-label="1 session">
+                <span class="h shell"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-shell"/></svg></span>
+              </span>
+            </div></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Selected × state <span class="hr"></span></h2>
+      <div class="railbox">
+        <ul class="wt">
+          <li><div class="wrow sel">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">main</span>
+            </span>
+            <span class="pile empty" aria-hidden="true"></span>
+          </div></li>
+          <li><div class="wrow sel">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">ai/draft-pr-gen</span>
+            </span>
+            <span class="l2">
+              <span class="statetag run">working</span>
+              <span class="sep">·</span>
+              <span class="diffn"><span class="a">+231</span> <span class="d">−58</span></span>
+            </span>
+            <span class="pile" aria-label="2 sessions">
+              <span class="h codex"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-codex"/></svg></span>
+              <span class="h shell"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-shell"/></svg></span>
+            </span>
+          </div></li>
+          <li><div class="wrow sel">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">feature/fast-reload</span>
+            </span>
+            <span class="l2">
+              <span class="statetag need">awaiting</span>
+              <span class="sep">·</span>
+              <span class="diffn"><span class="a">+18</span> <span class="d">−4</span></span>
+              <span class="sep">·</span>
+              <span class="prchip"><span class="svgi"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-pr"/></svg></span>#142</span>
+            </span>
+            <span class="pile" aria-label="3 sessions">
+              <span class="h codex"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-codex"/></svg></span>
+              <span class="h claude"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+              <span class="h claude"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+            </span>
+          </div></li>
+          <li><div class="wrow sel">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">fix/flaky-ci</span>
+            </span>
+            <span class="l2">
+              <span class="statetag need">error</span>
+              <span class="sep">·</span>
+              <span>exit 1</span>
+            </span>
+            <span class="pile" aria-label="1 session">
+              <span class="h shell"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-shell"/></svg></span>
+            </span>
+          </div></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Edge cases &amp; open alternates <span class="hr"></span></h2>
+      <div class="railbox">
+        <div class="cap">long branch name — truncation</div>
+        <ul class="wt">
+          <li><div class="wrow">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">feature/incremental-virtual-scrolling-rewrite</span>
+            </span>
+            <span class="l2">
+              <span class="statetag need">awaiting</span>
+              <span class="sep">·</span>
+              <span class="diffn"><span class="a">+402</span> <span class="d">−117</span></span>
+              <span class="sep">·</span>
+              <span class="prchip"><span class="svgi"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-pr"/></svg></span>#155</span>
+            </span>
+            <span class="pile" aria-label="3 sessions">
+              <span class="h codex"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-codex"/></svg></span>
+              <span class="h claude"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+              <span class="h shell"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-shell"/></svg></span>
+            </span>
+          </div></li>
+        </ul>
+        <div class="cap">working, no sessions yet — empty pile</div>
+        <ul class="wt">
+          <li><div class="wrow">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">chore/bump-deps</span>
+            </span>
+            <span class="l2">
+              <span class="statetag run">working</span>
+              <span class="sep">·</span>
+              <span class="diffn"><span class="a">+3</span> <span class="d">−3</span></span>
+            </span>
+            <span class="pile empty" aria-hidden="true"></span>
+          </div></li>
+        </ul>
+        <div class="cap">idle, session open — no state word</div>
+        <ul class="wt">
+          <li><div class="wrow">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">fix/session-state</span>
+            </span>
+            <span class="l2">
+              <span class="diffn"><span class="a">+12</span> <span class="d">−1</span></span>
+            </span>
+            <span class="pile" aria-label="1 session">
+              <span class="h claude"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+            </span>
+          </div></li>
+        </ul>
+        <div class="cap">clean, pr open — meta without a state word</div>
+        <ul class="wt">
+          <li><div class="wrow">
+            <span class="l1">
+              <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+              <span class="name">feature/settings-pane</span>
+            </span>
+            <span class="l2"><span class="prchip"><span class="svgi"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-pr"/></svg></span>#149</span></span>
+            <span class="pile empty" aria-hidden="true"></span>
+          </div></li>
+        </ul>
+        <div class="cap">collapsed project — rolled-up attention pill</div>
+        <div class="proj">
+          <div class="row">
+            <span class="tw">▸</span>
+            <svg class="folder" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-folder"/></svg>
+            <span>my-app</span>
+            <span class="rollup"><span class="g">◆</span>1 awaiting input</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="note">
+      <div><span class="k">Decided 2026-06-05:</span> word-only rows; the vocabulary is awaiting · error (act) and working (informs). Stalled is gone — not working = idle = no label. Idle/clean rows carry no state word; diffstat / PR / facepile are their only meta.</div>
+      <div><span class="k">Quiet rows:</span> an idle row with nothing to report collapses to a single line. <span class="k">Unchanged elsewhere:</span> the rollup pill and tab needdot keep their marks.</div>
+    </div>
+  </section>
+</body>
+</html>

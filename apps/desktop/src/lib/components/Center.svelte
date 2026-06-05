@@ -119,7 +119,7 @@
     min-height: 0;
     height: 100%;
     overflow: hidden;
-    background: var(--bg-1);
+    background: var(--paper-3);
   }
   .view {
     flex: 1;
@@ -151,36 +151,39 @@
     padding: 24px;
   }
   .empty h3 {
-    font-size: 13px;
-    font-weight: 560;
-    color: var(--tx-hi);
+    font-family: var(--ui);
+    font-size: var(--r1);
+    font-weight: 600;
+    color: var(--ink-1);
   }
   .empty p {
-    font-size: 12px;
-    color: var(--tx-lo);
+    font-family: var(--ui);
+    font-size: var(--r0);
+    color: var(--ink-2);
     max-width: 300px;
     line-height: 1.55;
   }
   .empty .mono {
     font-family: var(--mono);
-    color: var(--tx-md);
+    color: var(--ink-1);
   }
+  /* Quiet letterpress button: hairline, square, paper fill. */
   .empty .action {
     margin-top: 5px;
-    padding: 5px 12px;
-    font: inherit;
-    font-size: 11.5px;
-    border-radius: var(--radius);
+    padding: 6px 12px;
+    font-family: var(--ui);
+    font-size: var(--r0);
+    border-radius: 0;
     border: 1px solid var(--line);
-    background: var(--bg-3);
-    color: var(--tx-md);
+    background: var(--paper-2);
+    color: var(--ink-1);
     cursor: pointer;
     transition:
-      background var(--t-fast),
-      color var(--t-fast);
+      border-color 0.15s ease-out,
+      color 0.15s ease-out;
   }
   .empty .action:hover {
-    background: var(--bg-4);
-    color: var(--tx-hi);
+    border-color: var(--ink-3);
+    color: var(--ink-0);
   }
 </style>

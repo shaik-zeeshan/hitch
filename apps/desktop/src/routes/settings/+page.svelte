@@ -364,7 +364,7 @@
     width: 100%;
     display: grid;
     grid-template-rows: 52px 1fr;
-    background: var(--bg-1);
+    background: var(--paper-3);
     overflow: hidden;
   }
 
@@ -381,7 +381,7 @@
   .s-head h1 {
     font-size: 13px;
     font-weight: 600;
-    color: var(--tx-hi);
+    color: var(--ink-0);
     margin: 0;
   }
   .back {
@@ -389,22 +389,22 @@
     align-items: center;
     gap: 5px;
     padding: 5px 10px 5px 7px;
-    border-radius: var(--radius);
-    background: var(--bg-3);
+    border-radius: 0;
+    background: var(--paper-3);
     border: 1px solid var(--line);
-    color: var(--tx-md);
+    color: var(--ink-1);
     font: inherit;
     font-size: 11.5px;
     font-weight: 540;
     cursor: pointer;
     -webkit-app-region: no-drag;
     transition:
-      background var(--t-fast),
-      color var(--t-fast);
+      background 0.18s ease-out,
+      color 0.18s ease-out;
   }
   .back:hover {
-    background: var(--bg-4);
-    color: var(--tx-hi);
+    background: var(--paper-2);
+    color: var(--ink-0);
   }
   .back svg {
     width: 13px;
@@ -418,7 +418,7 @@
   }
 
   .s-nav {
-    background: var(--bg-2);
+    background: var(--paper-1);
     border-right: 1px solid var(--line);
     padding: 12px 8px;
     display: grid;
@@ -429,24 +429,25 @@
   .nav-row {
     text-align: left;
     padding: 7px 10px;
-    border-radius: var(--radius);
+    border-radius: 0;
     background: transparent;
     border: 1px solid transparent;
-    color: var(--tx-md);
+    color: var(--ink-1);
     font: inherit;
     font-size: 12px;
     cursor: pointer;
     transition:
-      background var(--t-fast),
-      color var(--t-fast);
+      background 0.18s ease-out,
+      color 0.18s ease-out;
   }
   .nav-row:hover {
-    background: var(--bg-3);
-    color: var(--tx-hi);
+    background: var(--paper-3);
+    color: var(--ink-0);
   }
   .nav-row.active {
-    background: var(--ac-wash);
-    color: var(--tx-hi);
+    background: var(--iris-wash);
+    color: var(--iris-ink);
+    border-color: var(--iris-line);
   }
 
   .s-content {
@@ -466,11 +467,11 @@
   .panel-head h2 {
     font-size: 15px;
     font-weight: 600;
-    color: var(--tx-hi);
+    color: var(--ink-0);
     margin: 0;
   }
   .panel-head .help b {
-    color: var(--tx-md);
+    color: var(--ink-1);
     font-weight: 540;
   }
   .row {
@@ -480,7 +481,7 @@
   }
   .saved {
     font-size: 11.5px;
-    color: var(--tx-lo);
+    color: var(--ink-2);
   }
 
   .about {
@@ -495,12 +496,12 @@
   }
   .about dt {
     font-size: 11px;
-    color: var(--tx-lo);
+    color: var(--ink-2);
   }
   .about dd {
     margin: 0;
     font-size: 12.5px;
-    color: var(--tx-hi);
+    color: var(--ink-0);
   }
   .about dd.mono {
     font-family: var(--mono);
@@ -512,9 +513,9 @@
     gap: 16px;
     justify-content: space-between;
     padding: 12px 14px;
-    border-radius: var(--radius);
+    border-radius: 0;
     border: 1px solid var(--line);
-    background: var(--bg-2);
+    background: var(--paper-1);
   }
   .toggle-info {
     display: grid;
@@ -523,11 +524,11 @@
   .toggle-label {
     font-size: 12.5px;
     font-weight: 540;
-    color: var(--tx-hi);
+    color: var(--ink-0);
   }
   .toggle-desc {
     font-size: 11.5px;
-    color: var(--tx-lo);
+    color: var(--ink-2);
     line-height: 1.45;
   }
   :global(.toggle-btn) {
@@ -543,26 +544,26 @@
     width: 38px;
     height: 22px;
     border-radius: 11px;
-    background: var(--bg-4);
+    background: var(--paper-2);
     border: 1px solid var(--line);
     padding: 3px;
     transition: background 0.15s, border-color 0.15s;
     box-sizing: border-box;
   }
   .track.on {
-    background: oklch(62% 0.1 265);
-    border-color: oklch(62% 0.1 265);
+    background: var(--iris);
+    border-color: var(--iris-ink);
   }
   .thumb {
     width: 14px;
     height: 14px;
     border-radius: 50%;
-    background: var(--tx-lo);
+    background: var(--ink-2);
     transition: transform 0.15s, background 0.15s;
     flex: none;
   }
   .track.on .thumb {
     transform: translateX(16px);
-    background: oklch(97% 0 0);
+    background: var(--iris-on);
   }
 </style>

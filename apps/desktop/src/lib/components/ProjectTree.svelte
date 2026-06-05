@@ -1,23 +1,37 @@
 <script lang="ts">
-  // Projects → Worktrees tree (mockup .tree). Project rows read as group
-  // headers; their worktrees nest under an indent guide with connector ticks.
-  // Agent state shows as a WORD in a reserved hue (rolled up to the project row
-  // when collapsed). Dirty worktrees show their aggregate +/− line stat next
-  // to the branch name.
+  // Projects → Worktrees tree (Paper Terminal shell). Project rows are mono
+  // group headers: twisty · folder icon (every project, git or plain) · name ·
+  // trailing kind label OR a rolled-up attention pill on a collapsed project.
+  // Worktrees hang under a hairline tree spine as word-only entries: a branch
+  // line, an optional meta line (state word · diffstat · PR chip), and a
+  // facepile of the worktree's live Agent sessions spanning both rows.
   import { ContextMenu } from "bits-ui";
   import { invoke } from "@tauri-apps/api/core";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { get } from "svelte/store";
+  import ChevronRight from "~icons/lucide/chevron-right";
+  import Folder from "~icons/lucide/folder";
+  import GitBranch from "~icons/lucide/git-branch";
+  import GitPullRequest from "~icons/lucide/git-pull-request";
+  import Plus from "~icons/lucide/plus";
+  import TerminalIcon from "~icons/lucide/terminal";
+  import FolderOpen from "~icons/lucide/folder-open";
+  import SquarePen from "~icons/lucide/square-pen";
+  import Copy from "~icons/lucide/copy";
+  import Trash2 from "~icons/lucide/trash-2";
+  import ClaudeMark from "~icons/hitch/claude";
+  import CodexMark from "~icons/hitch/codex";
   import { DEFAULT_EDITOR, editorApp } from "../settings";
   import {
     agentActRollupByProject,
     agentStateByWorktree,
-    dirtyWorktrees,
     openSession,
     prByWorktree,
     projects,
     selectedProjectId,
     selectedWorktreeId,
+    sessionAgents,
+    sessions,
     worktreeLineStats,
     worktrees,
   } from "../daemon";
@@ -27,13 +41,22 @@
     revealItemLabel,
     shellSessionShortcutLabel,
   } from "../desktopPlatform";
-  import { AGENT_LABEL, type Id, type PrInfo, type Project, type Worktree } from "../types";
+  import {
+    type AgentState,
+    type Id,
+    type KnownAgent,
+    type PrInfo,
+    type Project,
+    type Worktree,
+  } from "../types";
 
-  // The three kinds of worktree, distinguished only visually here — never
-  // reordered (branches stay in daemon order). `main` is the repo's anchor and
-  // is never removable; `managed` worktrees were created by Hitch and are safe
-  // to remove destructively; `external` ones were discovered/imported, so Hitch
-  // shows them but won't manage their lifecycle.
+  // The three kinds of worktree, distinguished only by a subtle trailing cue
+  // (never reordered — branches stay in daemon order). `main` is the repo's
+  // anchor and is never removable; `managed` worktrees were created by Hitch and
+  // are safe to remove; `external` ones were discovered/imported, so Hitch shows
+  // them but won't manage their lifecycle. The Paper Terminal shell dropped the
+  // old leading dot column; the distinction now lives in a `title` tooltip plus
+  // a faint `main` suffix on the anchor branch (the one a glance benefits from).
   type WorktreeKind = "main" | "managed" | "external";
   function worktreeKind(w: Worktree): WorktreeKind {
     if (w.is_main) return "main";
@@ -45,20 +68,32 @@
     external: "External worktree (not managed by Hitch)",
   };
 
-  // PR chip styling keys off draft first, then GitHub state. Colours are
-  // GitHub-conventional (open=green, merged=purple, closed=red, draft=grey) and
-  // deliberately distinct from the reserved agent-state hues — a `#`-prefixed
-  // chip reads as a PR, not a status word.
-  function prChipClass(pr: PrInfo): string {
-    return pr.draft ? "draft" : pr.state.toLowerCase();
-  }
+  // The worktree row's state WORD: only the act states and the live working
+  // word are ever shown (idle/clean carry no label). `awaiting`/`error` share
+  // the oxide `--st-need` (.need); `working` is teal `--st-run` (.run). Mirrors
+  // the state vocabulary in doc-design/structure.md.
+  const STATE_WORD: Partial<Record<AgentState, { word: string; cls: "need" | "run" }>> = {
+    running: { word: "WORKING", cls: "run" },
+    "needs-approval": { word: "AWAITING", cls: "need" },
+    error: { word: "ERROR", cls: "need" },
+  };
+
+  // The rolled-up project pill (collapsed project with attention items) reuses
+  // the same act-state vocabulary, lowercased into a human phrase.
+  const ROLLUP_WORD: Record<"needs-approval" | "error", string> = {
+    "needs-approval": "awaiting input",
+    error: "error",
+  };
+
+  // PR chip carries the GitHub-conventional state in a title tooltip; the chip
+  // itself is the rectangular `#N` mark from the mockup, neutral-inked.
   function prChipTitle(pr: PrInfo): string {
     const state = pr.draft ? "draft" : pr.state.toLowerCase();
     return `PR #${pr.number} (${state})`;
   }
 
-  // Open a session under a worktree, selecting it first so the new session
-  // lands in view. Used by the worktree context menu's launch items.
+  // Open a session under a worktree, selecting it first so the new session lands
+  // in view. Used by the worktree context menu's launch items.
   function launch(worktree: Worktree, command: string[] | null, name: string) {
     selectWorktree(worktree);
     void openSession({ kind: "worktree", id: worktree.id }, name, command);
@@ -103,6 +138,17 @@
   const worktreesFor = (projectId: Id) =>
     $worktrees.filter((w) => w.project_id === projectId);
 
+  // The facepile holds ONE circle per live Agent session (Claude/Codex) under a
+  // worktree — the announced agent identity (`sessionAgents`) is the only source
+  // for "is this an agent session?". Shell sessions have no announced agent and
+  // so contribute no circle; a worktree running only shells shows an empty pile.
+  function agentsFor(worktreeId: Id): Array<{ id: Id; agent: KnownAgent }> {
+    return $sessions
+      .filter((s) => s.parent.kind === "worktree" && s.parent.id === worktreeId)
+      .map((s) => ({ id: s.id, agent: $sessionAgents[s.id] }))
+      .filter((s): s is { id: Id; agent: KnownAgent } => s.agent != null);
+  }
+
   function isExpanded(p: Project): boolean {
     return p.kind === "git-backed" && !collapsed[p.id];
   }
@@ -111,11 +157,11 @@
     collapsed = { ...collapsed, [p.id]: !collapsed[p.id] };
   }
 
-  // Clicking a project row selects it (for palette context + the quick-add target)
-  // and ensures its worktree list is visible. It MUST also clear the selected
-  // worktree so even re-clicking the SAME project row returns the UI to the
-  // project-level “choose a worktree” state instead of leaving the prior branch
-  // selected.
+  // Clicking a project row selects it (for palette context + the quick-add
+  // target) and ensures its worktree list is visible. It MUST also clear the
+  // selected worktree so even re-clicking the SAME project row returns the UI to
+  // the project-level "choose a worktree" state instead of leaving the prior
+  // branch selected.
   function selectProject(p: Project) {
     selectedProjectId.set(p.id);
     selectedWorktreeId.set(null);
@@ -138,8 +184,6 @@
 </script>
 
 <div class="tree">
-  <div class="sec-head">Projects</div>
-
   {#if $projects.length === 0}
     <p class="empty-copy">No projects yet. Add a local repo or folder to begin.</p>
   {/if}
@@ -147,487 +191,359 @@
   {#each $projects as project (project.id)}
     {@const rollup = $agentActRollupByProject[project.id]}
     {@const expanded = isExpanded(project)}
-    <ContextMenu.Root>
-      <ContextMenu.Trigger>
-        {#snippet child({ props })}
-          <div
-            {...props}
-            class="row"
-            class:sel={project.id === $selectedProjectId && $selectedWorktreeId === null}
-            role="button"
-            tabindex="0"
-            onclick={() => selectProject(project)}
-            onkeydown={(e) => onProjectKey(e, project)}
-          >
-            {#if project.kind === "git-backed"}
-              <button
-                class="twirl"
-                class:open={expanded}
-                aria-label={expanded ? "Collapse" : "Expand"}
-                onclick={(e) => {
-                  e.stopPropagation();
-                  toggleExpand(project);
-                }}
-              >
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
-                  ><path d="M6 4l4 4-4 4" /></svg
-                >
-              </button>
-            {:else}
-              <span class="twirl"></span>
-            {/if}
-
-            {#if project.kind === "git-backed"}
-              <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
-                ><circle cx="4" cy="3.5" r="1.6" /><circle cx="4" cy="12.5" r="1.6" /><circle cx="12" cy="5" r="1.6" /><path
-                  d="M4 5.1v5.8M12 6.6C12 9.8 8.8 11 4.6 11"
-                /></svg
-              >
-            {:else}
-              <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                ><path d="M1.5 4.5a2 2 0 0 1 2-2h3l1.5 1.6h4.5a2 2 0 0 1 2 2v5.4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z" /></svg
-              >
-            {/if}
-
-            <span class="lbl">{project.name}</span>
-
-            <span class="right">
-              {#if !expanded && rollup}
-                {@const label = AGENT_LABEL[rollup.state]}
-                {#if label}
-                  <span class="pill rollup {label.cls}">
-                    {label.label}{#if rollup.count > 1}&nbsp;{rollup.count}{/if}
-                  </span>
-                {/if}
-              {/if}
-
-              {#if project.kind === "git-backed"}
+    {@const isGit = project.kind === "git-backed"}
+    <div class="proj">
+      <ContextMenu.Root>
+        <ContextMenu.Trigger>
+          {#snippet child({ props })}
+            <div
+              {...props}
+              class="row"
+              class:sel={project.id === $selectedProjectId && $selectedWorktreeId === null}
+              role="button"
+              tabindex="0"
+              onclick={() => selectProject(project)}
+              onkeydown={(e) => onProjectKey(e, project)}
+            >
+              {#if isGit}
                 <button
-                  class="quick-add"
-                  aria-label={`New worktree in ${project.name}`}
-                  title={`New worktree in ${project.name}`}
+                  class="tw"
+                  class:open={expanded}
+                  aria-label={expanded ? "Collapse" : "Expand"}
                   onclick={(e) => {
                     e.stopPropagation();
-                    createWorktreeFor.set(project);
+                    toggleExpand(project);
                   }}
                 >
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
-                    ><path d="M8 3.5v9M3.5 8h9" /></svg
-                  >
+                  <ChevronRight class="icon" />
                 </button>
+              {:else}
+                <span class="tw spacer"></span>
               {/if}
-            </span>
-          </div>
-        {/snippet}
-      </ContextMenu.Trigger>
-      <ContextMenu.Portal>
-        <ContextMenu.Content class="menu">
-          {#if project.kind === "git-backed"}
-            <ContextMenu.Item class="mi" onSelect={() => createWorktreeFor.set(project)}>
-              <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                ><path d="M8 3.5v9M3.5 8h9" /></svg
-              >
-              New worktree…
+
+              <Folder class="folder icon" />
+
+              <span class="pname">{project.name}</span>
+
+              <span class="trailing">
+                {#if !expanded && rollup}
+                  <span class="rollup">
+                    <span class="g">◆</span>
+                    {rollup.count}
+                    {ROLLUP_WORD[rollup.state]}
+                  </span>
+                {:else}
+                  <span class="pkind">{isGit ? "git" : "folder"}</span>
+                {/if}
+
+                {#if isGit}
+                  <button
+                    class="quick-add"
+                    aria-label={`New worktree in ${project.name}`}
+                    title={`New worktree in ${project.name}`}
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      createWorktreeFor.set(project);
+                    }}
+                  >
+                    <Plus class="icon" />
+                  </button>
+                {/if}
+              </span>
+            </div>
+          {/snippet}
+        </ContextMenu.Trigger>
+        <ContextMenu.Portal>
+          <ContextMenu.Content class="menu">
+            {#if isGit}
+              <ContextMenu.Item class="mi" onSelect={() => createWorktreeFor.set(project)}>
+                <Plus class="mi-ico icon" />
+                New worktree…
+              </ContextMenu.Item>
+              <ContextMenu.Separator class="m-sep" />
+            {/if}
+            <ContextMenu.Item class="mi" onSelect={() => void revealInFileManager(project.root)}>
+              <FolderOpen class="mi-ico icon" />
+              {revealMenuLabel}
+            </ContextMenu.Item>
+            <ContextMenu.Item class="mi" onSelect={() => void openInEditor(project.root)}>
+              <SquarePen class="mi-ico icon" />
+              Open in editor
+            </ContextMenu.Item>
+            <ContextMenu.Item class="mi" onSelect={() => void copyPath(project.root)}>
+              <Copy class="mi-ico icon" />
+              Copy path
             </ContextMenu.Item>
             <ContextMenu.Separator class="m-sep" />
-          {/if}
-          <ContextMenu.Item class="mi" onSelect={() => void revealInFileManager(project.root)}>
-            <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-              ><path d="M1.5 4.5a2 2 0 0 1 2-2h3l1.5 1.6h4.5a2 2 0 0 1 2 2v5.4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z" /></svg
-            >
-            {revealMenuLabel}
-          </ContextMenu.Item>
-          <ContextMenu.Item class="mi" onSelect={() => void openInEditor(project.root)}>
-            <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-              ><rect x="2" y="3" width="12" height="10" rx="2" /><path d="M6 6l-2 2 2 2M10 6l2 2-2 2" /></svg
-            >
-            Open in editor
-          </ContextMenu.Item>
-          <ContextMenu.Item class="mi" onSelect={() => void copyPath(project.root)}>
-            <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-              ><rect x="3" y="3" width="8" height="8" rx="1.5" /><path
-                d="M5.5 3V2.2a1 1 0 0 1 1-1H13a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1h-.8"
-              /></svg
-            >
-            Copy path
-          </ContextMenu.Item>
-          <ContextMenu.Separator class="m-sep" />
-          <ContextMenu.Item class="mi danger" onSelect={() => removeProjectTarget.set(project)}>
-            <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-              ><path
-                d="M3 4.5h10M6 4.5V3.2a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V4.5M4.5 4.5l.6 8a1 1 0 0 0 1 1h3.8a1 1 0 0 0 1-1l.6-8"
-              /></svg
-            >
-            Remove project…
-          </ContextMenu.Item>
-        </ContextMenu.Content>
-      </ContextMenu.Portal>
-    </ContextMenu.Root>
+            <ContextMenu.Item class="mi danger" onSelect={() => removeProjectTarget.set(project)}>
+              <Trash2 class="mi-ico icon" />
+              Remove project…
+            </ContextMenu.Item>
+          </ContextMenu.Content>
+        </ContextMenu.Portal>
+      </ContextMenu.Root>
 
-    {#if expanded}
-      <div class="worktrees">
-        {#each worktreesFor(project.id) as worktree (worktree.id)}
-          {@const wtStatus = $agentStateByWorktree[worktree.id]}
-          {@const lineStat = $worktreeLineStats[worktree.id]}
-          {@const isActive = worktree.id === $selectedWorktreeId}
-          {@const hasLoc = !!lineStat && (lineStat.additions > 0 || lineStat.deletions > 0)}
-          {@const kind = worktreeKind(worktree)}
-          {@const pr = $prByWorktree[worktree.id]}
-          <ContextMenu.Root>
-            <ContextMenu.Trigger>
-              {#snippet child({ props })}
-                <button
-                  {...props}
-                  class="row wt-row {kind}"
-                  class:sel={isActive}
-                  onclick={() => selectWorktree(worktree)}
-                >
-                  <!-- A leading dot marks the worktree's kind: filled accent for
-                       the repo's main anchor, solid for a Hitch-managed branch,
-                       hollow for an external one Hitch only observes. -->
-                  <span class="wt-dot {kind}" title={KIND_TITLE[kind]}></span>
-                  <span class="lbl br-name">{worktree.branch}</span>
-                  <!-- A fixed-order right-side cluster, each part shown only when
-                       it applies, so a branch never has to choose between signals:
-                       agent-state word · +/− line stat · PR chip. The agent word
-                       is suppressed on the worktree you're IN — you can see that
-                       agent live in the main pane — but its diff and PR still show. -->
-                  <span class="right">
-                    {#if !isActive && wtStatus}
-                      {@const label = AGENT_LABEL[wtStatus]}
-                      {#if label}<span class="pill {label.cls}">{label.label}</span>{/if}
-                    {/if}
-                    {#if hasLoc && lineStat}
-                      <span
-                        class="diffstat"
-                        title={`${lineStat.additions} additions, ${lineStat.deletions} deletions`}
-                      >
-                        {#if lineStat.additions > 0}<span class="add">{lineStat.additions}+</span>{/if}
-                        {#if lineStat.deletions > 0}<span class="del">{lineStat.deletions}-</span>{/if}
-                      </span>
-                    {/if}
-                    {#if pr}
-                      <span class="pr-chip {prChipClass(pr)}" title={prChipTitle(pr)}>#{pr.number}</span>
-                    {/if}
-                  </span>
-                </button>
-              {/snippet}
-            </ContextMenu.Trigger>
-            <ContextMenu.Portal>
-              <ContextMenu.Content class="menu">
-                <ContextMenu.Item class="mi" onSelect={() => launch(worktree, null, "shell")}>
-                  <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                    ><path d="M3 4l3.5 4L3 12M8 12h5" /></svg
-                  >
-                  Open shell session<span class="mi-k">{shellShortcutLabel}</span>
-                </ContextMenu.Item>
-                <ContextMenu.Item class="mi" onSelect={() => launch(worktree, ["claude"], "claude")}>
-                  <span class="mi-ico" style="color:var(--warn); display:grid; place-items:center">✳</span>
-                  Launch Claude
-                </ContextMenu.Item>
-                <ContextMenu.Separator class="m-sep" />
-                <ContextMenu.Item class="mi" onSelect={() => void revealInFileManager(worktree.path)}>
-                  <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                    ><path d="M1.5 4.5a2 2 0 0 1 2-2h3l1.5 1.6h4.5a2 2 0 0 1 2 2v5.4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z" /></svg
-                  >
-                  {revealMenuLabel}
-                </ContextMenu.Item>
-                <ContextMenu.Item class="mi" onSelect={() => void openInEditor(worktree.path)}>
-                  <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                    ><rect x="2" y="3" width="12" height="10" rx="2" /><path d="M6 6l-2 2 2 2M10 6l2 2-2 2" /></svg
-                  >
-                  Open in editor
-                </ContextMenu.Item>
-                <ContextMenu.Item class="mi" onSelect={() => void copyPath(worktree.path)}>
-                  <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                    ><rect x="3" y="3" width="8" height="8" rx="1.5" /><path
-                      d="M5.5 3V2.2a1 1 0 0 1 1-1H13a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1h-.8"
-                    /></svg
-                  >
-                  Copy path
-                </ContextMenu.Item>
-                {#if worktree.is_hitch_managed && !worktree.is_main}
-                  <ContextMenu.Separator class="m-sep" />
-                  <ContextMenu.Item class="mi danger" onSelect={() => removeWorktreeTarget.set(worktree)}>
-                    <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                      ><path
-                        d="M3 4.5h10M6 4.5V3.2a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V4.5M4.5 4.5l.6 8a1 1 0 0 0 1 1h3.8a1 1 0 0 0 1-1l.6-8"
-                      /></svg
+      {#if expanded}
+        <ul class="wt">
+          {#each worktreesFor(project.id) as worktree (worktree.id)}
+            {@const wtState = $agentStateByWorktree[worktree.id]}
+            {@const stateWord = wtState ? STATE_WORD[wtState] : undefined}
+            {@const lineStat = $worktreeLineStats[worktree.id]}
+            {@const isActive = worktree.id === $selectedWorktreeId}
+            {@const hasLoc = !!lineStat && (lineStat.additions > 0 || lineStat.deletions > 0)}
+            {@const kind = worktreeKind(worktree)}
+            {@const pr = $prByWorktree[worktree.id]}
+            {@const agents = agentsFor(worktree.id)}
+            {@const showMeta = !!stateWord || hasLoc || !!pr}
+            <li>
+              <ContextMenu.Root>
+                <ContextMenu.Trigger>
+                  {#snippet child({ props })}
+                    <div
+                      {...props}
+                      class="wrow"
+                      class:sel={isActive}
+                      role="button"
+                      tabindex="0"
+                      title={KIND_TITLE[kind]}
+                      onclick={() => selectWorktree(worktree)}
+                      onkeydown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          selectWorktree(worktree);
+                        }
+                      }}
                     >
-                    Remove worktree…
-                  </ContextMenu.Item>
-                {/if}
-              </ContextMenu.Content>
-            </ContextMenu.Portal>
-          </ContextMenu.Root>
-        {/each}
-      </div>
-    {/if}
+                      <div class="l1">
+                        <GitBranch class="branchic icon" />
+                        <span class="name">{worktree.branch}</span>
+                        {#if kind === "main"}<span class="mainsuf">main</span>{/if}
+                      </div>
+
+                      {#if showMeta}
+                        <div class="l2">
+                          {#if stateWord}
+                            <span class="statetag {stateWord.cls}">{stateWord.word}</span>
+                          {/if}
+                          {#if hasLoc && lineStat}
+                            {#if stateWord}<span class="sep">·</span>{/if}
+                            <span
+                              class="diffn"
+                              title={`${lineStat.additions} additions, ${lineStat.deletions} deletions`}
+                            >
+                              {#if lineStat.additions > 0}<span class="a">+{lineStat.additions}</span>{/if}
+                              {#if lineStat.deletions > 0}<span class="d">−{lineStat.deletions}</span>{/if}
+                            </span>
+                          {/if}
+                          {#if pr}
+                            {#if stateWord || hasLoc}<span class="sep">·</span>{/if}
+                            <span class="prchip" title={prChipTitle(pr)}>
+                              <GitPullRequest class="pric icon" />#{pr.number}
+                            </span>
+                          {/if}
+                        </div>
+                      {/if}
+
+                      <div class="pile" class:empty={agents.length === 0}>
+                        {#each agents as a (a.id)}
+                          <span class="h {a.agent === 'codex' ? 'codex' : 'claude'}">
+                            {#if a.agent === "codex"}
+                              <CodexMark class="icon" />
+                            {:else}
+                              <ClaudeMark class="icon" />
+                            {/if}
+                          </span>
+                        {/each}
+                      </div>
+                    </div>
+                  {/snippet}
+                </ContextMenu.Trigger>
+                <ContextMenu.Portal>
+                  <ContextMenu.Content class="menu">
+                    <ContextMenu.Item class="mi" onSelect={() => launch(worktree, null, "shell")}>
+                      <TerminalIcon class="mi-ico icon" />
+                      Open shell session<span class="mi-k">{shellShortcutLabel}</span>
+                    </ContextMenu.Item>
+                    <ContextMenu.Item class="mi" onSelect={() => launch(worktree, ["claude"], "claude")}>
+                      <ClaudeMark class="mi-ico icon" />
+                      Launch Claude
+                    </ContextMenu.Item>
+                    <ContextMenu.Separator class="m-sep" />
+                    <ContextMenu.Item class="mi" onSelect={() => void revealInFileManager(worktree.path)}>
+                      <FolderOpen class="mi-ico icon" />
+                      {revealMenuLabel}
+                    </ContextMenu.Item>
+                    <ContextMenu.Item class="mi" onSelect={() => void openInEditor(worktree.path)}>
+                      <SquarePen class="mi-ico icon" />
+                      Open in editor
+                    </ContextMenu.Item>
+                    <ContextMenu.Item class="mi" onSelect={() => void copyPath(worktree.path)}>
+                      <Copy class="mi-ico icon" />
+                      Copy path
+                    </ContextMenu.Item>
+                    {#if worktree.is_hitch_managed && !worktree.is_main}
+                      <ContextMenu.Separator class="m-sep" />
+                      <ContextMenu.Item class="mi danger" onSelect={() => removeWorktreeTarget.set(worktree)}>
+                        <Trash2 class="mi-ico icon" />
+                        Remove worktree…
+                      </ContextMenu.Item>
+                    {/if}
+                  </ContextMenu.Content>
+                </ContextMenu.Portal>
+              </ContextMenu.Root>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
   {/each}
 </div>
 
 <style>
   .tree {
-    padding: 8px 8px 4px;
-  }
-  .sec-head {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 9px 6px 6px;
-    font-size: 10.5px;
-    font-weight: 600;
-    letter-spacing: 0.5px;
-    text-transform: uppercase;
-    color: var(--tx-lo);
+    padding: 6px 6px 8px;
   }
   .empty-copy {
-    padding: 4px 8px 8px;
-    font-size: 11.5px;
-    color: var(--tx-lo);
+    padding: 8px;
+    font-family: var(--mono);
+    font-size: 0.6875rem;
+    color: var(--ink-2);
     line-height: 1.5;
   }
 
+  /* ---- project row ---- */
   .row {
     display: flex;
     align-items: center;
     gap: 7px;
     width: 100%;
-    /* Never let a long branch/project name push the icons or status word out of
-       the rail — the flexible label is the only part that shrinks + ellipsizes. */
     min-width: 0;
     overflow: hidden;
     text-align: left;
-    font: inherit;
-    /* denser than the old 6px rows so more branches fit at a glance */
-    padding: 4px 8px;
-    border-radius: var(--radius);
-    color: var(--tx-md);
+    font-family: var(--mono);
+    font-size: 0.8125rem;
+    font-weight: 600;
+    color: var(--ink-0);
+    padding: 6px 8px;
+    border-radius: 0;
     cursor: pointer;
     border: 1px solid transparent;
     background: transparent;
-    transition:
-      background var(--t-fast),
-      color var(--t-fast);
+    transition: background 0.15s ease-out;
   }
   .row:hover {
-    background: var(--bg-3);
-    color: var(--tx-hi);
+    background: var(--paper-3);
   }
   .row:focus-visible {
-    outline: 2px solid var(--ac);
-    outline-offset: -2px;
+    outline: 1px solid var(--iris-line);
+    outline-offset: -1px;
   }
   .row.sel {
-    background: var(--ac-wash);
-    color: var(--tx-hi);
+    background: var(--iris-wash);
+    box-shadow: inset 0 0 0 1px var(--iris-line);
   }
-  .row.sel .lbl {
-    font-weight: 560;
+  .row.sel .pname {
+    color: var(--iris-ink);
   }
-  .row .twirl {
-    width: 12px;
-    height: 12px;
-    color: var(--tx-lo);
+
+  .tw {
+    width: 0.625rem;
+    height: 0.625rem;
+    flex: 0 0 0.625rem;
     display: grid;
     place-items: center;
     padding: 0;
     border: 0;
     background: transparent;
+    color: var(--ink-3);
     cursor: pointer;
-    flex: none;
   }
-  .row .twirl svg {
-    width: 9px;
-    height: 9px;
-    transition: transform var(--t-fast);
+  .tw :global(svg) {
+    width: 0.625rem;
+    height: 0.625rem;
+    transition: transform 0.15s ease-out;
   }
-  .row .twirl.open svg {
+  .tw.open :global(svg) {
     transform: rotate(90deg);
   }
-  button.twirl:hover {
-    color: var(--tx-hi);
+  .tw.spacer {
+    cursor: default;
   }
-  .row .ico {
+  button.tw:hover {
+    color: var(--ink-2);
+  }
+
+  .row :global(.folder) {
     width: 15px;
     height: 15px;
-    color: var(--tx-lo);
-    flex: none;
+    flex: 0 0 15px;
+    color: var(--ink-2);
   }
-  .row.sel .ico {
-    color: var(--ac-bright);
-  }
-  .row .lbl {
+
+  .pname {
     flex: 1;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .row .br-name {
-    font-family: var(--mono);
-    font-size: 11.5px;
-  }
-  /* the right-hand cluster: agent word · diffstat · PR chip, each optional */
-  .right {
+
+  .trailing {
+    margin-left: auto;
     display: flex;
     align-items: center;
     gap: 6px;
     flex: none;
   }
-
-  /* leading kind marker on worktree rows */
-  .wt-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    flex: none;
-    box-sizing: border-box;
-    background: var(--tx-lo);
-  }
-  .wt-dot.main {
-    background: var(--ac-bright);
-  }
-  .wt-dot.external {
-    background: transparent;
-    border: 1px solid var(--tx-lo);
-  }
-  /* an external worktree isn't ours to manage — read it back a notch */
-  .wt-row.external .br-name {
-    color: var(--tx-lo);
-  }
-  .wt-row.external:hover .br-name,
-  .wt-row.external.sel .br-name {
-    color: var(--tx-md);
+  .pkind {
+    font-size: 0.625rem;
+    font-weight: 500;
+    color: var(--ink-3);
   }
 
-  /* PR chip: GitHub-conventional state colour, distinct from the agent hues */
-  .pr-chip {
-    flex: none;
-    font-family: var(--mono);
-    font-size: 9.5px;
-    font-weight: 600;
-    line-height: 1;
-    padding: 2px 5px;
-    border-radius: 5px;
-    white-space: nowrap;
-    border: 1px solid transparent;
-  }
-  .pr-chip.open {
-    color: oklch(77% 0.13 150);
-    background: oklch(77% 0.13 150 / 0.13);
-  }
-  .pr-chip.merged {
-    color: oklch(72% 0.13 300);
-    background: oklch(72% 0.13 300 / 0.15);
-  }
-  .pr-chip.closed {
-    color: var(--err);
-    background: oklch(68% 0.17 25 / 0.13);
-  }
-  /* a draft is open-but-not-ready: quiet, outlined, no fill */
-  .pr-chip.draft {
-    color: var(--tx-lo);
-    border-color: var(--line-soft);
-  }
-  .diffstat {
+  /* rolled-up attention pill on a collapsed project */
+  .rollup {
     display: inline-flex;
-    gap: 4px;
-    flex: none;
+    align-items: center;
+    gap: 5px;
     font-family: var(--mono);
-    font-size: 10.5px;
+    font-size: 0.625rem;
     font-weight: 600;
+    color: var(--st-need);
+    background: var(--st-need-wash);
+    border: 1px solid var(--st-need-line);
+    border-radius: 0;
+    padding: 1px 7px 1px 6px;
     white-space: nowrap;
   }
-  .diffstat .add {
-    color: var(--ok);
-  }
-  .diffstat .del {
-    color: var(--err);
+  .rollup .g {
+    font-size: 0.7rem;
+    line-height: 1;
   }
 
-  /* project rows read as group headers */
-  .tree > .row .lbl {
-    font-weight: 540;
-  }
-  .tree > .row {
-    margin-top: 1px;
-  }
-
-  .worktrees {
-    display: grid;
-    gap: 1px;
-  }
-  /* tree hierarchy: one quiet vertical hairline under the caret, no ticks */
-  .tree .worktrees {
-    padding-left: 24px;
-    margin: 2px 0 8px;
-    position: relative;
-  }
-  .tree .worktrees::before {
-    content: "";
-    position: absolute;
-    left: 14px;
-    top: -1px;
-    bottom: 12px;
-    width: 1px;
-    background: var(--line-soft);
-  }
-  .tree .wt-row {
-    padding-left: 6px;
-  }
-
-  /* agent state as a human-language word inside a tinted pill, reserved hue */
-  .pill {
-    font-size: 9.5px;
-    font-weight: 600;
-    letter-spacing: 0.2px;
-    flex: none;
-    white-space: nowrap;
-    padding: 1.5px 7px;
-    border-radius: 999px;
-  }
-  .pill.run {
-    color: var(--run);
-    background: oklch(78% 0.1 195 / 0.15);
-  }
-  .pill.approval {
-    color: var(--warn);
-    background: oklch(81% 0.13 75 / 0.16);
-  }
-  .pill.wait {
-    color: var(--ok);
-    background: oklch(77% 0.12 150 / 0.14);
-  }
-  .pill.error {
-    color: var(--err);
-    background: oklch(68% 0.17 25 / 0.16);
-  }
-
-  /* per-project quick-add: a "+" on the project row that creates a worktree
-     under it directly. Hidden at rest so the resting row stays quiet; revealed
-     on row hover/focus. On a collapsed project it shares the slot with the
-     rolled-up pill, which steps aside when the "+" appears. */
-  .row .quick-add {
+  /* per-project quick-add: a "+" on the project row, hidden at rest, revealed on
+     hover/focus. On a collapsed project it shares the trailing slot with the
+     rollup pill / kind label. */
+  .quick-add {
     width: 18px;
     height: 18px;
     display: grid;
     place-items: center;
     padding: 0;
-    border: 0;
-    border-radius: 5px;
+    border: 1px solid transparent;
+    border-radius: 0;
     background: transparent;
-    color: var(--tx-lo);
+    color: var(--ink-3);
     cursor: pointer;
     flex: none;
     opacity: 0;
     pointer-events: none;
     transition:
-      background var(--t-fast),
-      color var(--t-fast),
-      opacity var(--t-fast);
+      color 0.15s ease-out,
+      border-color 0.15s ease-out,
+      opacity 0.15s ease-out;
   }
-  .row .quick-add svg {
+  .quick-add :global(svg) {
     width: 12px;
     height: 12px;
   }
@@ -636,13 +552,206 @@
     opacity: 1;
     pointer-events: auto;
   }
-  .row .quick-add:hover {
-    background: var(--bg-4);
-    color: var(--ac-bright);
+  .quick-add:hover {
+    color: var(--iris-ink);
+    border-color: var(--iris-line);
   }
-  /* rolled-up pill yields to the "+" when the row is hovered/focused */
-  .row:hover .pill.rollup,
-  .row:focus-within .pill.rollup {
+  /* the kind label / rollup pill yields to the "+" on hover/focus */
+  .row:hover .trailing .pkind,
+  .row:focus-within .trailing .pkind,
+  .row:hover .trailing .rollup,
+  .row:focus-within .trailing .rollup {
     display: none;
+  }
+
+  /* ---- worktree list ---- */
+  .wt {
+    list-style: none;
+    margin: 1px 0 6px;
+    padding: 0;
+    margin-left: 8px;
+    border-left: 1px solid var(--line-soft);
+  }
+  .wt li {
+    margin: 0;
+  }
+
+  .wrow {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    grid-template-areas:
+      "name pile"
+      "meta pile";
+    align-items: center;
+    column-gap: 4px;
+    width: 100%;
+    min-width: 0;
+    padding: 5px 6px 5px 7px;
+    margin: 1px 0;
+    border-radius: 0;
+    border: 1px solid transparent;
+    background: transparent;
+    font-family: var(--mono);
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.15s ease-out;
+  }
+  .wrow:hover {
+    background: var(--paper-3);
+  }
+  .wrow:focus-visible {
+    outline: 1px solid var(--iris-line);
+    outline-offset: -1px;
+  }
+  .wrow.sel {
+    background: var(--iris-wash);
+    box-shadow: inset 0 0 0 1px var(--iris-line);
+    --pile-ring: var(--iris-wash);
+  }
+
+  .l1 {
+    grid-area: name;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+  }
+  .l1 :global(.branchic) {
+    width: 12px;
+    height: 12px;
+    flex: 0 0 12px;
+    margin-right: -1px;
+    color: var(--ink-3);
+  }
+  .wrow.sel .l1 :global(.branchic) {
+    color: var(--iris-ink);
+  }
+  .name {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    color: var(--ink-0);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+  .wrow.sel .name {
+    color: var(--iris-ink);
+  }
+  /* a faint cue marking the repo's main anchor (replaces the old kind dot) */
+  .mainsuf {
+    flex: none;
+    font-size: 0.5625rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  .l2 {
+    grid-area: meta;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 2px;
+    padding-left: 16px;
+    font-size: 0.625rem;
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .wrow.sel .l2 {
+    color: var(--iris-ink);
+  }
+  .sep {
+    color: var(--ink-3);
+  }
+  .wrow.sel .sep {
+    color: var(--iris-line);
+  }
+
+  .statetag {
+    font-size: 0.5625rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .statetag.need {
+    color: var(--st-need);
+  }
+  .statetag.run {
+    color: var(--st-run);
+  }
+
+  .diffn {
+    display: inline-flex;
+    gap: 4px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .diffn .a {
+    color: var(--diff-add);
+  }
+  .diffn .d {
+    color: var(--diff-del);
+  }
+
+  .prchip {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    color: var(--ink-1);
+    white-space: nowrap;
+  }
+  .prchip :global(.pric) {
+    width: 12px;
+    height: 12px;
+    color: var(--ink-1);
+  }
+  .wrow.sel .prchip,
+  .wrow.sel .prchip :global(.pric) {
+    color: var(--iris-ink);
+  }
+
+  /* ---- facepile: one ringed circle per live Agent session ---- */
+  .pile {
+    grid-area: pile;
+    display: flex;
+    align-items: center;
+    flex: 0 0 auto;
+  }
+  .pile.empty {
+    width: 4px;
+  }
+  .pile .h {
+    width: 17px;
+    height: 17px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    line-height: 1;
+    background: var(--paper-2);
+    box-shadow: 0 0 0 1.75px var(--pile-ring, var(--paper-1));
+    margin-left: -8px;
+  }
+  .pile .h:first-child {
+    margin-left: 0;
+  }
+  .pile .h :global(svg) {
+    width: 12px;
+    height: 12px;
+  }
+  .pile .h.codex :global(svg) {
+    width: 13px;
+    height: 13px;
+  }
+  .pile .h.claude {
+    color: var(--mark-claude);
+  }
+  .pile .h.codex {
+    color: var(--mark-codex);
   }
 </style>

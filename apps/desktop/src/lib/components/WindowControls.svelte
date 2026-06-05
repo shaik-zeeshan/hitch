@@ -131,10 +131,10 @@
     place-items: center;
     border: 0;
     background: transparent;
-    color: var(--tx-md);
+    color: var(--ink-1);
     cursor: default;
     padding: 0;
-    transition: background var(--t-fast), color var(--t-fast);
+    transition: background 0.18s ease-out, color 0.18s ease-out;
   }
   .cap svg {
     width: 10px;
@@ -148,15 +148,15 @@
      is non-client, so CSS :hover can't fire there); min/close use real :hover. */
   .cap.min:hover,
   .cap.max.hovered {
-    background: var(--bg-3);
-    color: var(--tx-hi);
+    background: var(--paper-3);
+    color: var(--ink-0);
   }
   .cap.close:hover {
-    background: var(--err);
-    color: oklch(98% 0 0);
+    background: var(--st-need);
+    color: var(--harness-fg);
   }
   .cap:focus-visible {
-    outline: 2px solid var(--ac);
+    outline: 2px solid var(--iris);
     outline-offset: -2px;
   }
 </style>
