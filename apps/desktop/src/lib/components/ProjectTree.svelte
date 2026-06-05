@@ -532,12 +532,13 @@
   }
 
   /* per-project quick-add: a "+" on the project row, hidden at rest, revealed on
-     hover/focus. On a collapsed project it shares the trailing slot with the
-     rollup pill / kind label. */
+     hover/focus. It SWAPS with the kind label / rollup pill in the trailing
+     slot, so at rest it must take no space (display, not opacity) — otherwise
+     the row shows a dead gap after the kind label. */
   .quick-add {
     width: 18px;
     height: 18px;
-    display: grid;
+    display: none;
     place-items: center;
     padding: 0;
     border: 1px solid transparent;
@@ -546,12 +547,9 @@
     color: var(--ink-3);
     cursor: pointer;
     flex: none;
-    opacity: 0;
-    pointer-events: none;
     transition:
       color 0.15s ease-out,
-      border-color 0.15s ease-out,
-      opacity 0.15s ease-out;
+      border-color 0.15s ease-out;
   }
   .quick-add :global(svg) {
     width: 12px;
@@ -559,8 +557,7 @@
   }
   .row:hover .quick-add,
   .row:focus-within .quick-add {
-    opacity: 1;
-    pointer-events: auto;
+    display: grid;
   }
   .quick-add:hover {
     color: var(--iris-ink);
