@@ -254,10 +254,12 @@ fn install_claude_hooks(
             ],
             "PostToolUse": [claude_hook_entry(helper_path, "post-tool-use", AgentState::Running)],
             "Stop": [claude_hook_entry(helper_path, "stop", AgentState::Waiting)],
-            // Per-matcher StopFailure entries each carry an explicit human-readable
-            // `--detail` reason; we never parse the agent's payload to discover why
-            // the turn failed (ADR 0011: no text inference).
+            // The explicit matcher entries carry human-readable `--detail` for
+            // known buckets. Keep the empty-matcher fallback too: Claude can add
+            // StopFailure reasons, and every failed turn must still surface as
+            // `error` even when Hitch has no detail string for that bucket.
             "StopFailure": [
+                claude_hook_entry(helper_path, "stop-failure", AgentState::Error),
                 claude_stop_failure_hook_entry(helper_path, "rate_limit", "rate limited"),
                 claude_stop_failure_hook_entry(helper_path, "billing_error", "billing issue"),
                 claude_stop_failure_hook_entry(helper_path, "server_error", "server error")
@@ -764,7 +766,10 @@ fn windows_command_arg(value: &str) -> String {
     // unquoted so the common command reads cleanly.
     if value.is_empty()
         || value.bytes().any(|byte| {
-            matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'\\' | b'$' | b'`')
+            matches!(
+                byte,
+                b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'\\' | b'$' | b'`'
+            )
         })
     {
         posix_command_arg(value)
@@ -1035,9 +1040,14 @@ mod tests {
                 && value.to_string().contains("--state running")
         }));
 
-        // StopFailure is per-matcher with explicit, human-readable --detail.
+        // StopFailure keeps a generic fallback plus per-matcher detailed errors.
         let stop_failure = config["hooks"]["StopFailure"].as_array().unwrap();
-        assert_eq!(stop_failure.len(), 3);
+        assert_eq!(stop_failure.len(), 4);
+        assert!(stop_failure.iter().any(|value| {
+            value["matcher"] == ""
+                && value.to_string().contains("--state error")
+                && !value.to_string().contains("--detail")
+        }));
         assert!(stop_failure.iter().any(|value| {
             value["matcher"] == "rate_limit"
                 && value.to_string().contains("--state error")
@@ -1093,7 +1103,8 @@ mod tests {
     #[test]
     fn announce_command_carries_announce_flag_and_no_state() {
         // The exact string the helper agent must map (`--announce` -> AnnounceAgent).
-        let claude = claude_announce_hook_entry(Path::new("/opt/hitch/hitch-hook"), "session-start");
+        let claude =
+            claude_announce_hook_entry(Path::new("/opt/hitch/hitch-hook"), "session-start");
         let command = claude["hooks"][0]["command"].as_str().unwrap();
         assert_eq!(
             command,
@@ -1112,8 +1123,11 @@ mod tests {
 
     #[test]
     fn stop_failure_entry_carries_explicit_state_and_detail() {
-        let entry =
-            claude_stop_failure_hook_entry(Path::new("/opt/hitch/hitch-hook"), "rate_limit", "rate limited");
+        let entry = claude_stop_failure_hook_entry(
+            Path::new("/opt/hitch/hitch-hook"),
+            "rate_limit",
+            "rate limited",
+        );
         assert_eq!(entry["matcher"], "rate_limit");
         let command = entry["hooks"][0]["command"].as_str().unwrap();
         assert_eq!(
@@ -1138,10 +1152,8 @@ mod tests {
 
         let first = read_notification(&worktree);
         assert_eq!(first.len(), 2, "two distinct Hitch Notification groups");
-        assert!(first
-            .iter()
-            .any(|v| v["matcher"] == "permission_prompt"
-                && v.to_string().contains("--state needs-approval")));
+        assert!(first.iter().any(|v| v["matcher"] == "permission_prompt"
+            && v.to_string().contains("--state needs-approval")));
         assert!(first
             .iter()
             .any(|v| v["matcher"] == "idle_prompt" && v.to_string().contains("--state waiting")));
@@ -1149,7 +1161,10 @@ mod tests {
         // Re-install must not duplicate or collapse the two matcher groups.
         install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
         let second = read_notification(&worktree);
-        assert_eq!(second, first, "Notification groups stable across re-install");
+        assert_eq!(
+            second, first,
+            "Notification groups stable across re-install"
+        );
 
         fs::remove_dir_all(worktree).unwrap();
     }
@@ -1255,8 +1270,8 @@ mod tests {
         let claude = fs::read_to_string(&claude_path).unwrap();
         assert!(!claude.contains("/old/target/debug/hitch-hook"));
         // SessionStart, UserPromptSubmit, PermissionRequest, PermissionDenied,
-        // Notification x2, PostToolUse, Stop, StopFailure x3, SessionEnd = 12.
-        assert_eq!(claude.matches("/new/target/debug/hitch-hook").count(), 12);
+        // Notification x2, PostToolUse, Stop, StopFailure x4, SessionEnd = 13.
+        assert_eq!(claude.matches("/new/target/debug/hitch-hook").count(), 13);
         assert!(claude.contains("echo keep-me"));
 
         let codex = fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap();

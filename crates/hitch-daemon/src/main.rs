@@ -45,6 +45,7 @@ use hitch_git::{
     staged_diff, CommandControl, CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState,
     GitClient, GitRepository, StatusEntry, WorktreeCheckout,
 };
+use hitch_process::{DrainOutcome, PipeReader, ProcessTree};
 use hitch_proto::{
     encode_control_message, encode_pty_frame,
     transport::{connect_daemon, DaemonListener, DaemonStream},
@@ -53,10 +54,7 @@ use hitch_proto::{
     ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode, WorktreePr,
     MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
-use hitch_process::{DrainOutcome, PipeReader, ProcessTree};
-use hitch_pty::{
-    ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY,
-};
+use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY};
 use hitch_store::Store;
 
 fn main() {
@@ -1207,27 +1205,27 @@ fn handle_request<R: Read>(
             rows,
         } => {
             let session = open_session(state, parent, name, command, cols, rows, &channels.pty_tx)?;
+            let replay = session_opened_replay(state, session.id)?;
             send_response(
                 state,
                 client_id,
                 request_id,
                 Response::SessionOpened {
                     session: session.clone(),
-                    agent: None,
-                    agent_state: None,
-                    agent_detail: None,
-                    // A freshly spawned session has produced no output yet.
-                    output_active: false,
+                    agent: replay.agent,
+                    agent_state: replay.agent_state,
+                    agent_detail: replay.agent_detail.clone(),
+                    output_active: replay.output_active,
                 },
             )?;
             broadcast_event(
                 state,
                 Event::SessionOpened {
                     session,
-                    agent: None,
-                    agent_state: None,
-                    agent_detail: None,
-                    output_active: false,
+                    agent: replay.agent,
+                    agent_state: replay.agent_state,
+                    agent_detail: replay.agent_detail,
+                    output_active: replay.output_active,
                 },
             )?;
         }
@@ -2207,6 +2205,31 @@ fn open_session(
     Ok(session)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionOpenedReplay {
+    agent: Option<KnownAgent>,
+    agent_state: Option<AgentState>,
+    agent_detail: Option<String>,
+    output_active: bool,
+}
+
+fn session_opened_replay(
+    state: &Arc<Mutex<DaemonState>>,
+    session_id: SessionId,
+) -> Result<SessionOpenedReplay, ProtocolError> {
+    let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    let daemon_session = state
+        .sessions
+        .get(&session_id)
+        .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidRequest, "session not found"))?;
+    Ok(SessionOpenedReplay {
+        agent: daemon_session.agent,
+        agent_state: daemon_session.agent_state,
+        agent_detail: daemon_session.agent_detail.clone(),
+        output_active: daemon_session.output_active,
+    })
+}
+
 fn remove_git_worktree_bounded(
     git_path: &Path,
     repo_root: &Path,
@@ -2353,7 +2376,9 @@ where
             // The child exited on its own, so its write ends are closed and the
             // readers reach EOF. Bounded-drain to collect stderr for the message
             // without blocking on a stuck reader.
-            let stderr_bytes = stderr_reader.map(drain_git_reader_bounded).unwrap_or_default();
+            let stderr_bytes = stderr_reader
+                .map(drain_git_reader_bounded)
+                .unwrap_or_default();
             let stderr = String::from_utf8_lossy(&stderr_bytes);
             return Err(ProtocolError::new(
                 ErrorCode::GitFailed,
@@ -5710,13 +5735,9 @@ mod tests {
         // A fresh, never-prompted session: the late-arrival guard is off here
         // (set true only after a clear), but the announce must store identity
         // while leaving Agent State absent.
-        let event = super::store_agent_announce(
-            &state,
-            KnownAgent::ClaudeCode,
-            Some(session_id),
-            None,
-        )
-        .unwrap();
+        let event =
+            super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None)
+                .unwrap();
         assert!(event.is_some(), "a new identity must broadcast");
         assert_eq!(
             current_state(&state, session_id),
@@ -5733,13 +5754,8 @@ mod tests {
             s.agent = None;
             s.agent_report_requires_running = true;
         }
-        let event = super::store_agent_announce(
-            &state,
-            KnownAgent::Codex,
-            Some(session_id),
-            None,
-        )
-        .unwrap();
+        let event =
+            super::store_agent_announce(&state, KnownAgent::Codex, Some(session_id), None).unwrap();
         assert!(event.is_some(), "announce must pass the late-arrival guard");
         assert_eq!(
             current_state(&state, session_id),
@@ -5756,7 +5772,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(dropped.is_none(), "state guard still drops late non-running");
+        assert!(
+            dropped.is_none(),
+            "state guard still drops late non-running"
+        );
         assert_eq!(
             current_state(&state, session_id),
             (Some(KnownAgent::Codex), None),
@@ -5784,8 +5803,15 @@ mod tests {
             None,
         )
         .unwrap();
-        super::store_agent_report(&state, KnownAgent::ClaudeCode, None, Some(session_id), None, None)
-            .unwrap();
+        super::store_agent_report(
+            &state,
+            KnownAgent::ClaudeCode,
+            None,
+            Some(session_id),
+            None,
+            None,
+        )
+        .unwrap();
 
         // Second run: announce only (the user opens the TUI but never prompts).
         super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None)
@@ -5809,7 +5835,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(event.is_some(), "the exit clear must broadcast past the guard");
+        assert!(
+            event.is_some(),
+            "the exit clear must broadcast past the guard"
+        );
         let event = event.unwrap();
         assert_eq!(event.agent, None, "the clear must carry agent: None");
         assert_eq!(current_state(&state, session_id), (None, None));
@@ -5840,6 +5869,38 @@ mod tests {
         let event = event.unwrap();
         assert_eq!(event.agent, None);
         assert_eq!(current_state(&state, session_id), (None, None));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_opened_replay_uses_current_agent_state_and_output_gate() {
+        use hitch_core::AgentState;
+        use hitch_proto::KnownAgent;
+        use std::time::Instant;
+
+        let (state, session_id, dir, _rx) = state_with_session();
+
+        super::store_agent_report(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(AgentState::Running),
+            Some(session_id),
+            None,
+            Some("busy".into()),
+        )
+        .unwrap();
+        {
+            let mut guard = state.lock().unwrap();
+            super::mark_output_active(&mut guard, session_id, Instant::now());
+        }
+
+        let replay = super::session_opened_replay(&state, session_id).unwrap();
+        assert_eq!(replay.agent, Some(KnownAgent::ClaudeCode));
+        assert_eq!(replay.agent_state, Some(AgentState::Running));
+        assert_eq!(replay.agent_detail.as_deref(), Some("busy"));
+        assert!(replay.output_active);
 
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5926,7 +5987,10 @@ mod tests {
             let mut guard = state.lock().unwrap();
             super::mark_output_active(&mut guard, session_id, t0 + Duration::from_millis(10))
         };
-        assert!(edge.is_none(), "no per-frame broadcast while already active");
+        assert!(
+            edge.is_none(),
+            "no per-frame broadcast while already active"
+        );
         assert!(gate_is_active(&state, session_id));
 
         drop(state);
@@ -6038,7 +6102,10 @@ mod tests {
                 Duration::from_secs(4),
             )
         };
-        assert!(edges.is_empty(), "never-active session yields no falling edge");
+        assert!(
+            edges.is_empty(),
+            "never-active session yields no falling edge"
+        );
 
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);

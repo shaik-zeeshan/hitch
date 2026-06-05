@@ -634,7 +634,11 @@ fn run_provider_command(
     //   * No EOF and the bytes were still growing when the grace elapsed -> a
     //     descendant is actively writing; forcing EOF now would truncate the
     //     payload, so report `TimedOut` instead of parsing a partial JSON draft.
-    let stdout = drain_success_stdout(stdout_reader, SUCCESS_DRAIN_GRACE, &mut terminate_for_cleanup);
+    let stdout = drain_success_stdout(
+        stdout_reader,
+        SUCCESS_DRAIN_GRACE,
+        &mut terminate_for_cleanup,
+    );
     // stderr is only diagnostic context on the success path; partial is fine and
     // we don't want to wait the full success grace for a stderr pipe a descendant
     // happens to hold open, so use the short grace.
