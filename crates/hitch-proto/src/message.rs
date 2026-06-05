@@ -39,8 +39,10 @@ use serde::{Deserialize, Serialize};
 /// 2026-06-05) — the gate behind the `WORKING` display word
 /// (`running` AND output-active) — and `output_active` on the `SessionOpened`
 /// replay so a newly attached client starts with the correct gate value instead
-/// of assuming.
-pub const PROTOCOL_VERSION: u16 = 20;
+/// of assuming. v21 adds optional `agent_run_id` to agent hook reports/announces
+/// so the daemon can drop stale lifecycle hooks from a previous agent process
+/// after a newer `SessionStart`.
+pub const PROTOCOL_VERSION: u16 = 21;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -284,6 +286,11 @@ pub enum Request {
         session_id: Option<SessionId>,
         cwd: Option<PathBuf>,
         detail: Option<String>,
+        /// Agent-native session/run id from hook payloads (Claude Code's
+        /// `session_id`), distinct from Hitch's PTY [`SessionId`]. Missing for
+        /// older helpers and non-agent manual invocations.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_run_id: Option<String>,
     },
     /// Hook helper **identity announce** (ADR 0011 amendment 2026-06-05): an
     /// agent's `SessionStart` declares *which* agent now runs in a session so the
@@ -296,6 +303,10 @@ pub enum Request {
         agent: KnownAgent,
         session_id: Option<SessionId>,
         cwd: Option<PathBuf>,
+        /// Agent-native session/run id from hook payloads, used only to reject
+        /// stale lifecycle hooks that arrive after a newer run announced itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_run_id: Option<String>,
     },
 
     /// Liveness heartbeat (ADR 0009). The daemon replies with [`Response::Pong`].
@@ -898,6 +909,7 @@ mod tests {
             session_id: Some(session_id),
             cwd: Some("/repo".into()),
             detail: None,
+            agent_run_id: None,
         };
         let value: serde_json::Value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["type"], "report-agent-state");
@@ -949,6 +961,7 @@ mod tests {
             agent: KnownAgent::ClaudeCode,
             session_id: Some(session_id),
             cwd: Some("/repo".into()),
+            agent_run_id: Some("claude-run-1".into()),
         };
         let value: serde_json::Value = serde_json::to_value(&announce).unwrap();
         assert_eq!(value["type"], "announce-agent");
@@ -968,6 +981,7 @@ mod tests {
             session_id: Some(session_id),
             cwd: Some("/repo".into()),
             detail: None,
+            agent_run_id: Some("claude-run-1".into()),
         };
         let clear_value: serde_json::Value = serde_json::to_value(&clear).unwrap();
         assert_eq!(clear_value["type"], "report-agent-state");
@@ -1113,7 +1127,7 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 20);
+        assert_eq!(PROTOCOL_VERSION, 21);
     }
 
     #[test]
@@ -1468,11 +1482,13 @@ mod tests {
                 session_id: Some(session_id),
                 cwd: Some("/repo".into()),
                 detail: Some("permission prompt".into()),
+                agent_run_id: Some("claude-run-1".into()),
             },
             Request::AnnounceAgent {
                 agent: KnownAgent::ClaudeCode,
                 session_id: Some(session_id),
                 cwd: Some("/repo".into()),
+                agent_run_id: Some("claude-run-1".into()),
             },
             Request::Ping,
             Request::StartJob {

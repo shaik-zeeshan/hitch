@@ -147,6 +147,7 @@ fn windows_agent_state_reports_store_broadcast_replay_and_clear_by_session_id() 
             session_id: Some(session.id),
             cwd: Some(nested_cwd.clone()),
             detail: Some("working from Windows cwd".into()),
+            agent_run_id: None,
         },
     );
     let event = reporter.read_agent_state_event(Duration::from_secs(5));
@@ -183,6 +184,7 @@ fn windows_agent_state_reports_store_broadcast_replay_and_clear_by_session_id() 
             session_id: Some(session.id),
             cwd: Some(nested_cwd),
             detail: None,
+            agent_run_id: None,
         },
     );
     let cleared = reporter.read_agent_state_event(Duration::from_secs(5));
@@ -1577,6 +1579,7 @@ impl TestClient {
                 session_id,
                 cwd,
                 detail,
+                agent_run_id: None,
             },
         );
     }

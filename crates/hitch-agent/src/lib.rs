@@ -254,15 +254,21 @@ fn install_claude_hooks(
             ],
             "PostToolUse": [claude_hook_entry(helper_path, "post-tool-use", AgentState::Running)],
             "Stop": [claude_hook_entry(helper_path, "stop", AgentState::Waiting)],
-            // The explicit matcher entries carry human-readable `--detail` for
-            // known buckets. Keep the empty-matcher fallback too: Claude can add
-            // StopFailure reasons, and every failed turn must still surface as
-            // `error` even when Hitch has no detail string for that bucket.
+            // StopFailure matchers are exact buckets. Do NOT install an empty
+            // matcher here: Claude treats it as match-all and runs every matching
+            // group in parallel, so the generic report can race the detailed one
+            // and erase its `--detail`.
             "StopFailure": [
-                claude_hook_entry(helper_path, "stop-failure", AgentState::Error),
                 claude_stop_failure_hook_entry(helper_path, "rate_limit", "rate limited"),
+                claude_stop_failure_hook_entry(helper_path, "overloaded", "server overloaded"),
+                claude_stop_failure_hook_entry(helper_path, "authentication_failed", "authentication failed"),
+                claude_stop_failure_hook_entry(helper_path, "oauth_org_not_allowed", "OAuth org not allowed"),
                 claude_stop_failure_hook_entry(helper_path, "billing_error", "billing issue"),
-                claude_stop_failure_hook_entry(helper_path, "server_error", "server error")
+                claude_stop_failure_hook_entry(helper_path, "invalid_request", "invalid request"),
+                claude_stop_failure_hook_entry(helper_path, "model_not_found", "model not found"),
+                claude_stop_failure_hook_entry(helper_path, "server_error", "server error"),
+                claude_stop_failure_hook_entry(helper_path, "max_output_tokens", "max output tokens"),
+                claude_stop_failure_hook_entry(helper_path, "unknown", "agent error")
             ],
             "SessionEnd": [claude_clear_hook_entry(helper_path, "session-end")]
         }
@@ -1081,14 +1087,11 @@ mod tests {
                 && value.to_string().contains("--state running")
         }));
 
-        // StopFailure keeps a generic fallback plus per-matcher detailed errors.
+        // StopFailure uses only non-empty exact matchers. An empty matcher would
+        // overlap detailed buckets and race away their human-readable detail.
         let stop_failure = config["hooks"]["StopFailure"].as_array().unwrap();
-        assert_eq!(stop_failure.len(), 4);
-        assert!(stop_failure.iter().any(|value| {
-            value["matcher"] == ""
-                && value.to_string().contains("--state error")
-                && !value.to_string().contains("--detail")
-        }));
+        assert_eq!(stop_failure.len(), 10);
+        assert!(!stop_failure.iter().any(|value| value["matcher"] == ""));
         assert!(stop_failure.iter().any(|value| {
             value["matcher"] == "rate_limit"
                 && value.to_string().contains("--state error")
@@ -1100,6 +1103,9 @@ mod tests {
         }));
         assert!(stop_failure.iter().any(|value| {
             value["matcher"] == "server_error" && value.to_string().contains("server error")
+        }));
+        assert!(stop_failure.iter().any(|value| {
+            value["matcher"] == "unknown" && value.to_string().contains("agent error")
         }));
 
         let session_end_hooks = config["hooks"]["SessionEnd"].as_array().unwrap();
@@ -1334,8 +1340,8 @@ mod tests {
         let claude = fs::read_to_string(&claude_path).unwrap();
         assert!(!claude.contains("/old/target/debug/hitch-hook"));
         // SessionStart, UserPromptSubmit, PermissionRequest, PermissionDenied,
-        // Notification x2, PostToolUse, Stop, StopFailure x4, SessionEnd = 13.
-        assert_eq!(claude.matches("/new/target/debug/hitch-hook").count(), 13);
+        // Notification x2, PostToolUse, Stop, StopFailure x10, SessionEnd = 19.
+        assert_eq!(claude.matches("/new/target/debug/hitch-hook").count(), 19);
         assert!(claude.contains("echo keep-me"));
 
         let codex = fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap();

@@ -428,7 +428,7 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     #[cfg(unix)]
     spawn_command_poller(Arc::clone(&state), Arc::clone(&shutdown));
     spawn_dirty_poller(Arc::clone(&state), Arc::clone(&shutdown));
-    spawn_output_activity_poller(Arc::clone(&state), Arc::clone(&shutdown));
+    spawn_output_activity_poller(dispatch_tx.clone(), Arc::clone(&shutdown));
 
     // A dedicated thread parks in the blocking `accept()` and forwards each
     // accepted stream over this channel. Parking (rather than polling a
@@ -725,6 +725,10 @@ struct DaemonSession {
     agent: Option<KnownAgent>,
     agent_state: Option<AgentState>,
     agent_detail: Option<String>,
+    /// Agent-native run id (Claude Code hook `session_id`) for the currently
+    /// announced process. Distinct from Hitch's PTY `SessionId`; used only to
+    /// reject stale hook deliveries from a previous agent process in this PTY.
+    agent_run_id: Option<String>,
     agent_report_requires_running: bool,
     /// Output-activity gate (ADR 0011 amendment 2026-06-05): whether this
     /// session's PTY produced output within the last [`OUTPUT_ACTIVE_QUIET`].
@@ -828,14 +832,15 @@ impl OutputBroadcaster {
 
 /// A message on the dispatcher's mpsc channel. `Pty` wraps the PTY reader's
 /// events; `ReplayToClient` is enqueued by `handle_client` after it answers a
-/// client's `Hello`. Routing the replay through the same queue makes the
-/// dispatcher the single serialization point: a replay is processed in mpsc
-/// order relative to `PtyEvent::Output`, so output appended before the replay
-/// is in the snapshot and output appended after it is broadcast live — with no
-/// gap and no duplication.
+/// client's `Hello`; `OutputActivityPoll` is enqueued by the output poller.
+/// Routing replay and falling output-active edges through the same queue makes
+/// the dispatcher the single serialization point: snapshots, live output, and
+/// active/quiet edges are processed in one order, with no gap, duplication, or
+/// stale quiet edge delivered after newer output.
 enum DispatchMsg {
     Pty(PtyEvent),
     ReplayToClient { client_id: u64 },
+    OutputActivityPoll { now: Instant },
 }
 
 impl From<PtyEvent> for DispatchMsg {
@@ -945,6 +950,7 @@ fn restore_layout(
                 agent: None,
                 agent_state: None,
                 agent_detail: None,
+                agent_run_id: None,
                 agent_report_requires_running: false,
                 output_active: false,
                 last_output_at: None,
@@ -1379,6 +1385,7 @@ fn handle_request<R: Read>(
             session_id,
             cwd,
             detail,
+            agent_run_id,
         } => {
             if let Some(event) = store_agent_report(
                 state,
@@ -1387,6 +1394,7 @@ fn handle_request<R: Read>(
                 session_id,
                 cwd.as_deref(),
                 detail,
+                agent_run_id,
             )? {
                 broadcast_agent_state_event(
                     state,
@@ -1405,6 +1413,7 @@ fn handle_request<R: Read>(
             agent,
             session_id,
             cwd,
+            agent_run_id,
         } => {
             // Identity-only announce: store *which* agent runs in the session so
             // the Session mark can render before the first prompt. Bypasses the
@@ -1412,7 +1421,9 @@ fn handle_request<R: Read>(
             // amendment 2026-06-05). Propagate a changed identity to attached
             // clients via the same `AgentState` event path state reports use —
             // there is no separate identity event type.
-            if let Some(event) = store_agent_announce(state, agent, session_id, cwd.as_deref())? {
+            if let Some(event) =
+                store_agent_announce(state, agent, session_id, cwd.as_deref(), agent_run_id)?
+            {
                 broadcast_agent_state_event(
                     state,
                     Event::AgentState {
@@ -2193,6 +2204,7 @@ fn open_session(
         session.id,
         DaemonSession {
             session: session.clone(),
+            agent_run_id: None,
             pty,
             restored_scrollback: Vec::new(),
             agent: None,
@@ -2914,30 +2926,24 @@ fn spawn_command_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool
         })
         .expect("failed to spawn command poller thread");
 }
-
 /// Poll for output-activity falling edges (ADR 0011 amendment 2026-06-05). The
 /// rising edge is emitted inline on the dispatcher thread when a frame arrives;
-/// the falling edge has no triggering event, so this thread checks once per
-/// [`OUTPUT_ACTIVE_POLL_INTERVAL`] whether any active session has been quiet for
-/// [`OUTPUT_ACTIVE_QUIET`] and broadcasts its `active: false` transition through
-/// the same replay gate as agent state, because `SessionOpened` carries an
-/// output-active snapshot. The daemon only ever watches WHETHER frames arrived
-/// (the timestamp), never their content — ADR 0011's no-text-inference rule.
-/// Spawned on all platforms: it reads only the in-memory gate, with no dependence
-/// on `foreground_command()`.
-fn spawn_output_activity_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>) {
+/// the falling edge has no triggering event, so this thread enqueues a clock tick
+/// onto the same dispatcher channel. The dispatcher then collects and broadcasts
+/// quiet edges in order relative to PTY output, so a delayed `active: false`
+/// cannot overtake newer output and hide WORKING.
+fn spawn_output_activity_poller(dispatch_tx: mpsc::Sender<DispatchMsg>, shutdown: Arc<AtomicBool>) {
     thread::Builder::new()
         .name("hitch-output-active-poll".into())
         .spawn(move || {
             while !shutdown.load(Ordering::SeqCst) {
-                let edges = match state.lock() {
-                    Ok(mut state) => {
-                        collect_output_quiet_edges(&mut state, Instant::now(), OUTPUT_ACTIVE_QUIET)
-                    }
-                    Err(_) => Vec::new(),
-                };
-                for edge in edges {
-                    let _ = broadcast_output_active_event(&state, edge);
+                if dispatch_tx
+                    .send(DispatchMsg::OutputActivityPoll {
+                        now: Instant::now(),
+                    })
+                    .is_err()
+                {
+                    break;
                 }
                 thread::sleep(OUTPUT_ACTIVE_POLL_INTERVAL);
             }
@@ -3014,6 +3020,17 @@ fn spawn_pty_dispatcher(
                         // thread, so every subsequent Output is broadcast to the
                         // now-live client strictly after its snapshot.
                         let _ = replay_sessions_to_client(&state, client_id);
+                    }
+                    DispatchMsg::OutputActivityPoll { now } => {
+                        let edges = match state.lock() {
+                            Ok(mut state) => {
+                                collect_output_quiet_edges(&mut state, now, OUTPUT_ACTIVE_QUIET)
+                            }
+                            Err(_) => Vec::new(),
+                        };
+                        for edge in edges {
+                            let _ = broadcast_output_active_event(&state, edge);
+                        }
                     }
                 }
             }
@@ -3176,6 +3193,7 @@ fn store_agent_report(
     session_id: Option<SessionId>,
     cwd: Option<&Path>,
     detail: Option<String>,
+    agent_run_id: Option<String>,
 ) -> Result<Option<AgentStateBroadcast>, ProtocolError> {
     let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
     let Some(session_id) = session_id else {
@@ -3192,6 +3210,18 @@ fn store_agent_report(
         );
         return Ok(None);
     };
+
+    if let (Some(current_run_id), Some(report_run_id)) = (
+        daemon_session.agent_run_id.as_deref(),
+        agent_run_id.as_deref(),
+    ) {
+        if current_run_id != report_run_id {
+            eprintln!(
+                "hitch-daemon: dropping stale agent state report: agent={agent:?} session_id={session_id} reason=run-id-mismatch"
+            );
+            return Ok(None);
+        }
+    }
 
     // The late-arrival guard drops stale *state* reports (waiting/error from a
     // dying agent's queued hooks) until a fresh `running` arrives. Clears are
@@ -3228,6 +3258,9 @@ fn store_agent_report(
                 );
                 return Ok(None);
             }
+            if agent_run_id.is_some() {
+                daemon_session.agent_run_id = agent_run_id.clone();
+            }
             daemon_session.agent = Some(agent);
             daemon_session.agent_state = Some(state);
             daemon_session.agent_detail = detail.clone();
@@ -3250,6 +3283,7 @@ fn store_agent_report(
             daemon_session.agent = None;
             daemon_session.agent_state = None;
             daemon_session.agent_detail = None;
+            daemon_session.agent_run_id = None;
             daemon_session.agent_report_requires_running = true;
             // Exit-to-`None`: broadcast `agent: None` so clients clear the
             // identity too — the null state alone must not be the signal (an
@@ -3269,9 +3303,9 @@ fn store_agent_report(
 /// agent's `SessionStart` declares *which* agent now runs in a session so the
 /// Session mark can render before the first prompt. Identity is **not** state:
 ///
-/// - It records `daemon_session.agent` and **never** touches `agent_state`,
-///   `agent_detail`, or the late-arrival guard — a fresh, never-prompted agent
-///   stays at no-state.
+/// - It records `daemon_session.agent` and the agent-native run id, and **never**
+///   touches `agent_state`, `agent_detail`, or the late-arrival guard — a fresh,
+///   never-prompted agent stays at no-state.
 /// - It **bypasses** the late-arrival guard (`agent_report_requires_running`):
 ///   that guard governs *state* reports only; an announce always passes.
 /// - Exit-to-`None` (a `ReportAgentState` with `state: None`) clears identity
@@ -3286,6 +3320,7 @@ fn store_agent_announce(
     agent: KnownAgent,
     session_id: Option<SessionId>,
     cwd: Option<&Path>,
+    agent_run_id: Option<String>,
 ) -> Result<Option<AgentStateBroadcast>, ProtocolError> {
     let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
     let Some(session_id) = session_id else {
@@ -3304,8 +3339,16 @@ fn store_agent_announce(
     };
 
     // Identity only: do not touch agent_state / agent_detail / the late-arrival
-    // guard. If the identity is already current, nothing changed.
-    if daemon_session.agent == Some(agent) {
+    // guard. Still refresh the run id when Claude reports one, even if the mark
+    // is unchanged, so a delayed SessionEnd from the previous process cannot
+    // clear this fresh announce.
+    let identity_changed = daemon_session.agent != Some(agent);
+    if let Some(run_id) = agent_run_id {
+        daemon_session.agent_run_id = Some(run_id);
+    } else if identity_changed {
+        daemon_session.agent_run_id = None;
+    }
+    if !identity_changed {
         return Ok(None);
     }
     let worktree_id = session_worktree_id(&daemon_session.session);
@@ -3347,6 +3390,7 @@ fn clear_stale_agent_state(
     daemon_session.agent = None;
     daemon_session.agent_state = None;
     daemon_session.agent_detail = None;
+    daemon_session.agent_run_id = None;
     daemon_session.agent_report_requires_running = true;
     // Dirty-exit backstop clear: `agent: None` clears identity on clients,
     // same as the exit-to-`None` report path.
@@ -4915,6 +4959,7 @@ mod tests {
             None,
             Some(&subdir),
             Some("ignored".into()),
+            None,
         )
         .unwrap();
         assert!(event.is_none());
@@ -5726,6 +5771,7 @@ mod tests {
             Some(session_id),
             None,
             None,
+            None,
         )
         .unwrap();
         super::store_agent_report(
@@ -5735,6 +5781,7 @@ mod tests {
             Some(session_id),
             None,
             Some("rate limited".into()),
+            None,
         )
         .unwrap();
 
@@ -5744,6 +5791,7 @@ mod tests {
             KnownAgent::ClaudeCode,
             Some(AgentState::Waiting),
             Some(session_id),
+            None,
             None,
             None,
         )
@@ -5774,6 +5822,7 @@ mod tests {
                 Some(session_id),
                 None,
                 None,
+                None,
             )
             .unwrap();
         }
@@ -5784,6 +5833,7 @@ mod tests {
             KnownAgent::ClaudeCode,
             Some(AgentState::Running),
             Some(session_id),
+            None,
             None,
             None,
         )
@@ -5813,6 +5863,7 @@ mod tests {
                 Some(session_id),
                 None,
                 None,
+                None,
             )
             .unwrap();
         }
@@ -5823,6 +5874,7 @@ mod tests {
             KnownAgent::ClaudeCode,
             None,
             Some(session_id),
+            None,
             None,
             None,
         )
@@ -5844,9 +5896,14 @@ mod tests {
         // A fresh, never-prompted session: the late-arrival guard is off here
         // (set true only after a clear), but the announce must store identity
         // while leaving Agent State absent.
-        let event =
-            super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None)
-                .unwrap();
+        let event = super::store_agent_announce(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(session_id),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(event.is_some(), "a new identity must broadcast");
         assert_eq!(
             current_state(&state, session_id),
@@ -5864,7 +5921,8 @@ mod tests {
             s.agent_report_requires_running = true;
         }
         let event =
-            super::store_agent_announce(&state, KnownAgent::Codex, Some(session_id), None).unwrap();
+            super::store_agent_announce(&state, KnownAgent::Codex, Some(session_id), None, None)
+                .unwrap();
         assert!(event.is_some(), "announce must pass the late-arrival guard");
         assert_eq!(
             current_state(&state, session_id),
@@ -5877,6 +5935,7 @@ mod tests {
             KnownAgent::Codex,
             Some(AgentState::Waiting),
             Some(session_id),
+            None,
             None,
             None,
         )
@@ -5910,6 +5969,7 @@ mod tests {
             Some(session_id),
             None,
             None,
+            None,
         )
         .unwrap();
         super::store_agent_report(
@@ -5919,11 +5979,12 @@ mod tests {
             Some(session_id),
             None,
             None,
+            None,
         )
         .unwrap();
 
         // Second run: announce only (the user opens the TUI but never prompts).
-        super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None)
+        super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None, None)
             .unwrap();
         assert_eq!(
             current_state(&state, session_id),
@@ -5942,6 +6003,7 @@ mod tests {
             Some(session_id),
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -5955,6 +6017,55 @@ mod tests {
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn stale_exit_clear_cannot_erase_fresh_announce() {
+        use hitch_proto::KnownAgent;
+
+        let (state, session_id, dir, _rx) = state_with_session();
+
+        super::store_agent_announce(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(session_id),
+            None,
+            Some("old-run".into()),
+        )
+        .unwrap();
+        let event = super::store_agent_announce(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(session_id),
+            None,
+            Some("fresh-run".into()),
+        )
+        .unwrap();
+        assert!(
+            event.is_none(),
+            "same identity should refresh run id without redundant broadcast"
+        );
+
+        let stale_clear = super::store_agent_report(
+            &state,
+            KnownAgent::ClaudeCode,
+            None,
+            Some(session_id),
+            None,
+            None,
+            Some("old-run".into()),
+        )
+        .unwrap();
+        assert!(
+            stale_clear.is_none(),
+            "stale SessionEnd clear must not remove the fresh announce"
+        );
+        assert_eq!(
+            current_state(&state, session_id),
+            (Some(KnownAgent::ClaudeCode), None)
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -5964,7 +6075,7 @@ mod tests {
         let (state, session_id, dir, _rx) = state_with_session();
 
         // Announce only — a never-prompted agent has identity but no state.
-        super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None)
+        super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None, None)
             .unwrap();
 
         // The agent dies without SessionEnd (dirty exit); the foreground
@@ -5998,6 +6109,7 @@ mod tests {
             Some(session_id),
             None,
             Some("busy".into()),
+            None,
         )
         .unwrap();
         {
@@ -6021,7 +6133,7 @@ mod tests {
 
         let (state, session_id, dir, _rx) = state_with_session();
 
-        super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None)
+        super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None, None)
             .unwrap();
 
         // Replay reads identity straight off the session record (the same field
@@ -6045,14 +6157,24 @@ mod tests {
 
         let (state, session_id, dir, _rx) = state_with_session();
 
-        let first =
-            super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None)
-                .unwrap();
+        let first = super::store_agent_announce(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(session_id),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(first.is_some());
         // Re-announcing the same agent is a no-op: no redundant broadcast.
-        let second =
-            super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None)
-                .unwrap();
+        let second = super::store_agent_announce(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(session_id),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(second.is_none(), "unchanged identity must not re-broadcast");
 
         drop(state);
@@ -6188,6 +6310,41 @@ mod tests {
             }
             other => panic!("expected a rising-edge event on reactivation, got {other:?}"),
         }
+        assert!(gate_is_active(&state, session_id));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_quiet_poll_does_not_emit_stale_false_after_new_output() {
+        use std::time::{Duration, Instant};
+
+        let (state, session_id, dir, _rx) = state_with_session();
+        let quiet = Duration::from_secs(4);
+        let t0 = Instant::now();
+
+        {
+            let mut guard = state.lock().unwrap();
+            super::mark_output_active(&mut guard, session_id, t0);
+        }
+
+        // The poller captured this timestamp when the session was old enough to
+        // go quiet, but its tick is processed on the dispatcher only after this
+        // newer output frame refreshes `last_output_at`.
+        {
+            let mut guard = state.lock().unwrap();
+            super::mark_output_active(&mut guard, session_id, t0 + quiet + Duration::from_secs(1));
+        }
+        let edges = {
+            let mut guard = state.lock().unwrap();
+            super::collect_output_quiet_edges(&mut guard, t0 + quiet, quiet)
+        };
+
+        assert!(
+            edges.is_empty(),
+            "a delayed quiet tick must not emit active:false after newer output"
+        );
         assert!(gate_is_active(&state, session_id));
 
         drop(state);

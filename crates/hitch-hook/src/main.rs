@@ -100,6 +100,7 @@ where
         Some(cwd) => Some(cwd),
         None => cwd_from_payload(&payload).or_else(|| std::env::current_dir().ok()),
     };
+    let agent_run_id = agent_run_id_from_payload(&payload);
 
     // An identity announce (ADR 0011 amendment) is *not* a state report: it
     // declares which agent now runs in this session so the Session mark renders
@@ -113,6 +114,7 @@ where
             agent: args.agent,
             session_id: args.session_id,
             cwd,
+            agent_run_id,
         });
     }
 
@@ -133,6 +135,7 @@ where
         session_id: args.session_id,
         cwd,
         detail,
+        agent_run_id,
     })
 }
 
@@ -244,6 +247,7 @@ struct HookReport {
     session_id: Option<SessionId>,
     cwd: Option<PathBuf>,
     detail: Option<String>,
+    agent_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +256,7 @@ struct HookAnnounce {
     agent: KnownAgent,
     session_id: Option<SessionId>,
     cwd: Option<PathBuf>,
+    agent_run_id: Option<String>,
 }
 
 /// Send an identity-only announce (`Request::AnnounceAgent`): which agent now
@@ -275,6 +280,7 @@ fn send_announce(announce: HookAnnounce) -> Result<(), HookError> {
                 agent: announce.agent,
                 session_id: announce.session_id,
                 cwd: announce.cwd,
+                agent_run_id: announce.agent_run_id,
             },
         ))
         .map_err(|err| HookError::Transport(err.to_string()))?;
@@ -307,6 +313,7 @@ fn send_report(report: HookReport) -> Result<(), HookError> {
                 session_id: report.session_id,
                 cwd: report.cwd,
                 detail,
+                agent_run_id: report.agent_run_id,
             },
         ))
         .map_err(|err| HookError::Transport(err.to_string()))?;
@@ -472,6 +479,15 @@ fn cwd_from_payload(payload: &str) -> Option<PathBuf> {
         .as_str()
         .filter(|cwd| !cwd.is_empty())
         .map(PathBuf::from)
+}
+
+fn agent_run_id_from_payload(payload: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()?
+        .get("session_id")?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn detail_from_payload(payload: &str) -> Option<String> {
@@ -892,7 +908,9 @@ mod tests {
             messages.into_iter().next().unwrap()
         });
 
-        let mut stdin = Cursor::new(r#"{"message":"permission requested"}"#.as_bytes());
+        let mut stdin = Cursor::new(
+            r#"{"message":"permission requested","session_id":"claude-run-1"}"#.as_bytes(),
+        );
         real_main(
             [
                 "--agent".to_string(),
@@ -917,6 +935,7 @@ mod tests {
             state,
             cwd,
             detail,
+            agent_run_id,
             ..
         } = request
         else {
@@ -927,6 +946,7 @@ mod tests {
         assert_eq!(cwd, Some(PathBuf::from("/repo/worktree")));
         assert_eq!(detail.as_deref(), Some("permission requested"));
 
+        assert_eq!(agent_run_id.as_deref(), Some("claude-run-1"));
         #[cfg(unix)]
         let _ = std::fs::remove_file(socket);
     }
@@ -973,6 +993,7 @@ mod tests {
             agent,
             session_id,
             cwd,
+            agent_run_id,
         } = request
         else {
             panic!("expected announce-agent, got {request:?}");
@@ -983,6 +1004,7 @@ mod tests {
             Some(parse_session_id("44444444-4444-4444-8444-444444444444").unwrap())
         );
         assert_eq!(cwd, Some(PathBuf::from("/repo/worktree")));
+        assert_eq!(agent_run_id, None);
 
         #[cfg(unix)]
         let _ = std::fs::remove_file(socket);

@@ -81,8 +81,8 @@ Request:
   pull(worktree_id)
   create-pull-request(worktree_id, title, body?, base?, draft)
   install-agent-hooks(worktree_id)
-  report-agent-state(agent, state, session_id?, cwd?, detail?)
-  announce-agent(agent, session_id?, cwd?)
+  report-agent-state(agent, state, session_id?, cwd?, detail?, agent_run_id?)
+  announce-agent(agent, session_id?, cwd?, agent_run_id?)
   ping
   start-job(clone-project | create-worktree | list-draft-models | generate-commit-draft | generate-pull-request-draft | push | fetch | pull | pr-status | project-pr-statuses | create-pull-request)
   cancel-job(job_id)
