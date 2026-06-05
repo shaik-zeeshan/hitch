@@ -18,17 +18,9 @@
 
   let { collapsed = false }: { collapsed?: boolean } = $props();
 
-  // Footer counts. A worktree is "active" when it hosts at least one live
-  // session (agent or shell); the count emphasises how much of the tree is
-  // currently in play, not how many worktrees exist.
+  // Footer counts: plain totals only ("4 sessions · 3 worktrees"). An earlier
+  // "2 of 4 worktrees active" form read as a puzzle, not a count.
   const sessionCount = $derived($sessions.length);
-  const activeWorktreeCount = $derived(
-    new Set(
-      $sessions
-        .filter((s) => s.parent.kind === "worktree")
-        .map((s) => s.parent.id),
-    ).size,
-  );
   const worktreeCount = $derived($worktrees.length);
   const plural = (n: number, word: string) => `${word}${n === 1 ? "" : "s"}`;
 </script>
@@ -81,10 +73,8 @@
     <span class="k">{sessionCount}</span>
     {plural(sessionCount, "session")}
     <span class="sep">·</span>
-    <span class="k">{activeWorktreeCount}</span>
-    of
     <span class="k">{worktreeCount}</span>
-    {plural(worktreeCount, "worktree")} active
+    {plural(worktreeCount, "worktree")}
   </footer>
 </aside>
 
