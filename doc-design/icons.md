@@ -73,6 +73,51 @@ Stroke conventions to enforce everywhere: **1.5px stroke, round caps and joins,
 `currentColor`, 12-15px rendered size, no fills except the harness marks and
 status dots.**
 
+## File-type icons (VS Code Material Icons)
+
+The per-file marks in the right-rail **Changes** list are a separate set from the
+unplugin-icons/Lucide stroke icons above: the **VS Code "Material Icon Theme"**
+glyph set, via the **`vscode-material-icons`** npm package (matejchalk's MIT
+wrapper around the material-icon-theme assets — it ships ~900 SVG files plus a
+`getIconForFilePath(path)` resolver). Added 2026-06-06 alongside the
+syntax-highlighted diff.
+
+- **Deliberate full-colour exception.** Unlike every other icon in the shell,
+  these are **multi-tone, full-colour** glyphs and are *not* tinted to an ink
+  token. The Paper Terminal shell is otherwise strictly monochrome, but at the
+  `16px` size of a changes row a single-ink mark is too hard to recognise at a
+  glance, so we use the icons' native colours purely for instant recognition
+  (user call, 2026-06-06). They are rendered as `<img src>` (colored SVGs are not
+  tintable), **not** inline `{@html}` — so the old `currentColor`/`:global(svg)`
+  machinery is gone. This is the one place colour is allowed besides the harness
+  marks and status dots; it is a recognition affordance, not decoration.
+- **Size & slot:** a fixed `16px` box between the status letter and the path. The
+  row is `display:flex; align-items:center`, so the box stays vertically centred
+  and the fixed size keeps rows from jumping.
+- **Resolver:** `apps/desktop/src/lib/file-icons.ts` —
+  `fileIconUrl(path) → asset URL` (plus `fileIconName(path)` for the resolved icon
+  name, used by tests). It delegates *all* precedence to the library's
+  `getIconForFilePath`, which keys off the basename only and resolves:
+  1. exact file name (`package.json` → nodejs, `tsconfig.json`, `Dockerfile`, …)
+  2. lowercased file name
+  3. file *suffix* — everything after the first dot, so compound extensions win
+     (`.d.ts` → typescript-def, `.test.ts` → test-ts, `bun.lockb` → bun, …)
+  4. file extension (after the last dot)
+  5. `.html`/`.ts`/`.js` language fallbacks
+  6. a generic `"file"` glyph.
+  The library never throws — it always returns a valid icon *name* — and our
+  wrapper additionally guards with a generic-file fallback so `fileIconUrl` can
+  never throw and always returns a usable URL. `.svelte`, `.rs`, `.proto`, etc.
+  all have faithful native glyphs, so the hand-rolled override map is gone.
+- **Asset strategy (Vite/Tauri):** we do **not** inline the ~900 SVGs as strings
+  into the JS bundle. `file-icons.ts` pulls them via
+  `import.meta.glob('.../vscode-material-icons/generated/icons/*.svg', { query:
+  '?url', eager: true })`, which gives a name→URL map. `vite.config.ts` sets
+  `build.assetsInlineLimit` to **exclude** anything under `vscode-material-icons`
+  from data-URI inlining, so every glyph is emitted as a hashed `.svg` file under
+  `build/_app/immutable/assets/` and referenced by a short URL (keeping the page
+  JS chunk lean and resolving cleanly under Tauri's custom protocol).
+
 ## Inventory
 
 ### Harness marks (identity — keep custom)

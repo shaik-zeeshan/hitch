@@ -156,6 +156,43 @@ Edge-to-edge: no gutter, meets column dividers + window bottom. Cursor:
 `.cursor` `8px` x `1.05em` block, `background: oklch(82% 0.10 92)`, blink
 animation (disabled under reduced-motion).
 
+## Diff view (`DiffTab`)
+
+When a diff tab is active the center pane swaps the terminal for a
+**syntax-highlighted unified diff** (`apps/desktop/src/lib/components/DiffTab.svelte`).
+This supersedes the earlier flat, un-highlighted classified-row view (2026-06-06;
+ADR 0006 holds the prior decision as the historical record — left intact).
+
+- **Header bar** (kept by `DiffTab`, *not* @pierre's): `±` glyph + the file path
+  + a right-aligned `+N −N` count. `disableFileHeader: true` suppresses
+  @pierre/diffs' own header so this one is the only one shown. The `+N`/`−N`
+  counts and binary/empty detection come from `apps/desktop/src/lib/diff.ts`,
+  which now survives only for that (its line classifier is no longer rendered).
+- **Body** is rendered by **[@pierre/diffs](https://www.npmjs.com/package/@pierre/diffs)**
+  (vanilla core, not React; Shiki with the `shiki-js` engine — no WASM). DiffTab
+  parses the libgit2 unified-diff string with `processFile(str, { isGitDiff: true })`
+  and renders through the `FileDiff` class into a shadow-DOM `<diffs-container>`
+  custom element. Options:
+
+  | Option | Value | Effect |
+  | --- | --- | --- |
+  | `diffStyle` | `'unified'` | One-column unified diff (not split). |
+  | `lineDiffType` | `'word'` | Word-level intra-line emphasis. |
+  | `diffIndicators` | `'classic'` | `+`/`−` gutter indicators. |
+  | `hunkSeparators` | `'line-info'` | `@@`-style line-info hunk separators. |
+  | `disableFileHeader` | `true` | DiffTab keeps its own header bar (above). |
+
+- **Token colors:** Shiki themes `pierre-light` / `pierre-dark`, with `themeType`
+  following the app theme store.
+- **Chrome token bridge:** panel/gutter backgrounds, add/del row tints, and the
+  mono font are bridged across the shadow boundary via `--diffs-*-override` CSS
+  custom properties set **inline** on `<diffs-container>`. They inherit across the
+  shadow DOM and resolve against the app's `--term-bg` / `--term-bg2` /
+  `--term-line` / `--term-fg`, `--diff-add` / `--diff-del`, and `--mono`. This is
+  the same `terminalSurfaceOverride` pattern the terminal uses, so the diff
+  **follows the per-mode terminal theme** in both themes. See
+  [colors.md](colors.md#syntax-highlighted-diff--pierrediffs).
+
 ## Worktree entry (`.wrow`)
 
 ```css
@@ -390,6 +427,8 @@ Header: glyph `◆` + `PERMISSION REQUIRED` (oxide). Body shows the command and 
   font-size: .6rem; color: var(--paper-2); }
 .frow .chk.on { background: var(--iris); border-color: var(--iris-ink); color: var(--iris-on); }
 .frow .st { width: 13px; text-align: center; font-weight: 700; font-size: .75rem; flex: 0 0 13px; }
+.frow .ftype { width: 16px; height: 16px; flex: 0 0 16px; display: grid; place-items: center; }
+.frow .ftype img { width: 16px; height: 16px; display: block; }  /* full-colour Material Icon, not tinted */
 .frow .path { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .frow .path b { color: var(--ink-0); font-weight: 500; }
 .frow .fdiff { margin-left: auto; font-size: .625rem; font-variant-numeric: tabular-nums; }
@@ -400,6 +439,17 @@ Status letters (mono, weight 700, colored — never color alone): `M` modified
 state was removed); `A` added `--st-ok` (green); `D` deleted `--diff-del`
 (red); `U` untracked/unknown `--ink-3` (faint). (Letter→color map from the live
 `RightRail.svelte`.) Diffstat: `.a` add `.d` del; an added file shows `new`.
+
+**File-type icon (`.ftype`)** sits between the status letter and the path in both
+staged and unstaged rows. It is a **full-colour** VS Code Material Icons glyph
+(the `vscode-material-icons` package) rendered as `<img src>` at a `16px` slot —
+a deliberate colour exception in the otherwise monochrome shell, chosen for
+instant recognition at this small size (it is *not* tinted to an ink token). The
+fixed box plus the row's `align-items: center` keeps it vertically centred without
+growing the row. The resolver lives in `apps/desktop/src/lib/file-icons.ts`
+(`fileIconUrl(path)`); see
+[icons.md](icons.md#file-type-icons-vs-code-material-icons) for its precedence,
+fallback, and asset strategy.
 
 Group head (`.fgroup h3`): mono `0.625rem` uppercase `letter-spacing: .1em`
 weight 700 `--ink-2`; count `.ct` `--ink-3`; a `.hr` flex hairline; a right-aligned

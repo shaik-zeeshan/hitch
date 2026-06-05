@@ -116,8 +116,39 @@ Purple for the merged PR state (a PR state, not an agent state — hence not
 
 | Token | Light | Dark | Usage |
 | --- | --- | --- | --- |
-| `--diff-add` | `oklch(46.0% 0.095 150)` | `oklch(76.0% 0.120 152)` | `+N` additions. |
-| `--diff-del` | `oklch(50.0% 0.130 28)` | `oklch(74.0% 0.140 28)` | `−N` deletions. |
+| `--diff-add` | `oklch(46.0% 0.095 150)` | `oklch(76.0% 0.120 152)` | `+N` additions (diffstat numerals; diff body add tint). |
+| `--diff-del` | `oklch(50.0% 0.130 28)` | `oklch(74.0% 0.140 28)` | `−N` deletions (diffstat numerals; diff body del tint). |
+
+## Syntax-highlighted diff (@pierre/diffs)
+
+The diff tab renders a **syntax-highlighted unified diff** through `@pierre/diffs`
+(Shiki, `shiki-js` engine, no WASM) into a shadow-DOM `<diffs-container>`; see
+[components.md](components.md#diff-view-difftab) for the recipe.
+
+Two color layers:
+
+- **Token colors** come from the Shiki themes `pierre-light` / `pierre-dark`,
+  selected by `themeType` following the app theme store. These are @pierre's own
+  themes — not Hitch tokens — and are the one place inside the chrome where a
+  bundled third-party palette renders the *content* (the code itself), analogous
+  to the literal ANSI accents inside the terminal panel.
+- **Diff chrome** (panel/gutter backgrounds, add/del row tints, mono font) is
+  bridged in from Hitch tokens via `--diffs-*-override` CSS custom properties set
+  inline on `<diffs-container>`; they inherit across the shadow boundary and
+  resolve against `--term-bg`/`--term-bg2`/`--term-line`/`--term-fg`,
+  `--diff-add`/`--diff-del`, and `--mono`. This is the same
+  `terminalSurfaceOverride` bridge the terminal uses, so the diff **follows the
+  per-mode terminal theme** in both themes (the cool surface, the matching
+  add/del tints), exactly as rule 4 below requires of the terminal.
+
+> **Mockup divergence note (2026-06-06).** The locked mockup has no
+> syntax-highlighted diff body — the center pane only ever draws the terminal,
+> and earlier docs/ADR 0006 locked a *flat, un-highlighted classified* diff. That
+> stance is **superseded**: the shipped diff is the highlighted @pierre/diffs view
+> bridged to the terminal tokens above. The mockup remains the visual lock for the
+> chrome; treat the diff body the same way rule 4 treats the terminal — the chrome
+> follows the theme, and the divergence from the mockup is intentional and recorded
+> here. (ADR 0006 is left intact as the historical record of the prior decision.)
 
 ## Harness marks
 

@@ -24,6 +24,18 @@ export default defineConfig(async () => ({
     }),
   ],
 
+  build: {
+    // The changes-list file-type glyphs (vscode-material-icons) are pulled in
+    // via `import.meta.glob(..., { query: '?url', eager: true })`. By default
+    // Vite would inline every small SVG as a base64 data URI, dumping ~880 icons
+    // (~2 MB) straight into the page JS chunk. Keep them as separate emitted
+    // `.svg` assets instead — referenced by short hashed URLs and served from the
+    // build output — so the JS bundle stays lean. Everything else keeps Vite's
+    // default 4 KB inline threshold.
+    assetsInlineLimit: (filePath: string) =>
+      filePath.includes("vscode-material-icons") ? false : undefined,
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

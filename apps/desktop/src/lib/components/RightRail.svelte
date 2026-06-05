@@ -41,6 +41,7 @@
     viewDiff,
   } from "../daemon";
   import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
+  import { fileIconUrl } from "../file-icons";
   import { autoCommitPush } from "../settings";
   import { commitOpen, createPrOpen } from "../overlays";
   import { STATUS_GLYPH, statusGlyphClass } from "../types";
@@ -471,6 +472,7 @@
                 onkeydown={() => {}}
               >✓</span>
               <span class="st {statusGlyphClass(file.status)}">{STATUS_GLYPH[file.status]}</span>
+              <span class="ftype" aria-hidden="true"><img src={fileIconUrl(file.path)} alt="" /></span>
               <span class="path">{#if parts.dir}<span class="dir">{parts.dir}</span>{/if}<b>{parts.name}</b></span>
               <span class="fdiff">
                 {#if file.status === "added" || file.status === "untracked"}
@@ -520,6 +522,7 @@
                 onkeydown={() => {}}
               ></span>
               <span class="st {statusGlyphClass(file.status)}">{STATUS_GLYPH[file.status]}</span>
+              <span class="ftype" aria-hidden="true"><img src={fileIconUrl(file.path)} alt="" /></span>
               <span class="path">{#if parts.dir}<span class="dir">{parts.dir}</span>{/if}<b>{parts.name}</b></span>
               <span class="fdiff">
                 {#if file.status === "added" || file.status === "untracked"}
@@ -1008,6 +1011,23 @@
   }
   .frow .st.U {
     color: var(--ink-3);
+  }
+  /* Per-file-type glyph (VS Code Material Icons, full colour). Sits between the
+     status letter and the path. Deliberate colour exception in the otherwise
+     monochrome shell — chosen for instant recognition at this small size.
+     Rendered as <img> (colored SVGs aren't tintable). Fixed 16px box keeps rows
+     from jumping; the flex row's align-items:center keeps it vertically centred. */
+  .frow .ftype {
+    flex: 0 0 16px;
+    width: 16px;
+    height: 16px;
+    display: grid;
+    place-items: center;
+  }
+  .frow .ftype img {
+    width: 16px;
+    height: 16px;
+    display: block;
   }
   .frow .path {
     flex: 1;

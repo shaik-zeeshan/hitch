@@ -1,11 +1,14 @@
 // Unified-diff line classifier. The daemon's `git-diff` returns a unified diff
-// *string* (FileDiff.diff); this turns it into the classified rows the locked
-// mockup renders — hunk / add / del / ctx with a line-number gutter (.dl/.gut).
+// *string* (FileDiff.diff); this turns it into classified rows — hunk / add /
+// del / ctx with a line-number gutter.
 //
-// This is the deliberate diff renderer for the shell, not a stopgap: the locked
-// design (hitch-shell-mockup.html) shows a flat, un-highlighted classified
-// diff, so a Shiki-highlighted view would deviate from the lock. Kept pure and
-// framework-agnostic so it can be unit-reasoned without a DOM.
+// The diff view itself now renders through @pierre/diffs (Shiki syntax
+// highlighting; see DiffTab.svelte) — the earlier flat, un-highlighted view is
+// no longer the locked design. This classifier is retained for the cheap things
+// it does well without spinning up the highlighter: the +N/−N add/del counts in
+// the header and the binary / empty (mode/rename-only) detection that drives the
+// fallback states. Kept pure and framework-agnostic so it can be unit-reasoned
+// without a DOM.
 
 export type DiffLineKind = "hunk" | "add" | "del" | "ctx";
 

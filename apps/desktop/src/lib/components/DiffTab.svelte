@@ -1,13 +1,78 @@
 <script lang="ts">
-  // Diff view (mockup .diff): a unified diff rendered as classified rows with a
-  // line-number gutter. Reads the daemon-fetched diff text from the store and
-  // classifies it locally (see lib/diff.ts) to match the locked design, which
-  // shows a flat, un-highlighted diff. Peer of the session terminal in the
-  // center; the tab + close affordance live in SessionTabs.
+  // Diff view (mockup .diff): a unified diff rendered with Shiki syntax
+  // highlighting via @pierre/diffs. The daemon-fetched diff text (a full git
+  // unified-diff string) is parsed by @pierre/diffs' processFile and rendered
+  // into a shadow-DOM <diffs-container> by a FileDiff instance. The local
+  // classifier (lib/diff.ts) is still used for the add/del counts and the
+  // empty/binary fallback states. Theming follows the app's light/dark mode and
+  // bridges Pierre's --diffs-* chrome vars to the app's --term-* tokens. Peer of
+  // the session terminal in the center; the tab + close affordance live in
+  // SessionTabs.
+  // Importing FileDiff also registers the <diffs-container> custom element it
+  // renders into (its module pulls in @pierre/diffs' web-components side effect,
+  // which owns the shadow root + adopted Pierre stylesheet).
+  import { FileDiff, processFile, type FileDiffOptions } from "@pierre/diffs";
   import { diffPath, diffText } from "../daemon";
   import { parseDiff } from "../diff";
+  import { theme } from "../theme";
 
+  // Local classifier: only used here for the add/del counts shown in the header
+  // and to detect the binary / empty (mode/rename-only) cases that processFile
+  // also returns `undefined` for — keeping the existing fallback UI.
   const parsed = $derived($diffText === null ? null : parseDiff($diffText));
+
+  // Pierre's FileDiffMetadata (undefined for empty/binary).
+  const fileDiff = $derived(
+    $diffText === null ? undefined : processFile($diffText, { isGitDiff: true }),
+  );
+
+  const options: FileDiffOptions<undefined> = {
+    diffStyle: "unified",
+    disableFileHeader: true, // DiffTab renders its own header bar.
+    disableLineNumbers: false,
+    diffIndicators: "classic",
+    hunkSeparators: "line-info",
+    lineDiffType: "word",
+    overflow: "scroll",
+    stickyHeader: false,
+    preferredHighlighter: "shiki-js", // no WASM, faster startup.
+    theme: { light: "pierre-light", dark: "pierre-dark" },
+    themeType: $theme,
+  };
+
+  let container = $state<HTMLElement>();
+  let instance: FileDiff<undefined> | undefined;
+
+  // Create the instance once, (re)render whenever the parsed diff changes.
+  // Deliberately NO teardown on this effect: an $effect teardown runs before
+  // every re-run (not just on destroy), and FileDiff.cleanUp() removes the
+  // container element from the DOM (it assumes it created it, but ours is the
+  // Svelte-owned <diffs-container> below) — cleaning up between renders would
+  // leave every render after the first in a detached node, so only the first
+  // clicked diff would ever show. When there's no renderable diff (empty /
+  // binary / loading) the previous render is left in place, hidden by
+  // `class:hidden` so only the fallback markup shows.
+  $effect(() => {
+    const el = container;
+    if (!el || !fileDiff) return;
+    if (!instance) instance = new FileDiff<undefined>(options);
+    instance.render({ fileDiff, fileContainer: el, forceRender: true });
+  });
+
+  // Destroy-only teardown: this effect reads no reactive state, so it runs
+  // exactly once and its cleanup fires only on unmount (where cleanUp()
+  // detaching the container is fine — Svelte is removing it anyway).
+  $effect(() => {
+    return () => {
+      instance?.cleanUp();
+      instance = undefined;
+    };
+  });
+
+  // Follow the app's light/dark mode.
+  $effect(() => {
+    instance?.setThemeType($theme);
+  });
 </script>
 
 <div class="diff">
@@ -26,12 +91,18 @@
     <div class="diff-empty"><p>Loading diff…</p></div>
   {:else if parsed.isBinary}
     <div class="diff-empty"><p>Binary file — no text diff.</p></div>
-  {:else if parsed.isEmpty}
+  {:else if parsed.isEmpty || !fileDiff}
     <div class="diff-empty"><p>No textual changes.</p></div>
-  {:else}
-    <pre>{#each parsed.lines as line, i (i)}<span class="dl {line.kind}"><span class="gut"
-            >{line.gutter ?? ""}</span>{line.text}</span>{/each}</pre>
   {/if}
+
+  <!-- The FileDiff renders into this element via shadow DOM; it stays mounted so
+       a single instance can re-render across diff changes. Hidden when there's
+       nothing renderable so only the fallback message above shows. -->
+  <diffs-container
+    bind:this={container}
+    class="diffs"
+    class:hidden={!fileDiff}
+  ></diffs-container>
 </div>
 
 <style>
@@ -90,59 +161,34 @@
     font-weight: 600;
     margin-left: 4px;
   }
-  .diff pre {
-    font-family: var(--mono);
-    font-size: var(--r1);
-    line-height: 1.5;
-    padding: 0;
-    margin: 0;
-  }
-  .dl {
+
+  /* The @pierre/diffs container. The --diffs-* custom properties inherit across
+     the shadow boundary, so setting them here bridges Pierre's chrome to the
+     app's terminal tokens (which Center.svelte already overrides per-mode via
+     terminalSurfaceOverride). Token (syntax) colors come from the pierre-light/
+     pierre-dark Shiki themes; only the chrome is overridden. */
+  .diffs {
     display: block;
-    padding: 0 16px;
-    white-space: pre-wrap;
-    word-break: break-word;
+    /* Match the previous diff view's monospace styling. */
+    --diffs-font-family: var(--mono);
+    --diffs-font-size: var(--r1);
+    /* Base surface → the terminal panel fill. */
+    --diffs-light-bg: var(--term-bg2);
+    --diffs-dark-bg: var(--term-bg2);
+    --diffs-bg-context-override: var(--term-bg2);
+    /* Add/del row tints → derived from the app's diff accent tokens. */
+    --diffs-bg-addition-override: oklch(from var(--diff-add) l c h / 0.1);
+    --diffs-bg-deletion-override: oklch(from var(--diff-del) l c h / 0.1);
+    --diffs-bg-addition-emphasis-override: oklch(from var(--diff-add) l c h / 0.22);
+    --diffs-bg-deletion-emphasis-override: oklch(from var(--diff-del) l c h / 0.22);
+    --diffs-addition-color-override: var(--diff-add);
+    --diffs-deletion-color-override: var(--diff-del);
+    /* Line-number gutter + hover → dim terminal tokens. */
+    --diffs-fg-number-override: var(--term-dim);
+    --diffs-bg-hover-override: oklch(from var(--term-fg) l c h / 0.06);
   }
-  .dl .gut {
-    box-sizing: content-box;
-    display: inline-block;
-    width: 4ch;
-    color: var(--term-dim);
-    user-select: none;
-    text-align: right;
-    padding-right: 12px;
-    white-space: nowrap;
-  }
-  /* Hunk header + add/del rows: literal in-terminal accents, one set per theme
-     (same family as the terminal's per-theme ANSI greens/reds;
-     doc-design/colors.md). Base values are the light/paper set; the dark
-     overrides below swap in the deep-ink set. */
-  .dl.hunk {
-    color: oklch(48% 0.13 280);
-    background: oklch(48% 0.13 280 / 0.1);
-  }
-  .dl.add {
-    background: oklch(52% 0.13 150 / 0.08);
-    color: oklch(52% 0.13 150);
-  }
-  .dl.del {
-    background: oklch(52% 0.16 28 / 0.08);
-    color: oklch(52% 0.16 28);
-  }
-  :global(html[data-theme="dark"]) .dl.hunk {
-    color: oklch(80% 0.10 280);
-    background: oklch(80% 0.10 280 / 0.12);
-  }
-  :global(html[data-theme="dark"]) .dl.add {
-    background: oklch(82% 0.13 150 / 0.1);
-    color: oklch(82% 0.13 150);
-  }
-  :global(html[data-theme="dark"]) .dl.del {
-    background: oklch(78% 0.13 28 / 0.1);
-    color: oklch(78% 0.13 28);
-  }
-  .dl.ctx {
-    color: var(--term-dim);
+  .diffs.hidden {
+    display: none;
   }
 
   .diff-empty {

@@ -229,6 +229,20 @@ Background `linear-gradient(var(--term-bg2), var(--term-bg))`. Body
 The permission prompt is a terminal-internal boxed UI; see
 [components.md](components.md#permission-prompt-block).
 
+### Diff view (`DiffTab`)
+
+When a diff tab is active, the center pane shows a **syntax-highlighted unified
+diff** instead of a terminal (`apps/desktop/src/lib/components/DiffTab.svelte`).
+A `DiffTab` keeps its own header bar (`±` glyph + path + `+N −N` counts) and
+renders the diff body through [@pierre/diffs](components.md#diff-view-difftab)
+into a shadow-DOM `<diffs-container>` custom element: unified layout, word-level
+intra-line emphasis, line-info hunk separators, Shiki-highlighted tokens. The
+diff chrome (backgrounds, gutters, add/del tints, fonts) is bridged across the
+shadow boundary so the diff follows the **per-mode terminal theme** the same way
+the terminal surface does. Full recipe and the token bridge are in
+[components.md](components.md#diff-view-difftab); colors in
+[colors.md](colors.md#syntax-highlighted-diff--pierrediffs).
+
 ## Right rail — Changes
 
 `background: var(--paper-1)`, `border-left: 1px solid var(--line)`, vertical
@@ -309,11 +323,25 @@ unstaged group).
 - **Changes** — unstaged working-tree changes.
 
 Each `.frow` (mono `0.8125rem`): stage checkbox (`.chk`, 14px square; filled
-iris with `✓` when on) + status letter (`.st`, see vocabulary) + path (dir
-dimmed `--ink-2`, filename `--ink-0`) + right-aligned per-file diffstat
-(`+N −N`, or `new` for an added file). The active/selected row gets a
-`--paper-3` fill + inset hairline. In production, hovering a row reveals inline
-stage/unstage (`+`/`−`) and discard (`×`) affordances.
+iris with `✓` when on) + status letter (`.st`, see vocabulary) + **file-type
+icon** (`.ftype`, a full-colour VS Code Material Icons glyph, `16px` slot,
+rendered as `<img>` — see below) + path (dir dimmed `--ink-2`, filename
+`--ink-0`) + right-aligned per-file diffstat (`+N −N`, or `new` for an added
+file). The active/selected row gets a `--paper-3` fill + inset hairline. In
+production, hovering a row reveals inline stage/unstage (`+`/`−`) and discard
+(`×`) affordances.
+
+The **file-type icon** sits between the status letter and the path in both the
+staged and unstaged rows. It is a full-colour
+[VS Code Material Icons](icons.md#file-type-icons-vs-code-material-icons) glyph,
+rendered as `<img src>` at a `16px` slot — a deliberate colour exception in the
+otherwise monochrome shell, chosen for instant recognition at this small size
+(it is *not* tinted to an ink token). The row is `align-items: center`, so the
+fixed `16px` box stays vertically centred without growing the row. The resolver
+(`apps/desktop/src/lib/file-icons.ts`, `fileIconUrl(path)`) delegates precedence
+to the library: exact file name → compound suffix → extension → language →
+generic `"file"` glyph; it never throws (see
+[icons.md](icons.md#file-type-icons-vs-code-material-icons)).
 
 ### Footer (`.rail-r-foot`)
 
