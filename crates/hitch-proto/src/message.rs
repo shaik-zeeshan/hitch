@@ -30,8 +30,19 @@ use serde::{Deserialize, Serialize};
 /// explicit Job so remote refs can be refreshed without blocking the request loop.
 /// v17 adds `Event::WorktreeRemoved` so peers can drop daemon-owned removed
 /// worktrees without waiting for a full tree refresh. v18 adds Draft Generator
-/// CLI path overrides and passes draft settings into model-discovery Jobs.
-pub const PROTOCOL_VERSION: u16 = 18;
+/// CLI path overrides and passes draft settings into model-discovery Jobs. v19
+/// adds `Request::AnnounceAgent`, the hook helper's identity-only announce (ADR
+/// 0011 amendment 2026-06-05) — it carries *which* agent with no state field, so
+/// the Session mark can render before the first prompt without being confused
+/// with a `state: None` clear. v20 adds `Event::OutputActive`, the daemon's
+/// edge-triggered per-session output-activity transition (ADR 0011 amendment
+/// 2026-06-05) — the gate behind the `WORKING` display word
+/// (`running` AND output-active) — and `output_active` on the `SessionOpened`
+/// replay so a newly attached client starts with the correct gate value instead
+/// of assuming. v21 adds optional `agent_run_id` to agent hook reports/announces
+/// so the daemon can drop stale lifecycle hooks from a previous agent process
+/// after a newer `SessionStart`.
+pub const PROTOCOL_VERSION: u16 = 21;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -275,6 +286,28 @@ pub enum Request {
         session_id: Option<SessionId>,
         cwd: Option<PathBuf>,
         detail: Option<String>,
+        /// Agent-native session/run id from hook payloads (Claude Code's
+        /// `session_id`), distinct from Hitch's PTY [`SessionId`]. Missing for
+        /// older helpers and non-agent manual invocations.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_run_id: Option<String>,
+    },
+    /// Hook helper **identity announce** (ADR 0011 amendment 2026-06-05): an
+    /// agent's `SessionStart` declares *which* agent now runs in a session so the
+    /// Session mark can render before the first prompt. Identity is **not** a
+    /// non-null state: this shape carries no `state` field, so it can never be
+    /// confused with a [`ReportAgentState`] whose `state: None` *clears*
+    /// identity. A new identity/run id is still a process boundary; the daemon may
+    /// clear stale visible state while keeping `agent: Some(..)`. The late-arrival
+    /// guard does not block announces; exit-to-`None` clears identity with state.
+    AnnounceAgent {
+        agent: KnownAgent,
+        session_id: Option<SessionId>,
+        cwd: Option<PathBuf>,
+        /// Agent-native session/run id from hook payloads, used only to reject
+        /// stale lifecycle hooks that arrive after a newer run announced itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_run_id: Option<String>,
     },
 
     /// Liveness heartbeat (ADR 0009). The daemon replies with [`Response::Pong`].
@@ -474,6 +507,14 @@ pub enum Response {
         agent: Option<KnownAgent>,
         agent_state: Option<AgentState>,
         agent_detail: Option<String>,
+        /// Whether the session's PTY produced output within the last ~N seconds
+        /// (the daemon-computed output-activity gate, ADR 0011 amendment
+        /// 2026-06-05). Defaults to `false` for rolling upgrades. A newly attached
+        /// client combines `running ∧ output_active` for the `WORKING` display
+        /// word; carrying the current value here keeps it from assuming wrongly
+        /// before the next edge-triggered [`Event::OutputActive`] arrives.
+        #[serde(default)]
+        output_active: bool,
     },
     GitStatus {
         status: GitStatus,
@@ -538,6 +579,11 @@ pub enum Event {
         agent: Option<KnownAgent>,
         agent_state: Option<AgentState>,
         agent_detail: Option<String>,
+        /// Current output-activity gate value at attach time (ADR 0011 amendment
+        /// 2026-06-05); see [`Response::SessionOpened::output_active`]. Defaults
+        /// to `false` for rolling upgrades.
+        #[serde(default)]
+        output_active: bool,
     },
     SessionClosed {
         session_id: SessionId,
@@ -548,12 +594,35 @@ pub enum Event {
         session_id: SessionId,
         byte_count: u32,
     },
+    /// Daemon-owned Agent identity + state for a session. Identity and state
+    /// clear INDEPENDENTLY (ADR 0011 amendment 2026-06-05): `agent: None` is
+    /// the identity clear (exit-to-`None` reverts the Session mark to shell),
+    /// while an identity announce carries `agent: Some(..)` with the session's
+    /// current — typically still `None` pre-prompt — state. A null `state`
+    /// alone must never be read as an identity clear, or the announce would be
+    /// indistinguishable from the exit clear on the wire.
     AgentState {
         session_id: Option<SessionId>,
         worktree_id: Option<WorktreeId>,
-        agent: KnownAgent,
+        agent: Option<KnownAgent>,
         state: Option<AgentState>,
         detail: Option<String>,
+    },
+    /// Edge-triggered per-session output-activity transition (ADR 0011 amendment
+    /// 2026-06-05). The daemon sees every PTY output frame regardless of GUI
+    /// attachment; it broadcasts `active: true` on the rising edge (first frame
+    /// after a quiet period) and `active: false` on the falling edge (~N seconds
+    /// with no output). It is a *transition*, never a per-frame ping or a
+    /// timestamp — while a session stays active no further events fire. This
+    /// gates the `WORKING` display word (`running ∧ output-active`); it watches
+    /// *whether* bytes flow, never what they say, so it does not revisit the
+    /// no-text-inference rule (ADR 0011 / ADR 0002). `worktree_id` mirrors
+    /// [`Event::AgentState`] so a worktree-scoped client can route it without a
+    /// session lookup; it is `None` for project-root sessions.
+    OutputActive {
+        session_id: SessionId,
+        worktree_id: Option<WorktreeId>,
+        active: bool,
     },
     WorktreeDirty {
         worktree_id: WorktreeId,
@@ -841,6 +910,7 @@ mod tests {
             session_id: Some(session_id),
             cwd: Some("/repo".into()),
             detail: None,
+            agent_run_id: None,
         };
         let value: serde_json::Value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["type"], "report-agent-state");
@@ -848,18 +918,93 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
+        // The exit-to-`None` clear event carries `agent: null` too: identity
+        // clears on a null AGENT, never on the null state alone (the identity
+        // announce also broadcasts a null pre-prompt state).
         let event = Event::AgentState {
             session_id: Some(session_id),
             worktree_id: Some(worktree_id),
-            agent: KnownAgent::ClaudeCode,
+            agent: None,
             state: None,
             detail: None,
         };
         let value: serde_json::Value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["type"], "agent-state");
         assert!(value["state"].is_null());
+        assert!(value["agent"].is_null());
         let back: Event = serde_json::from_value(value).unwrap();
         assert_eq!(event, back);
+
+        // The identity announce broadcast: agent known, state still null. Same
+        // null state as the clear above — only the `agent` field tells them
+        // apart on the wire.
+        let announce_event = Event::AgentState {
+            session_id: Some(session_id),
+            worktree_id: Some(worktree_id),
+            agent: Some(KnownAgent::ClaudeCode),
+            state: None,
+            detail: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&announce_event).unwrap();
+        assert_eq!(value["agent"], "claude-code");
+        assert!(value["state"].is_null());
+        let back: Event = serde_json::from_value(value).unwrap();
+        assert_eq!(announce_event, back);
+    }
+
+    #[test]
+    fn announce_agent_round_trips_and_is_distinct_from_state_report() {
+        let (_, _, session_id) = ids();
+
+        // The identity announce round-trips like any other request and serializes
+        // with its own kebab-case tag.
+        let announce = Request::AnnounceAgent {
+            agent: KnownAgent::ClaudeCode,
+            session_id: Some(session_id),
+            cwd: Some("/repo".into()),
+            agent_run_id: Some("claude-run-1".into()),
+        };
+        let value: serde_json::Value = serde_json::to_value(&announce).unwrap();
+        assert_eq!(value["type"], "announce-agent");
+        assert_eq!(value["agent"], "claude-code");
+        assert_eq!(value["session_id"], session_id.to_string());
+        assert_eq!(value["cwd"], "/repo");
+        // Identity is NOT state: the wire shape has no `state` field at all, so it
+        // can never be confused with a `state: None` clear.
+        assert!(value.get("state").is_none());
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(announce, back);
+
+        // A `state: None` clear is a DIFFERENT report shape with a different tag.
+        let clear = Request::ReportAgentState {
+            agent: KnownAgent::ClaudeCode,
+            state: None,
+            session_id: Some(session_id),
+            cwd: Some("/repo".into()),
+            detail: None,
+            agent_run_id: Some("claude-run-1".into()),
+        };
+        let clear_value: serde_json::Value = serde_json::to_value(&clear).unwrap();
+        assert_eq!(clear_value["type"], "report-agent-state");
+        assert!(clear_value["state"].is_null());
+
+        // The two shapes are not interchangeable: deserializing an announce as a
+        // state report (and vice versa) fails on the tag, so a clear can never be
+        // misread as an announce.
+        assert_ne!(value_tag(&announce), value_tag(&clear));
+        let announce_json = serde_json::to_string(&announce).unwrap();
+        let clear_json = serde_json::to_string(&clear).unwrap();
+        let reparsed_announce: Request = serde_json::from_str(&announce_json).unwrap();
+        let reparsed_clear: Request = serde_json::from_str(&clear_json).unwrap();
+        assert!(matches!(reparsed_announce, Request::AnnounceAgent { .. }));
+        assert!(matches!(reparsed_clear, Request::ReportAgentState { .. }));
+    }
+
+    fn value_tag(request: &Request) -> String {
+        serde_json::to_value(request).unwrap()["type"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     #[test]
@@ -872,12 +1017,14 @@ mod tests {
             agent: Some(KnownAgent::ClaudeCode),
             agent_state: Some(AgentState::NeedsApproval),
             agent_detail: Some("permission prompt".into()),
+            output_active: true,
         };
         let value: serde_json::Value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["type"], "session-opened");
         assert_eq!(value["agent"], "claude-code");
         assert_eq!(value["agent_state"], "needs-approval");
         assert_eq!(value["agent_detail"], "permission prompt");
+        assert_eq!(value["output_active"], true);
         let back: Response = serde_json::from_value(value).unwrap();
         assert_eq!(response, back);
 
@@ -886,14 +1033,31 @@ mod tests {
             agent: None,
             agent_state: None,
             agent_detail: None,
+            output_active: false,
         };
         let value: serde_json::Value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["type"], "session-opened");
         assert!(value["agent"].is_null());
         assert!(value["agent_state"].is_null());
         assert!(value["agent_detail"].is_null());
+        assert_eq!(value["output_active"], false);
         let back: Event = serde_json::from_value(value).unwrap();
         assert_eq!(event, back);
+
+        // Rolling upgrade: an old daemon's session-opened without `output_active`
+        // deserializes with the field defaulted to false.
+        let legacy = serde_json::json!({
+            "type": "session-opened",
+            "session": serde_json::to_value(sample_session(worktree_id, session_id)).unwrap(),
+            "agent": null,
+            "agent_state": null,
+            "agent_detail": null,
+        });
+        let back: Event = serde_json::from_value(legacy).unwrap();
+        let Event::SessionOpened { output_active, .. } = back else {
+            panic!("expected session-opened event");
+        };
+        assert!(!output_active);
     }
 
     #[test]
@@ -964,7 +1128,42 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 18);
+        assert_eq!(PROTOCOL_VERSION, 21);
+    }
+
+    #[test]
+    fn output_active_event_serializes_as_edge_transition_contract() {
+        let (_, worktree_id, session_id) = ids();
+
+        // Rising edge for a worktree-scoped session: carries session + worktree
+        // ids and the boolean transition, never a timestamp.
+        let rising = Event::OutputActive {
+            session_id,
+            worktree_id: Some(worktree_id),
+            active: true,
+        };
+        let value: serde_json::Value = serde_json::to_value(&rising).unwrap();
+        assert_eq!(value["type"], "output-active");
+        assert_eq!(value["session_id"], session_id.to_string());
+        assert_eq!(value["worktree_id"], worktree_id.to_string());
+        assert_eq!(value["active"], true);
+        // No timestamp field: the event is a pure edge transition.
+        assert!(value.get("at").is_none());
+        assert!(value.get("timestamp").is_none());
+        let back: Event = serde_json::from_value(value).unwrap();
+        assert_eq!(rising, back);
+
+        // Falling edge for a project-root session: worktree_id is null.
+        let falling = Event::OutputActive {
+            session_id,
+            worktree_id: None,
+            active: false,
+        };
+        let value: serde_json::Value = serde_json::to_value(&falling).unwrap();
+        assert_eq!(value["active"], false);
+        assert!(value["worktree_id"].is_null());
+        let back: Event = serde_json::from_value(value).unwrap();
+        assert_eq!(falling, back);
     }
 
     #[test]
@@ -973,6 +1172,7 @@ mod tests {
         assert!(crate::MESSAGE_CATALOG.contains("Response:"));
         assert!(crate::MESSAGE_CATALOG.contains("Event:"));
         assert!(crate::MESSAGE_CATALOG.contains("session-output"));
+        assert!(crate::MESSAGE_CATALOG.contains("output-active"));
         assert!(crate::MESSAGE_CATALOG.contains("worktree-dirty"));
         // v8 heartbeat + Job families (ADR 0008/0009).
         assert!(crate::MESSAGE_CATALOG.contains("ping"));
@@ -1283,6 +1483,13 @@ mod tests {
                 session_id: Some(session_id),
                 cwd: Some("/repo".into()),
                 detail: Some("permission prompt".into()),
+                agent_run_id: Some("claude-run-1".into()),
+            },
+            Request::AnnounceAgent {
+                agent: KnownAgent::ClaudeCode,
+                session_id: Some(session_id),
+                cwd: Some("/repo".into()),
+                agent_run_id: Some("claude-run-1".into()),
             },
             Request::Ping,
             Request::StartJob {
@@ -1319,6 +1526,7 @@ mod tests {
                 agent: Some(KnownAgent::ClaudeCode),
                 agent_state: Some(AgentState::NeedsApproval),
                 agent_detail: Some("permission prompt".into()),
+                output_active: true,
             },
             Response::GitStatus {
                 status: sample_status(worktree_id),
@@ -1374,6 +1582,7 @@ mod tests {
                 agent: Some(KnownAgent::ClaudeCode),
                 agent_state: Some(AgentState::Running),
                 agent_detail: Some("working".into()),
+                output_active: true,
             },
             Event::SessionClosed {
                 session_id,
@@ -1386,9 +1595,19 @@ mod tests {
             Event::AgentState {
                 session_id: Some(session_id),
                 worktree_id: Some(worktree_id),
-                agent: KnownAgent::Codex,
+                agent: Some(KnownAgent::Codex),
                 state: Some(AgentState::Running),
                 detail: None,
+            },
+            Event::OutputActive {
+                session_id,
+                worktree_id: Some(worktree_id),
+                active: true,
+            },
+            Event::OutputActive {
+                session_id,
+                worktree_id: None,
+                active: false,
             },
             Event::WorktreeDirty {
                 worktree_id,

@@ -10,7 +10,7 @@
   import { get } from "svelte/store";
   import { DEFAULT_EDITOR, editorApp } from "../settings";
   import {
-    agentStateByProject,
+    agentActRollupByProject,
     agentStateByWorktree,
     dirtyWorktrees,
     openSession,
@@ -145,7 +145,7 @@
   {/if}
 
   {#each $projects as project (project.id)}
-    {@const status = $agentStateByProject[project.id]}
+    {@const rollup = $agentActRollupByProject[project.id]}
     {@const expanded = isExpanded(project)}
     <ContextMenu.Root>
       <ContextMenu.Trigger>
@@ -192,8 +192,13 @@
             <span class="lbl">{project.name}</span>
 
             <span class="right">
-              {#if !expanded && status}
-                <span class="pill rollup {AGENT_LABEL[status].cls}">{AGENT_LABEL[status].label}</span>
+              {#if !expanded && rollup}
+                {@const label = AGENT_LABEL[rollup.state]}
+                {#if label}
+                  <span class="pill rollup {label.cls}">
+                    {label.label}{#if rollup.count > 1}&nbsp;{rollup.count}{/if}
+                  </span>
+                {/if}
               {/if}
 
               {#if project.kind === "git-backed"}
@@ -289,7 +294,8 @@
                        agent live in the main pane — but its diff and PR still show. -->
                   <span class="right">
                     {#if !isActive && wtStatus}
-                      <span class="pill {AGENT_LABEL[wtStatus].cls}">{AGENT_LABEL[wtStatus].label}</span>
+                      {@const label = AGENT_LABEL[wtStatus]}
+                      {#if label}<span class="pill {label.cls}">{label.label}</span>{/if}
                     {/if}
                     {#if hasLoc && lineStat}
                       <span

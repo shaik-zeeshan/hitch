@@ -96,16 +96,34 @@ where
         }
     }
 
+    let cwd = match args.cwd {
+        Some(cwd) => Some(cwd),
+        None => cwd_from_payload(&payload).or_else(|| std::env::current_dir().ok()),
+    };
+    let agent_run_id = agent_run_id_from_payload(&payload);
+
+    // An identity announce (ADR 0011 amendment) is *not* a state report: it
+    // declares which agent now runs in this session so the Session mark renders
+    // before the first prompt. It carries no state at all, so it bypasses
+    // `--state` and `state_from_event` entirely. The flag is the installed path;
+    // a hand-configured `session-start` entry without `--announce` is mapped to
+    // the same behavior below.
+    if args.announce || event_announces(args.event.as_deref()) {
+        return send_announce(HookAnnounce {
+            socket_path: args.socket_path,
+            agent: args.agent,
+            session_id: args.session_id,
+            cwd,
+            agent_run_id,
+        });
+    }
+
     let state = match args.state {
         Some(state) => state,
         None => match state_from_event(args.agent, args.event.as_deref()) {
             Some(state) => state,
             None => return Ok(()),
         },
-    };
-    let cwd = match args.cwd {
-        Some(cwd) => Some(cwd),
-        None => cwd_from_payload(&payload).or_else(|| std::env::current_dir().ok()),
     };
     let detail = args.detail.or_else(|| detail_from_payload(&payload));
 
@@ -117,6 +135,7 @@ where
         session_id: args.session_id,
         cwd,
         detail,
+        agent_run_id,
     })
 }
 
@@ -130,6 +149,7 @@ struct HookArgs {
     cwd: Option<PathBuf>,
     detail: Option<String>,
     payload: Option<String>,
+    announce: bool,
 }
 
 impl HookArgs {
@@ -151,6 +171,7 @@ impl HookArgs {
         let mut cwd = None;
         let mut detail = None;
         let mut payload = None;
+        let mut announce = false;
 
         let mut iter = args.into_iter().map(Into::into).peekable();
         while let Some(arg) = iter.next() {
@@ -168,6 +189,9 @@ impl HookArgs {
                 }
                 "--cwd" => cwd = Some(PathBuf::from(required_value(&mut iter, "--cwd")?)),
                 "--detail" => detail = Some(required_value(&mut iter, "--detail")?),
+                // Boolean flag (no value): the installed `SessionStart` entry uses
+                // it to send an identity announce instead of a state report.
+                "--announce" => announce = true,
                 "--help" | "-h" => return Err(HookError::Usage(usage())),
                 other if !other.starts_with('-') && payload.is_none() => {
                     payload = Some(other.to_owned());
@@ -209,6 +233,7 @@ impl HookArgs {
             cwd,
             detail,
             payload,
+            announce,
         })
     }
 }
@@ -222,6 +247,48 @@ struct HookReport {
     session_id: Option<SessionId>,
     cwd: Option<PathBuf>,
     detail: Option<String>,
+    agent_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HookAnnounce {
+    socket_path: PathBuf,
+    agent: KnownAgent,
+    session_id: Option<SessionId>,
+    cwd: Option<PathBuf>,
+    agent_run_id: Option<String>,
+}
+
+/// Send an identity-only announce (`Request::AnnounceAgent`): which agent now
+/// runs in this session, with no state field at all. Mirrors [`send_report`]'s
+/// best-effort connect + ack contract — a missing or busy daemon is a quiet
+/// no-op, never an error that could break the agent's hook.
+fn send_announce(announce: HookAnnounce) -> Result<(), HookError> {
+    let Some(mut client) = connect_to_daemon(&announce.socket_path)? else {
+        debug_log("connect: no daemon (unavailable); announce not sent");
+        return Ok(());
+    };
+    debug_log(&format!(
+        "connect OK; announcing agent={:?} session_id={:?} cwd={:?}",
+        announce.agent, announce.session_id, announce.cwd
+    ));
+    client
+        .connection_mut()
+        .send_control(&ControlMessage::request(
+            1,
+            Request::AnnounceAgent {
+                agent: announce.agent,
+                session_id: announce.session_id,
+                cwd: announce.cwd,
+                agent_run_id: announce.agent_run_id,
+            },
+        ))
+        .map_err(|err| HookError::Transport(err.to_string()))?;
+
+    debug_log("sent announce; waiting for ack");
+    wait_for_ack(client.into_connection());
+    debug_log("done");
+    Ok(())
 }
 
 fn send_report(report: HookReport) -> Result<(), HookError> {
@@ -246,6 +313,7 @@ fn send_report(report: HookReport) -> Result<(), HookError> {
                 session_id: report.session_id,
                 cwd: report.cwd,
                 detail,
+                agent_run_id: report.agent_run_id,
             },
         ))
         .map_err(|err| HookError::Transport(err.to_string()))?;
@@ -350,8 +418,20 @@ fn daemon_unavailable(err: &io::Error) -> bool {
 /// occupied or not yet armed; after the retry deadline it is equivalent to
 /// daemon-unavailable for a best-effort hook report.
 fn daemon_transiently_unavailable(err: &io::Error) -> bool {
-    matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
-        || hitch_proto::transport::is_endpoint_busy(err)
+    matches!(
+        err.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ) || hitch_proto::transport::is_endpoint_busy(err)
+}
+
+/// True when a (hand-configured) event should send an identity announce rather
+/// than a state report. The installed `SessionStart` entry carries the explicit
+/// `--announce` flag; this fallback covers a hand-typed entry that names the
+/// event but omits the flag. Crucially, `session-start` must NEVER resolve to a
+/// state — a fresh, never-prompted agent has no Agent State (ADR 0011) — so this
+/// is handled here in `run`, ahead of `state_from_event`, not as a state mapping.
+fn event_announces(event: Option<&str>) -> bool {
+    event.is_some_and(|event| event_matches(event, b"sessionstart"))
 }
 
 fn state_from_event(agent: KnownAgent, event: Option<&str>) -> Option<Option<AgentState>> {
@@ -360,6 +440,11 @@ fn state_from_event(agent: KnownAgent, event: Option<&str>) -> Option<Option<Age
         Some(Some(AgentState::Running))
     } else if event_matches(event, b"permissionrequest") {
         Some(Some(AgentState::NeedsApproval))
+    } else if event_matches(event, b"permissiondenied") {
+        // After a deny the agent consumes the denial and finishes its turn —
+        // symmetric with PostToolUse. Fallback path; the installed entry carries
+        // an explicit `--state running` anyway (ADR 0011 amendment).
+        Some(Some(AgentState::Running))
     } else if agent == KnownAgent::ClaudeCode && event_matches(event, b"notification") {
         Some(Some(AgentState::NeedsApproval))
     } else if event_matches(event, b"stop") {
@@ -394,6 +479,15 @@ fn cwd_from_payload(payload: &str) -> Option<PathBuf> {
         .as_str()
         .filter(|cwd| !cwd.is_empty())
         .map(PathBuf::from)
+}
+
+fn agent_run_id_from_payload(payload: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()?
+        .get("session_id")?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn detail_from_payload(payload: &str) -> Option<String> {
@@ -470,7 +564,7 @@ where
 }
 
 fn usage() -> String {
-    "usage: hitch-hook --agent <claude-code|codex> [--event NAME] [--state running|needs-approval|waiting|error|none] [--socket PATH] [--cwd PATH] [--detail TEXT]".into()
+    "usage: hitch-hook --agent <claude-code|codex> [--event NAME] [--state running|needs-approval|waiting|error|none] [--announce] [--socket PATH] [--cwd PATH] [--detail TEXT]".into()
 }
 
 #[derive(Debug)]
@@ -673,6 +767,25 @@ mod tests {
             state_from_event(KnownAgent::Codex, Some("notification")),
             None
         );
+        // PermissionDenied → running (fallback; installed entry carries --state).
+        assert_eq!(
+            state_from_event(KnownAgent::ClaudeCode, Some("permission-denied")),
+            Some(Some(AgentState::Running))
+        );
+        assert_eq!(
+            state_from_event(KnownAgent::Codex, Some("permission-denied")),
+            Some(Some(AgentState::Running))
+        );
+        // SessionStart must NEVER resolve to a state: a fresh agent has no Agent
+        // State. It announces identity instead (see `event_announces`).
+        assert_eq!(
+            state_from_event(KnownAgent::ClaudeCode, Some("session-start")),
+            None
+        );
+        assert!(event_announces(Some("session-start")));
+        assert!(event_announces(Some("SessionStart")));
+        assert!(!event_announces(Some("stop")));
+        assert!(!event_announces(None));
     }
 
     #[test]
@@ -795,7 +908,9 @@ mod tests {
             messages.into_iter().next().unwrap()
         });
 
-        let mut stdin = Cursor::new(r#"{"message":"permission requested"}"#.as_bytes());
+        let mut stdin = Cursor::new(
+            r#"{"message":"permission requested","session_id":"claude-run-1"}"#.as_bytes(),
+        );
         real_main(
             [
                 "--agent".to_string(),
@@ -820,6 +935,7 @@ mod tests {
             state,
             cwd,
             detail,
+            agent_run_id,
             ..
         } = request
         else {
@@ -830,8 +946,126 @@ mod tests {
         assert_eq!(cwd, Some(PathBuf::from("/repo/worktree")));
         assert_eq!(detail.as_deref(), Some("permission requested"));
 
+        assert_eq!(agent_run_id.as_deref(), Some("claude-run-1"));
         #[cfg(unix)]
         let _ = std::fs::remove_file(socket);
+    }
+
+    #[test]
+    fn announce_flag_sends_identity_announce_to_socket() {
+        // `--announce` (the installed SessionStart path) sends an AnnounceAgent —
+        // identity only, no state — even though no --state and the event would not
+        // map to one. The wire shape carries agent + session id + cwd, never state.
+        let _env = session_env("44444444-4444-4444-8444-444444444444");
+        let socket = test_socket_path();
+        let listener = DaemonListener::bind(&socket).unwrap();
+        let socket_for_client = socket.clone();
+
+        let server = thread::spawn(move || {
+            let mut stream = listener.accept().unwrap();
+            let messages = stream.read_control_messages().unwrap();
+            assert_eq!(messages.len(), 1);
+            messages.into_iter().next().unwrap()
+        });
+
+        let mut stdin = Cursor::new(b"{}" as &[u8]);
+        real_main(
+            [
+                "--agent".to_string(),
+                "claude-code".to_string(),
+                "--event".to_string(),
+                "session-start".to_string(),
+                "--announce".to_string(),
+                "--socket".to_string(),
+                socket_for_client.display().to_string(),
+                "--cwd".to_string(),
+                "/repo/worktree".to_string(),
+            ],
+            &mut stdin,
+        )
+        .unwrap();
+
+        let message = server.join().unwrap();
+        let ControlMessage::Request { request, .. } = message else {
+            panic!("expected request");
+        };
+        let Request::AnnounceAgent {
+            agent,
+            session_id,
+            cwd,
+            agent_run_id,
+        } = request
+        else {
+            panic!("expected announce-agent, got {request:?}");
+        };
+        assert_eq!(agent, KnownAgent::ClaudeCode);
+        assert_eq!(
+            session_id,
+            Some(parse_session_id("44444444-4444-4444-8444-444444444444").unwrap())
+        );
+        assert_eq!(cwd, Some(PathBuf::from("/repo/worktree")));
+        assert_eq!(agent_run_id, None);
+
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[test]
+    fn announce_flag_bypasses_explicit_state() {
+        // `--announce` must override any --state: it is identity, not a report.
+        let _env = session_env("55555555-5555-4555-8555-555555555555");
+        let socket = test_socket_path();
+        let listener = DaemonListener::bind(&socket).unwrap();
+        let socket_for_client = socket.clone();
+
+        let server = thread::spawn(move || {
+            let mut stream = listener.accept().unwrap();
+            let messages = stream.read_control_messages().unwrap();
+            messages.into_iter().next().unwrap()
+        });
+
+        let mut stdin = Cursor::new(b"{}" as &[u8]);
+        real_main(
+            [
+                "--agent".to_string(),
+                "codex".to_string(),
+                "--announce".to_string(),
+                "--state".to_string(),
+                "running".to_string(),
+                "--socket".to_string(),
+                socket_for_client.display().to_string(),
+                "--cwd".to_string(),
+                "/repo/worktree".to_string(),
+            ],
+            &mut stdin,
+        )
+        .unwrap();
+
+        let message = server.join().unwrap();
+        let ControlMessage::Request { request, .. } = message else {
+            panic!("expected request");
+        };
+        assert!(
+            matches!(request, Request::AnnounceAgent { .. }),
+            "expected announce-agent (state must be bypassed), got {request:?}"
+        );
+
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[test]
+    fn announce_flag_parses() {
+        let args = HookArgs::parse([
+            "--agent",
+            "claude-code",
+            "--event",
+            "session-start",
+            "--announce",
+        ])
+        .unwrap();
+        assert!(args.announce);
+        assert_eq!(args.state, None);
     }
 
     #[test]

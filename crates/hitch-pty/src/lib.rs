@@ -417,11 +417,7 @@ fn set_command_cwd(builder: &mut CommandBuilder, cwd: &Path) {
 }
 
 #[cfg(windows)]
-fn configure_powershell_display_cwd(
-    builder: &mut CommandBuilder,
-    cwd: &Path,
-    is_powershell: bool,
-) {
+fn configure_powershell_display_cwd(builder: &mut CommandBuilder, cwd: &Path, is_powershell: bool) {
     if !is_powershell {
         return;
     }
@@ -436,11 +432,9 @@ fn configure_powershell_display_cwd(
     );
     let argv = builder.get_argv_mut();
     if let Some(command) = argv.windows(2).position(|args| {
-        args[0]
-            .to_str()
-            .is_some_and(|arg| {
-                arg.eq_ignore_ascii_case("-Command") || arg.eq_ignore_ascii_case("-c")
-            })
+        args[0].to_str().is_some_and(|arg| {
+            arg.eq_ignore_ascii_case("-Command") || arg.eq_ignore_ascii_case("-c")
+        })
     }) {
         let command = command + 1;
         let existing = argv[command].to_string_lossy().into_owned();
@@ -1063,10 +1057,9 @@ mod tests {
         let builder = build_command(&SessionId::new(), &command, cwd);
 
         assert!(
-            !builder
-                .get_argv()
-                .iter()
-                .any(|arg| arg.to_str().is_some_and(|a| a.eq_ignore_ascii_case("-Command"))),
+            !builder.get_argv().iter().any(|arg| arg
+                .to_str()
+                .is_some_and(|a| a.eq_ignore_ascii_case("-Command"))),
             "must not append -Command alongside -ec",
         );
     }

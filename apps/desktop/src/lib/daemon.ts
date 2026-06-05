@@ -13,9 +13,11 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { derived, get, writable } from "svelte/store";
 import { ByteRing } from "./byteRing";
 import {
+  aggregateActRollup,
   aggregateAgentState,
   parentKey,
   sessionBelongsTo,
+  type ActRollup,
   type AgentState,
   type BranchSummary,
   type ChangedFile,
@@ -28,6 +30,7 @@ import {
   type Id,
   type JobStatus,
   type JobRequest,
+  type KnownAgent,
   type PrFields,
   type PrInfo,
   isOpenPr,
@@ -85,20 +88,44 @@ export const projects = writable<Project[]>([]);
 export const worktrees = writable<Worktree[]>([]);
 export const sessions = writable<Session[]>([]);
 
+// Per-session hook-reported Agent State, the daemon-owned stored truth (ADR
+// 0011). `waiting` lives here but renders unlabeled; `running` is gated to the
+// WORKING display word by output activity (see `displaySessionStates`).
 export const agentStates = writable<Record<Id, AgentState>>({});
-export const dismissedSessionAgentStates = writable<Record<Id, AgentState>>({});
-export const visibleAgentStates = derived(
-  [agentStates, dismissedSessionAgentStates],
-  ([$agentStates, $dismissed]) => {
+
+// Per-session announced Agent identity (ADR 0011 amendment 2026-06-05): the
+// agent's own `SessionStart` hook announces *which* agent the moment its TUI
+// starts, replayed on attach via `SessionOpened`. This is the ONLY source for
+// the Session mark's facepile/glyph — identity is never inferred from the
+// session title or launch command. Cleared when the agent exits to `None`.
+export const sessionAgents = writable<Record<Id, KnownAgent>>({});
+
+// Per-session PTY output-activity gate (ADR 0011 amendment 2026-06-05): the
+// daemon broadcasts edge-triggered `output-active` transitions (rising/falling)
+// and seeds the current value in `SessionOpened`. `WORKING = running ∧
+// output_active`; an interrupted/hung agent stops producing output, the gate
+// falls, and the WORKING word drops to idle without the hook state changing.
+export const sessionOutputActive = writable<Record<Id, boolean>>({});
+
+// Per-session DISPLAY state the shell consumes (tabs, rollups). It applies two
+// derivations to the stored hook state, both from the 2026-06-05 grill:
+//  - `running` is gated by output activity: a session reporting `running` whose
+//    output gate is closed renders as idle (the WORKING word is suppressed).
+//  - `waiting` renders unlabeled, so it is omitted entirely.
+// Act states (`needs-approval`, `error`) always pass through unchanged.
+export const displaySessionStates = derived(
+  [agentStates, sessionOutputActive],
+  ([$agentStates, $outputActive]) => {
     const map: Record<Id, AgentState> = {};
     for (const [sessionId, state] of Object.entries($agentStates)) {
-      if ($dismissed[sessionId] === state) continue;
+      if (state === "waiting") continue;
+      if (state === "running" && !$outputActive[sessionId]) continue;
       map[sessionId] = state;
     }
     return map;
   },
 );
-export const dismissedWorktreeAgentStates = writable<Record<Id, AgentState>>({});
+
 // Live foreground command per session (the process the user is interacting
 // with in the PTY), pushed by the daemon. Absent until the first report.
 export const sessionCommands = writable<Record<Id, string | null>>({});
@@ -164,11 +191,6 @@ function writePrByWorktree(worktreeId: Id, pr: PrInfo | null, seq: number): bool
   prByWorktree.update((map) => ({ ...map, [worktreeId]: pr }));
   return true;
 }
-// True while no newer per-worktree write has landed — lets the failure path clear
-// the selected `prInfo` without clobbering a fresher success or touching the chip.
-function isFreshestPr(worktreeId: Id, seq: number): boolean {
-  return seq >= freshestPrSeq(worktreeId);
-}
 
 const diffCache = new Map<string, string>();
 let diffRequestSeq = 0;
@@ -186,67 +208,6 @@ const STATUS_POLL_MS = 1_000;
 // minutes of latency is fine. We also skip it while the window is hidden (the
 // focus refresh catches up on return), so a backgrounded app spawns no `gh`.
 const PR_POLL_MS = 180_000;
-const DISMISSIBLE_TAB_VISIBLE_MS = 2_500;
-const dismissibleTabTimers = new Map<Id, ReturnType<typeof setTimeout>>();
-
-function isDismissibleSessionState(state: AgentState | undefined): state is "waiting" | "error" {
-  return state === "waiting" || state === "error";
-}
-
-function clearDismissibleTabTimer(sessionId: Id): void {
-  const timer = dismissibleTabTimers.get(sessionId);
-  if (!timer) return;
-  clearTimeout(timer);
-  dismissibleTabTimers.delete(sessionId);
-}
-
-function scheduleVisibleSessionStateDismissal(sessionId: Id, state: "waiting" | "error"): void {
-  clearDismissibleTabTimer(sessionId);
-  dismissibleTabTimers.set(
-    sessionId,
-    setTimeout(() => {
-      dismissibleTabTimers.delete(sessionId);
-      if (get(activeSessionId) !== sessionId) return;
-      if (get(diffActive)) return;
-      if (get(agentStates)[sessionId] !== state) return;
-      dismissSessionState(sessionId, state);
-    }, DISMISSIBLE_TAB_VISIBLE_MS),
-  );
-}
-
-function acknowledgeVisibleSessionState(sessionId: Id): void {
-  const state = get(agentStates)[sessionId];
-  if (!isDismissibleSessionState(state)) {
-    clearDismissibleTabTimer(sessionId);
-    return;
-  }
-  scheduleVisibleSessionStateDismissal(sessionId, state);
-}
-
-
-function dismissSessionState(sessionId: Id, state: AgentState): void {
-  dismissedSessionAgentStates.update((current) =>
-    current[sessionId] === state ? current : { ...current, [sessionId]: state },
-  );
-}
-
-function resetDismissedSessionState(sessionId: Id): void {
-  dismissedSessionAgentStates.update((current) => {
-    if (!current[sessionId]) return current;
-    const next = { ...current };
-    delete next[sessionId];
-    return next;
-  });
-}
-
-function resetDismissedWorktreeState(worktreeId: Id): void {
-  dismissedWorktreeAgentStates.update((current) => {
-    if (!current[worktreeId]) return current;
-    const next = { ...current };
-    delete next[worktreeId];
-    return next;
-  });
-}
 
 // ---- derived stores -------------------------------------------------------
 
@@ -294,68 +255,60 @@ export const activeSession = derived(
   ([$sessions, $id]) => $sessions.find((s) => s.id === $id) ?? null,
 );
 
-// Per-worktree rollups are derived only from daemon-owned per-session state.
-// Waiting/error states can be dismissed locally after the user sees them;
-// needs-approval stays visible until the daemon reports a different state or clears it.
-const rawAgentStateByWorktree = derived(
-  [worktrees, sessions, agentStates],
-  ([$worktrees, $sessions, $agentStates]) => {
+// Per-worktree rollup of the DISPLAY state (act states always; `running` only
+// while its output gate is open; `waiting` is unlabeled and never rolls up).
+// The single running word on the worktree you are actively looking at is
+// suppressed — you can see that agent live in the main pane.
+export const agentStateByWorktree = derived(
+  [worktrees, sessions, displaySessionStates, selectedWorktreeId, activeSessionId, diffActive],
+  ([$worktrees, $sessions, $display, $selectedWorktreeId, $activeSessionId, $diffActive]) => {
+    const activeSession = $sessions.find((session) => session.id === $activeSessionId);
+    const activeRunningWorktree =
+      !$diffActive &&
+      activeSession?.parent.kind === "worktree" &&
+      $display[activeSession.id] === "running"
+        ? activeSession.parent.id
+        : null;
     const map: Record<Id, AgentState> = {};
     for (const worktree of $worktrees) {
       const agg = aggregateAgentState(
         $sessions
           .filter((s) => s.parent.kind === "worktree" && s.parent.id === worktree.id)
-          .map((s) => $agentStates[s.id]),
+          .map((s) => $display[s.id]),
       );
-      if (agg) map[worktree.id] = agg;
+      if (!agg) continue;
+      if (agg === "running" && worktree.id === $selectedWorktreeId && worktree.id === activeRunningWorktree) {
+        continue;
+      }
+      map[worktree.id] = agg;
     }
     return map;
   },
 );
 
-export const agentStateByWorktree = derived(
-  [rawAgentStateByWorktree, selectedWorktreeId, dismissedWorktreeAgentStates, sessions, agentStates, activeSessionId, diffActive],
-  ([$raw, $selectedWorktreeId, $dismissed, $sessions, $agentStates, $activeSessionId, $diffActive]) => {
-    const activeSession = $sessions.find((session) => session.id === $activeSessionId);
-    const activeRunningWorktree =
-      !$diffActive &&
-      activeSession?.parent.kind === "worktree" &&
-      $agentStates[activeSession.id] === "running"
-        ? activeSession.parent.id
-        : null;
-    const map: Record<Id, AgentState> = {};
-    for (const [worktreeId, state] of Object.entries($raw)) {
-      if (worktreeId === $selectedWorktreeId && state === "running" && worktreeId === activeRunningWorktree) continue;
-      if (state !== "needs-approval" && $dismissed[worktreeId] === state) continue;
-      map[worktreeId] = state;
-    }
-    return map;
-  },
-);
-
-export const agentStateByProject = derived(
-  [projects, worktrees, agentStateByWorktree, sessions, agentStates],
-  ([$projects, $worktrees, $agentStateByWorktree, $sessions, $agentStates]) => {
-    const map: Record<Id, AgentState> = {};
+// Per-project act-state rollup: the highest-priority act state across the
+// project's sessions plus the count of sessions in an act state (ADR 0011
+// amendment / CONTEXT.md). One pill, mixed act states collapse to the highest
+// priority. `null` = nothing in the project needs action. The rollup counts the
+// raw hook act states directly (act states are never output-gated), so a
+// collapsed project never hides a session demanding attention.
+export const agentActRollupByProject = derived(
+  [projects, worktrees, sessions, agentStates],
+  ([$projects, $worktrees, $sessions, $agentStates]) => {
+    const map: Record<Id, ActRollup> = {};
     for (const project of $projects) {
       const projectWorktreeIds = new Set(
         $worktrees.filter((w) => w.project_id === project.id).map((w) => w.id),
       );
-      const states = Array.from(
-        projectWorktreeIds,
-        (id) => $agentStateByWorktree[id],
-      );
-      // A plain project can also host sessions parented to the project itself
-      // (not a worktree); surface their state on the project row too. Unlike a
-      // worktree badge, a project badge is not suppressed while selected, so
-      // these always count toward the aggregate.
-      for (const session of $sessions) {
-        if (session.parent.kind === "project" && session.parent.id === project.id) {
-          states.push($agentStates[session.id]);
-        }
-      }
-      const agg = aggregateAgentState(states);
-      if (agg) map[project.id] = agg;
+      const states = $sessions
+        .filter(
+          (s) =>
+            (s.parent.kind === "worktree" && projectWorktreeIds.has(s.parent.id)) ||
+            (s.parent.kind === "project" && s.parent.id === project.id),
+        )
+        .map((s) => $agentStates[s.id]);
+      const rollup = aggregateActRollup(states);
+      if (rollup) map[project.id] = rollup;
     }
     return map;
   },
@@ -588,7 +541,6 @@ function removeWorktreeLocal(worktreeId: Id): void {
     .filter((session) => session.parent.kind === "worktree" && session.parent.id === worktreeId)
     .map((session) => session.id);
   for (const sessionId of removedSessionIds) {
-    clearDismissibleTabTimer(sessionId);
     closeSessionOutput(sessionId);
   }
 
@@ -598,7 +550,6 @@ function removeWorktreeLocal(worktreeId: Id): void {
   worktrees.update((items) => items.filter((worktree) => worktree.id !== worktreeId));
   dirtyWorktrees.update((current) => omitKey(current, worktreeId));
   worktreeLineStats.update((current) => omitKey(current, worktreeId));
-  dismissedWorktreeAgentStates.update((current) => omitKey(current, worktreeId));
   prByWorktree.update((current) => omitKey(current, worktreeId));
   prByWorktreeApplied.delete(worktreeId);
   prByWorktreeStarted.delete(worktreeId);
@@ -836,6 +787,39 @@ function reconcileSessionOutputs(liveSessions: Session[]): void {
 }
 
 
+// Set or clear a session's stored Agent State. `null` is the daemon's clear.
+function applyAgentState(sessionId: Id, state: AgentState | null): void {
+  if (state) {
+    agentStates.update((current) =>
+      current[sessionId] === state ? current : { ...current, [sessionId]: state },
+    );
+  } else {
+    agentStates.update((current) => {
+      if (!(sessionId in current)) return current;
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
+  }
+}
+
+// Set or clear a session's announced Agent identity (the Session mark source).
+// `null` clears it back to the shell mark (agent exited to `None`).
+function applySessionAgent(sessionId: Id, agent: KnownAgent | null): void {
+  if (agent) {
+    sessionAgents.update((current) =>
+      current[sessionId] === agent ? current : { ...current, [sessionId]: agent },
+    );
+  } else {
+    sessionAgents.update((current) => {
+      if (!(sessionId in current)) return current;
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
+  }
+}
+
 export function applyHitchEvent(event: HitchEvent): void {
   if (event.type === "project-updated") {
     projects.update((items) => upsert(items, event.project as Project));
@@ -857,30 +841,26 @@ export function applyHitchEvent(event: HitchEvent): void {
     void loadGitStatus(worktreeId).catch(() => {});
   }
   if (event.type === "agent-state") {
+    // The daemon broadcasts AgentState both for real state reports and for
+    // identity announces (where `state` is null pre-prompt but `agent` is now
+    // known). Identity and state are cleared INDEPENDENTLY: `agent: null` is
+    // the identity clear (exit-to-`None` reverts the mark to shell), a null
+    // state only clears state — it must NOT drop an announced identity, or the
+    // Session mark would not render until the first prompt (ADR 0011 amendment).
     const sessionId = (event.session_id as Id | null) ?? null;
-    const worktreeId = (event.worktree_id as Id | null) ?? null;
     const state = (event.state as AgentState | null) ?? null;
-    if (worktreeId) resetDismissedWorktreeState(worktreeId);
+    const agent = (event.agent as KnownAgent | null | undefined) ?? null;
     if (sessionId) {
-      if (state) {
-        resetDismissedSessionState(sessionId);
-        agentStates.update((current) => ({ ...current, [sessionId]: state }));
-        if (get(activeSessionId) === sessionId && !get(diffActive)) {
-          acknowledgeVisibleSessionState(sessionId);
-        } else {
-          clearDismissibleTabTimer(sessionId);
-        }
-      } else {
-        agentStates.update((current) => {
-          if (!(sessionId in current)) return current;
-          const next = { ...current };
-          delete next[sessionId];
-          return next;
-        });
-        resetDismissedSessionState(sessionId);
-        clearDismissibleTabTimer(sessionId);
-      }
+      applyAgentState(sessionId, state);
+      applySessionAgent(sessionId, agent);
     }
+  }
+  if (event.type === "output-active") {
+    const sessionId = event.session_id as Id;
+    const active = Boolean(event.active);
+    sessionOutputActive.update((current) =>
+      current[sessionId] === active ? current : { ...current, [sessionId]: active },
+    );
   }
   if (event.type === "session-command") {
     const sessionId = event.session_id as Id;
@@ -901,25 +881,16 @@ export function applyHitchEvent(event: HitchEvent): void {
   if (event.type === "session-opened") {
     const session = event.session as Session;
     sessions.update((items) => upsert(items, session));
+    // Replay the daemon-owned state, announced identity, and output gate on
+    // attach so a late-joining window is immediately correct (ADR 0011).
     const state = (event.agent_state as AgentState | null | undefined) ?? null;
-    if (state) {
-      resetDismissedSessionState(session.id);
-      agentStates.update((current) => ({ ...current, [session.id]: state }));
-      if (get(activeSessionId) === session.id && !get(diffActive)) {
-        acknowledgeVisibleSessionState(session.id);
-      } else {
-        clearDismissibleTabTimer(session.id);
-      }
-    } else {
-      agentStates.update((current) => {
-        if (!(session.id in current)) return current;
-        const next = { ...current };
-        delete next[session.id];
-        return next;
-      });
-      resetDismissedSessionState(session.id);
-      clearDismissibleTabTimer(session.id);
-    }
+    const agent = (event.agent as KnownAgent | null | undefined) ?? null;
+    const outputActive = Boolean(event.output_active);
+    applyAgentState(session.id, state);
+    applySessionAgent(session.id, agent);
+    sessionOutputActive.update((current) =>
+      current[session.id] === outputActive ? current : { ...current, [session.id]: outputActive },
+    );
     activeSessionId.update((current) => current ?? session.id);
     // Reset the ring + (re)register the output channel. On a reconnect the
     // daemon replays the full scrollback right after this event, so the
@@ -937,12 +908,18 @@ export function applyHitchEvent(event: HitchEvent): void {
       delete next[sessionId];
       return next;
     });
-    dismissedSessionAgentStates.update((current) => {
+    sessionAgents.update((current) => {
+      if (!(sessionId in current)) return current;
       const next = { ...current };
       delete next[sessionId];
       return next;
     });
-    clearDismissibleTabTimer(sessionId);
+    sessionOutputActive.update((current) => {
+      if (!(sessionId in current)) return current;
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
     sessionCommands.update((current) => {
       const next = { ...current };
       delete next[sessionId];
@@ -970,11 +947,6 @@ export function applyHitchEvent(event: HitchEvent): void {
     }
     projects.update((items) => items.filter((p) => p.id !== projectId));
     worktrees.update((items) => items.filter((w) => w.project_id !== projectId));
-    dismissedWorktreeAgentStates.update((current) => {
-      const next = { ...current };
-      for (const id of removedWorktreeIds) delete next[id];
-      return next;
-    });
   }
 }
 
@@ -1074,9 +1046,6 @@ export function disposeDaemon(): void {
   unlisteners = [];
   stopGitStatusPolling();
   stopPrStatusPolling();
-  for (const id of Array.from(dismissibleTabTimers.keys())) {
-    clearDismissibleTabTimer(id);
-  }
   for (const sessionId of Array.from(channels.keys())) {
     closeSessionOutput(sessionId);
   }
@@ -1191,9 +1160,11 @@ export async function loadPrStatus(worktreeId: Id): Promise<void> {
       prInfo.set(response.pr ?? null);
     }
   } catch {
-    // Clear only if no newer lookup for this worktree has landed, so a slow
-    // failure can't wipe a fresher success. Leave the chip map untouched.
-    if (isFreshestPr(worktreeId, freshnessSeq) && get(gitWorktreeId) === worktreeId) {
+    // A failed lookup is authoritative for this worktree only if no newer lookup
+    // has started or landed. Keep the selected action state and sidebar chip in
+    // lockstep by clearing both through the same per-worktree freshness guard.
+    const applied = writePrByWorktree(worktreeId, null, freshnessSeq);
+    if (applied && get(gitWorktreeId) === worktreeId) {
       prInfo.set(null);
     }
   }
@@ -2031,41 +2002,11 @@ visibleSessions.subscribe(($visible) => {
   activeSessionId.set($visible[0]?.id ?? null);
 });
 
-// Visiting a worktree acknowledges its current waiting/error rollup. Running is
-// live activity, not a stale notification: hide it while the worktree is
-// selected, then show it again elsewhere after the user leaves.
-derived([selectedWorktreeId, rawAgentStateByWorktree], ([$id, $states]) => ({
-  id: $id,
-  state: $id ? $states[$id] : undefined,
-})).subscribe(({ id, state }) => {
-  if (!id) return;
-  if (state !== "waiting" && state !== "error") return;
-  dismissedWorktreeAgentStates.update((current) =>
-    current[id] === state ? current : { ...current, [id]: state },
-  );
-});
-
 // Remember the user's active choice per parent so we can restore it later.
 activeSessionId.subscribe(($id) => {
   const parent = get(selectedParent);
   if (!parent || !$id) return;
   lastActiveByParent.set(parentKey(parent), $id);
-});
-
-// Viewing a tab acknowledges waiting/error states after a short visible dwell.
-// If the state arrives while the tab is already active, the event handler starts
-// the same dwell timer. Approval-needed is sticky until the daemon reports a
-// different state or clears it.
-activeSessionId.subscribe(($id) => {
-  if (!$id || get(diffActive)) return;
-  acknowledgeVisibleSessionState($id);
-});
-
-diffActive.subscribe(($active) => {
-  if ($active) return;
-  const id = get(activeSessionId);
-  if (!id) return;
-  acknowledgeVisibleSessionState(id);
 });
 
 // Drop remembered ids for sessions that have closed.
@@ -2076,42 +2017,21 @@ sessions.subscribe(($sessions) => {
   }
 });
 
-// Forget agent state + running command for sessions that have closed (or were
-// dropped on a reconnect), so stale labels never linger on the tree or tabs.
+// Forget agent state, announced identity, output gate, and running command for
+// sessions that have closed (or were dropped on a reconnect), so stale labels
+// never linger on the tree or tabs.
 sessions.subscribe(($sessions) => {
   const liveIds = new Set($sessions.map((s) => s.id));
-  agentStates.update((current) => {
+  function pruneToLive<T>(current: Record<Id, T>): Record<Id, T> {
     const next = Object.fromEntries(
       Object.entries(current).filter(([id]) => liveIds.has(id)),
-    );
+    ) as Record<Id, T>;
     return Object.keys(next).length === Object.keys(current).length ? current : next;
-  });
-  dismissedSessionAgentStates.update((current) => {
-    const next = Object.fromEntries(
-      Object.entries(current).filter(([id]) => liveIds.has(id)),
-    );
-    return Object.keys(next).length === Object.keys(current).length ? current : next;
-  });
-  for (const id of Array.from(dismissibleTabTimers.keys())) {
-    if (!liveIds.has(id)) clearDismissibleTabTimer(id);
   }
-
-  sessionCommands.update((current) => {
-    const next = Object.fromEntries(
-      Object.entries(current).filter(([id]) => liveIds.has(id)),
-    );
-    return Object.keys(next).length === Object.keys(current).length ? current : next;
-  });
-});
-
-worktrees.subscribe(($worktrees) => {
-  const liveIds = new Set($worktrees.map((w) => w.id));
-  dismissedWorktreeAgentStates.update((current) => {
-    const next = Object.fromEntries(
-      Object.entries(current).filter(([id]) => liveIds.has(id)),
-    );
-    return Object.keys(next).length === Object.keys(current).length ? current : next;
-  });
+  agentStates.update(pruneToLive);
+  sessionAgents.update(pruneToLive);
+  sessionOutputActive.update(pruneToLive);
+  sessionCommands.update(pruneToLive);
 });
 
 // Reset the per-worktree Git view state and (re)load status whenever the target

@@ -13,8 +13,8 @@ use hitch_core::{Project, Session, SessionId, SessionParent, Worktree};
 use hitch_proto::transport::{connect_daemon, DaemonStream};
 #[cfg(any(unix, windows))]
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, CommitDraft, DraftProvider, Event, FileDiff,
-    GitStatus, JobRequest, JobStatus, PullRequestDraft, WorktreeCreateMode,
+    encode_control_message, encode_pty_frame, CommitDraft, Event, FileDiff, GitStatus, JobRequest,
+    JobStatus, PullRequestDraft, WorktreeCreateMode,
 };
 use hitch_proto::{ControlMessage, ErrorCode, KnownAgent, Request, Response, PROTOCOL_VERSION};
 
@@ -147,6 +147,7 @@ fn windows_agent_state_reports_store_broadcast_replay_and_clear_by_session_id() 
             session_id: Some(session.id),
             cwd: Some(nested_cwd.clone()),
             detail: Some("working from Windows cwd".into()),
+            agent_run_id: None,
         },
     );
     let event = reporter.read_agent_state_event(Duration::from_secs(5));
@@ -183,6 +184,7 @@ fn windows_agent_state_reports_store_broadcast_replay_and_clear_by_session_id() 
             session_id: Some(session.id),
             cwd: Some(nested_cwd),
             detail: None,
+            agent_run_id: None,
         },
     );
     let cleared = reporter.read_agent_state_event(Duration::from_secs(5));
@@ -381,6 +383,185 @@ fn reconnect_replays_scrollback_and_receives_live_output() {
     let _ = std::fs::remove_dir_all(project_root);
 }
 
+#[cfg(unix)]
+#[test]
+fn reattach_replays_agent_state_report_with_run_id_and_ignores_stale_report() {
+    let socket = test_socket_path("runid");
+    let project_root = test_dir_path("runid-project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &project_root);
+    let session = client.open_session(
+        3,
+        SessionParent::Project(project.id),
+        vec!["/bin/sh".into(), "-lc".into(), "sleep 30".into()],
+    );
+    drop(client);
+
+    let mut reporter = TestClient::connect(&socket);
+    reporter.hello(4);
+    reporter.read_session_opened_with_agent_state(
+        session.id,
+        None,
+        None,
+        None,
+        Duration::from_secs(5),
+    );
+
+    reporter.send_request(
+        5,
+        Request::ReportAgentState {
+            agent: KnownAgent::ClaudeCode,
+            state: Some(hitch_core::AgentState::Running),
+            session_id: Some(session.id),
+            cwd: Some(project_root.clone()),
+            detail: Some("fresh run".into()),
+            agent_run_id: Some("run-fresh".into()),
+        },
+    );
+    let event = reporter.read_agent_state_event(Duration::from_secs(5));
+    assert_eq!(
+        event,
+        Event::AgentState {
+            session_id: Some(session.id),
+            worktree_id: None,
+            agent: Some(KnownAgent::ClaudeCode),
+            state: Some(hitch_core::AgentState::Running),
+            detail: Some("fresh run".into()),
+        }
+    );
+    reporter.read_ack(5);
+
+    {
+        let mut reattached = TestClient::connect(&socket);
+        reattached.hello(6);
+        reattached.read_session_opened_with_agent_state(
+            session.id,
+            Some(KnownAgent::ClaudeCode),
+            Some(hitch_core::AgentState::Running),
+            Some("fresh run"),
+            Duration::from_secs(5),
+        );
+    }
+
+    reporter.report_agent_state_with_run_id(
+        7,
+        KnownAgent::ClaudeCode,
+        Some(hitch_core::AgentState::Waiting),
+        Some(session.id),
+        Some(project_root.clone()),
+        Some("stale run".into()),
+        Some("run-stale".into()),
+    );
+
+    {
+        let mut reattached = TestClient::connect(&socket);
+        reattached.hello(8);
+        reattached.read_session_opened_with_agent_state(
+            session.id,
+            Some(KnownAgent::ClaudeCode),
+            Some(hitch_core::AgentState::Running),
+            Some("fresh run"),
+            Duration::from_secs(5),
+        );
+    }
+
+    reporter.shutdown(99);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(project_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn same_agent_announce_with_new_run_id_clears_stale_state() {
+    let socket = test_socket_path("announce-clear");
+    let project_root = test_dir_path("announce-clear-project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &project_root);
+    let session = client.open_session(
+        3,
+        SessionParent::Project(project.id),
+        vec!["/bin/sh".into(), "-lc".into(), "sleep 30".into()],
+    );
+    drop(client);
+
+    let mut reporter = TestClient::connect(&socket);
+    reporter.hello(4);
+    reporter.read_session_opened_with_agent_state(
+        session.id,
+        None,
+        None,
+        None,
+        Duration::from_secs(5),
+    );
+
+    reporter.send_request(
+        5,
+        Request::ReportAgentState {
+            agent: KnownAgent::ClaudeCode,
+            state: Some(hitch_core::AgentState::Error),
+            session_id: Some(session.id),
+            cwd: Some(project_root.clone()),
+            detail: Some("old failure".into()),
+            agent_run_id: Some("run-old".into()),
+        },
+    );
+    let old_event = reporter.read_agent_state_event(Duration::from_secs(5));
+    assert_eq!(
+        old_event,
+        Event::AgentState {
+            session_id: Some(session.id),
+            worktree_id: None,
+            agent: Some(KnownAgent::ClaudeCode),
+            state: Some(hitch_core::AgentState::Error),
+            detail: Some("old failure".into()),
+        }
+    );
+
+    reporter.send_request(
+        6,
+        Request::AnnounceAgent {
+            agent: KnownAgent::ClaudeCode,
+            session_id: Some(session.id),
+            cwd: Some(project_root.clone()),
+            agent_run_id: Some("run-new".into()),
+        },
+    );
+    let clear_event = reporter.read_agent_state_event(Duration::from_secs(1));
+    assert_eq!(
+        clear_event,
+        Event::AgentState {
+            session_id: Some(session.id),
+            worktree_id: None,
+            agent: Some(KnownAgent::ClaudeCode),
+            state: None,
+            detail: None,
+        }
+    );
+
+    {
+        let mut reattached = TestClient::connect(&socket);
+        reattached.hello(7);
+        reattached.read_session_opened_with_agent_state(
+            session.id,
+            Some(KnownAgent::ClaudeCode),
+            None,
+            None,
+            Duration::from_secs(5),
+        );
+    }
+
+    reporter.shutdown(99);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(project_root);
+}
 #[cfg(unix)]
 #[test]
 fn simulated_reboot_restores_persisted_session_layout_as_fresh_session() {
@@ -1569,6 +1750,19 @@ impl TestClient {
         cwd: Option<PathBuf>,
         detail: Option<String>,
     ) {
+        self.report_agent_state_with_run_id(id, agent, state, session_id, cwd, detail, None);
+    }
+
+    fn report_agent_state_with_run_id(
+        &mut self,
+        id: u64,
+        agent: KnownAgent,
+        state: Option<hitch_core::AgentState>,
+        session_id: Option<SessionId>,
+        cwd: Option<PathBuf>,
+        detail: Option<String>,
+        agent_run_id: Option<String>,
+    ) {
         self.ack(
             id,
             Request::ReportAgentState {
@@ -1577,6 +1771,7 @@ impl TestClient {
                 session_id,
                 cwd,
                 detail,
+                agent_run_id,
             },
         );
     }
@@ -1616,6 +1811,7 @@ impl TestClient {
                             agent,
                             agent_state,
                             agent_detail,
+                            ..
                         },
                 }) if session.id == session_id => {
                     assert_eq!(agent, expected_agent);
