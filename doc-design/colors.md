@@ -13,10 +13,12 @@ token is consumed and [components.md](components.md) for recipes.
    going cold/grey.
 3. **Accent is reserved.** The iris accent appears only for **selection**,
    **the primary action**, and **state**. It is never decorative.
-4. **The terminal is the darkest surface in both themes.** `--term-bg` is the
-   lowest L value in light *and* dark, preserving the paper/ink figure-ground:
-   the terminal reads as ink on paper even in dusk mode. The terminal hue is
-   cool (blue, ~262-265) to separate it from the warm chrome.
+4. **The terminal follows the theme but stays cool.** In light it is a
+   paper-light surface; in dusk it is the darkest surface (lowest L). What
+   separates the terminal from the chrome in *both* themes is hue: the
+   terminal is cool (blue, ~262-265) against the warm paper/ink neutrals.
+   (Earlier revisions kept the terminal dark in both themes; superseded —
+   each theme now themes the terminal to match.)
 5. **State is never color alone** (see the state vocabulary in
    [structure.md](structure.md#state-vocabulary)); state renders as a colored
    uppercase **word** — the word is the non-color channel. State words appear
@@ -40,21 +42,31 @@ token is consumed and [components.md](components.md) for recipes.
 
 ## Terminal panel
 
-The cool deep-ink surface. Darkest L in both themes.
+The cool-tinted surface. Follows the theme: paper-light in light, deep ink in
+dusk; the cool hue (~262-265) is what separates it from the warm chrome.
 
 | Token | Light | Dark | Usage |
 | --- | --- | --- | --- |
-| `--term-bg` | `oklch(22.5% 0.020 265)` | `oklch(12.0% 0.018 262)` | Terminal base (gradient bottom). |
-| `--term-bg2` | `oklch(25.5% 0.020 265)` | `oklch(13.8% 0.018 262)` | Terminal top of gradient; active-tab fill; bridge. |
-| `--term-line` | `oklch(34.0% 0.024 265)` | `oklch(26.0% 0.022 262)` | Terminal/tab hairlines (the seam). |
-| `--term-fg` | `oklch(90.0% 0.012 90)` | `oklch(90.0% 0.012 90)` | Terminal foreground text. |
-| `--term-dim` | `oklch(68.0% 0.018 100)` | `oklch(64.0% 0.016 100)` | Dim terminal text, active-tab close glyph. |
+| `--term-bg` | `oklch(96.8% 0.006 265)` | `oklch(12.0% 0.018 262)` | Terminal base (gradient bottom). |
+| `--term-bg2` | `oklch(98.4% 0.005 265)` | `oklch(13.8% 0.018 262)` | Terminal top of gradient; active-tab fill; bridge. |
+| `--term-line` | `oklch(87.0% 0.014 265)` | `oklch(26.0% 0.022 262)` | Terminal/tab hairlines (the seam). |
+| `--term-fg` | `oklch(27.0% 0.020 265)` | `oklch(90.0% 0.012 90)` | Terminal foreground text. |
+| `--term-dim` | `oklch(54.0% 0.016 265)` | `oklch(64.0% 0.016 100)` | Dim terminal text, active-tab close glyph. |
 
-In-terminal ANSI-ish accents (literal values in the mockup, not tokenized):
-`t-grn oklch(82% 0.13 150)`, `t-red oklch(78% 0.13 28)`, `t-cy oklch(82% 0.10
-195)`, `t-yl oklch(86% 0.12 92)`, `t-iris oklch(80% 0.10 280)`, `t-b
-oklch(96% 0.01 90)`. These are tuned for the dark surface and read the same in
-both themes.
+In-terminal ANSI-ish accents (literal values, not tokenized) — one set per
+theme, since the surface flips with the theme.
+
+Dark (tuned for the deep-ink surface): `t-grn oklch(82% 0.13 150)`, `t-red
+oklch(78% 0.13 28)`, `t-cy oklch(82% 0.10 195)`, `t-yl oklch(86% 0.12 92)`,
+`t-iris oklch(80% 0.10 280)`, `t-b oklch(96% 0.01 90)`; ANSI black maps to
+`--term-line` so it stays visible; cursor `oklch(82% 0.10 92)`; selection
+`oklch(60% 0.10 280 / 0.32)`.
+
+Light (darker inks tuned for the paper surface): `t-grn oklch(52% 0.13 150)`,
+`t-red oklch(52% 0.16 28)`, `t-cy oklch(52% 0.10 195)`, `t-yl oklch(58% 0.11
+92)`, `t-iris oklch(48% 0.13 280)`, `t-b oklch(45% 0.012 90)` (ANSI white maps
+to a mid grey ink so it stays visible on paper); ANSI black `oklch(30% 0.02
+265)`; cursor `oklch(48% 0.11 92)`; selection `oklch(50% 0.12 280 / 0.22)`.
 
 ## Iris accent
 

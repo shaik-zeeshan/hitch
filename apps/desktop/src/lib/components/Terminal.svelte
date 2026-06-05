@@ -168,10 +168,10 @@
   //    Background is the FLAT --term-bg2 (the active-tab/gradient top); the
   //    panel's CSS gradient shows in the host padding, while xterm's own grid
   //    sits on the flat fill so the WebGL renderer stays crisp.
-  //  - In-terminal ANSI accents are the LITERAL oklch values from colors.md
-  //    ("In-terminal ANSI-ish accents"), tuned for the dark surface and read the
-  //    same in BOTH themes (the terminal is the darkest surface in either).
-  //    Cursor is the literal oklch(82% 0.10 92) from components.md.
+  //  - In-terminal ANSI accents are LITERAL oklch values from colors.md
+  //    ("In-terminal ANSI-ish accents"), one set per theme: the terminal
+  //    surface follows the theme, so light gets darker accent inks tuned for
+  //    the paper surface and dusk gets the brighter set tuned for deep ink.
   function resolveTheme(): ITheme {
     const probe = document.createElement("span");
     probe.style.display = "none";
@@ -181,35 +181,56 @@
       probe.style.color = color;
       return getComputedStyle(probe).color || "#d4d6da";
     };
-    // colors.md in-terminal accents (literal; same both themes).
-    const tGrn = "oklch(82% 0.13 150)";
-    const tRed = "oklch(78% 0.13 28)";
-    const tCy = "oklch(82% 0.10 195)";
-    const tYl = "oklch(86% 0.12 92)";
-    const tIris = "oklch(80% 0.10 280)";
-    const tB = "oklch(96% 0.01 90)";
+    // colors.md in-terminal accents (literal; per theme).
+    const dark =
+      document.documentElement.getAttribute("data-theme") === "dark";
+    const a = dark
+      ? {
+          grn: "oklch(82% 0.13 150)",
+          red: "oklch(78% 0.13 28)",
+          cy: "oklch(82% 0.10 195)",
+          yl: "oklch(86% 0.12 92)",
+          iris: "oklch(80% 0.10 280)",
+          b: "oklch(96% 0.01 90)",
+          // "black" must stay visible on the dark surface: the seam hairline.
+          blk: "var(--term-line)",
+          cursor: "oklch(82% 0.10 92)",
+          sel: "oklch(60% 0.10 280 / 0.32)",
+        }
+      : {
+          grn: "oklch(52% 0.13 150)",
+          red: "oklch(52% 0.16 28)",
+          cy: "oklch(52% 0.10 195)",
+          yl: "oklch(58% 0.11 92)",
+          iris: "oklch(48% 0.13 280)",
+          // "white" must stay visible on the paper surface: a mid grey ink.
+          b: "oklch(45% 0.012 90)",
+          blk: "oklch(30% 0.02 265)",
+          cursor: "oklch(48% 0.11 92)",
+          sel: "oklch(50% 0.12 280 / 0.22)",
+        };
     const theme: ITheme = {
       background: rgb("var(--term-bg2)"),
       foreground: rgb("var(--term-fg)"),
-      cursor: rgb("oklch(82% 0.10 92)"),
+      cursor: rgb(a.cursor),
       cursorAccent: rgb("var(--term-bg2)"),
-      selectionBackground: rgb("oklch(60% 0.10 280 / 0.32)"),
-      black: rgb("var(--term-line)"),
-      red: rgb(tRed),
-      green: rgb(tGrn),
-      yellow: rgb(tYl),
-      blue: rgb(tIris),
-      magenta: rgb(tIris),
-      cyan: rgb(tCy),
-      white: rgb(tB),
+      selectionBackground: rgb(a.sel),
+      black: rgb(a.blk),
+      red: rgb(a.red),
+      green: rgb(a.grn),
+      yellow: rgb(a.yl),
+      blue: rgb(a.iris),
+      magenta: rgb(a.iris),
+      cyan: rgb(a.cy),
+      white: rgb(a.b),
       brightBlack: rgb("var(--term-dim)"),
-      brightRed: rgb(tRed),
-      brightGreen: rgb(tGrn),
-      brightYellow: rgb(tYl),
-      brightBlue: rgb(tIris),
-      brightMagenta: rgb(tIris),
-      brightCyan: rgb(tCy),
-      brightWhite: rgb(tB),
+      brightRed: rgb(a.red),
+      brightGreen: rgb(a.grn),
+      brightYellow: rgb(a.yl),
+      brightBlue: rgb(a.iris),
+      brightMagenta: rgb(a.iris),
+      brightCyan: rgb(a.cy),
+      brightWhite: rgb(a.b),
     };
     probe.remove();
     return theme;
@@ -409,18 +430,13 @@
   // surface tokens (--term-bg2/--term-fg/--term-dim) differ per theme, so a
   // light↔dark swap must repaint every mounted terminal — including hidden ones,
   // so they're already correct when re-shown. Reading $themeStore here registers
-  // the dependency; we skip the very first run (the onMount theme is already
-  // applied) by gating on `term` being live AND a real change.
-  let lastTheme: string | null = null;
+  // the dependency. No first-run gating: the effect's first run happens before
+  // onMount creates `term` (so it bails on !term), and `term` isn't reactive —
+  // gating on "first real change" here would swallow the first toggle instead.
+  // Reapplying is idempotent and cheap, so every store change just repaints.
   $effect(() => {
-    const current = $themeStore;
+    void $themeStore;
     if (!term) return;
-    if (lastTheme === null) {
-      lastTheme = current;
-      return;
-    }
-    if (current === lastTheme) return;
-    lastTheme = current;
     term.options.theme = resolveTheme();
   });
 
@@ -630,8 +646,10 @@
 
 <style>
   /* Edge-to-edge terminal panel: zero gutter, meets the column dividers and the
-     window bottom directly. The panel carries the inset so the gradient ink
-     shows around the grid (the xterm grid sits on the flat --term-bg2 fill). */
+     window bottom directly. The panel carries the inset; its fill is the SAME
+     flat --term-bg2 the xterm grid sits on, so the padding reads as part of
+     the terminal (a gradient here visibly seams against the flat grid,
+     especially on the light surface). */
   .terminal {
     position: relative;
     flex: 1;
@@ -640,7 +658,7 @@
     width: 100%;
     display: flex;
     flex-direction: column;
-    background: linear-gradient(var(--term-bg2), var(--term-bg));
+    background: var(--term-bg2);
     border: none;
     border-radius: 0;
     padding: 14px 16px 4px;

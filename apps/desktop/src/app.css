@@ -16,8 +16,9 @@
    theme on :root; dark ("dusk") lives on html[data-theme="dark"].
 
    Rules (colors.md):
-   - Warm-tinted neutrals (paper/ink hue ~70-82); the terminal is the
-     darkest surface in BOTH themes, cool (~262-265) to separate it.
+   - Warm-tinted neutrals (paper/ink hue ~70-82); the terminal follows the
+     theme (paper-light in light, deep ink in dusk) but keeps a cool hue
+     (~262-265) to separate it from the warm chrome.
    - The iris accent is reserved for selection, the primary action, and
      state — never decorative.
    - State is never color alone: it renders as a colored uppercase WORD.
@@ -36,12 +37,12 @@
   --ink-2: oklch(56.0% 0.016 72); /* tertiary text, labels, icons */
   --ink-3: oklch(66.0% 0.014 74); /* faint text, separators, twisties */
 
-  /* ---- terminal panel (cool deep ink; darkest L in both themes) ---- */
-  --term-bg: oklch(22.5% 0.020 265); /* terminal base (gradient bottom) */
-  --term-bg2: oklch(25.5% 0.020 265); /* terminal top; active-tab fill; bridge */
-  --term-line: oklch(34.0% 0.024 265); /* terminal/tab hairlines (the seam) */
-  --term-fg: oklch(90.0% 0.012 90); /* terminal foreground text */
-  --term-dim: oklch(68.0% 0.018 100); /* dim terminal text, active-tab close */
+  /* ---- terminal panel (cool-tinted paper; follows the light theme) ---- */
+  --term-bg: oklch(96.8% 0.006 265); /* terminal base (gradient bottom) */
+  --term-bg2: oklch(98.4% 0.005 265); /* terminal top; active-tab fill; bridge */
+  --term-line: oklch(87.0% 0.014 265); /* terminal/tab hairlines (the seam) */
+  --term-fg: oklch(27.0% 0.020 265); /* terminal foreground text */
+  --term-dim: oklch(54.0% 0.016 265); /* dim terminal text, active-tab close */
 
   /* ---- iris accent (selection + primary action) ---- */
   --iris: oklch(48.0% 0.150 275); /* accent fill (primary button, checkbox on) */

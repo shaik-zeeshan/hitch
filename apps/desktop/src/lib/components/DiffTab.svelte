@@ -40,7 +40,9 @@
   .diff {
     height: 100%;
     width: 100%;
-    background: linear-gradient(var(--term-bg2), var(--term-bg));
+    /* Flat fill matching the terminal panel (Terminal.svelte dropped the
+       bg2→bg gradient — a gradient seams against flat sibling surfaces). */
+    background: var(--term-bg2);
     overflow-y: auto;
   }
   .diff-head {
@@ -111,17 +113,31 @@
     padding-right: 12px;
     white-space: nowrap;
   }
-  /* Hunk header + add/del rows: literal in-terminal accents tuned for the deep
-     ink (same family as the terminal's ANSI greens/reds; doc-design/colors.md). */
+  /* Hunk header + add/del rows: literal in-terminal accents, one set per theme
+     (same family as the terminal's per-theme ANSI greens/reds;
+     doc-design/colors.md). Base values are the light/paper set; the dark
+     overrides below swap in the deep-ink set. */
   .dl.hunk {
+    color: oklch(48% 0.13 280);
+    background: oklch(48% 0.13 280 / 0.1);
+  }
+  .dl.add {
+    background: oklch(52% 0.13 150 / 0.08);
+    color: oklch(52% 0.13 150);
+  }
+  .dl.del {
+    background: oklch(52% 0.16 28 / 0.08);
+    color: oklch(52% 0.16 28);
+  }
+  :global(html[data-theme="dark"]) .dl.hunk {
     color: oklch(80% 0.10 280);
     background: oklch(80% 0.10 280 / 0.12);
   }
-  .dl.add {
+  :global(html[data-theme="dark"]) .dl.add {
     background: oklch(82% 0.13 150 / 0.1);
     color: oklch(82% 0.13 150);
   }
-  .dl.del {
+  :global(html[data-theme="dark"]) .dl.del {
     background: oklch(78% 0.13 28 / 0.1);
     color: oklch(78% 0.13 28);
   }
