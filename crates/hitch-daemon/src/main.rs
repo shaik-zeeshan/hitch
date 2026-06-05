@@ -18,9 +18,22 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod drafts;
+
+/// How long a session's PTY may stay quiet before the output-activity gate falls
+/// to inactive (ADR 0011 amendment 2026-06-05). Agent TUIs repaint spinners
+/// continuously, so genuine in-progress work holds the gate open; an interrupted
+/// or hung agent stops emitting and the gate drops, taking the downstream
+/// `WORKING` word with it. Tunable: PLAN.md slice 7 calibrates this against real
+/// agent TUIs at implementation-verification time (~3–5s; 4s to start).
+const OUTPUT_ACTIVE_QUIET: Duration = Duration::from_secs(4);
+
+/// How often the output-activity poller scans for sessions that have gone quiet
+/// past [`OUTPUT_ACTIVE_QUIET`] and fires their falling edge. Mirrors the other
+/// per-second daemon pollers.
+const OUTPUT_ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 use drafts::{CommitDraftInput, DraftProviderConfig, PullRequestDraftInput};
 use hitch_agent::HookInstallOptions;
@@ -417,6 +430,7 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     #[cfg(unix)]
     spawn_command_poller(Arc::clone(&state), Arc::clone(&shutdown));
     spawn_dirty_poller(Arc::clone(&state), Arc::clone(&shutdown));
+    spawn_output_activity_poller(Arc::clone(&state), Arc::clone(&shutdown));
 
     // A dedicated thread parks in the blocking `accept()` and forwards each
     // accepted stream over this channel. Parking (rather than polling a
@@ -714,6 +728,17 @@ struct DaemonSession {
     agent_state: Option<AgentState>,
     agent_detail: Option<String>,
     agent_report_requires_running: bool,
+    /// Output-activity gate (ADR 0011 amendment 2026-06-05): whether this
+    /// session's PTY produced output within the last [`OUTPUT_ACTIVE_QUIET`].
+    /// Edge-triggered — the dispatcher flips it `true` and broadcasts on the
+    /// first frame after a quiet period; the output-activity poller flips it
+    /// `false` and broadcasts once the session goes quiet. It gates the `WORKING`
+    /// display word (`running ∧ output_active`) downstream.
+    output_active: bool,
+    /// Instant of the most recent output frame, or `None` if no output has been
+    /// seen yet. The poller compares `now - last_output_at` against
+    /// [`OUTPUT_ACTIVE_QUIET`] to drive the falling edge.
+    last_output_at: Option<Instant>,
 }
 
 /// The dispatcher thread's authoritative, per-session record of "what has been
@@ -922,6 +947,8 @@ fn restore_layout(
                 agent_state: None,
                 agent_detail: None,
                 agent_report_requires_running: false,
+                output_active: false,
+                last_output_at: None,
             },
         );
     }
@@ -1189,6 +1216,8 @@ fn handle_request<R: Read>(
                     agent: None,
                     agent_state: None,
                     agent_detail: None,
+                    // A freshly spawned session has produced no output yet.
+                    output_active: false,
                 },
             )?;
             broadcast_event(
@@ -1198,6 +1227,7 @@ fn handle_request<R: Read>(
                     agent: None,
                     agent_state: None,
                     agent_detail: None,
+                    output_active: false,
                 },
             )?;
         }
@@ -1359,6 +1389,31 @@ fn handle_request<R: Read>(
                 cwd.as_deref(),
                 detail,
             )? {
+                broadcast_agent_state_event(
+                    state,
+                    Event::AgentState {
+                        session_id: Some(event.session_id),
+                        worktree_id: event.worktree_id,
+                        agent: event.agent,
+                        state: event.state,
+                        detail: event.detail,
+                    },
+                )?;
+            }
+            send_response(state, client_id, request_id, Response::Ack)?;
+        }
+        Request::AnnounceAgent {
+            agent,
+            session_id,
+            cwd,
+        } => {
+            // Identity-only announce: store *which* agent runs in the session so
+            // the Session mark can render before the first prompt. Bypasses the
+            // late-arrival guard and never sets/changes Agent State (ADR 0011
+            // amendment 2026-06-05). Propagate a changed identity to attached
+            // clients via the same `AgentState` event path state reports use —
+            // there is no separate identity event type.
+            if let Some(event) = store_agent_announce(state, agent, session_id, cwd.as_deref())? {
                 broadcast_agent_state_event(
                     state,
                     Event::AgentState {
@@ -2145,6 +2200,8 @@ fn open_session(
             agent_state: None,
             agent_detail: None,
             agent_report_requires_running: false,
+            output_active: false,
+            last_output_at: None,
         },
     );
     Ok(session)
@@ -2832,6 +2889,34 @@ fn spawn_command_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool
         .expect("failed to spawn command poller thread");
 }
 
+/// Poll for output-activity falling edges (ADR 0011 amendment 2026-06-05). The
+/// rising edge is emitted inline on the dispatcher thread when a frame arrives;
+/// the falling edge has no triggering event, so this thread checks once per
+/// [`OUTPUT_ACTIVE_POLL_INTERVAL`] whether any active session has been quiet for
+/// [`OUTPUT_ACTIVE_QUIET`] and broadcasts its `active: false` transition. The
+/// daemon only ever watches WHETHER frames arrived (the timestamp), never their
+/// content — ADR 0011's no-text-inference rule. Spawned on all platforms: it
+/// reads only the in-memory gate, with no dependence on `foreground_command()`.
+fn spawn_output_activity_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>) {
+    thread::Builder::new()
+        .name("hitch-output-active-poll".into())
+        .spawn(move || {
+            while !shutdown.load(Ordering::SeqCst) {
+                let edges = match state.lock() {
+                    Ok(mut state) => {
+                        collect_output_quiet_edges(&mut state, Instant::now(), OUTPUT_ACTIVE_QUIET)
+                    }
+                    Err(_) => Vec::new(),
+                };
+                for edge in edges {
+                    let _ = broadcast_event(&state, edge);
+                }
+                thread::sleep(OUTPUT_ACTIVE_POLL_INTERVAL);
+            }
+        })
+        .expect("failed to spawn output-activity poller thread");
+}
+
 /// Forward PTY reader events into the dispatcher's single ordered channel as
 /// `DispatchMsg::Pty`. The `ManagedPty` contract emits `PtyEvent`, but replay
 /// requests must travel the SAME queue as output so the dispatcher can serialize
@@ -2917,12 +3002,77 @@ fn record_and_broadcast_output(
     session_id: SessionId,
     bytes: &[u8],
 ) {
-    if let Ok(mut state) = state.lock() {
+    let rising_edge = if let Ok(mut state) = state.lock() {
         // The log holds live bytes only; restored scrollback is prepended in
         // `replay_snapshot` and does not need to be passed for every frame.
         state.broadcaster.record_output(session_id, bytes);
-    }
+        // Output-activity gate (ADR 0011 amendment 2026-06-05): stamp the
+        // last-output instant on EVERY frame (cheap, no broadcast), but only emit
+        // a rising edge the first time a quiet session goes active. While already
+        // active we never broadcast per frame, so a busy session does not spam.
+        mark_output_active(&mut state, session_id, Instant::now())
+    } else {
+        None
+    };
     let _ = broadcast_session_output(state, session_id, bytes);
+    if let Some(edge) = rising_edge {
+        let _ = broadcast_event(state, edge);
+    }
+}
+
+/// Record an output frame's arrival on a session's activity gate, returning a
+/// rising-edge [`Event::OutputActive`] (`active: true`) only when the session was
+/// previously inactive. Always refreshes `last_output_at` so the poller's falling
+/// edge measures from the most recent frame. Returns `None` when the session is
+/// already active (no per-frame broadcast) or unknown. Runs on the dispatcher
+/// thread under the state lock.
+fn mark_output_active(
+    state: &mut DaemonState,
+    session_id: SessionId,
+    now: Instant,
+) -> Option<Event> {
+    let daemon_session = state.sessions.get_mut(&session_id)?;
+    daemon_session.last_output_at = Some(now);
+    if daemon_session.output_active {
+        return None;
+    }
+    daemon_session.output_active = true;
+    Some(Event::OutputActive {
+        session_id,
+        worktree_id: session_worktree_id(&daemon_session.session),
+        active: true,
+    })
+}
+
+/// Scan every session for a falling edge: a session that is currently marked
+/// active but whose last output frame is older than [`OUTPUT_ACTIVE_QUIET`] flips
+/// to inactive. Returns one `active: false` [`Event::OutputActive`] per session
+/// that just went quiet (the falling edge). A session with no output yet
+/// (`last_output_at == None`) is never active, so it is skipped. Pure over the
+/// passed `now` so tests can drive the clock deterministically.
+fn collect_output_quiet_edges(
+    state: &mut DaemonState,
+    now: Instant,
+    quiet: Duration,
+) -> Vec<Event> {
+    let mut edges = Vec::new();
+    for daemon_session in state.sessions.values_mut() {
+        if !daemon_session.output_active {
+            continue;
+        }
+        let quiet_for = daemon_session
+            .last_output_at
+            .map(|last| now.saturating_duration_since(last));
+        if matches!(quiet_for, Some(elapsed) if elapsed >= quiet) {
+            daemon_session.output_active = false;
+            edges.push(Event::OutputActive {
+                session_id: daemon_session.session.id,
+                worktree_id: session_worktree_id(&daemon_session.session),
+                active: false,
+            });
+        }
+    }
+    edges
 }
 
 fn read_control_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
@@ -2982,7 +3132,11 @@ fn find_pty(
 struct AgentStateBroadcast {
     session_id: SessionId,
     worktree_id: Option<WorktreeId>,
-    agent: KnownAgent,
+    /// `None` on the identity clear (exit-to-`None`); `Some` on state reports
+    /// and identity announces. Mirrors `Event::AgentState.agent` — a null
+    /// *state* alone never clears identity (the pre-prompt announce carries
+    /// `state: None` too, see ADR 0011 amendment 2026-06-05).
+    agent: Option<KnownAgent>,
     state: Option<AgentState>,
     detail: Option<String>,
 }
@@ -3011,7 +3165,13 @@ fn store_agent_report(
         return Ok(None);
     };
 
+    // The late-arrival guard drops stale *state* reports (waiting/error from a
+    // dying agent's queued hooks) until a fresh `running` arrives. Clears are
+    // exempt: a clear is idempotent, and for a never-prompted agent (identity
+    // announced, no state, guard still closed from the previous run's exit) the
+    // SessionEnd clear is the only thing that reverts the Session mark to shell.
     if daemon_session.agent_report_requires_running
+        && agent_state.is_some()
         && !matches!(agent_state, Some(AgentState::Running))
     {
         eprintln!(
@@ -3023,6 +3183,23 @@ fn store_agent_report(
     let worktree_id = session_worktree_id(&daemon_session.session);
     match agent_state {
         Some(state) => {
+            // Transition precedence (ADR 0011 amendment 2026-06-05): a `waiting`
+            // report must never downgrade `error`. After `StopFailure` the agent
+            // is idle at its prompt, so the ~60s idle-prompt heal
+            // (`Notification[idle_prompt] → waiting`) — and any `Stop → waiting`
+            // that follows a failed turn — would otherwise silently blank an
+            // unseen failure. `error` clears only via a `running` report
+            // (UserPromptSubmit → running) or exit-to-`None`. All other
+            // transitions behave as before. This is a precedence rule on the
+            // daemon-owned value, not text inference.
+            if matches!(state, AgentState::Waiting)
+                && matches!(daemon_session.agent_state, Some(AgentState::Error))
+            {
+                eprintln!(
+                    "hitch-daemon: ignoring waiting report over error: agent={agent:?} session_id={session_id} reason=error-outranks-idle-heal"
+                );
+                return Ok(None);
+            }
             daemon_session.agent = Some(agent);
             daemon_session.agent_state = Some(state);
             daemon_session.agent_detail = detail.clone();
@@ -3030,25 +3207,92 @@ fn store_agent_report(
             Ok(Some(AgentStateBroadcast {
                 session_id,
                 worktree_id,
-                agent,
+                agent: Some(agent),
                 state: Some(state),
                 detail,
             }))
         }
         None => {
+            // Idempotent: a clear over an already-cleared session (the dirty-exit
+            // backstop raced a late SessionEnd) changes nothing — no broadcast,
+            // and the guard is left untouched.
+            if daemon_session.agent.is_none() && daemon_session.agent_state.is_none() {
+                return Ok(None);
+            }
             daemon_session.agent = None;
             daemon_session.agent_state = None;
             daemon_session.agent_detail = None;
             daemon_session.agent_report_requires_running = true;
+            // Exit-to-`None`: broadcast `agent: None` so clients clear the
+            // identity too — the null state alone must not be the signal (an
+            // identity announce also broadcasts a null pre-prompt state).
             Ok(Some(AgentStateBroadcast {
                 session_id,
                 worktree_id,
-                agent,
+                agent: None,
                 state: None,
                 detail: None,
             }))
         }
     }
+}
+
+/// Store an **identity-only announce** (ADR 0011 amendment 2026-06-05): the
+/// agent's `SessionStart` declares *which* agent now runs in a session so the
+/// Session mark can render before the first prompt. Identity is **not** state:
+///
+/// - It records `daemon_session.agent` and **never** touches `agent_state`,
+///   `agent_detail`, or the late-arrival guard — a fresh, never-prompted agent
+///   stays at no-state.
+/// - It **bypasses** the late-arrival guard (`agent_report_requires_running`):
+///   that guard governs *state* reports only; an announce always passes.
+/// - Exit-to-`None` (a `ReportAgentState` with `state: None`) clears identity
+///   along with state, reverting the mark to shell — handled in
+///   [`store_agent_report`], not here.
+///
+/// Returns the stored identity if it changed (so the caller can propagate it to
+/// attached clients the same way state reports do), or `None` when the report
+/// could not resolve to a session or the identity was already current.
+fn store_agent_announce(
+    state: &Arc<Mutex<DaemonState>>,
+    agent: KnownAgent,
+    session_id: Option<SessionId>,
+    cwd: Option<&Path>,
+) -> Result<Option<AgentStateBroadcast>, ProtocolError> {
+    let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    let Some(session_id) = session_id else {
+        eprintln!(
+            "hitch-daemon: dropping agent announce: agent={agent:?} cwd={} reason=missing-session-id",
+            cwd.map(path_display).unwrap_or("<none>")
+        );
+        return Ok(None);
+    };
+    let Some(daemon_session) = state.sessions.get_mut(&session_id) else {
+        eprintln!(
+            "hitch-daemon: dropping agent announce: agent={agent:?} cwd={} reason=unknown-session-id",
+            cwd.map(path_display).unwrap_or("<none>")
+        );
+        return Ok(None);
+    };
+
+    // Identity only: do not touch agent_state / agent_detail / the late-arrival
+    // guard. If the identity is already current, nothing changed.
+    if daemon_session.agent == Some(agent) {
+        return Ok(None);
+    }
+    let worktree_id = session_worktree_id(&daemon_session.session);
+    daemon_session.agent = Some(agent);
+    Ok(Some(AgentStateBroadcast {
+        session_id,
+        worktree_id,
+        agent: Some(agent),
+        // The announce carries no state; broadcast the session's *current*
+        // stored state (typically `None` pre-prompt) so an attached client
+        // learns the new identity without inventing a state. The client keys
+        // the identity clear on `agent: None`, never on this null state.
+        state: daemon_session.agent_state,
+        detail: daemon_session.agent_detail.clone(),
+    }))
 }
 
 // Only the Unix command poller calls this (the ADR 0011 dirty-exit backstop).
@@ -3061,8 +3305,10 @@ fn clear_stale_agent_state(
 ) -> Option<AgentStateBroadcast> {
     let mut state = state.lock().ok()?;
     let daemon_session = state.sessions.get_mut(&session_id)?;
+    // Identity alone is enough to need the backstop: a never-prompted agent
+    // (announced, no Agent State) that dies without SessionEnd would otherwise
+    // hold the Session mark forever.
     let agent = daemon_session.agent?;
-    daemon_session.agent_state?;
     let Some(command) = command else {
         return None;
     };
@@ -3074,10 +3320,12 @@ fn clear_stale_agent_state(
     daemon_session.agent_state = None;
     daemon_session.agent_detail = None;
     daemon_session.agent_report_requires_running = true;
+    // Dirty-exit backstop clear: `agent: None` clears identity on clients,
+    // same as the exit-to-`None` report path.
     Some(AgentStateBroadcast {
         session_id,
         worktree_id,
-        agent,
+        agent: None,
         state: None,
         detail: None,
     })
@@ -3154,6 +3402,7 @@ fn replay_sessions_to_client(
                     daemon_session.agent,
                     daemon_session.agent_state,
                     daemon_session.agent_detail.clone(),
+                    daemon_session.output_active,
                 )
             })
             .collect::<Vec<_>>();
@@ -3169,7 +3418,7 @@ fn replay_sessions_to_client(
     // dispatcher thread, then spawn a thread to do the potentially blocking
     // replay output writes. This prevents slow clients from freezing the
     // dispatcher and blocking output delivery for other sessions.
-    for (session, _, command, agent, agent_state, agent_detail) in &replay_items {
+    for (session, _, command, agent, agent_state, agent_detail, output_active) in &replay_items {
         send_event_to_client(
             state,
             client_id,
@@ -3178,6 +3427,9 @@ fn replay_sessions_to_client(
                 agent: *agent,
                 agent_state: *agent_state,
                 agent_detail: agent_detail.clone(),
+                // Attach with the current gate value so the client does not
+                // assume idle/active before the next edge-triggered event.
+                output_active: *output_active,
             },
         )?;
         send_event_to_client(
@@ -3212,7 +3464,7 @@ fn replay_sessions_to_client(
     // strictly: snapshot bytes → pending bytes → live broadcasts.
     let state_clone = Arc::clone(state);
     thread::spawn(move || {
-        for (session, scrollback, _, _, _, _) in &replay_items {
+        for (session, scrollback, _, _, _, _, _) in &replay_items {
             if !scrollback.is_empty() {
                 let _ = send_output_to_client(&state_clone, client_id, session.id, scrollback);
             }
@@ -4198,7 +4450,7 @@ mod tests {
 
         let (mut reader, writer) = UnixStream::pair().unwrap();
         let sink = Arc::new(super::ClientSink {
-            writer: Mutex::new(writer),
+            writer: Mutex::new(super::DaemonStream::new(writer)),
             live: AtomicBool::new(true),
             jobs_live: AtomicBool::new(true),
             agent_state_live: AtomicBool::new(false),
@@ -4214,7 +4466,7 @@ mod tests {
         let event = Event::AgentState {
             session_id: Some(SessionId::new()),
             worktree_id: Some(WorktreeId::new()),
-            agent: KnownAgent::ClaudeCode,
+            agent: Some(KnownAgent::ClaudeCode),
             state: Some(AgentState::Running),
             detail: None,
         };
@@ -4803,7 +5055,7 @@ mod tests {
         let (request_writer, _request_reader) = UnixStream::pair().unwrap();
         let (peer_writer, _peer_reader) = UnixStream::pair().unwrap();
         let requester = Arc::new(super::ClientSink {
-            writer: Mutex::new(request_writer),
+            writer: Mutex::new(super::DaemonStream::new(request_writer)),
             live: AtomicBool::new(true),
             jobs_live: AtomicBool::new(true),
             agent_state_live: AtomicBool::new(true),
@@ -4812,7 +5064,7 @@ mod tests {
             pending_agent_state_events: Mutex::new(Vec::new()),
         });
         let blocked = Arc::new(super::ClientSink {
-            writer: Mutex::new(peer_writer),
+            writer: Mutex::new(super::DaemonStream::new(peer_writer)),
             live: AtomicBool::new(true),
             jobs_live: AtomicBool::new(true),
             agent_state_live: AtomicBool::new(true),
@@ -5129,7 +5381,7 @@ mod tests {
         // back off the wire.
         let (reader, writer) = UnixStream::pair().unwrap();
         let sink = Arc::new(super::ClientSink {
-            writer: Mutex::new(writer),
+            writer: Mutex::new(super::DaemonStream::new(writer)),
             live: AtomicBool::new(true),
             jobs_live: AtomicBool::new(true),
             agent_state_live: AtomicBool::new(true),
@@ -5247,6 +5499,546 @@ mod tests {
             "external worktree path must be untouched"
         );
         assert!(state.lock().unwrap().worktrees.contains_key(&worktree.id));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Slice 4: transition precedence + identity announce/replay/clear ---
+
+    /// Build a DaemonState with one real (shell) session open under a plain
+    /// project, returning the state, the session id, and the temp dir to clean
+    /// up. Opening via `open_session` spawns a PTY the way production does, so
+    /// the session record is the genuine `DaemonSession`.
+    fn state_with_session() -> (
+        std::sync::Arc<std::sync::Mutex<super::DaemonState>>,
+        hitch_core::SessionId,
+        std::path::PathBuf,
+        std::sync::mpsc::Receiver<hitch_pty::PtyEvent>,
+    ) {
+        use hitch_core::{Project, ProjectKind, SessionParent};
+        use std::path::PathBuf;
+        use std::sync::{Arc, Mutex};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-slice4-{nonce}"));
+        let project_root = dir.join("repo");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store_path = dir.join("state.db");
+        let config = super::DaemonConfig {
+            socket_path: dir.join("daemon.sock"),
+            store_path: store_path.clone(),
+            managed_root: dir.join("managed"),
+            hook_helper: dir.join("hitch-hook"),
+            git: PathBuf::from("git"),
+            gh: PathBuf::from("gh"),
+            draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+        };
+        let store = hitch_store::Store::open(&store_path).unwrap();
+        let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
+
+        let project = Project::new("slice4", &project_root, ProjectKind::Plain);
+        let project_id = project.id;
+        {
+            let mut guard = state.lock().unwrap();
+            guard.store.insert_project(&project).unwrap();
+            guard.projects.insert(project.id, project);
+        }
+
+        // Keep the receiver alive so the PTY reader thread's sends don't error;
+        // the tests never need to consume it.
+        let (pty_tx, pty_rx) = std::sync::mpsc::channel();
+        let session = super::open_session(
+            &state,
+            SessionParent::Project(project_id),
+            "shell".into(),
+            None,
+            80,
+            24,
+            &pty_tx,
+        )
+        .unwrap();
+        (state, session.id, dir, pty_rx)
+    }
+
+    fn current_state(
+        state: &std::sync::Arc<std::sync::Mutex<super::DaemonState>>,
+        session_id: hitch_core::SessionId,
+    ) -> (
+        Option<hitch_proto::KnownAgent>,
+        Option<hitch_core::AgentState>,
+    ) {
+        let guard = state.lock().unwrap();
+        let s = guard.sessions.get(&session_id).unwrap();
+        (s.agent, s.agent_state)
+    }
+
+    #[test]
+    fn waiting_report_does_not_downgrade_error() {
+        use hitch_core::AgentState;
+        use hitch_proto::KnownAgent;
+
+        let (state, session_id, dir, _rx) = state_with_session();
+
+        // Enter running (clears the late-arrival guard), then error.
+        super::store_agent_report(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(AgentState::Running),
+            Some(session_id),
+            None,
+            None,
+        )
+        .unwrap();
+        super::store_agent_report(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(AgentState::Error),
+            Some(session_id),
+            None,
+            Some("rate limited".into()),
+        )
+        .unwrap();
+
+        // The idle-prompt heal (waiting) must NOT downgrade error.
+        let event = super::store_agent_report(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(AgentState::Waiting),
+            Some(session_id),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(event.is_none(), "waiting over error must not broadcast");
+        assert_eq!(
+            current_state(&state, session_id),
+            (Some(KnownAgent::ClaudeCode), Some(AgentState::Error)),
+            "error must hold through the idle heal"
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn running_report_clears_error() {
+        use hitch_core::AgentState;
+        use hitch_proto::KnownAgent;
+
+        let (state, session_id, dir, _rx) = state_with_session();
+
+        for s in [AgentState::Running, AgentState::Error] {
+            super::store_agent_report(
+                &state,
+                KnownAgent::ClaudeCode,
+                Some(s),
+                Some(session_id),
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        // UserPromptSubmit → running clears error.
+        let event = super::store_agent_report(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(AgentState::Running),
+            Some(session_id),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(event.is_some(), "running over error must broadcast");
+        assert_eq!(
+            current_state(&state, session_id),
+            (Some(KnownAgent::ClaudeCode), Some(AgentState::Running)),
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exit_to_none_clears_error_and_identity() {
+        use hitch_core::AgentState;
+        use hitch_proto::KnownAgent;
+
+        let (state, session_id, dir, _rx) = state_with_session();
+
+        for s in [AgentState::Running, AgentState::Error] {
+            super::store_agent_report(
+                &state,
+                KnownAgent::ClaudeCode,
+                Some(s),
+                Some(session_id),
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        // Exit-to-None clears both state and identity (mark reverts to shell).
+        let event = super::store_agent_report(
+            &state,
+            KnownAgent::ClaudeCode,
+            None,
+            Some(session_id),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(event.is_some(), "exit-to-None must broadcast a clear");
+        assert_eq!(current_state(&state, session_id), (None, None));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn announce_stores_identity_pre_running_without_tripping_guard() {
+        use hitch_core::AgentState;
+        use hitch_proto::KnownAgent;
+
+        let (state, session_id, dir, _rx) = state_with_session();
+
+        // A fresh, never-prompted session: the late-arrival guard is off here
+        // (set true only after a clear), but the announce must store identity
+        // while leaving Agent State absent.
+        let event = super::store_agent_announce(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(session_id),
+            None,
+        )
+        .unwrap();
+        assert!(event.is_some(), "a new identity must broadcast");
+        assert_eq!(
+            current_state(&state, session_id),
+            (Some(KnownAgent::ClaudeCode), None),
+            "announce sets identity but never sets state"
+        );
+
+        // Announce must bypass the late-arrival guard: simulate a guard that is
+        // closed (as it is right after an exit-to-None clear) and confirm an
+        // announce still stores identity even though no `running` has arrived.
+        {
+            let mut guard = state.lock().unwrap();
+            let s = guard.sessions.get_mut(&session_id).unwrap();
+            s.agent = None;
+            s.agent_report_requires_running = true;
+        }
+        let event = super::store_agent_announce(
+            &state,
+            KnownAgent::Codex,
+            Some(session_id),
+            None,
+        )
+        .unwrap();
+        assert!(event.is_some(), "announce must pass the late-arrival guard");
+        assert_eq!(
+            current_state(&state, session_id),
+            (Some(KnownAgent::Codex), None),
+            "announce stores identity even while the state guard is closed"
+        );
+        // A *state* report (non-running) is still dropped by the guard.
+        let dropped = super::store_agent_report(
+            &state,
+            KnownAgent::Codex,
+            Some(AgentState::Waiting),
+            Some(session_id),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(dropped.is_none(), "state guard still drops late non-running");
+        assert_eq!(
+            current_state(&state, session_id),
+            (Some(KnownAgent::Codex), None),
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exit_clear_passes_the_late_arrival_guard() {
+        use hitch_core::AgentState;
+        use hitch_proto::KnownAgent;
+
+        let (state, session_id, dir, _rx) = state_with_session();
+
+        // Run an agent to completion once: the exit-to-None clear closes the
+        // late-arrival guard.
+        super::store_agent_report(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(AgentState::Running),
+            Some(session_id),
+            None,
+            None,
+        )
+        .unwrap();
+        super::store_agent_report(&state, KnownAgent::ClaudeCode, None, Some(session_id), None, None)
+            .unwrap();
+
+        // Second run: announce only (the user opens the TUI but never prompts).
+        super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None)
+            .unwrap();
+        assert_eq!(
+            current_state(&state, session_id),
+            (Some(KnownAgent::ClaudeCode), None),
+        );
+
+        // Exit without ever prompting: the SessionEnd clear must pass the guard
+        // and clear the announced identity, or the Session mark sticks forever
+        // (the guard exists to drop stale *state* reports, never clears — a
+        // clear is idempotent and is the only thing that can revert the mark
+        // for a never-prompted agent).
+        let event = super::store_agent_report(
+            &state,
+            KnownAgent::ClaudeCode,
+            None,
+            Some(session_id),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(event.is_some(), "the exit clear must broadcast past the guard");
+        let event = event.unwrap();
+        assert_eq!(event.agent, None, "the clear must carry agent: None");
+        assert_eq!(current_state(&state, session_id), (None, None));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backstop_clears_announced_identity_without_state() {
+        use hitch_proto::KnownAgent;
+
+        let (state, session_id, dir, _rx) = state_with_session();
+
+        // Announce only — a never-prompted agent has identity but no state.
+        super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None)
+            .unwrap();
+
+        // The agent dies without SessionEnd (dirty exit); the foreground
+        // command poller sees the shell again. The backstop must clear the
+        // announced identity even though there is no Agent State to clear.
+        let event = super::clear_stale_agent_state(&state, session_id, Some("zsh"));
+        assert!(
+            event.is_some(),
+            "the backstop must clear an identity-only session"
+        );
+        let event = event.unwrap();
+        assert_eq!(event.agent, None);
+        assert_eq!(current_state(&state, session_id), (None, None));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn announced_identity_is_replayed_in_session_opened() {
+        use hitch_proto::KnownAgent;
+
+        let (state, session_id, dir, _rx) = state_with_session();
+
+        super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None)
+            .unwrap();
+
+        // Replay reads identity straight off the session record (the same field
+        // `attach`'s SessionOpened replay reads). Confirm it is populated even
+        // with no Agent State yet.
+        let (agent, agent_state) = {
+            let guard = state.lock().unwrap();
+            let s = guard.sessions.get(&session_id).unwrap();
+            (s.agent, s.agent_state)
+        };
+        assert_eq!(agent, Some(KnownAgent::ClaudeCode));
+        assert_eq!(agent_state, None);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn announce_is_idempotent_for_same_identity() {
+        use hitch_proto::KnownAgent;
+
+        let (state, session_id, dir, _rx) = state_with_session();
+
+        let first =
+            super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None)
+                .unwrap();
+        assert!(first.is_some());
+        // Re-announcing the same agent is a no-op: no redundant broadcast.
+        let second =
+            super::store_agent_announce(&state, KnownAgent::ClaudeCode, Some(session_id), None)
+                .unwrap();
+        assert!(second.is_none(), "unchanged identity must not re-broadcast");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn gate_is_active(
+        state: &std::sync::Arc<std::sync::Mutex<super::DaemonState>>,
+        session_id: hitch_core::SessionId,
+    ) -> bool {
+        state
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&session_id)
+            .unwrap()
+            .output_active
+    }
+
+    #[test]
+    fn output_first_frame_rises_then_stays_active_without_per_frame_broadcast() {
+        use std::time::{Duration, Instant};
+
+        let (state, session_id, dir, _rx) = state_with_session();
+        let t0 = Instant::now();
+
+        // First frame after a quiet period is the rising edge: it broadcasts.
+        let edge = {
+            let mut guard = state.lock().unwrap();
+            super::mark_output_active(&mut guard, session_id, t0)
+        };
+        match edge {
+            Some(super::Event::OutputActive { active, .. }) => assert!(active),
+            other => panic!("expected a rising-edge active event, got {other:?}"),
+        }
+        assert!(gate_is_active(&state, session_id));
+
+        // A second frame while already active must NOT broadcast (no spam), even
+        // though it still refreshes the last-output instant.
+        let edge = {
+            let mut guard = state.lock().unwrap();
+            super::mark_output_active(&mut guard, session_id, t0 + Duration::from_millis(10))
+        };
+        assert!(edge.is_none(), "no per-frame broadcast while already active");
+        assert!(gate_is_active(&state, session_id));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_falls_inactive_after_quiet_period() {
+        use std::time::{Duration, Instant};
+
+        let (state, session_id, dir, _rx) = state_with_session();
+        let quiet = Duration::from_secs(4);
+        let t0 = Instant::now();
+
+        // Go active.
+        {
+            let mut guard = state.lock().unwrap();
+            super::mark_output_active(&mut guard, session_id, t0);
+        }
+
+        // Before the quiet window elapses there is no falling edge.
+        let edges = {
+            let mut guard = state.lock().unwrap();
+            super::collect_output_quiet_edges(&mut guard, t0 + Duration::from_secs(3), quiet)
+        };
+        assert!(edges.is_empty(), "must stay active before the quiet window");
+        assert!(gate_is_active(&state, session_id));
+
+        // Once quiet for >= N, the falling edge fires exactly once.
+        let edges = {
+            let mut guard = state.lock().unwrap();
+            super::collect_output_quiet_edges(&mut guard, t0 + quiet, quiet)
+        };
+        assert_eq!(edges.len(), 1, "exactly one falling edge");
+        match &edges[0] {
+            super::Event::OutputActive {
+                session_id: id,
+                active,
+                ..
+            } => {
+                assert_eq!(*id, session_id);
+                assert!(!*active, "falling edge carries active: false");
+            }
+            other => panic!("expected a falling-edge event, got {other:?}"),
+        }
+        assert!(!gate_is_active(&state, session_id));
+
+        // Idempotent: an already-inactive session never re-fires the falling edge.
+        let edges = {
+            let mut guard = state.lock().unwrap();
+            super::collect_output_quiet_edges(&mut guard, t0 + quiet + quiet, quiet)
+        };
+        assert!(edges.is_empty(), "no repeat falling edge once inactive");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_reactivates_after_quiet_period() {
+        use std::time::{Duration, Instant};
+
+        let (state, session_id, dir, _rx) = state_with_session();
+        let quiet = Duration::from_secs(4);
+        let t0 = Instant::now();
+
+        // Active, then quiet → inactive.
+        {
+            let mut guard = state.lock().unwrap();
+            super::mark_output_active(&mut guard, session_id, t0);
+        }
+        {
+            let mut guard = state.lock().unwrap();
+            super::collect_output_quiet_edges(&mut guard, t0 + quiet, quiet);
+        }
+        assert!(!gate_is_active(&state, session_id));
+
+        // New output after the quiet period broadcasts a fresh rising edge.
+        let edge = {
+            let mut guard = state.lock().unwrap();
+            super::mark_output_active(&mut guard, session_id, t0 + quiet + Duration::from_secs(1))
+        };
+        match edge {
+            Some(super::Event::OutputActive { active, .. }) => {
+                assert!(active, "reactivation re-broadcasts active: true")
+            }
+            other => panic!("expected a rising-edge event on reactivation, got {other:?}"),
+        }
+        assert!(gate_is_active(&state, session_id));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_gate_starts_inactive_and_quiet_scan_ignores_never_active_sessions() {
+        use std::time::{Duration, Instant};
+
+        let (state, session_id, dir, _rx) = state_with_session();
+
+        // A brand-new session has produced no output: the gate is inactive and a
+        // quiet scan emits nothing (no last_output_at to measure against).
+        assert!(!gate_is_active(&state, session_id));
+        let edges = {
+            let mut guard = state.lock().unwrap();
+            super::collect_output_quiet_edges(
+                &mut guard,
+                Instant::now() + Duration::from_secs(60),
+                Duration::from_secs(4),
+            )
+        };
+        assert!(edges.is_empty(), "never-active session yields no falling edge");
 
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);

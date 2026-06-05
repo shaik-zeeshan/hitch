@@ -2692,7 +2692,7 @@ mod tests {
     #[cfg(unix)]
     use super::{read_pty_payload, wait_for_socket_release};
     use hitch_core::SessionId;
-    use hitch_proto::transport::{connect_daemon, DaemonListener};
+    use hitch_proto::transport::{connect_daemon, DaemonListener, DaemonStream};
     #[cfg(unix)]
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::{Arc, Mutex};
@@ -3493,7 +3493,7 @@ mod tests {
             .0
             .connected
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        *client.0.writer.lock().unwrap() = Some(writer);
+        *client.0.writer.lock().unwrap() = Some(DaemonStream::new(writer));
 
         client.clear_connection_state(HEARTBEAT_LOST_REASON, false);
 
@@ -3520,7 +3520,7 @@ mod tests {
             .0
             .connected
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        *client.0.writer.lock().unwrap() = Some(writer);
+        *client.0.writer.lock().unwrap() = Some(DaemonStream::new(writer));
 
         let oversized = vec![0_u8; hitch_proto::MAX_PTY_FRAME_LEN + 1];
         client.write_input_frame(SessionId::new(), &oversized);
@@ -3557,7 +3557,7 @@ mod tests {
             .0
             .connected
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        *client.0.writer.lock().unwrap() = Some(writer);
+        *client.0.writer.lock().unwrap() = Some(DaemonStream::new(writer));
 
         // A rapid, distinct sequence so any reordering is detectable. One byte per
         // keystroke mirrors typing.

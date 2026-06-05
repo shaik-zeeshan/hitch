@@ -7,63 +7,24 @@ const AGENT_DISPLAY: Record<KnownAgent, { kind: Exclude<SessionTabKind, "shell">
   codex: { kind: "codex", title: "Codex" },
 };
 
-function agentForCommand(command: string | null | undefined): KnownAgent | null {
-  const normalized = (command ?? "").trim().toLowerCase();
-  switch (normalized) {
-    case "claude":
-    case "claude-code":
-    case "claude code":
-      return "claude-code";
-    case "codex":
-      return "codex";
-    default:
-      return normalized.includes("claude code") ? "claude-code" : null;
-  }
+// The Session mark (glyph + agent title) comes from the daemon-announced Agent
+// identity ONLY (ADR 0011 amendment 2026-06-05): the agent's own `SessionStart`
+// hook announces which agent the moment its TUI starts, so a hand-typed `claude`
+// is marked the same as a launched one. Identity is never inferred from the
+// session title or launch command — that fragile fallback was deleted.
+//
+// `agent` is the announced identity for the session (null = no known agent
+// running). `command` is the live foreground command, used only to label a
+// non-agent shell tab (e.g. "vim"); it never decides the agent kind.
+export function sessionTabKind(agent: KnownAgent | null | undefined): SessionTabKind {
+  return agent ? AGENT_DISPLAY[agent].kind : "shell";
 }
 
-function looksLikeClaudeVersionCommand(command: string | null | undefined): boolean {
-  return /^\d+(?:\.\d+)+(?:\s|$)/.test((command ?? "").trim());
-}
-
-function initialAgentForSessionName(
+export function sessionTabTitle(
+  agent: KnownAgent | null | undefined,
   sessionName: string,
   command: string | null | undefined,
-): KnownAgent | null {
-  if (command != null) return null;
-  switch (sessionName.trim().toLowerCase()) {
-    case "claude":
-    case "claude-code":
-    case "claude code":
-      return "claude-code";
-    case "codex":
-      return "codex";
-    default:
-      return null;
-  }
-}
-
-function displayAgent(sessionName: string, command: string | null | undefined): KnownAgent | null {
-  const commandAgent = agentForCommand(command);
-  if (commandAgent) return commandAgent;
-  if (
-    looksLikeClaudeVersionCommand(command) &&
-    initialAgentForSessionName(sessionName, undefined) === "claude-code"
-  ) {
-    return "claude-code";
-  }
-  return initialAgentForSessionName(sessionName, command);
-}
-
-export function sessionTabTitle(sessionName: string, command: string | null | undefined): string {
-  const agent = displayAgent(sessionName, command);
+): string {
   if (agent) return AGENT_DISPLAY[agent].title;
   return command ?? sessionName;
-}
-
-export function sessionTabKind(
-  sessionName: string,
-  command: string | null | undefined,
-): SessionTabKind {
-  const agent = displayAgent(sessionName, command);
-  return agent ? AGENT_DISPLAY[agent].kind : "shell";
 }

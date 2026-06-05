@@ -22,7 +22,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 import {
   addProject,
   activeSessionId,
-  agentStateByProject,
+  agentActRollupByProject,
   agentStateByWorktree,
   agentStates,
   applyDaemonStatus,
@@ -35,8 +35,7 @@ import {
   connection,
   createWorktree,
   daemonReason,
-  dismissedSessionAgentStates,
-  dismissedWorktreeAgentStates,
+  displaySessionStates,
   diffActive,
   diffPath,
   diffText,
@@ -64,12 +63,13 @@ import {
   runJob,
   selectedProjectId,
   selectedWorktreeId,
+  sessionAgents,
   sessionCommands,
+  sessionOutputActive,
   sessions,
-  worktrees,
-  visibleAgentStates,
   viewDiff,
   worktreeLineStats,
+  worktrees,
 } from "./daemon";
 import { draftClaudePath, draftCodexPath, draftModel, draftProvider } from "./settings";
 
@@ -91,8 +91,8 @@ beforeEach(() => {
   worktrees.set([]);
   sessions.set([]);
   agentStates.set({});
-  dismissedSessionAgentStates.set({});
-  dismissedWorktreeAgentStates.set({});
+  sessionAgents.set({});
+  sessionOutputActive.set({});
   dirtyWorktrees.set({});
   worktreeLineStats.set({});
   gitStatus.set(null);
@@ -146,24 +146,30 @@ describe("daemon status mapping", () => {
 });
 
 describe("agent state propagation", () => {
-  it("seeds and clears per-session state from session-opened replay", () => {
+  it("seeds and clears per-session state and identity from session-opened replay", () => {
     applyHitchEvent({
       type: "session-opened",
       session: { id: "s1", name: "claude", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
       agent: "claude-code",
       agent_state: "waiting",
       agent_detail: null,
+      output_active: false,
     } as any);
     expect(get(agentStates)).toEqual({ s1: "waiting" });
+    expect(get(sessionAgents)).toEqual({ s1: "claude-code" });
 
+    // A null-state replay clears state but identity persists while the agent is
+    // still announced (the replay still carries `agent`).
     applyHitchEvent({
       type: "session-opened",
       session: { id: "s1", name: "claude", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
       agent: "claude-code",
       agent_state: null,
       agent_detail: null,
+      output_active: false,
     } as any);
     expect(get(agentStates)).toEqual({});
+    expect(get(sessionAgents)).toEqual({ s1: "claude-code" });
 
     agentStates.set({ s1: "error" });
     applyHitchEvent({
@@ -175,7 +181,51 @@ describe("agent state propagation", () => {
     expect(get(agentStates)).toEqual({});
   });
 
-  it("updates and clears agent state only by session id", () => {
+  it("seeds the output gate from the session-opened replay", () => {
+    applyHitchEvent({
+      type: "session-opened",
+      session: { id: "s1", name: "claude", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
+      agent: "claude-code",
+      agent_state: "running",
+      agent_detail: null,
+      output_active: true,
+    } as any);
+    expect(get(sessionOutputActive)).toEqual({ s1: true });
+    expect(get(displaySessionStates)).toEqual({ s1: "running" });
+  });
+
+  it("records announced identity from an agent-state announce even when state is null", () => {
+    sessions.set([
+      { id: "s1", name: "shell", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+    ]);
+    // SessionStart announce: agent known, state still null pre-prompt. The
+    // identity must be recorded NOW — it drives the Session mark before the
+    // first prompt (ADR 0011 amendment). A clear is `agent: null`, not a null
+    // state: the announce broadcast carries the session's current (null) state.
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: "s1",
+      worktree_id: "w1",
+      agent: "claude-code",
+      state: null,
+      detail: null,
+    } as any);
+    expect(get(agentStates)).toEqual({});
+    expect(get(sessionAgents)).toEqual({ s1: "claude-code" });
+
+    // A real state report keeps the identity it carries.
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: "s1",
+      worktree_id: "w1",
+      agent: "claude-code",
+      state: "running",
+      detail: null,
+    } as any);
+    expect(get(sessionAgents)).toEqual({ s1: "claude-code" });
+  });
+
+  it("updates and clears agent state and identity only by session id", () => {
     sessions.set([
       { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
     ]);
@@ -189,6 +239,7 @@ describe("agent state propagation", () => {
       detail: null,
     } as any);
     expect(get(agentStates)).toEqual({ s1: "running" });
+    expect(get(sessionAgents)).toEqual({ s1: "claude-code" });
 
     applyHitchEvent({
       type: "agent-state",
@@ -200,28 +251,64 @@ describe("agent state propagation", () => {
     } as any);
     expect(get(agentStates)).toEqual({ s1: "running" });
 
+    // Exit-to-null clears both state and identity (the mark reverts to shell).
+    // The clear is distinguished from an identity announce by `agent: null`,
+    // never by the null state (the announce also carries a null state).
+    applyHitchEvent({
+      type: "agent-state",
+      session_id: "s1",
+      worktree_id: "w1",
+      agent: null,
+      state: null,
+      detail: null,
+    } as any);
+    expect(get(agentStates)).toEqual({});
+    expect(get(sessionAgents)).toEqual({});
+  });
+
+  it("gates the WORKING display state on output activity", () => {
+    sessions.set([
+      { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+    ]);
     applyHitchEvent({
       type: "agent-state",
       session_id: "s1",
       worktree_id: "w1",
       agent: "claude-code",
-      state: null,
+      state: "running",
       detail: null,
     } as any);
-    expect(get(agentStates)).toEqual({});
+    // running hook state with the gate closed renders idle (no WORKING word).
+    expect(get(agentStates)).toEqual({ s1: "running" });
+    expect(get(displaySessionStates)).toEqual({});
+
+    // Output rising edge opens the gate → WORKING shows.
+    applyHitchEvent({ type: "output-active", session_id: "s1", worktree_id: "w1", active: true } as any);
+    expect(get(displaySessionStates)).toEqual({ s1: "running" });
+
+    // Falling edge (interrupt/hang) closes it again → WORKING drops.
+    applyHitchEvent({ type: "output-active", session_id: "s1", worktree_id: "w1", active: false } as any);
+    expect(get(displaySessionStates)).toEqual({});
   });
 
-  it("rolls per-session states up to worktree and project by priority", () => {
+  it("never gates act states or shows the unlabeled waiting state", () => {
+    sessions.set([
+      { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+    ]);
+    // Act states show regardless of output activity.
+    agentStates.set({ s1: "needs-approval" });
+    expect(get(displaySessionStates)).toEqual({ s1: "needs-approval" });
+    agentStates.set({ s1: "error" });
+    expect(get(displaySessionStates)).toEqual({ s1: "error" });
+    // waiting renders unlabeled (omitted from the display map entirely).
+    agentStates.set({ s1: "waiting" });
+    expect(get(displaySessionStates)).toEqual({});
+  });
+
+  it("rolls per-session display states up to the worktree by priority", () => {
     projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
     worktrees.set([
-      {
-        id: "w1",
-        project_id: "p1",
-        path: "/repo",
-        branch: "main",
-        is_main: true,
-        is_hitch_managed: false,
-      },
+      { id: "w1", project_id: "p1", path: "/repo", branch: "main", is_main: true, is_hitch_managed: false },
       {
         id: "w2",
         project_id: "p1",
@@ -234,94 +321,21 @@ describe("agent state propagation", () => {
     sessions.set([
       { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
       { id: "s2", name: "codex", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
-      {
-        id: "s3",
-        name: "claude",
-        parent: { kind: "worktree", id: "w2" },
-        cwd: "/repo/.hitch/worktrees/feature",
-      },
+      { id: "s3", name: "claude", parent: { kind: "worktree", id: "w2" }, cwd: "/repo/.hitch/worktrees/feature" },
     ]);
+    // s1 running with its gate open; s2 waiting (unlabeled); s3 error.
     agentStates.set({ s1: "running", s2: "waiting", s3: "error" });
-    expect(get(agentStateByWorktree)).toEqual({ w1: "waiting", w2: "error" });
-    expect(get(agentStateByProject)).toEqual({ p1: "error" });
+    sessionOutputActive.set({ s1: true });
+    expect(get(agentStateByWorktree)).toEqual({ w1: "running", w2: "error" });
 
     agentStates.set({ s1: "needs-approval", s2: "waiting", s3: "error" });
     expect(get(agentStateByWorktree)).toEqual({ w1: "needs-approval", w2: "error" });
-    expect(get(agentStateByProject)).toEqual({ p1: "needs-approval" });
-  });
-
-  it("dismisses waiting and error worktree rollups when seen, but not needs-approval", () => {
-    projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
-    worktrees.set([
-      {
-        id: "w1",
-        project_id: "p1",
-        path: "/repo",
-        branch: "main",
-        is_main: true,
-        is_hitch_managed: false,
-      },
-      {
-        id: "w2",
-        project_id: "p1",
-        path: "/repo/.hitch/worktrees/feature",
-        branch: "feature",
-        is_main: false,
-        is_hitch_managed: true,
-      },
-    ]);
-    sessions.set([
-      { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
-    ]);
-    agentStates.set({ s1: "waiting" });
-    expect(get(agentStateByWorktree)).toEqual({ w1: "waiting" });
-
-    selectedWorktreeId.set("w1");
-    expect(get(dismissedWorktreeAgentStates)).toEqual({ w1: "waiting" });
-    selectedWorktreeId.set("w2");
-    expect(get(agentStateByWorktree)).toEqual({});
-    expect(get(agentStateByProject)).toEqual({});
-
-    applyHitchEvent({
-      type: "agent-state",
-      session_id: "s1",
-      worktree_id: "w1",
-      agent: "claude-code",
-      state: "error",
-      detail: null,
-    } as any);
-    expect(get(agentStateByWorktree)).toEqual({ w1: "error" });
-    selectedWorktreeId.set("w1");
-    selectedWorktreeId.set("w2");
-    expect(get(agentStateByWorktree)).toEqual({});
-
-    applyHitchEvent({
-      type: "agent-state",
-      session_id: "s1",
-      worktree_id: "w1",
-      agent: "claude-code",
-      state: "needs-approval",
-      detail: null,
-    } as any);
-    expect(get(agentStateByWorktree)).toEqual({ w1: "needs-approval" });
-    selectedWorktreeId.set("w1");
-    expect(get(dismissedWorktreeAgentStates)).toEqual({});
-    expect(get(agentStateByWorktree)).toEqual({ w1: "needs-approval" });
-    selectedWorktreeId.set("w2");
-    expect(get(agentStateByWorktree)).toEqual({ w1: "needs-approval" });
   });
 
   it("hides selected-worktree running only when the active tab is the running session", () => {
     projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
     worktrees.set([
-      {
-        id: "w1",
-        project_id: "p1",
-        path: "/repo",
-        branch: "main",
-        is_main: true,
-        is_hitch_managed: false,
-      },
+      { id: "w1", project_id: "p1", path: "/repo", branch: "main", is_main: true, is_hitch_managed: false },
       {
         id: "w2",
         project_id: "p1",
@@ -336,10 +350,10 @@ describe("agent state propagation", () => {
       { id: "s2", name: "shell", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
     ]);
     agentStates.set({ s1: "running" });
+    sessionOutputActive.set({ s1: true });
 
     selectedWorktreeId.set("w1");
     activeSessionId.set("s1");
-    expect(get(dismissedWorktreeAgentStates)).toEqual({});
     expect(get(agentStateByWorktree)).toEqual({});
 
     activeSessionId.set("s2");
@@ -352,167 +366,66 @@ describe("agent state propagation", () => {
     diffActive.set(false);
     selectedWorktreeId.set("w2");
     expect(get(agentStateByWorktree)).toEqual({ w1: "running" });
-    expect(get(agentStateByProject)).toEqual({ p1: "running" });
   });
 
-  it("keeps waiting and error tab status briefly visible when the user visits that tab", () => {
-    vi.useFakeTimers();
-    try {
-      sessions.set([
-        { id: "s1", name: "codex", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
-        { id: "s2", name: "shell", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
-      ]);
-      activeSessionId.set("s2");
-      applyHitchEvent({
-        type: "agent-state",
-        session_id: "s1",
-        worktree_id: null,
-        agent: "codex",
-        state: "waiting",
-        detail: null,
-      } as any);
-      expect(get(visibleAgentStates)).toEqual({ s1: "waiting" });
-
-      activeSessionId.set("s1");
-      expect(get(visibleAgentStates)).toEqual({ s1: "waiting" });
-      vi.advanceTimersByTime(2_499);
-      expect(get(visibleAgentStates)).toEqual({ s1: "waiting" });
-      vi.advanceTimersByTime(1);
-      expect(get(dismissedSessionAgentStates)).toEqual({ s1: "waiting" });
-      expect(get(visibleAgentStates)).toEqual({});
-
-      activeSessionId.set("s2");
-      applyHitchEvent({
-        type: "agent-state",
-        session_id: "s1",
-        worktree_id: null,
-        agent: "codex",
-        state: "error",
-        detail: null,
-      } as any);
-      expect(get(visibleAgentStates)).toEqual({ s1: "error" });
-      activeSessionId.set("s1");
-      expect(get(visibleAgentStates)).toEqual({ s1: "error" });
-      vi.advanceTimersByTime(2_500);
-      expect(get(dismissedSessionAgentStates)).toEqual({ s1: "error" });
-      expect(get(visibleAgentStates)).toEqual({});
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("keeps active waiting status briefly visible before dismissing it", () => {
-    vi.useFakeTimers();
-    try {
-      sessions.set([
-        { id: "s1", name: "codex", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
-      ]);
-      activeSessionId.set("s1");
-      applyHitchEvent({
-        type: "agent-state",
-        session_id: "s1",
-        worktree_id: null,
-        agent: "codex",
-        state: "waiting",
-        detail: null,
-      } as any);
-      expect(get(visibleAgentStates)).toEqual({ s1: "waiting" });
-      vi.advanceTimersByTime(2_499);
-      expect(get(visibleAgentStates)).toEqual({ s1: "waiting" });
-      vi.advanceTimersByTime(1);
-      expect(get(dismissedSessionAgentStates)).toEqual({ s1: "waiting" });
-      expect(get(visibleAgentStates)).toEqual({});
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("acknowledges replayed waiting status for the already active tab", () => {
-    vi.useFakeTimers();
-    try {
-      sessions.set([
-        { id: "s1", name: "codex", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
-      ]);
-      activeSessionId.set("s1");
-
-      applyHitchEvent({
-        type: "session-opened",
-        session: { id: "s1", name: "codex", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
-        agent: "codex",
-        agent_state: "waiting",
-        agent_detail: null,
-      } as any);
-
-      expect(get(visibleAgentStates)).toEqual({ s1: "waiting" });
-      vi.advanceTimersByTime(2_499);
-      expect(get(visibleAgentStates)).toEqual({ s1: "waiting" });
-      vi.advanceTimersByTime(1);
-      expect(get(dismissedSessionAgentStates)).toEqual({ s1: "waiting" });
-      expect(get(visibleAgentStates)).toEqual({});
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("keeps needs-approval tab status sticky until state changes or clears", () => {
-    sessions.set([
-      { id: "s1", name: "codex", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
-      { id: "s2", name: "shell", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
-    ]);
-    activeSessionId.set("s2");
-    applyHitchEvent({
-      type: "agent-state",
-      session_id: "s1",
-      worktree_id: null,
-      agent: "codex",
-      state: "needs-approval",
-      detail: null,
-    } as any);
-
-    activeSessionId.set("s1");
-    expect(get(dismissedSessionAgentStates)).toEqual({});
-    expect(get(visibleAgentStates)).toEqual({ s1: "needs-approval" });
-
-    applyHitchEvent({
-      type: "agent-state",
-      session_id: "s1",
-      worktree_id: null,
-      agent: "codex",
-      state: "waiting",
-      detail: null,
-    } as any);
-    expect(get(visibleAgentStates)).toEqual({ s1: "waiting" });
-
-    applyHitchEvent({
-      type: "agent-state",
-      session_id: "s1",
-      worktree_id: null,
-      agent: "codex",
-      state: null,
-      detail: null,
-    } as any);
-    expect(get(agentStates)).toEqual({});
-    expect(get(dismissedSessionAgentStates)).toEqual({});
-  });
-
-  it("drops per-session state when the session closes", () => {
+  it("rolls up a per-project act-state pill with its count, collapsing to the highest priority", () => {
+    projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
     worktrees.set([
+      { id: "w1", project_id: "p1", path: "/repo", branch: "main", is_main: true, is_hitch_managed: false },
       {
-        id: "w1",
+        id: "w2",
         project_id: "p1",
-        path: "/repo",
-        branch: "main",
-        is_main: true,
-        is_hitch_managed: false,
+        path: "/repo/.hitch/worktrees/feature",
+        branch: "feature",
+        is_main: false,
+        is_hitch_managed: true,
       },
+    ]);
+    sessions.set([
+      { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+      { id: "s2", name: "codex", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+      { id: "s3", name: "claude", parent: { kind: "worktree", id: "w2" }, cwd: "/repo/.hitch/worktrees/feature" },
+    ]);
+
+    // Two act sessions (error + needs-approval) collapse to needs-approval (the
+    // higher priority) with count 2; the running/waiting ones don't count.
+    agentStates.set({ s1: "error", s2: "running", s3: "needs-approval" });
+    expect(get(agentActRollupByProject)).toEqual({ p1: { state: "needs-approval", count: 2 } });
+
+    // Only errors → error rollup with count 1.
+    agentStates.set({ s1: "error", s2: "waiting", s3: "running" });
+    expect(get(agentActRollupByProject)).toEqual({ p1: { state: "error", count: 1 } });
+
+    // No act states → no pill (act rollup never hides behind output gating).
+    agentStates.set({ s1: "running", s2: "waiting" });
+    sessionOutputActive.set({});
+    expect(get(agentActRollupByProject)).toEqual({});
+  });
+
+  it("counts project-parented sessions toward the project act rollup", () => {
+    projects.set([{ id: "p1", name: "Plain", root: "/repo", kind: "plain" }]);
+    sessions.set([
+      { id: "s1", name: "claude", parent: { kind: "project", id: "p1" }, cwd: "/repo" },
+    ]);
+    agentStates.set({ s1: "needs-approval" });
+    expect(get(agentActRollupByProject)).toEqual({ p1: { state: "needs-approval", count: 1 } });
+  });
+
+  it("drops per-session state, identity, and output gate when the session closes", () => {
+    worktrees.set([
+      { id: "w1", project_id: "p1", path: "/repo", branch: "main", is_main: true, is_hitch_managed: false },
     ]);
     sessions.set([
       { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
     ]);
     agentStates.set({ s1: "running" });
+    sessionAgents.set({ s1: "claude-code" });
+    sessionOutputActive.set({ s1: true });
 
     applyHitchEvent({ type: "session-closed", session_id: "s1", exit_code: null } as any);
     expect(get(agentStates)).toEqual({});
+    expect(get(sessionAgents)).toEqual({});
+    expect(get(sessionOutputActive)).toEqual({});
     expect(get(agentStateByWorktree)).toEqual({});
   });
 });
@@ -1425,8 +1338,8 @@ describe("Windows project paths", () => {
     selectedWorktreeId.set(removed.id);
     activeSessionId.set("session-remove");
     agentStates.set({ "session-remove": "waiting", "session-keep": "running" });
-    dismissedSessionAgentStates.set({ "session-remove": "waiting" });
-    dismissedWorktreeAgentStates.set({ [removed.id]: "waiting" });
+    sessionAgents.set({ "session-remove": "claude-code" });
+    sessionOutputActive.set({ "session-remove": true, "session-keep": true });
     sessionCommands.set({ "session-remove": "claude", "session-keep": "pwsh" });
     dirtyWorktrees.set({ [removed.id]: true, [worktree.id]: false });
     worktreeLineStats.set({
@@ -1468,8 +1381,8 @@ describe("Windows project paths", () => {
     expect(get(prInfo)).toBeNull();
     expect(get(prUrl)).toBeNull();
     expect(get(agentStates)).toEqual({ "session-keep": "running" });
-    expect(get(dismissedSessionAgentStates)).toEqual({});
-    expect(get(dismissedWorktreeAgentStates)).toEqual({});
+    expect(get(sessionAgents)).toEqual({});
+    expect(get(sessionOutputActive)).toEqual({ "session-keep": true });
     expect(get(sessionCommands)).toEqual({ "session-keep": "pwsh" });
     expect(get(agentStateByWorktree)).toEqual({ [worktree.id]: "running" });
   });

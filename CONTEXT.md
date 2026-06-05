@@ -32,18 +32,24 @@ _Avoid_: Harness, Assistant.
 The current status of an Agent running in a Session, reported by the agent's own hook system (Claude Code lifecycle hooks, Codex lifecycle hooks) over a local channel — not inferred from terminal output. Values:
 - *running* — the Agent is actively working.
 - *needs-approval* — the Agent is **blocked mid-turn** on a permission gate; it cannot proceed without the user. The urgent "your turn".
-- *waiting* — the Agent finished its turn and is **idle at its prompt**, content to wait; the ball is in the user's court. The soft "your turn". (Surfaced to a person glancing at a branch as *"your turn"*.)
-- *error* — the Agent stopped because of a failure.
+- *waiting* — the Agent finished its turn and is **idle at its prompt**, content to wait; the ball is in the user's court. The soft "your turn". **Renders unlabeled** in the shell (decided 2026-06-05): a finished turn is visually just idle — *waiting* remains in the taxonomy as the hook-truth that a turn ended (it drops *running*, floors the rollup, and feeds palette/sorting), but no word, badge, or dot is shown for it, and there is nothing to dismiss.
+- *error* — the Agent's **turn** failed (agent-reported via its failure hook: rate limit, billing, server error, …); the Agent process is still alive at its prompt. A process exit is never *error* — exit clears to `None`.
+
+*needs-approval* and *error* are the **act states**: they alone demand the user's attention, and one predicate (`state ∈ {needs-approval, error}`) drives every attention surface — the row's state word, the tab needdot, and the collapsed-project rollup pill — all in the single attention color (decided 2026-06-05).
 
 A Session not running a known Agent has **no** Agent State (`None`). This absence is also how Hitch models an Agent that has **exited** — when the Agent process leaves the Session's foreground (the user quit `claude`/`codex`, or it died), the Agent State clears to `None` rather than lingering on a stale value or becoming a distinct terminal status. There is no *completed* state: an interactive Agent in a PTY never "completes", it goes *waiting* until re-prompted or it exits to `None`.
 _Avoid_: Status (too generic), Completed/Done (an interactive Agent does not terminate into a state — it idles to *waiting* or exits to `None`), Idle (resolved as *waiting*).
+
+**Session mark**:
+The glyph identifying what a **Session** runs: a known **Agent**'s mark (Claude, Codex) or the shell mark. Tabs mark every Session; the worktree row's facepile shows **Agent Sessions only** — a worktree running only shells has an empty pile (decided 2026-06-05). Mark identity is announced by the Agent's own `SessionStart` hook as an **identity-only report** (it carries which Agent, never an Agent State) and clears when the Agent exits to `None`, reverting the Session to the shell mark. Identity is never inferred from the Session's title or launch command.
+_Avoid_: Harness mark (see **Agent**'s avoided terms), State glyph (marks identify what runs; they never convey Agent State).
 
 **Agent Registry**:
 Hitch's built-in set of known Agents (Claude Code, Codex to start), each with a code-level integration describing its launch command and hook mechanism. Adding an Agent is a contained code change, not user config. Commands outside the registry still run as plain Sessions, just without Agent State.
 _Avoid_: Plugins, Providers.
 
 **Hook helper**:
-A small `hitch` CLI invoked by an Agent's installed hook; it reports the Agent's state to the **Daemon**'s local socket, which **owns** the current value (see ADR 0011). Hitch installs the hook by merging it into a per-Worktree, gitignored agent-local config (e.g. `.claude/settings.local.json`, `.codex/hooks.json`) without overwriting the user's own keys. Every installed hook carries an explicit state; the helper never infers state from payload text. It resolves to a Session by `HITCH_SESSION_ID` (injected into every PTY) only — a report that cannot be resolved is logged and dropped, never smeared onto a Worktree. The helper never breaks the Agent: any failure exits 0, unknown args are ignored, a `--session-id` flag is rejected, and `HITCH_HOOK_DEBUG` gates a diagnostic log (ADR 0002 amendment 2026-06-04).
+A small `hitch` CLI invoked by an Agent's installed hook; it reports the Agent's state to the **Daemon**'s local socket, which **owns** the current value (see ADR 0011). It is strictly **one-way**: a fire-and-forget reporter, never a decision channel. Permission prompts are the Agent's own terminal UI — Hitch surfaces *needs-approval* and routes attention to the Session, but never renders or answers the prompt itself (decided 2026-06-05). Hitch installs the hook by merging it into a per-Worktree, gitignored agent-local config (e.g. `.claude/settings.local.json`, `.codex/hooks.json`) without overwriting the user's own keys. Every installed hook carries an explicit state; the helper never infers state from payload text. It resolves to a Session by `HITCH_SESSION_ID` (injected into every PTY) only — a report that cannot be resolved is logged and dropped, never smeared onto a Worktree. The helper never breaks the Agent: any failure exits 0, unknown args are ignored, a `--session-id` flag is rejected, and `HITCH_HOOK_DEBUG` gates a diagnostic log (ADR 0002 amendment 2026-06-04).
 _Avoid_: Notifier, Bridge.
 
 **Job**:
@@ -72,5 +78,8 @@ _Avoid_: Agent harness, Agent.
 - "Tracked task" — there is no Task entity. A Session running an Agent is the closest thing; its "tracking" is just its Agent State, surfaced in the tree/tab. Typing `claude` in any Session reports state because the hook lives in the worktree config, not in how the Session was launched.
 - "Agent harness" — resolved as **Draft Generator** for this feature; **Agent** remains reserved for known CLIs running in Sessions.
 - "completed" / "done" — removed (ADR 0011). An interactive Agent does not terminate into a state: a finished turn is *waiting*, an exited Agent is `None`.
-- "your turn" is two distinct states: *needs-approval* (blocking gate, sticky until resolved) vs *waiting* (idle prompt, dismiss-on-seen).
+- "your turn" is two distinct states: *needs-approval* (blocking gate, sticky until resolved) vs *waiting* (idle prompt, unlabeled in the shell). The former dismiss-on-seen machinery for *waiting* is removed with the Paper Terminal shell (2026-06-05) — an unlabeled state has nothing to dismiss.
 - **Known gap:** Codex exposes no failure hook, so the *error* Agent State is never shown for Codex (a crash clears to `None`); accepted for now (ADR 0011).
+- **Known gap:** abandoning a permission prompt (Esc at the gate) can leave a wrong *needs-approval* for up to ~60s until the agent's idle notification self-heals it to *waiting* (ADR 0011 amendment 2026-06-05). The heal is **Claude-only** — Codex has no idle notification, so a Codex residue lasts until the user re-prompts that Session.
+- **Known gap:** Codex has no `SessionEnd` hook (docs-verified 2026-06-05), so a clean Codex exit never hook-clears to `None` — it relies on the Unix foreground-poller backstop; on Windows (no backstop) a quit Codex's state lingers until the Session closes.
+- **Known gap:** Codex executes a project-local `.codex/hooks.json` only after the user trusts that project's `.codex` layer (Codex `/hooks`). Hitch installs the file but cannot auto-trust it; until trusted, Codex Agent State is silently absent. Accepted; a UX nudge may come later.

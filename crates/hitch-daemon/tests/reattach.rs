@@ -1616,6 +1616,7 @@ impl TestClient {
                             agent,
                             agent_state,
                             agent_detail,
+                            ..
                         },
                 }) if session.id == session_id => {
                     assert_eq!(agent, expected_agent);

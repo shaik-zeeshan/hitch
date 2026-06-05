@@ -10,12 +10,13 @@
   import {
     activeSession,
     activeSessionId,
-    visibleAgentStates,
+    displaySessionStates,
     closeDiff,
     closeSession,
     diffActive,
     diffPath,
     openSession,
+    sessionAgents,
     sessionCommands,
     visibleSessions,
   } from "../daemon";
@@ -33,10 +34,11 @@
 
 <div class="tabs" role="tablist">
   {#each $visibleSessions as session (session.id)}
-    {@const state = $visibleAgentStates[session.id]}
+    {@const state = $displaySessionStates[session.id]}
+    {@const agent = $sessionAgents[session.id]}
     {@const command = $sessionCommands[session.id]}
-    {@const title = sessionTabTitle(session.name, command)}
-    {@const kind = sessionTabKind(session.name, command)}
+    {@const title = sessionTabTitle(agent, session.name, command)}
+    {@const kind = sessionTabKind(agent)}
     {@const active = !$diffActive && session.id === $activeSession?.id}
     <ContextMenu.Root>
       <ContextMenu.Trigger>
@@ -77,7 +79,8 @@
             <span class="name">{title}</span>
 
             {#if state}
-              <span class="runtag {AGENT_LABEL[state].cls}">{AGENT_LABEL[state].label}</span>
+              {@const label = AGENT_LABEL[state]}
+              {#if label}<span class="runtag {label.cls}">{label.label}</span>{/if}
             {/if}
 
             <span

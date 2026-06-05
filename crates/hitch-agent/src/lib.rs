@@ -235,12 +235,33 @@ fn install_claude_hooks(
     let path = worktree_path.join(".claude/settings.local.json");
     let overlay = json!({
         "hooks": {
+            // Identity-only announce (ADR 0011 amendment 2026-06-05): carries WHICH
+            // agent with no Agent State, so the Session mark renders before the
+            // first prompt. It must NOT pass `--state` (that would mean "clear").
+            "SessionStart": [claude_announce_hook_entry(helper_path, "session-start")],
             "UserPromptSubmit": [claude_hook_entry(helper_path, "user-prompt-submit", AgentState::Running)],
             "PermissionRequest": [claude_hook_entry(helper_path, "permission-request", AgentState::NeedsApproval)],
-            "Notification": [claude_hook_entry_with_matcher(helper_path, "permission_prompt", "notification", AgentState::NeedsApproval)],
+            // After a deny the agent consumes the denial and finishes its turn, so
+            // PermissionDenied -> running heals the sticky `needs-approval` signal
+            // (symmetric with PostToolUse).
+            "PermissionDenied": [claude_hook_entry(helper_path, "permission-denied", AgentState::Running)],
+            // Two distinct Notification matcher groups, both Hitch-owned:
+            // `permission_prompt` -> needs-approval, `idle_prompt` -> waiting (the
+            // agent's own "done and idle" signal that self-heals stale state).
+            "Notification": [
+                claude_hook_entry_with_matcher(helper_path, "permission_prompt", "notification", AgentState::NeedsApproval),
+                claude_hook_entry_with_matcher(helper_path, "idle_prompt", "notification", AgentState::Waiting)
+            ],
             "PostToolUse": [claude_hook_entry(helper_path, "post-tool-use", AgentState::Running)],
             "Stop": [claude_hook_entry(helper_path, "stop", AgentState::Waiting)],
-            "StopFailure": [claude_hook_entry(helper_path, "stop-failure", AgentState::Error)],
+            // Per-matcher StopFailure entries each carry an explicit human-readable
+            // `--detail` reason; we never parse the agent's payload to discover why
+            // the turn failed (ADR 0011: no text inference).
+            "StopFailure": [
+                claude_stop_failure_hook_entry(helper_path, "rate_limit", "rate limited"),
+                claude_stop_failure_hook_entry(helper_path, "billing_error", "billing issue"),
+                claude_stop_failure_hook_entry(helper_path, "server_error", "server error")
+            ],
             "SessionEnd": [claude_clear_hook_entry(helper_path, "session-end")]
         }
     });
@@ -251,6 +272,7 @@ fn install_claude_hooks(
         &[
             "UserPromptSubmit",
             "PermissionRequest",
+            "PermissionDenied",
             "Notification",
             "PostToolUse",
             "Stop",
@@ -274,11 +296,16 @@ fn install_codex_hooks(
     let path = worktree_path.join(".codex/hooks.json");
     let overlay = json!({
         "hooks": {
+            // Identity-only announce, same shape as Claude's. Codex's `SessionStart`
+            // is a documented, valid event (ADR 0011 amendment 2026-06-05).
+            "SessionStart": [codex_announce_hook_entry(helper_path, "session-start")],
             "UserPromptSubmit": [codex_hook_entry(helper_path, "user-prompt-submit", AgentState::Running)],
             "PermissionRequest": [codex_hook_entry(helper_path, "permission-request", AgentState::NeedsApproval)],
             "PostToolUse": [codex_hook_entry(helper_path, "post-tool-use", AgentState::Running)],
-            "Stop": [codex_hook_entry(helper_path, "stop", AgentState::Waiting)],
-            "SessionEnd": [codex_clear_hook_entry(helper_path, "session-end")]
+            "Stop": [codex_hook_entry(helper_path, "stop", AgentState::Waiting)]
+            // No `SessionEnd`: the event does not exist in Codex (the old install's
+            // entry was silently ignored). It is still pruned below so re-installing
+            // over an old config migrates it away.
         }
     });
     merge_json_file(
@@ -291,6 +318,7 @@ fn install_codex_hooks(
             "PostToolUse",
             "Stop",
             "SessionStart",
+            // Pruned so old installs migrate: Codex never had a real SessionEnd.
             "SessionEnd",
         ],
     )?;
@@ -311,12 +339,45 @@ fn codex_hook_entry(helper_path: &Path, event: &str, state: AgentState) -> Value
     })
 }
 
-fn codex_clear_hook_entry(helper_path: &Path, event: &str) -> Value {
+fn codex_announce_hook_entry(helper_path: &Path, event: &str) -> Value {
     json!({
         "matcher": "",
         "hooks": [{
             "type": "command",
-            "command": hook_command(helper_path, AgentKind::Codex, event, None)
+            "command": announce_command(helper_path, AgentKind::Codex, event)
+        }]
+    })
+}
+
+fn claude_announce_hook_entry(helper_path: &Path, event: &str) -> Value {
+    json!({
+        "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": announce_command(helper_path, AgentKind::ClaudeCode, event)
+        }]
+    })
+}
+
+/// A Claude `StopFailure` entry scoped to a single failure `matcher`, carrying an
+/// explicit human-readable `--detail` reason. Hitch never parses the agent's
+/// payload to discover why the turn failed (ADR 0011: no text inference); the
+/// matcher selects the entry and the installer hard-codes the reason string.
+fn claude_stop_failure_hook_entry(helper_path: &Path, matcher: &str, detail: &str) -> Value {
+    let mut command = hook_command(
+        helper_path,
+        AgentKind::ClaudeCode,
+        "stop-failure",
+        Some(AgentState::Error),
+    );
+    let style = command_arg_style_for_path(helper_path);
+    command.push_str(" --detail ");
+    command.push_str(&platform_command_arg(detail, style));
+    json!({
+        "matcher": matcher,
+        "hooks": [{
+            "type": "command",
+            "command": command
         }]
     })
 }
@@ -349,12 +410,36 @@ fn claude_hook_entry_with_matcher(
     })
 }
 
+/// Build a helper invocation for an **identity announce**: it names which agent
+/// (via `--agent`) and the `session-start` event, plus an explicit `--announce`
+/// flag, and carries NO `--state`. The announce is identity, not Agent State, so
+/// it must never pass `--state` — that would be read as "clear" (ADR 0011
+/// amendment 2026-06-05). The explicit flag mirrors how state entries carry an
+/// explicit `--state`, so the installed entry does not depend on the helper's
+/// event mapping.
+fn announce_command(helper_path: &Path, agent: AgentKind, event: &str) -> String {
+    let mut command = hook_command_prefix(helper_path, agent, event);
+    command.push_str(" --announce");
+    command
+}
+
 fn hook_command(
     helper_path: &Path,
     agent: AgentKind,
     event: &str,
     state: Option<AgentState>,
 ) -> String {
+    let mut command = hook_command_prefix(helper_path, agent, event);
+    if let Some(state) = state {
+        command.push_str(" --state ");
+        command.push_str(state_arg(state));
+    }
+    command
+}
+
+/// The shared `<helper> --agent <id> --event <event>` prefix, written in the
+/// shell each agent evaluates hook commands with (see the per-agent notes below).
+fn hook_command_prefix(helper_path: &Path, agent: AgentKind, event: &str) -> String {
     let style = command_arg_style_for_path(helper_path);
     // Each agent evaluates hook commands with a different shell, so the command
     // must be written in that shell's language:
@@ -369,7 +454,7 @@ fn hook_command(
     //   `& 'C:\...\hitch-hook.exe' --agent codex ...`. Single quotes also keep
     //   the string free of `"` characters, which would otherwise be mangled by
     //   the Rust-side argv quoting Codex uses to pass the command to PowerShell.
-    let mut command = if agent == AgentKind::Codex && style == CommandArgStyle::Windows {
+    if agent == AgentKind::Codex && style == CommandArgStyle::Windows {
         format!(
             "& {} --agent {} --event {}",
             hitch_core::powershell_single_quoted(&helper_path.to_string_lossy()),
@@ -383,12 +468,7 @@ fn hook_command(
             agent.id(),
             platform_command_arg(event, style)
         )
-    };
-    if let Some(state) = state {
-        command.push_str(" --state ");
-        command.push_str(state_arg(state));
     }
-    command
 }
 
 fn state_arg(state: AgentState) -> &'static str {
@@ -898,7 +978,7 @@ mod tests {
         fs::create_dir_all(worktree.join(".codex")).unwrap();
         fs::write(
             worktree.join(".codex/hooks.json"),
-            r#"{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"/opt/hitch/hitch-hook --agent codex --event session-start --state running"}]}]}}"#,
+            r#"{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"/opt/hitch/hitch-hook --agent codex --event session-start --state running"}]}],"SessionEnd":[{"matcher":"","hooks":[{"type":"command","command":"/opt/hitch/hitch-hook --agent codex --event session-end"}]}]}}"#,
         )
         .unwrap();
 
@@ -916,14 +996,61 @@ mod tests {
         let notification_hooks = config["hooks"]["Notification"].as_array().unwrap();
         assert_eq!(
             notification_hooks.len(),
-            2,
-            "keeps user hook and appends Hitch hook"
+            3,
+            "keeps the user's empty-hooks entry and appends BOTH Hitch matcher groups"
         );
+        // The two Hitch-owned Notification groups are distinct: permission_prompt ->
+        // needs-approval and idle_prompt -> waiting both survive prune+merge.
         assert!(notification_hooks.iter().any(|value| {
-            value.to_string().contains("--agent claude-code")
+            value["matcher"] == "permission_prompt"
+                && value.to_string().contains("--agent claude-code")
                 && value.to_string().contains("--state needs-approval")
         }));
-        assert!(config["hooks"]["SessionStart"].is_null());
+        assert!(notification_hooks.iter().any(|value| {
+            value["matcher"] == "idle_prompt"
+                && value.to_string().contains("--agent claude-code")
+                && value.to_string().contains("--state waiting")
+        }));
+        // The user's empty Notification group is untouched.
+        assert!(notification_hooks
+            .iter()
+            .any(|value| value["matcher"] == "user"));
+
+        // SessionStart is now an identity announce: the user's stale hitch
+        // session-start entry is pruned and replaced with `--announce` (no state).
+        let session_start_hooks = config["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session_start_hooks.len(), 1);
+        assert!(session_start_hooks.iter().any(|value| {
+            value.to_string().contains("--agent claude-code")
+                && value.to_string().contains("session-start")
+                && value.to_string().contains("--announce")
+                && !value.to_string().contains("--state")
+        }));
+
+        // PermissionDenied -> running heals an abandoned permission prompt.
+        let permission_denied = config["hooks"]["PermissionDenied"].as_array().unwrap();
+        assert!(permission_denied.iter().any(|value| {
+            value.to_string().contains("--agent claude-code")
+                && value.to_string().contains("permission-denied")
+                && value.to_string().contains("--state running")
+        }));
+
+        // StopFailure is per-matcher with explicit, human-readable --detail.
+        let stop_failure = config["hooks"]["StopFailure"].as_array().unwrap();
+        assert_eq!(stop_failure.len(), 3);
+        assert!(stop_failure.iter().any(|value| {
+            value["matcher"] == "rate_limit"
+                && value.to_string().contains("--state error")
+                && value.to_string().contains("--detail")
+                && value.to_string().contains("rate limited")
+        }));
+        assert!(stop_failure.iter().any(|value| {
+            value["matcher"] == "billing_error" && value.to_string().contains("billing issue")
+        }));
+        assert!(stop_failure.iter().any(|value| {
+            value["matcher"] == "server_error" && value.to_string().contains("server error")
+        }));
+
         let session_end_hooks = config["hooks"]["SessionEnd"].as_array().unwrap();
         assert!(session_end_hooks.iter().any(|value| {
             value.to_string().contains("--agent claude-code")
@@ -941,15 +1068,119 @@ mod tests {
                 && value.to_string().contains("user-prompt-submit")
                 && value.to_string().contains("--state running")
         }));
-        assert!(codex["hooks"]["SessionStart"].is_null());
-        let codex_session_end_hooks = codex["hooks"]["SessionEnd"].as_array().unwrap();
-        assert!(codex_session_end_hooks.iter().any(|value| {
+        // Codex SessionStart is now the identity announce (replacing the stale
+        // hitch session-start entry), NOT null.
+        let codex_session_start = codex["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(codex_session_start.len(), 1);
+        assert!(codex_session_start.iter().any(|value| {
             value.to_string().contains("--agent codex")
-                && value.to_string().contains("session-end")
+                && value.to_string().contains("session-start")
+                && value.to_string().contains("--announce")
                 && !value.to_string().contains("--state")
         }));
+        // The dead Codex SessionEnd is pruned on re-install and not re-added: the
+        // event does not exist in Codex.
+        assert!(
+            codex["hooks"]["SessionEnd"].is_null(),
+            "Codex must not carry a SessionEnd entry"
+        );
 
         assert!(!worktree.join(".gitignore").exists());
+
+        fs::remove_dir_all(worktree).unwrap();
+    }
+
+    #[test]
+    fn announce_command_carries_announce_flag_and_no_state() {
+        // The exact string the helper agent must map (`--announce` -> AnnounceAgent).
+        let claude = claude_announce_hook_entry(Path::new("/opt/hitch/hitch-hook"), "session-start");
+        let command = claude["hooks"][0]["command"].as_str().unwrap();
+        assert_eq!(
+            command,
+            "'/opt/hitch/hitch-hook' --agent claude-code --event 'session-start' --announce"
+        );
+        assert!(!command.contains("--state"));
+
+        let codex = codex_announce_hook_entry(Path::new("/opt/hitch/hitch-hook"), "session-start");
+        let command = codex["hooks"][0]["command"].as_str().unwrap();
+        assert_eq!(
+            command,
+            "'/opt/hitch/hitch-hook' --agent codex --event 'session-start' --announce"
+        );
+        assert!(!command.contains("--state"));
+    }
+
+    #[test]
+    fn stop_failure_entry_carries_explicit_state_and_detail() {
+        let entry =
+            claude_stop_failure_hook_entry(Path::new("/opt/hitch/hitch-hook"), "rate_limit", "rate limited");
+        assert_eq!(entry["matcher"], "rate_limit");
+        let command = entry["hooks"][0]["command"].as_str().unwrap();
+        assert_eq!(
+            command,
+            "'/opt/hitch/hitch-hook' --agent claude-code --event 'stop-failure' --state error --detail 'rate limited'"
+        );
+    }
+
+    #[test]
+    fn claude_notification_keeps_two_distinct_groups_and_is_idempotent() {
+        let worktree = temp_dir("two-notifications");
+        init_git_repo(&worktree);
+        install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        let read_notification = |worktree: &Path| -> Vec<Value> {
+            let config: Value = serde_json::from_str(
+                &fs::read_to_string(worktree.join(".claude/settings.local.json")).unwrap(),
+            )
+            .unwrap();
+            config["hooks"]["Notification"].as_array().unwrap().clone()
+        };
+
+        let first = read_notification(&worktree);
+        assert_eq!(first.len(), 2, "two distinct Hitch Notification groups");
+        assert!(first
+            .iter()
+            .any(|v| v["matcher"] == "permission_prompt"
+                && v.to_string().contains("--state needs-approval")));
+        assert!(first
+            .iter()
+            .any(|v| v["matcher"] == "idle_prompt" && v.to_string().contains("--state waiting")));
+
+        // Re-install must not duplicate or collapse the two matcher groups.
+        install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+        let second = read_notification(&worktree);
+        assert_eq!(second, first, "Notification groups stable across re-install");
+
+        fs::remove_dir_all(worktree).unwrap();
+    }
+
+    #[test]
+    fn reinstall_migrates_old_codex_session_end_away() {
+        let worktree = temp_dir("codex-session-end-migrate");
+        init_git_repo(&worktree);
+        // Simulate an old install that wrote a Codex SessionEnd entry.
+        fs::create_dir_all(worktree.join(".codex")).unwrap();
+        fs::write(
+            worktree.join(".codex/hooks.json"),
+            r#"{"hooks":{"SessionEnd":[{"matcher":"","hooks":[{"type":"command","command":"/opt/hitch/hitch-hook --agent codex --event session-end"}]}]}}"#,
+        )
+        .unwrap();
+
+        install_hooks(&worktree, &HookInstallOptions::new("/opt/hitch/hitch-hook")).unwrap();
+
+        let codex: Value =
+            serde_json::from_str(&fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap())
+                .unwrap();
+        assert!(
+            codex["hooks"]["SessionEnd"].is_null(),
+            "old Codex SessionEnd must be pruned on re-install"
+        );
+        // And the announce is now present.
+        assert!(codex["hooks"]["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.to_string().contains("--announce")));
 
         fs::remove_dir_all(worktree).unwrap();
     }
@@ -1023,11 +1254,15 @@ mod tests {
 
         let claude = fs::read_to_string(&claude_path).unwrap();
         assert!(!claude.contains("/old/target/debug/hitch-hook"));
-        assert_eq!(claude.matches("/new/target/debug/hitch-hook").count(), 7);
+        // SessionStart, UserPromptSubmit, PermissionRequest, PermissionDenied,
+        // Notification x2, PostToolUse, Stop, StopFailure x3, SessionEnd = 12.
+        assert_eq!(claude.matches("/new/target/debug/hitch-hook").count(), 12);
         assert!(claude.contains("echo keep-me"));
 
         let codex = fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap();
         assert!(!codex.contains("/old/target/debug/hitch-hook"));
+        // SessionStart, UserPromptSubmit, PermissionRequest, PostToolUse, Stop = 5
+        // (no SessionEnd).
         assert_eq!(codex.matches("/new/target/debug/hitch-hook").count(), 5);
 
         fs::remove_dir_all(worktree).unwrap();

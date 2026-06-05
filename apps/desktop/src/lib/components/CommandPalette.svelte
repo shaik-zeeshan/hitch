@@ -108,7 +108,7 @@
                       ><span class="mono">{w.branch}</span> <span class="ctx">· {projectName(w.project_id)}</span
                       ></span
                     >
-                    {#if state}<span class="status {AGENT_LABEL[state].cls}">{AGENT_LABEL[state].label}</span>{/if}
+                    {#if state}{@const label = AGENT_LABEL[state]}{#if label}<span class="status {label.cls}">{label.label}</span>{/if}{/if}
                   </Command.Item>
                 {/each}
 

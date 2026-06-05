@@ -207,23 +207,67 @@ export function statusGlyphClass(status: FileStatus): string {
 // reserved hue (never a bare symbol), so it survives grayscale and color
 // blindness. `cls` matches the .pill.{run,approval,wait,error} classes. The
 // labels are phrased for a person glancing at a branch they're NOT in: "what is
-// that agent doing?" — working / awaiting input / your turn.
-export const AGENT_LABEL: Record<AgentState, { label: string; cls: string }> = {
+// that agent doing?" — working / awaiting input.
+//
+// `waiting` stays in the taxonomy (it is hook-truth that a turn ended — it drops
+// `running` and floors the rollup) but renders UNLABELED (ADR 0011 amendment
+// 2026-06-05): a finished turn is visually just idle, so there is no entry here.
+// Only the act states (`needs-approval`, `error`) and the live `running` word
+// are ever shown.
+export const AGENT_LABEL: Partial<Record<AgentState, { label: string; cls: string }>> = {
   running: { label: "working", cls: "run" },
   "needs-approval": { label: "awaiting input", cls: "approval" },
-  waiting: { label: "your turn", cls: "wait" },
   error: { label: "error", cls: "error" },
 };
 
+// The ACT states (ADR 0011 amendment / CONTEXT.md): the states that demand the
+// user's attention. One predicate drives every attention surface — the row's
+// state word, the tab needdot, and the collapsed-project rollup pill.
+export const ACT_STATES = ["needs-approval", "error"] as const;
+export type ActState = (typeof ACT_STATES)[number];
+
+// `state ∈ {needs-approval, error}` → needs action. The single source of truth
+// for "does this session demand attention".
+export function needsAction(state: AgentState | null | undefined): state is ActState {
+  return state === "needs-approval" || state === "error";
+}
+
 // When a worktree (or project) holds several agent sessions, the row shows the
-// one that most needs attention: a blocked approval outranks an error, which
-// outranks a turn waiting on the user, which outranks an in-progress run.
+// one that most needs attention. CONTEXT.md fixes the priority order:
+// `needs-approval > error > waiting > running` — a blocked approval outranks a
+// failed turn, which outranks a turn idling on the user, which outranks a run.
 export const AGENT_PRIORITY: AgentState[] = [
   "needs-approval",
   "error",
   "waiting",
   "running",
 ];
+
+// Highest-priority act state among `states`, or null if none needs action.
+// Mixed act states collapse to the single highest-priority one (the pill is
+// always one word).
+export function highestActState(
+  states: Array<AgentState | undefined | null>,
+): ActState | null {
+  for (const candidate of AGENT_PRIORITY) {
+    if (needsAction(candidate) && states.includes(candidate)) return candidate;
+  }
+  return null;
+}
+
+// A per-project (or per-worktree) act-state rollup: the highest-priority act
+// state across the row's sessions plus the count of sessions currently in an
+// act state. `null` means nothing in the row needs action.
+export type ActRollup = { state: ActState; count: number };
+
+export function aggregateActRollup(
+  states: Array<AgentState | undefined | null>,
+): ActRollup | null {
+  const state = highestActState(states);
+  if (!state) return null;
+  const count = states.reduce((n, s) => (needsAction(s) ? n + 1 : n), 0);
+  return { state, count };
+}
 
 export function aggregateAgentState(
   states: Array<AgentState | undefined>,
