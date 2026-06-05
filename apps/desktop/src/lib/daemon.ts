@@ -26,6 +26,7 @@ import {
   type DraftGenerationSettings,
   type FileStatus,
   type GitStatus,
+  type GitDiffRequest,
   type HitchEvent,
   type Id,
   type JobStatus,
@@ -224,11 +225,41 @@ function writePrByWorktree(worktreeId: Id, pr: PrInfo | null, seq: number): bool
 }
 
 const diffCache = new Map<string, string>();
-// Per-path freshness clock: each `viewDiff(path)` stamps a seq for that path so a
-// slow fetch can't overwrite a newer one for the SAME file, while two in-flight
-// fetches for DIFFERENT files never cancel each other (each path has its own
-// counter). Keyed by worktree+path so a re-selected worktree starts clean.
+// Diff freshness is scoped by consumer. A single-file tab and the all-changes
+// fan-out may request the same path concurrently; each should only gate its own
+// UI state, while cache writes are guarded by a separate per-path clock below.
 const diffRequestSeq = new Map<string, number>();
+const diffCacheWriteSeq = new Map<string, number>();
+const diffSideKey = (staged: boolean | undefined) =>
+  staged === undefined ? "legacy" : staged ? "staged" : "worktree";
+const diffCacheKey = (worktreeId: Id, path: string, staged?: boolean) =>
+  `${worktreeId}\0${diffSideKey(staged)}\0${path}`;
+const diffFreshnessKey = (worktreeId: Id, consumer: string, path: string, staged?: boolean) =>
+  `${worktreeId}\0${consumer}\0${diffSideKey(staged)}\0${path}`;
+
+function nextDiffRequestSeq(
+  worktreeId: Id,
+  consumer: string,
+  path: string,
+  staged?: boolean,
+): number {
+  const requestKey = diffFreshnessKey(worktreeId, consumer, path, staged);
+  const requestSeq = (diffRequestSeq.get(requestKey) ?? 0) + 1;
+  diffRequestSeq.set(requestKey, requestSeq);
+  return requestSeq;
+}
+
+function nextDiffCacheWriteSeq(cacheKey: string): number {
+  const writeSeq = (diffCacheWriteSeq.get(cacheKey) ?? 0) + 1;
+  diffCacheWriteSeq.set(cacheKey, writeSeq);
+  return writeSeq;
+}
+
+function writeFreshDiffCache(cacheKey: string, writeSeq: number, text: string): boolean {
+  if (diffCacheWriteSeq.get(cacheKey) !== writeSeq) return false;
+  diffCache.set(cacheKey, text);
+  return true;
+}
 let statusRequestSeq = 0;
 let statusPollTimer: ReturnType<typeof setInterval> | null = null;
 let statusPollInFlight = false;
@@ -582,6 +613,9 @@ function removeWorktreeLocal(worktreeId: Id): void {
   }
   for (const key of diffRequestSeq.keys()) {
     if (key.startsWith(diffCachePrefix)) diffRequestSeq.delete(key);
+  }
+  for (const key of diffCacheWriteSeq.keys()) {
+    if (key.startsWith(diffCachePrefix)) diffCacheWriteSeq.delete(key);
   }
 
   if (get(gitStatus)?.worktree_id === worktreeId) gitStatus.set(null);
@@ -1076,6 +1110,9 @@ export function disposeDaemon(): void {
     closeSessionOutput(sessionId);
   }
   rings.clear();
+  diffCache.clear();
+  diffRequestSeq.clear();
+  diffCacheWriteSeq.clear();
   booted = false;
 }
 
@@ -1686,12 +1723,13 @@ function setDiffTabText(path: string, text: string | null): void {
 // diff never yanks the view away from a terminal the user is looking at. Opening
 // a file that's already in the strip re-uses its tab (no duplicates) and just
 // refreshes its text; a new file appends a tab.
-export async function viewDiff(path: string, activate = true): Promise<void> {
+export async function viewDiff(path: string, activate = true, staged?: boolean): Promise<void> {
   const worktreeId = get(gitWorktreeId);
   if (!worktreeId) return;
-  const cacheKey = `${worktreeId}\0${path}`;
-  const requestSeq = (diffRequestSeq.get(cacheKey) ?? 0) + 1;
-  diffRequestSeq.set(cacheKey, requestSeq);
+  const cacheKey = diffCacheKey(worktreeId, path, staged);
+  const requestSeq = nextDiffRequestSeq(worktreeId, "single", path, staged);
+  const requestKey = diffFreshnessKey(worktreeId, "single", path, staged);
+  const writeSeq = nextDiffCacheWriteSeq(cacheKey);
 
   const cached = diffCache.get(cacheKey) ?? null;
   diffTabs.update((tabs) =>
@@ -1708,19 +1746,21 @@ export async function viewDiff(path: string, activate = true): Promise<void> {
     activeDiffPath.set(path);
   }
 
-  // The tab is live (still open) and this is the freshest request for its path.
+  // The tab is live (still open) and this is the freshest single-file request for its side.
   const isLatest = () =>
-    diffRequestSeq.get(cacheKey) === requestSeq &&
+    diffRequestSeq.get(requestKey) === requestSeq &&
     get(gitWorktreeId) === worktreeId &&
     get(diffTabs).some((tab) => tab.path === path);
 
   try {
-    const response = await daemonRequest<Response & { diff: { diff: string } }>({
+    const request: GitDiffRequest = {
       type: "git-diff",
       worktree_id: worktreeId,
       path,
-    });
-    diffCache.set(cacheKey, response.diff.diff);
+      ...(staged === undefined ? {} : { staged }),
+    };
+    const response = await daemonRequest<Response & { diff: { diff: string } }>(request);
+    writeFreshDiffCache(cacheKey, writeSeq, response.diff.diff);
     if (isLatest()) setDiffTabText(path, response.diff.diff);
   } catch (err) {
     error.set(toMessage(err));
@@ -1728,24 +1768,31 @@ export async function viewDiff(path: string, activate = true): Promise<void> {
   }
 }
 
-// Fetch one file's unified diff, honoring the same per-path cache + freshness
-// guard as `viewDiff`. Returns the diff text (or `null` on error). Shared by the
-// all-changes fan-out so it reuses `diffCache` and can't be regressed by a stale
-// fetch for the same file.
-async function fetchFileDiff(worktreeId: Id, path: string): Promise<string | null> {
-  const cacheKey = `${worktreeId}\0${path}`;
+// Fetch one file's unified diff for the all-changes fan-out. It has its own
+// freshness key so it cannot cancel a single-file tab request for the same path.
+// Cache writes are separately guarded so an older response cannot replace newer
+// cached text.
+async function fetchFileDiff(
+  worktreeId: Id,
+  path: string,
+  staged: boolean,
+): Promise<string | null> {
+  const cacheKey = diffCacheKey(worktreeId, path, staged);
   const cached = diffCache.get(cacheKey);
   if (cached !== undefined) return cached;
-  const requestSeq = (diffRequestSeq.get(cacheKey) ?? 0) + 1;
-  diffRequestSeq.set(cacheKey, requestSeq);
+  const requestSeq = nextDiffRequestSeq(worktreeId, "all", path, staged);
+  const requestKey = diffFreshnessKey(worktreeId, "all", path, staged);
+  const writeSeq = nextDiffCacheWriteSeq(cacheKey);
   try {
-    const response = await daemonRequest<Response & { diff: { diff: string } }>({
+    const request: GitDiffRequest = {
       type: "git-diff",
       worktree_id: worktreeId,
       path,
-    });
-    diffCache.set(cacheKey, response.diff.diff);
-    return response.diff.diff;
+      staged,
+    };
+    const response = await daemonRequest<Response & { diff: { diff: string } }>(request);
+    writeFreshDiffCache(cacheKey, writeSeq, response.diff.diff);
+    return diffRequestSeq.get(requestKey) === requestSeq ? response.diff.diff : null;
   } catch (err) {
     error.set(toMessage(err));
     return null;
@@ -1778,7 +1825,7 @@ export async function viewAllChanges(activate = true): Promise<void> {
     ordered.map((file) => ({
       path: file.path,
       staged: file.staged,
-      text: diffCache.get(`${worktreeId}\0${file.path}`) ?? null,
+      text: diffCache.get(diffCacheKey(worktreeId, file.path, file.staged)) ?? null,
     })),
   );
 
@@ -1799,10 +1846,12 @@ export async function viewAllChanges(activate = true): Promise<void> {
 
   await Promise.all(
     ordered.map(async (file) => {
-      const text = await fetchFileDiff(worktreeId, file.path);
+      const text = await fetchFileDiff(worktreeId, file.path, file.staged);
       if (!isLatest()) return;
       allChangesFiles.update((rows) =>
-        rows.map((row) => (row.path === file.path ? { ...row, text } : row)),
+        rows.map((row) =>
+          row.path === file.path && row.staged === file.staged ? { ...row, text } : row,
+        ),
       );
     }),
   );
@@ -1814,6 +1863,7 @@ export async function viewAllChanges(activate = true): Promise<void> {
 // first), matching normal editor tab behavior.
 export function closeDiff(path?: string): void {
   if (path === undefined) {
+    allChangesSeq += 1;
     diffTabs.set([]);
     activeDiffPath.set(null);
     diffActive.set(false);
@@ -1823,9 +1873,12 @@ export function closeDiff(path?: string): void {
   const tabs = get(diffTabs);
   const index = tabs.findIndex((tab) => tab.path === path);
   if (index === -1) return;
-  // Closing the all-changes tab drops its per-file rows; a stale fan-out that
-  // resolves after this is gated out by `allChangesSeq` advancing on re-open.
-  if (path === ALL_CHANGES_TAB) allChangesFiles.set([]);
+  // Closing the all-changes tab drops its per-file rows and invalidates any
+  // in-flight fan-out so late rows cannot repopulate a dismissed tab.
+  if (path === ALL_CHANGES_TAB) {
+    allChangesSeq += 1;
+    allChangesFiles.set([]);
+  }
   const remaining = tabs.filter((tab) => tab.path !== path);
   diffTabs.set(remaining);
   if (remaining.length === 0) {
@@ -1864,9 +1917,11 @@ export async function setFilesStaged(
     const openTabs = get(diffTabs);
     const openPaths = new Set(openTabs.map((tab) => tab.path));
     for (const path of paths) {
-      diffCache.delete(`${worktreeId}\0${path}`);
+      diffCache.delete(diffCacheKey(worktreeId, path, true));
+      diffCache.delete(diffCacheKey(worktreeId, path, false));
+      diffCache.delete(diffCacheKey(worktreeId, path));
       if (!openPaths.has(path)) continue;
-      void viewDiff(path, false);
+      void viewDiff(path, false, staged);
     }
     // The all-changes tab spans every file, so any (un)stage can change its file
     // set (a row moving group) or counts. Re-fan it without stealing focus; the
@@ -1906,7 +1961,9 @@ export async function discardFiles(paths: string[]): Promise<void> {
     });
     // A discarded file has no diff left to show, so drop its tab.
     for (const path of paths) {
-      diffCache.delete(`${worktreeId}\0${path}`);
+      diffCache.delete(diffCacheKey(worktreeId, path, true));
+      diffCache.delete(diffCacheKey(worktreeId, path, false));
+      diffCache.delete(diffCacheKey(worktreeId, path));
       closeDiff(path);
     }
     await loadGitStatus(worktreeId);
@@ -2200,19 +2257,27 @@ sessions.subscribe(($sessions) => {
 
 // Keep the all-changes tab fresh: whenever git status changes (a poll catching
 // an agent's edits, or our own stage/commit) while that tab is open, re-fan its
-// per-file diffs without stealing focus. Cheap — `viewAllChanges` reuses
-// `diffCache`, so unchanged files don't re-fetch. Compares the changed-file
-// signature so an unrelated status field (ahead/behind) doesn't trigger a refan.
+// per-file diffs without stealing focus. Compares the changed-file metadata
+// signature so line-count/status/content changes refetch, while unrelated status
+// fields (ahead/behind) don't trigger a refan.
 let lastAllChangesSig: string | null = null;
 gitStatus.subscribe(($status) => {
   if (!get(diffTabs).some((tab) => tab.path === ALL_CHANGES_TAB)) {
     lastAllChangesSig = null;
     return;
   }
-  const sig = ($status?.files ?? [])
-    .map((file) => `${file.staged ? "1" : "0"}${file.path}`)
+  const files = $status?.files ?? [];
+  const sig = files
+    .map(
+      (file) =>
+        `${file.staged ? "1" : "0"}\0${file.path}\0${file.status}\0${file.additions ?? 0}\0${file.deletions ?? 0}`,
+    )
     .join("\n");
   if (sig === lastAllChangesSig) return;
+  const worktreeId = $status?.worktree_id;
+  if (worktreeId) {
+    for (const file of files) diffCache.delete(diffCacheKey(worktreeId, file.path, file.staged));
+  }
   lastAllChangesSig = sig;
   void viewAllChanges(false);
 });

@@ -1609,7 +1609,14 @@ impl TestClient {
         worktree_id: hitch_core::WorktreeId,
         path: PathBuf,
     ) -> FileDiff {
-        self.send_request(id, Request::GitDiff { worktree_id, path });
+        self.send_request(
+            id,
+            Request::GitDiff {
+                worktree_id,
+                path,
+                staged: None,
+            },
+        );
         loop {
             match self.read_packet() {
                 Packet::Control(ControlMessage::Response {

@@ -19,6 +19,19 @@
   // $state object to match the surrounding runes idiom; toggled on header click.
   let collapsed = $state<Record<string, boolean>>({});
 
+  type ParsedDiff = ReturnType<typeof parseDiff>;
+  const parsedByPath = new Map<string, { text: string; parsed: ParsedDiff }>();
+
+  function parsedFor(path: string, text: string | null, expanded: boolean): ParsedDiff | null {
+    if (text === null) return null;
+    const cached = parsedByPath.get(path);
+    if (cached?.text === text) return cached.parsed;
+    if (!expanded) return null;
+    const parsed = parseDiff(text);
+    parsedByPath.set(path, { text, parsed });
+    return parsed;
+  }
+
   const options: FileDiffOptions<undefined> = {
     diffStyle: "unified",
     disableFileHeader: true, // each section renders its own header row.
@@ -85,8 +98,8 @@
   {/if}
 
   {#each $allChangesFiles as file (file.path)}
-    {@const parsed = file.text === null ? null : parseDiff(file.text)}
     {@const isCollapsed = collapsed[file.path] === true}
+    {@const parsed = parsedFor(file.path, file.text, !isCollapsed)}
     <section class="file">
       <button
         class="file-head"

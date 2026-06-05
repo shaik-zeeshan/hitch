@@ -639,8 +639,25 @@ fn login_shell() -> Option<String> {
 }
 
 #[cfg(unix)]
+fn is_usable_login_shell(shell: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = Path::new(shell);
+    if matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("false" | "nologin")
+    ) {
+        return false;
+    }
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
 fn default_command() -> CommandBuilder {
     let shell = login_shell()
+        .filter(|shell| is_usable_login_shell(shell))
         .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "/bin/sh".to_string());
     let mut builder = CommandBuilder::new(&shell);
@@ -916,6 +933,16 @@ mod tests {
             shell.starts_with('/'),
             "login shell should be an absolute path; got {shell:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_usable_check_rejects_disabled_shells() {
+        assert!(!is_usable_login_shell("/bin/false"));
+        assert!(!is_usable_login_shell("/usr/sbin/nologin"));
+        if Path::new("/bin/sh").exists() {
+            assert!(is_usable_login_shell("/bin/sh"));
+        }
     }
 
     #[test]

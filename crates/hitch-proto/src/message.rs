@@ -220,10 +220,14 @@ pub enum Request {
     PrStatus { worktree_id: WorktreeId },
     /// Look up the PR for every worktree in a project via a Job (batched).
     ProjectPrStatuses { project_id: ProjectId },
-    /// Read a file-level diff for a path in a worktree.
+    /// Read a file-level diff for a path in a worktree. `staged == Some(true)`
+    /// selects HEAD↔index; `Some(false)` selects index↔worktree. `None` keeps
+    /// the legacy worktree-first, staged-fallback behavior for older clients.
     GitDiff {
         worktree_id: WorktreeId,
         path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        staged: Option<bool>,
     },
     /// Stage whole files.
     StageFiles {
@@ -892,11 +896,27 @@ mod tests {
         assert_eq!(file.additions, 0);
         assert_eq!(file.deletions, 0);
 
-        let with_counts =
-            r#"{"path":"src/lib.rs","status":"modified","staged":true,"additions":7,"deletions":2}"#;
+        let with_counts = r#"{"path":"src/lib.rs","status":"modified","staged":true,"additions":7,"deletions":2}"#;
         let file: ChangedFile = serde_json::from_str(with_counts).unwrap();
         assert_eq!(file.additions, 7);
         assert_eq!(file.deletions, 2);
+    }
+
+    #[test]
+    fn git_diff_deserializes_without_side_for_rolling_upgrades() {
+        let (_, worktree_id, _) = ids();
+        let json =
+            format!(r#"{{"type":"git-diff","worktree_id":"{worktree_id}","path":"src/lib.rs"}}"#);
+        let request: Request = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            request,
+            Request::GitDiff {
+                worktree_id,
+                path: "src/lib.rs".into(),
+                staged: None,
+            }
+        );
     }
 
     #[test]
@@ -1443,6 +1463,7 @@ mod tests {
             Request::GitDiff {
                 worktree_id,
                 path: "src/lib.rs".into(),
+                staged: Some(false),
             },
             Request::StageFiles {
                 worktree_id,

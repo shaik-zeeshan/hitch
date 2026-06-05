@@ -1,11 +1,11 @@
-# Frontend stack: Svelte + Vite + Tailwind v4
+# Frontend stack: SvelteKit + Vite + Tailwind v4
 
-The `apps/desktop` frontend is built on **Svelte** (Svelte 5, runes) + **Vite** + **Tailwind CSS v4**, not React. This revises the frontend choice noted in passing in [0005](0005-monorepo-crate-structure.md); everything else in 0005 — the crate DAG and `src-tauri` as a thin proto-only IPC client — stands unchanged.
+The `apps/desktop` frontend is built on **SvelteKit** (Svelte 5, runes, static SPA mode) + **Vite** + **Tailwind CSS v4**, not React. This revises the frontend choice noted in passing in [0005](0005-monorepo-crate-structure.md); everything else in 0005 — the crate DAG and `src-tauri` as a thin proto-only IPC client — stands unchanged.
 
 ## Stack
 
-- **Svelte 5** with `@sveltejs/vite-plugin-svelte` and `svelte-check` for type checking. Plain Svelte + Vite (an SPA mounted in the Tauri webview), **not SvelteKit** — there is no server, routing, or SSR to justify it.
-- **Tailwind CSS v4** via `@tailwindcss/vite`, OKLCH-native `@theme`. Design tokens are ported verbatim from the locked mockup (`hitch-shell-mockup.html`).
+- **SvelteKit** with `@sveltejs/adapter-static`, `@sveltejs/vite-plugin-svelte`, and `svelte-check` for type checking. It runs as a static SPA mounted in the Tauri webview: `adapter({ fallback: "index.html" })` provides the shell for `/` and `/settings`, routes/layouts live under `src/routes`, and there is no SSR/server dependency.
+- **Tailwind CSS v4** via `@tailwindcss/vite`, OKLCH-native `@theme`. Design tokens are ported verbatim from the locked mockup (`../../doc-design/mockup.html` from this ADR, or `doc-design/mockup.html` from the repo root).
 - **`bits-ui` v2** for headless overlays (dialog, dropdown, popover, context-menu, command palette). Its `Command` and `ContextMenu` primitives cover the ⌘K palette and the worktree/session menus — no `cmdk-sv` needed.
 - **A local unified-diff classifier** (`lib/diff.ts`) for the diff tab, not `@pierre/diffs`. The locked mockup renders a flat, un-highlighted diff (hunk/add/del/ctx rows with a line-number gutter); `@pierre/diffs`'s `FileDiff` is a heavyweight imperative Shiki/worker renderer whose output deviates from the lock. The classifier matches the locked design at no Shiki/worker cost. `@pierre/diffs` stays in `package.json` (tree-shaken out of the bundle) should a richer syntax-highlighted view ever be wanted.
 - **`@xterm/xterm` + `@xterm/addon-fit`** retained from the React scaffold for the terminal.
@@ -22,7 +22,7 @@ The unified dark top nav the mockup draws is the title bar on every platform; ho
 ## Considered Options
 
 - **Keep React** (the provisional scaffold) — rejected: the team is standardizing on Svelte; one framework for all future UI work.
-- **SvelteKit** — rejected: a Tauri webview needs an SPA, not a meta-framework; plain Svelte + Vite is the smaller, more direct fit.
+- **Plain Svelte + Vite without SvelteKit routing/layouts** — rejected: the shipped desktop shell uses SvelteKit's file-based routes and layouts while still building to a static SPA for Tauri; this keeps routing structure explicit without introducing SSR/server runtime.
 - **Native title bar** — rejected: breaks the single unified top nav in the locked design.
 
 ## Consequences
@@ -35,7 +35,7 @@ The unified dark top nav the mockup draws is the title bar on every platform; ho
 
 The "local unified-diff classifier, not `@pierre/diffs`" decision under **Stack**
 is **superseded**. The diff tab now renders a syntax-highlighted, word-level diff
-through `@pierre/diffs` (v1.2.3), and the Changes list gained monochrome
+through `@pierre/diffs` (v1.2.3), and the Changes list gained full-colour
 file-type icons. The flat un-highlighted classifier the locked mockup drew was
 matched at the time, but the user wants file-type recognition and *readable*
 diffs — syntax color plus intra-line emphasis on what actually changed — which a

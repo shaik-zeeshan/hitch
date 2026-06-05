@@ -251,7 +251,7 @@
   .topbar .grow{flex:1;}
   .topbar .palette, .topbar .daemon, .topbar .theme-toggle{ -webkit-app-region:no-drag; }
 
-  /* ---------- command palette trigger: absolutely centered in the window ----------
+  /* ---------- command palette visual: absolutely centered in the window ----------
      a quiet rectangular search/jump field (Linear/Arc style), pinned dead-center
      of the whole bar width regardless of the flex content on either side. */
   .palette{
@@ -259,10 +259,7 @@
     display:inline-flex; align-items:center; gap:8px;
     width:300px; max-width:42vw; height:26px; padding:0 8px 0 9px;
     background:var(--paper-2); border:1px solid var(--line); border-radius:0;
-    color:var(--ink-3); cursor:text;
-    transition:border-color .18s ease-out;
-  }
-  .palette:hover{ border-color:var(--ink-3); }
+    color:var(--ink-3); cursor:default;
   .palette .seek{ width:13px; height:13px; flex:0 0 13px; color:var(--ink-3); }
   .palette .ph{
     flex:1; min-width:0; font-size:var(--r0); color:var(--ink-3);
@@ -850,8 +847,8 @@
     <div class="topbar">
       <div class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></div>
 
-      <!-- command palette trigger: absolutely centered in the window (Linear/Arc style) -->
-      <div class="palette" role="button" tabindex="0" aria-label="Open command palette" title="Jump to worktree, session, or action">
+      <!-- command palette visual: absolutely centered in the window (Linear/Arc style) -->
+      <div class="palette" title="Jump to worktree, session, or action">
         <svg class="seek" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <circle cx="10.5" cy="10.5" r="6.2"/><path d="M15.2 15.2 20 20"/>
         </svg>

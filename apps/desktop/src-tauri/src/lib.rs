@@ -2329,6 +2329,65 @@ fn env_editor_launch_spec(path: &Path) -> Result<EditorLaunchSpec, String> {
     Ok(env_editor_command_spec(&command, path))
 }
 
+#[cfg(windows)]
+fn split_windows_editor_command(command: &str) -> Vec<OsString> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut in_quotes = false;
+    let mut has_arg = false;
+
+    while let Some(ch) = chars.next() {
+        if ch == ' ' || ch == '\t' {
+            if in_quotes {
+                current.push(ch);
+                has_arg = true;
+            } else if has_arg {
+                args.push(OsString::from(std::mem::take(&mut current)));
+                has_arg = false;
+            }
+            continue;
+        }
+
+        if ch == '\\' {
+            let mut backslashes = 1;
+            while chars.next_if_eq(&'\\').is_some() {
+                backslashes += 1;
+            }
+
+            if chars.peek() == Some(&'"') {
+                current.extend(std::iter::repeat('\\').take(backslashes / 2));
+                if backslashes % 2 == 0 {
+                    chars.next();
+                    in_quotes = !in_quotes;
+                } else {
+                    chars.next();
+                    current.push('"');
+                    has_arg = true;
+                }
+            } else {
+                current.extend(std::iter::repeat('\\').take(backslashes));
+                has_arg = true;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            has_arg = true;
+            continue;
+        }
+
+        current.push(ch);
+        has_arg = true;
+    }
+
+    if has_arg {
+        args.push(OsString::from(current));
+    }
+    args
+}
+
 /// Spec for a non-empty $VISUAL/$EDITOR command line.
 fn env_editor_command_spec(command: &str, path: &Path) -> EditorLaunchSpec {
     // Unix: run the value through the shell, git-style, so quoting and
@@ -2347,16 +2406,16 @@ fn env_editor_command_spec(command: &str, path: &Path) -> EditorLaunchSpec {
         }
     }
 
-    // Windows: no POSIX shell to lean on; split the command line on whitespace
-    // (program + args) and reuse the cmd shim for `.cmd` launchers so a GUI
-    // parent doesn't flash a console window.
+    // Windows: no POSIX shell to lean on; parse the command line with Windows
+    // quote/backslash semantics (program + args) and reuse the cmd shim for
+    // `.cmd` launchers so a GUI parent doesn't flash a console window.
     #[cfg(windows)]
     {
-        let mut parts = command.split_whitespace();
+        let mut parts = split_windows_editor_command(command).into_iter();
         let program = parts.next().expect("non-empty after trim");
-        let mut args: Vec<OsString> = parts.map(OsString::from).collect();
+        let mut args: Vec<OsString> = parts.collect();
         args.push(path.as_os_str().to_os_string());
-        let command_processor_shim = Path::new(program)
+        let command_processor_shim = Path::new(&program)
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"));
         EditorLaunchSpec {
@@ -2734,11 +2793,11 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 mod tests {
     use super::{
         build_editor_launch_spec, describe_handshake_failure, encode_control_message,
-        env_editor_command_spec,
-        parse_spawned_daemon_pid, read_control_message, read_log_tail, recovery_mode_for_loss,
-        run_probe, should_force_kill_daemon, tray_status_text, ControlMessage, CrashLoopGuard,
-        DaemonStatus, ErrorCode, HitchClient, OutputRouter, ProbeError, ProtocolError,
-        RecoveryMode, Request, Response, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
+        env_editor_command_spec, parse_spawned_daemon_pid, read_control_message, read_log_tail,
+        recovery_mode_for_loss, run_probe, should_force_kill_daemon, tray_status_text,
+        ControlMessage, CrashLoopGuard, DaemonStatus, ErrorCode, HitchClient, OutputRouter,
+        ProbeError, ProtocolError, RecoveryMode, Request, Response, CRASH_LOOP_MAX,
+        HEARTBEAT_LOST_REASON,
     };
     #[cfg(windows)]
     use super::{
@@ -2818,8 +2877,42 @@ mod tests {
         assert_eq!(plain.args, vec![worktree.as_os_str().to_os_string()]);
         assert!(!plain.command_processor_shim);
 
+        let program_files = env_editor_command_spec(
+            r#""C:\Program Files\Microsoft VS Code\Code.exe" --wait"#,
+            worktree,
+        );
+        assert_eq!(
+            program_files.program,
+            std::ffi::OsString::from(r"C:\Program Files\Microsoft VS Code\Code.exe")
+        );
+        assert_eq!(
+            program_files.args,
+            vec![
+                std::ffi::OsString::from("--wait"),
+                worktree.as_os_str().to_os_string(),
+            ]
+        );
+
+        let quoted_args = env_editor_command_spec(
+            r#"code --goto "C:\repo with spaces\src\main.rs:10" "say \"hi\"""#,
+            worktree,
+        );
+        assert_eq!(quoted_args.program, std::ffi::OsString::from("code"));
+        assert_eq!(
+            quoted_args.args,
+            vec![
+                std::ffi::OsString::from("--goto"),
+                std::ffi::OsString::from(r"C:\repo with spaces\src\main.rs:10"),
+                std::ffi::OsString::from(r#"say "hi""#),
+                worktree.as_os_str().to_os_string(),
+            ]
+        );
+
         let shimmed = env_editor_command_spec(r"C:\bin\code.CMD --wait", worktree);
-        assert_eq!(shimmed.program, std::ffi::OsString::from(r"C:\bin\code.CMD"));
+        assert_eq!(
+            shimmed.program,
+            std::ffi::OsString::from(r"C:\bin\code.CMD")
+        );
         assert_eq!(
             shimmed.args,
             vec![

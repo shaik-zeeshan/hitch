@@ -37,7 +37,6 @@
     stickyHeader: false,
     preferredHighlighter: "shiki-js", // no WASM, faster startup.
     theme: { light: "pierre-light", dark: "pierre-dark" },
-    themeType: $theme,
   };
 
   let container = $state<HTMLElement>();
@@ -55,7 +54,8 @@
   $effect(() => {
     const el = container;
     if (!el || !fileDiff) return;
-    if (!instance) instance = new FileDiff<undefined>(options);
+    if (!instance) instance = new FileDiff<undefined>({ ...options, themeType: $theme });
+    instance.setThemeType($theme);
     instance.render({ fileDiff, fileContainer: el, forceRender: true });
   });
 

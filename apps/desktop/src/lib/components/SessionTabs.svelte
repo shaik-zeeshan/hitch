@@ -34,8 +34,26 @@
   import { sessionTabKind, sessionTabTitle } from "../sessionDisplay";
   let { parent }: { parent: SessionParent } = $props();
 
-  function diffName(path: string): string {
+  function basename(path: string): string {
     return path.split("/").pop() ?? "diff";
+  }
+
+  function diffName(path: string, tabs: Array<{ path: string }>): string {
+    const name = basename(path);
+    const duplicatePaths = tabs
+      .map((tab) => tab.path)
+      .filter((tabPath) => tabPath !== ALL_CHANGES_TAB && basename(tabPath) === name);
+    if (duplicatePaths.length <= 1) return name;
+
+    const parts = path.split("/");
+    for (let depth = 2; depth <= parts.length; depth += 1) {
+      const suffix = parts.slice(-depth).join("/");
+      const unique = duplicatePaths.every(
+        (other) => other === path || other.split("/").slice(-depth).join("/") !== suffix,
+      );
+      if (unique) return suffix;
+    }
+    return path;
   }
 
   function select(session: Session) {
@@ -137,7 +155,7 @@
         <span class="tabmark ftype" aria-hidden="true">
           <img src={fileIconUrl(tab.path)} alt="" />
         </span>
-        <span class="name">{diffName(tab.path)}</span>
+        <span class="name">{diffName(tab.path, $diffTabs)}</span>
       {/if}
       <span
         class="closer"

@@ -454,6 +454,7 @@
             <button
               class="group-label"
               title="View all changes as one diff"
+              aria-label="View all staged changes diff"
               onclick={() => void viewAllChanges()}
             >Staged</button><span class="ct">{staged.length}</span><span class="hr"></span>
             <button
@@ -463,7 +464,7 @@
           </h3>
           {#each staged as file (file.path)}
             {@const parts = splitPath(file.path)}
-            <button class="frow" class:active={$diffPath === file.path} onclick={() => void viewDiff(file.path)}>
+            <button class="frow" class:active={$diffPath === file.path} onclick={() => void viewDiff(file.path, true, true)}>
               <span
                 class="chk on"
                 role="button"
@@ -506,6 +507,7 @@
             <button
               class="group-label"
               title="View all changes as one diff"
+              aria-label="View all unstaged changes diff"
               onclick={() => void viewAllChanges()}
             >Changes</button><span class="ct">{unstaged.length}</span><span class="hr"></span>
             <button
@@ -516,7 +518,7 @@
           </h3>
           {#each unstaged as file (file.path)}
             {@const parts = splitPath(file.path)}
-            <button class="frow" class:active={$diffPath === file.path} onclick={() => void viewDiff(file.path)}>
+            <button class="frow" class:active={$diffPath === file.path} onclick={() => void viewDiff(file.path, true, false)}>
               <span
                 class="chk"
                 role="button"

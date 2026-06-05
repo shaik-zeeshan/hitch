@@ -1243,6 +1243,36 @@ describe("Windows project paths", () => {
     expect(get(diffText)).toBe("diff --git");
   });
 
+  it("requests the clicked file's staged or worktree diff side", async () => {
+    const requests: unknown[] = [];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; staged?: boolean } }) => {
+        requests.push(request);
+        if (request.type === "git-diff") {
+          return {
+            type: "git-diff",
+            diff: { diff: request.staged ? "staged diff" : "worktree diff" },
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await viewDiff(filePath, true, true);
+    expect(get(diffText)).toBe("staged diff");
+
+    await viewDiff(filePath, true, false);
+    expect(get(diffText)).toBe("worktree diff");
+    expect(requests).toEqual([
+      { type: "git-diff", worktree_id: worktree.id, path: filePath, staged: true },
+      { type: "git-diff", worktree_id: worktree.id, path: filePath, staged: false },
+    ]);
+  });
+
+
   it("opens each clicked file as its own diff tab and re-uses an existing tab", async () => {
     projects.set([project]);
     worktrees.set([worktree]);
@@ -1446,13 +1476,24 @@ describe("all-changes diff tab", () => {
 
   function mockDiffs() {
     invokeMock.mockImplementation(
-      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+      async (
+        _command: string,
+        { request }: { request: { type: string; path?: string; staged?: boolean } },
+      ) => {
         if (request.type === "git-diff") {
           return { type: "git-diff", diff: { diff: `diff for ${request.path}` } };
         }
         throw new Error(`unexpected request ${request.type}`);
       },
     );
+  }
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((res) => {
+      resolve = res;
+    });
+    return { promise, resolve };
   }
 
   it("opens the sentinel tab and fans out per-file diffs (staged first)", async () => {
@@ -1506,6 +1547,99 @@ describe("all-changes diff tab", () => {
 
     expect(get(diffTabs).map((tab) => tab.path)).toEqual(["src/x.ts"]);
     expect(get(activeDiffPath)).toBe("src/x.ts");
+    expect(get(allChangesFiles)).toEqual([]);
+  });
+
+  it("keeps stale all-changes responses out of its diff cache", async () => {
+    const pending: {
+      path: string;
+      resolve: (value: { type: "git-diff"; diff: { diff: string } }) => void;
+    }[] = [];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false, additions: 1 }]);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type !== "git-diff" || !request.path) throw new Error(`unexpected request ${request.type}`);
+        const deferredResponse = deferred<{ type: "git-diff"; diff: { diff: string } }>();
+        pending.push({ path: request.path, resolve: deferredResponse.resolve });
+        return deferredResponse.promise;
+      },
+    );
+
+    const olderPromise = viewAllChanges();
+    await flush();
+    const singlePromise = viewDiff("src/a.ts", true, false);
+    await flush();
+
+    expect(pending.map((request) => request.path)).toEqual(["src/a.ts", "src/a.ts"]);
+
+    pending[1]!.resolve({ type: "git-diff", diff: { diff: "new all diff" } });
+    await singlePromise;
+    await flush();
+    pending[0]!.resolve({ type: "git-diff", diff: { diff: "old all diff" } });
+    await olderPromise;
+
+    await viewAllChanges(false);
+
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "new all diff" },
+    ]);
+    expect(pending).toHaveLength(2);
+  });
+
+  it("auto-refreshes all-changes when file metadata changes without a path or staged change", async () => {
+    let diffVersion = 0;
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false, additions: 1 }]);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffVersion += 1;
+          return { type: "git-diff", diff: { diff: `diff v${diffVersion} for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await viewAllChanges();
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v1 for src/a.ts" },
+    ]);
+
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false, additions: 2 }]);
+    await flush();
+
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v2 for src/a.ts" },
+    ]);
+  });
+
+  it("closing the sentinel tab invalidates in-flight all-changes fan-out rows", async () => {
+    const response = deferred<{ type: "git-diff"; diff: { diff: string } }>();
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false }]);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string } }) => {
+        if (request.type === "git-diff") return response.promise;
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    const promise = viewAllChanges();
+    await flush();
+    expect(get(allChangesFiles)).toEqual([{ path: "src/a.ts", staged: false, text: null }]);
+
+    closeDiff(ALL_CHANGES_TAB);
+    response.resolve({ type: "git-diff", diff: { diff: "late diff" } });
+    await promise;
+
+    expect(get(diffTabs)).toEqual([]);
     expect(get(allChangesFiles)).toEqual([]);
   });
 

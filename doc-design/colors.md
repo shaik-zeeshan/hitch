@@ -188,7 +188,7 @@ Declared in `:root` and used across components:
 | Token | Value | Note |
 | --- | --- | --- |
 | `--radius` | `6px` | Defined but the shell is rectangular; see the radius policy in [components.md](components.md#shape--radius-policy). |
-| `--mono` | `"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace` | Mono stack. JetBrains Mono is loaded from Google Fonts (weights 400/500/600/700 + italic 400). |
+| `--mono` | `"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace` | Mono stack. JetBrains Mono is bundled through `@fontsource/jetbrains-mono` (weights 400/500/600/700 + italic 400); no Google Fonts network request. |
 | `--ui` | `-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif` | UI sans stack. |
 | `--r0`..`--r4` | `.75 / .8125 / .875 / 1 / 1.125 rem` | Type scale (12 / 13 / 14 / 16 / 18 px at 16px root). |
 

@@ -110,8 +110,9 @@
 
     <button
       class="bar-btn"
-      title="Toggle theme"
-      aria-label="Toggle theme"
+      title={$theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+      aria-label={$theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+      aria-pressed={$theme === "dark"}
       onclick={() => toggleTheme()}
     >
       {#if $theme === "dark"}

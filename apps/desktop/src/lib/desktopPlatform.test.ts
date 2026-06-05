@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   desktopPlatformFromPlatform,
   revealItemLabel,
@@ -7,6 +7,53 @@ import {
   shortcutKeys,
   shellSessionShortcutLabel,
 } from "./desktopPlatform";
+import { get } from "svelte/store";
+
+class LocalStorageStub {
+  readonly values = new Map<string, string>();
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null;
+  }
+
+  setItem(key: string, value: string): void {
+    this.values.set(key, value);
+  }
+}
+
+beforeEach(() => {
+  vi.unstubAllGlobals();
+  vi.resetModules();
+});
+
+describe("editorApp settings migration", () => {
+  async function loadEditorApp(stored: string) {
+    const storage = new LocalStorageStub();
+    storage.values.set("hitch.editorApp", stored);
+    vi.stubGlobal("localStorage", storage);
+
+    const settings = await import("./settings");
+
+    return { storage, settings };
+  }
+
+  it("normalizes the legacy Visual Studio Code default to system default", async () => {
+    const { storage, settings } = await loadEditorApp("Visual Studio Code");
+
+    expect(get(settings.editorApp)).toBe(settings.SYSTEM_DEFAULT_EDITOR);
+    expect(storage.values.get("hitch.editorApp")).toBe(settings.SYSTEM_DEFAULT_EDITOR);
+  });
+
+  it("keeps explicit non-default editor values intact", async () => {
+    for (const stored of ["Cursor", "Zed", "/Applications/Custom Editor.app"]) {
+      const { storage, settings } = await loadEditorApp(stored);
+
+      expect(get(settings.editorApp)).toBe(stored);
+      expect(storage.values.get("hitch.editorApp")).toBe(stored);
+      vi.resetModules();
+    }
+  });
+});
 
 describe("desktopPlatformFromPlatform", () => {
   it("normalizes browser platform strings", () => {

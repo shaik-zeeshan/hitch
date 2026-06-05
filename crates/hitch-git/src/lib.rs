@@ -9,7 +9,9 @@
 //! A feature crate: depends only on `hitch-core`, never on another Hitch feature
 //! crate.
 
-use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
+use git2::{
+    BranchType, DiffFindOptions, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions,
+};
 use hitch_core::{ProjectId, Worktree};
 use hitch_process::{DrainOutcome, PipeReader, ProcessTree, ProcessTreeRegistration};
 use std::borrow::Cow;
@@ -1053,7 +1055,8 @@ fn diff_line_stats(repo: &Repository) -> Result<DiffLineStats> {
 
     let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
     let index = repo.index()?;
-    let staged = repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), None)?;
+    let mut staged = repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), None)?;
+    detect_diff_renames(&mut staged)?;
     let mut staged_per_path = HashMap::new();
     let (sa, sd) = accumulate_diff_line_stats(&staged, &mut staged_per_path)?;
     stats.additions += sa;
@@ -1066,7 +1069,8 @@ fn diff_line_stats(repo: &Repository) -> Result<DiffLineStats> {
         .recurse_untracked_dirs(false)
         .show_untracked_content(true);
     let index = repo.index()?;
-    let worktree = repo.diff_index_to_workdir(Some(&index), Some(&mut options))?;
+    let mut worktree = repo.diff_index_to_workdir(Some(&index), Some(&mut options))?;
+    detect_diff_renames(&mut worktree)?;
     let mut worktree_per_path = HashMap::new();
     let (wa, wd) = accumulate_diff_line_stats(&worktree, &mut worktree_per_path)?;
     stats.additions += wa;
@@ -1074,6 +1078,13 @@ fn diff_line_stats(repo: &Repository) -> Result<DiffLineStats> {
     stats.worktree = worktree_per_path;
 
     Ok(stats)
+}
+
+fn detect_diff_renames(diff: &mut git2::Diff<'_>) -> Result<()> {
+    let mut options = DiffFindOptions::new();
+    options.renames(true).for_untracked(true);
+    diff.find_similar(Some(&mut options))?;
+    Ok(())
 }
 
 /// Fold one libgit2 [`Diff`] into a per-path stats map and return its aggregate
@@ -1152,13 +1163,27 @@ pub fn diff_file(
 }
 
 fn diff_pathspec<'a>(repo: &Repository, path: &'a Path) -> Cow<'a, Path> {
-    if path.is_absolute() {
-        if let Some(workdir) = repo.workdir() {
-            if let Ok(relative) = path.strip_prefix(workdir) {
-                return Cow::Owned(relative.to_path_buf());
-            }
+    if !path.is_absolute() {
+        return Cow::Borrowed(path);
+    }
+
+    let Some(workdir) = repo.workdir() else {
+        return Cow::Borrowed(path);
+    };
+    if let Ok(relative) = path.strip_prefix(workdir) {
+        return Cow::Owned(relative.to_path_buf());
+    }
+
+    // On macOS, temp dirs often cross the /var → /private/var symlink boundary:
+    // callers hand us /var/..., while libgit2 reports the workdir as /private/var/....
+    // Fall back to physical paths for existing files so absolute pathspecs still
+    // become repository-relative.
+    if let (Ok(real_path), Ok(real_workdir)) = (fs::canonicalize(path), fs::canonicalize(workdir)) {
+        if let Ok(relative) = real_path.strip_prefix(real_workdir) {
+            return Cow::Owned(relative.to_path_buf());
         }
     }
+
     Cow::Borrowed(path)
 }
 
@@ -2287,7 +2312,10 @@ mod tests {
 
         let summary = status(fixture.path()).unwrap();
         let tracked = summary.entry_for("tracked.txt").unwrap();
-        assert_eq!((tracked.worktree_additions, tracked.worktree_deletions), (1, 1));
+        assert_eq!(
+            (tracked.worktree_additions, tracked.worktree_deletions),
+            (1, 1)
+        );
         assert_eq!((tracked.staged_additions, tracked.staged_deletions), (0, 0));
         let new = summary.entry_for("new.txt").unwrap();
         assert_eq!((new.worktree_additions, new.worktree_deletions), (1, 0));
@@ -2299,7 +2327,61 @@ mod tests {
         let summary = status(fixture.path()).unwrap();
         let tracked = summary.entry_for("tracked.txt").unwrap();
         assert_eq!((tracked.staged_additions, tracked.staged_deletions), (1, 1));
-        assert_eq!((tracked.worktree_additions, tracked.worktree_deletions), (0, 0));
+        assert_eq!(
+            (tracked.worktree_additions, tracked.worktree_deletions),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn status_attaches_staged_renamed_and_edited_line_counts_to_new_path() {
+        let fixture = RepoFixture::new();
+        fixture.write("tracked.txt", "one\ntwo\nthree\nfour\n");
+        fixture.git(["add", "tracked.txt"]);
+        fixture.git(["commit", "-m", "expand tracked"]);
+
+        fs::rename(
+            fixture.path().join("tracked.txt"),
+            fixture.path().join("moved.txt"),
+        )
+        .unwrap();
+        fixture.write("moved.txt", "one\nTWO\nthree\nfour\n");
+        fixture.git(["add", "-A"]);
+
+        let summary = status(fixture.path()).unwrap();
+        assert_eq!(summary.entries.len(), 1, "entries were {summary:?}");
+        assert!(summary.entry_for("tracked.txt").is_none());
+        let moved = summary.entry_for("moved.txt").unwrap();
+        assert_eq!(moved.old_path.as_deref(), Some(Path::new("tracked.txt")));
+        assert_eq!(moved.index, FileState::Renamed);
+        assert_eq!((moved.staged_additions, moved.staged_deletions), (1, 1));
+        assert_eq!((moved.worktree_additions, moved.worktree_deletions), (0, 0));
+        assert_eq!((summary.additions, summary.deletions), (1, 1));
+    }
+
+    #[test]
+    fn status_attaches_worktree_renamed_and_edited_line_counts_to_new_path() {
+        let fixture = RepoFixture::new();
+        fixture.write("tracked.txt", "one\ntwo\nthree\nfour\n");
+        fixture.git(["add", "tracked.txt"]);
+        fixture.git(["commit", "-m", "expand tracked"]);
+
+        fs::rename(
+            fixture.path().join("tracked.txt"),
+            fixture.path().join("moved.txt"),
+        )
+        .unwrap();
+        fixture.write("moved.txt", "one\nTWO\nthree\nfour\n");
+
+        let summary = status(fixture.path()).unwrap();
+        assert_eq!(summary.entries.len(), 1, "entries were {summary:?}");
+        assert!(summary.entry_for("tracked.txt").is_none());
+        let moved = summary.entry_for("moved.txt").unwrap();
+        assert_eq!(moved.old_path.as_deref(), Some(Path::new("tracked.txt")));
+        assert_eq!(moved.working_tree, FileState::Renamed);
+        assert_eq!((moved.worktree_additions, moved.worktree_deletions), (1, 1));
+        assert_eq!((moved.staged_additions, moved.staged_deletions), (0, 0));
+        assert_eq!((summary.additions, summary.deletions), (1, 1));
     }
 
     #[test]

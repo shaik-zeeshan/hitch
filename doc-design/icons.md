@@ -5,23 +5,26 @@ The mockup uses hand-drawn inline `<svg><symbol>` marks referenced with `<use>`
 file gives, per slot: purpose, the mockup's approach, a recommended production
 source, and alternatives.
 
-## What the app already has
+## What the app uses now
 
-Checked `apps/desktop/package.json` and `apps/desktop/src`:
+Checked `apps/desktop/package.json`, `apps/desktop/vite.config.ts`, and
+`apps/desktop/src`:
 
-- **No icon library is installed.** No `lucide`, `@lucide/svelte`,
-  `@primer/octicons`, `simple-icons`, `@iconify`, or `feather` in dependencies
-  or `node_modules`.
-- Every icon in the existing components (`RightRail.svelte`, `TopNav.svelte`,
-  `SessionTabs.svelte`, `ProjectTree.svelte`, etc.) is a **bespoke inline SVG**,
-  stroke-style, `viewBox="0 0 16 16"`, `stroke-width` ~1.3-1.6, `currentColor`.
-- The UI primitive library is **`bits-ui`** (used for the dropdown menu); it is
-  not an icon set.
+- **Generic UI icons** use `unplugin-icons` with the Iconify **Lucide**
+  collection (`@iconify-json/lucide`). Components import Svelte icon components
+  from `~icons/lucide/<name>`, compiled to inline SVG at build time.
+- **Harness marks** (Claude, Codex, shell) are local SVG files under
+  `apps/desktop/src/lib/icons/`, exposed as a custom `~icons/hitch/<name>`
+  collection through unplugin-icons' `FileSystemIconLoader`.
+- **Changes-list file-type icons** use the `vscode-material-icons` package via
+  `apps/desktop/src/lib/file-icons.ts`; they render as full-colour SVG asset URLs
+  in `<img src>`, separate from the monochrome Lucide/harness icon policy.
+- The UI primitive library is **`bits-ui`**; it is not an icon set.
 
-## Recommendation
+## Generic/harness icon policy
 
-**Adopt [unplugin-icons](https://github.com/unplugin/unplugin-icons) with
-[Iconify](https://iconify.design) collections** (decided 2026-06-05). Icons are
+Use [unplugin-icons](https://github.com/unplugin/unplugin-icons) with
+[Iconify](https://iconify.design) collections for generic UI icons. Icons are
 imported as Svelte components from the `~icons/<collection>/<name>` virtual
 module and compiled to inline SVG at build time — tree-shaken, no runtime, no
 external requests.
@@ -56,9 +59,9 @@ plugins: [
 ],
 ```
 
-Install `unplugin-icons` + `@iconify-json/lucide` (per-collection JSON, not the
-full `@iconify/json`). For TypeScript, reference `unplugin-icons/types/svelte`
-in `app.d.ts` or tsconfig `types`.
+Installed packages: `unplugin-icons` + `@iconify-json/lucide` (per-collection
+JSON, not the full `@iconify/json`). TypeScript references
+`unplugin-icons/types/svelte` in `vite-env.d.ts`.
 
 Usage: `import GitBranch from "~icons/lucide/git-branch"` then
 `<GitBranch class="icon" />`.

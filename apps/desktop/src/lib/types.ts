@@ -122,6 +122,15 @@ export type BranchSummary = {
 };
 
 export type Request = { type: string; [key: string]: unknown };
+export type GitDiffRequest = {
+  type: "git-diff";
+  worktree_id: Id;
+  path: string;
+  // Optional for protocol compatibility. Omitted requests keep daemon legacy
+  // worktree-first, staged-fallback selection.
+  staged?: boolean;
+};
+
 
 // Force a fresh full repaint of a session's PTY child after its size has
 // settled (daemon replies with an Ack). Modeled on the inline `resize-session`

@@ -12,9 +12,15 @@ const AUTO_COMMIT_PUSH_KEY = "hitch.autoCommitPush";
 
 // Editor preference passed to the desktop backend. Empty string is the
 // default and means "System default": the backend resolves $VISUAL/$EDITOR at
-// launch time (and errors when neither is set). A non-empty value is a display
-// name (Visual Studio Code, Cursor, Zed…) or an explicit executable path.
+// launch time (and errors when neither is set). Cursor, Zed, or an explicit
+// executable path remain explicit choices; legacy Visual Studio Code defaults
+// are normalized back to system default on read.
 export const SYSTEM_DEFAULT_EDITOR = "";
+const LEGACY_DEFAULT_EDITOR = "Visual Studio Code";
+
+function normalizeEditorApp(value: string): string {
+  return value === LEGACY_DEFAULT_EDITOR ? SYSTEM_DEFAULT_EDITOR : value;
+}
 
 export type DraftProvider = "stub" | "claude" | "codex";
 export const DEFAULT_DRAFT_PROVIDER: DraftProvider = "stub";
@@ -30,10 +36,14 @@ export const DRAFT_MODEL_OPTIONS: Record<DraftProvider, string[]> = {
   codex: ["gpt-5-codex", "gpt-5", "gpt-5-mini"],
 };
 
-function persisted(key: string, initial: string): Writable<string> {
+function persisted(
+  key: string,
+  initial: string,
+  normalize: (value: string) => string = (value) => value,
+): Writable<string> {
   let start = initial;
   try {
-    start = localStorage.getItem(key) ?? initial;
+    start = normalize(localStorage.getItem(key) ?? initial);
   } catch {
     // localStorage can be unavailable (private mode / denied); fall back to the
     // default and keep an in-memory store for the session.
@@ -92,7 +102,7 @@ function persistedBool(key: string, initial: boolean): Writable<boolean> {
   return store;
 }
 
-export const editorApp = persisted(EDITOR_KEY, SYSTEM_DEFAULT_EDITOR);
+export const editorApp = persisted(EDITOR_KEY, SYSTEM_DEFAULT_EDITOR, normalizeEditorApp);
 export const draftProvider = persistedDraftProvider();
 export const draftModel = persisted(DRAFT_MODEL_KEY, DEFAULT_DRAFT_MODEL);
 export const draftClaudePath = persisted(DRAFT_CLAUDE_PATH_KEY, "");

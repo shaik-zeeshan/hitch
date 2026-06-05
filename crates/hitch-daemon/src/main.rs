@@ -1293,8 +1293,12 @@ fn handle_request<R: Read>(
             let status = git_status(state, worktree_id)?;
             send_response(state, client_id, request_id, Response::GitStatus { status })?;
         }
-        Request::GitDiff { worktree_id, path } => {
-            let diff = git_diff(state, worktree_id, path)?;
+        Request::GitDiff {
+            worktree_id,
+            path,
+            staged,
+        } => {
+            let diff = git_diff(state, worktree_id, path, staged)?;
             send_response(state, client_id, request_id, Response::FileDiff { diff })?;
         }
         Request::StageFiles { worktree_id, paths } => {
@@ -2603,6 +2607,7 @@ fn git_diff(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
     path: PathBuf,
+    staged: Option<bool>,
 ) -> Result<FileDiff, ProtocolError> {
     let worktree = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
@@ -2614,14 +2619,25 @@ fn git_diff(
     };
     let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
     let diff_path = diff_path_for_worktree(&worktree.path, &path);
-    let mut diff = repo
-        .diff_file(&diff_path, DiffTarget::Worktree)
-        .map_err(git_error)?;
-    if diff.is_empty() {
-        diff = repo
+    let diff = match staged {
+        Some(true) => repo
             .diff_file(&diff_path, DiffTarget::Staged)
-            .map_err(git_error)?;
-    }
+            .map_err(git_error)?,
+        Some(false) => repo
+            .diff_file(&diff_path, DiffTarget::Worktree)
+            .map_err(git_error)?,
+        None => {
+            let mut diff = repo
+                .diff_file(&diff_path, DiffTarget::Worktree)
+                .map_err(git_error)?;
+            if diff.is_empty() {
+                diff = repo
+                    .diff_file(&diff_path, DiffTarget::Staged)
+                    .map_err(git_error)?;
+            }
+            diff
+        }
+    };
     Ok(FileDiff {
         worktree_id,
         path,
