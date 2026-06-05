@@ -611,11 +611,43 @@ fn default_command() -> CommandBuilder {
     CommandBuilder::new(shell)
 }
 
+/// Resolve the user's login shell from the passwd database. Inherited $SHELL
+/// is not trustworthy here: the daemon may have been launched from a GUI
+/// bundle, launchd, or a wrapper script whose environment carries a SHELL
+/// that does not match what the user actually logs in with.
+#[cfg(unix)]
+fn login_shell() -> Option<String> {
+    let mut buf = [0_u8; 4096];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let ret = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut pwd,
+            buf.as_mut_ptr().cast::<libc::c_char>(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if ret != 0 || result.is_null() || pwd.pw_shell.is_null() {
+        return None;
+    }
+    let shell = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) }
+        .to_str()
+        .ok()?;
+    (!shell.is_empty()).then(|| shell.to_string())
+}
+
 #[cfg(unix)]
 fn default_command() -> CommandBuilder {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let mut builder = CommandBuilder::new(shell);
+    let shell = login_shell()
+        .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "/bin/sh".to_string());
+    let mut builder = CommandBuilder::new(&shell);
     builder.arg("-l");
+    // Children should see the shell we actually spawned, not whatever SHELL
+    // the daemon happened to inherit.
+    builder.env("SHELL", &shell);
     builder
 }
 
@@ -875,6 +907,16 @@ mod tests {
     use super::*;
     #[cfg(any(unix, windows))]
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_resolves_from_passwd_database() {
+        let shell = login_shell().expect("current user should have a passwd entry");
+        assert!(
+            shell.starts_with('/'),
+            "login shell should be an absolute path; got {shell:?}"
+        );
+    }
 
     #[test]
     fn scrollback_keeps_latest_bytes() {
