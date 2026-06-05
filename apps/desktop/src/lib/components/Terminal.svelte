@@ -582,10 +582,12 @@
 </script>
 
 <!-- .terminal is the edge-to-edge panel (gradient ink, meets the column
-     dividers + window bottom). The xterm host IS .term-body and carries the
-     panel inset (14px 16px 4px): FitAddon reads the host's content-box width
-     (padding excluded) from getComputedStyle, so the grid sits inside the inset
-     and still measures correctly. -->
+     dividers + window bottom) and carries the panel inset (14px 16px 4px);
+     .term-body is a clean UNPADDED host. FitAddon measures the host via
+     getComputedStyle height/width, which WKWebView resolves to the PADDED
+     border-box — padding on the host makes fit() over-count by ~a row/col and
+     the grid's bottom row clips past the panel. Keep all inset on the wrapper
+     so fit reads the true content area. -->
 <div class="terminal">
   <!-- data-session-id lets the app-wide file-drop listener hit-test a drop
        point back to this session (see fileDrop.ts); the drop-target ring shows
@@ -628,8 +630,8 @@
 
 <style>
   /* Edge-to-edge terminal panel: zero gutter, meets the column dividers and the
-     window bottom directly. The gradient ink shows through the host's padding
-     inset (the xterm grid sits on the flat --term-bg2 fill). */
+     window bottom directly. The panel carries the inset so the gradient ink
+     shows around the grid (the xterm grid sits on the flat --term-bg2 fill). */
   .terminal {
     position: relative;
     flex: 1;
@@ -641,15 +643,15 @@
     background: linear-gradient(var(--term-bg2), var(--term-bg));
     border: none;
     border-radius: 0;
+    padding: 14px 16px 4px;
     overflow: hidden;
   }
-  /* The xterm host carries the panel inset. FitAddon reads the host's
-     content-box width (padding excluded), so the grid measures correctly. */
+  /* Clean unpadded host so fit.fit() reads an exact content size (see the
+     template comment — host padding skews FitAddon's measurement). */
   .term-body {
     flex: 1;
     min-height: 0;
     width: 100%;
-    padding: 14px 16px 4px;
   }
   /* Compact search overlay pinned to the top-right of the terminal. */
   .term-search {
