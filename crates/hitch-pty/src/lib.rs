@@ -432,7 +432,7 @@ fn configure_powershell_display_cwd(
 
     let set_location = format!(
         "Set-Location -LiteralPath {}",
-        powershell_single_quoted_literal(&display_cwd.to_string_lossy())
+        hitch_core::powershell_single_quoted(&display_cwd.to_string_lossy())
     );
     let argv = builder.get_argv_mut();
     if let Some(command) = argv.windows(2).position(|args| {
@@ -512,11 +512,6 @@ fn command_name_is_powershell(command: &str) -> bool {
         .is_some_and(|name| {
             name.eq_ignore_ascii_case("powershell") || name.eq_ignore_ascii_case("pwsh")
         })
-}
-
-#[cfg(windows)]
-fn powershell_single_quoted_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(windows)]

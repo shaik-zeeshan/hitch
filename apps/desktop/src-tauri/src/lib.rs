@@ -1212,6 +1212,11 @@ impl HitchClient {
     }
 
     fn handshake_after_restart(&self, app: &AppHandle) -> Result<(), String> {
+        let fail = |reason: String| {
+            self.mark_disconnected(app, reason.clone());
+            self.set_status(app, DaemonStatus::Unreachable, Some(reason.clone()));
+            Err(reason)
+        };
         match self.dispatch_request(
             app,
             Request::Hello {
@@ -1230,23 +1235,10 @@ impl HitchClient {
                 Ok(())
             }
             Ok(Response::Error { error }) => {
-                let reason = format!("daemon hello failed after restart: {}", error.message);
-                self.mark_disconnected(app, reason.clone());
-                self.set_status(app, DaemonStatus::Unreachable, Some(reason.clone()));
-                Err(reason)
+                fail(format!("daemon hello failed after restart: {}", error.message))
             }
-            Ok(other) => {
-                let reason = format!("unexpected hello response after restart: {other:?}");
-                self.mark_disconnected(app, reason.clone());
-                self.set_status(app, DaemonStatus::Unreachable, Some(reason.clone()));
-                Err(reason)
-            }
-            Err(err) => {
-                let reason = format!("daemon hello failed after restart: {err}");
-                self.mark_disconnected(app, reason.clone());
-                self.set_status(app, DaemonStatus::Unreachable, Some(reason.clone()));
-                Err(reason)
-            }
+            Ok(other) => fail(format!("unexpected hello response after restart: {other:?}")),
+            Err(err) => fail(format!("daemon hello failed after restart: {err}")),
         }
     }
 
@@ -1255,37 +1247,28 @@ impl HitchClient {
         self.handshake_after_restart(app)
     }
 
+    /// Attach a freshly connected stream with no buffered frames. Clones the
+    /// stream into a writer/reader pair and delegates to [`attach_with_reader`],
+    /// which owns the single implementation of the attach sequence.
     fn attach_stream(&self, app: &AppHandle, stream: DaemonStream) -> Result<(), String> {
-        stream
-            .set_nonblocking(false)
-            .map_err(|err| format!("failed to configure daemon socket: {err}"))?;
-
         let writer = stream
             .try_clone()
             .map_err(|err| format!("failed to clone daemon socket: {err}"))?;
-        *self
-            .0
-            .writer
-            .lock()
-            .map_err(|_| "writer lock poisoned".to_string())? = Some(writer);
-        self.0.connected.store(true, Ordering::SeqCst);
-
-        let generation = self.0.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let reader = BufReader::new(stream);
-        self.start_reader(app.clone(), reader, generation);
-        self.start_heartbeat(app.clone(), generation);
-        Ok(())
+        self.attach_with_reader(app, writer, reader)
     }
 
-    /// Attach a connection whose `Hello` was already read by a probe, reusing
-    /// the probe's `BufReader` rather than building a fresh one. The daemon
-    /// enqueues `ReplayToClient` (scrollback + live output) immediately after
-    /// the Hello response, so those frames can already be buffered inside the
-    /// probe's reader. Building a new reader here would drop the probe's buffer
-    /// and lose (or desync on) those frames; carrying the same reader forward
-    /// preserves every byte read past the Hello frame. `writer_stream` is the
-    /// writer half; `reader` already wraps a separate clone of the connection,
-    /// so no extra clone is needed.
+    /// Attach a connection, taking over its writer half and reader. Used both
+    /// for fresh connections (via [`attach_stream`]) and for connections whose
+    /// `Hello` was already read by a probe, reusing the probe's `BufReader`
+    /// rather than building a fresh one. The daemon enqueues `ReplayToClient`
+    /// (scrollback + live output) immediately after the Hello response, so
+    /// those frames can already be buffered inside the probe's reader. Building
+    /// a new reader here would drop the probe's buffer and lose (or desync on)
+    /// those frames; carrying the same reader forward preserves every byte read
+    /// past the Hello frame. `writer_stream` is the writer half; `reader`
+    /// already wraps a separate clone of the connection, so no extra clone is
+    /// needed.
     fn attach_with_reader(
         &self,
         app: &AppHandle,

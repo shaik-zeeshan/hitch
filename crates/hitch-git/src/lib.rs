@@ -1764,9 +1764,7 @@ fn run_command(
 /// [`DrainOutcome`] preserves for the daemon's success path is not meaningful
 /// here; see [`PipeReader::drain_bounded`] for the shared chunk-loop/grace logic.
 fn drain_pipe_reader_bounded(reader: PipeReader, grace: Duration) -> std::io::Result<Vec<u8>> {
-    reader.drain_bounded(grace).map(|outcome| match outcome {
-        DrainOutcome::Drained(bytes) | DrainOutcome::TimedOut(bytes) => bytes,
-    })
+    reader.drain_bounded(grace).map(DrainOutcome::into_inner)
 }
 
 fn command_failed(

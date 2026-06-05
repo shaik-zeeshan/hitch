@@ -372,7 +372,7 @@ fn hook_command(
     let mut command = if agent == AgentKind::Codex && style == CommandArgStyle::Windows {
         format!(
             "& {} --agent {} --event {}",
-            powershell_command_arg(&helper_path.to_string_lossy()),
+            hitch_core::powershell_single_quoted(&helper_path.to_string_lossy()),
             agent.id(),
             event
         )
@@ -389,12 +389,6 @@ fn hook_command(
         command.push_str(state_arg(state));
     }
     command
-}
-
-/// Quote `value` as a PowerShell single-quoted literal: no interpolation, and
-/// embedded single quotes escape by doubling.
-fn powershell_command_arg(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn state_arg(state: AgentState) -> &'static str {

@@ -2290,7 +2290,9 @@ fn write_windows_hanging_command_stub(
 
 #[cfg(windows)]
 fn powershell_literal(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "''"))
+    // Thin `&Path` convenience wrapper; the canonical escaper lives in
+    // `hitch_core::powershell_single_quoted`.
+    hitch_core::powershell_single_quoted(&path.display().to_string())
 }
 
 #[cfg(any(unix, windows))]

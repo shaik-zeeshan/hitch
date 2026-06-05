@@ -40,7 +40,7 @@ use hitch_proto::{
     ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode, WorktreePr,
     MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
-use hitch_process::ProcessTree;
+use hitch_process::{DrainOutcome, PipeReader, ProcessTree};
 use hitch_pty::{
     ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY,
 };
@@ -1975,18 +1975,27 @@ fn remove_worktree(
         ));
     }
 
-    let mut closed_session_ids = Vec::new();
-    for session_id in live_session_ids {
-        match close_session(state, session_id, true) {
-            Ok(()) => closed_session_ids.push(session_id),
+    // Tear down every session that lives in this worktree, then run git. We kill
+    // the PTYs BEFORE git removal because on Windows a live shell holds the
+    // worktree directory open and `git worktree remove` would fail. The
+    // destructive teardown must be SURVIVABLE: git removal can still fail (the
+    // directory is busy, the branch has unmerged commits), and a failed removal
+    // must leave the worktree usable rather than orphaning its sessions. We
+    // therefore capture each closed session's layout row and, on git failure,
+    // re-insert those rows so the next daemon launch's `restore_layout` revives
+    // them as fresh terminals (ADR 0003). We rely on restore rather than keeping
+    // the dead PTYs in memory because killing a PTY makes its in-memory session
+    // unusable anyway, and the PTY-exit dispatcher deletes such rows on its own.
+    let mut closed = Vec::new();
+    {
+        let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        for session_id in live_session_ids {
             // Tolerate a session that vanished on its own (PTY-exit dispatcher)
             // or was closed by another client; a force-removal must continue.
-            Err(err) if err.code == ErrorCode::NotFound => {}
-            Err(err) => return Err(err),
+            if let Some(session) = state.sessions.remove(&session_id) {
+                closed.push(session);
+            }
         }
-    }
-    let orphans = {
-        let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
         let racing_ids = state
             .sessions
             .values()
@@ -1999,27 +2008,27 @@ fn remove_worktree(
                 "worktree has live sessions; retry with force to kill them",
             ));
         }
-        let orphans = racing_ids
-            .into_iter()
-            .filter_map(|id| state.sessions.remove(&id).map(|session| (id, session)))
-            .collect::<Vec<_>>();
-        for (session_id, _) in &orphans {
-            state
-                .store
-                .delete_session(*session_id)
-                .map_err(store_error)?;
+        for session_id in racing_ids {
+            if let Some(session) = state.sessions.remove(&session_id) {
+                closed.push(session);
+            }
         }
         // Hide the worktree from new OpenSession requests while the bounded git
-        // removal runs without the global state mutex. The persistent row is
-        // deleted only after git succeeds so a failed removal can be restored.
+        // removal runs without the global state mutex. Both the worktree and the
+        // session store rows are deleted only after git succeeds (below) so a
+        // failed removal can be restored.
         state.worktrees.remove(&worktree_id);
-        orphans
-    };
-    for (_, session) in &orphans {
-        let _ = session.pty.kill();
     }
-    for (session_id, _) in &orphans {
-        closed_session_ids.push(*session_id);
+    // Kill the PTYs (their handles were removed from the map above). This fires
+    // the PTY-exit dispatcher, which deletes their store rows; the re-insert on
+    // git failure runs after the settle below, so it lands after the dispatcher
+    // has processed those exits.
+    let mut closed_session_ids = Vec::new();
+    let mut closed_sessions = Vec::new();
+    for session in closed {
+        let _ = session.pty.kill();
+        closed_session_ids.push(session.session.id);
+        closed_sessions.push(session.session);
     }
     if force && !closed_session_ids.is_empty() {
         thread::sleep(Duration::from_millis(500));
@@ -2033,8 +2042,32 @@ fn remove_worktree(
         delete_branch.then_some(worktree.branch.as_str()),
     ) {
         let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        // Restore the in-memory worktree row so the GUI shows it again, and
+        // re-insert the closed sessions' layout rows so the next daemon launch
+        // revives them as fresh terminals. The PTY-exit dispatcher has by now
+        // deleted those rows, so a plain insert is the expected path; tolerate a
+        // surviving row (a slow dispatcher) by replacing it.
         state.worktrees.entry(worktree_id).or_insert(worktree);
+        for session in &closed_sessions {
+            let _ = state.store.delete_session(session.id);
+            if let Err(insert_err) = state.store.insert_session(session) {
+                eprintln!(
+                    "hitch-daemon: failed to restore session after git removal failed: {}",
+                    store_error(insert_err).message
+                );
+            }
+        }
         return Err(err);
+    }
+
+    // Git removal succeeded: now delete the closed sessions' store rows. The
+    // PTY-exit dispatcher most likely already deleted them, so tolerate a
+    // missing row rather than treating it as an error.
+    {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        for session in &closed_sessions {
+            let _ = state.store.delete_session(session.id);
+        }
     }
 
     let post_remove_orphans = {
@@ -2208,6 +2241,11 @@ enum OsArg<'a> {
     OwnedOs(OsString),
 }
 
+/// Bounded wait for a git reader thread to reach EOF after the child exited.
+/// Matches `hitch-git::READER_DRAIN_GRACE`; the child is already reaped here, so
+/// a still-parked reader is detached with whatever git wrote.
+const GIT_READER_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
 fn run_git_with_timeout<'a, I>(
     git_path: &Path,
     repo_root: &Path,
@@ -2237,25 +2275,37 @@ where
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| ProtocolError::new(ErrorCode::GitFailed, err.to_string()))?;
+    // Drain stdout/stderr on reader threads while we poll. Without concurrent
+    // draining, git that writes more than the OS pipe buffer (~64KB) blocks on a
+    // full pipe and never exits, so the poll loop below would spuriously kill it
+    // at the deadline. `PipeReader` is the shared primitive used by `hitch-git`
+    // and `drafts.rs` for exactly this. We never read stdout's content (only
+    // stderr feeds the error message), but the reader must stay bound for the
+    // whole function so its thread keeps draining the pipe.
+    let _stdout_reader = child.stdout.take().map(PipeReader::spawn);
+    let stderr_reader = child.stderr.take().map(PipeReader::spawn);
     let started = std::time::Instant::now();
     loop {
         if let Some(status) = child
             .try_wait()
             .map_err(|err| ProtocolError::new(ErrorCode::GitFailed, err.to_string()))?
         {
-            let output = child
-                .wait_with_output()
-                .map_err(|err| ProtocolError::new(ErrorCode::GitFailed, err.to_string()))?;
             if status.success() {
                 return Ok(());
             }
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            // The child exited on its own, so its write ends are closed and the
+            // readers reach EOF. Bounded-drain to collect stderr for the message
+            // without blocking on a stuck reader.
+            let stderr_bytes = stderr_reader.map(drain_git_reader_bounded).unwrap_or_default();
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             return Err(ProtocolError::new(
                 ErrorCode::GitFailed,
                 format!("git failed: {stderr}"),
             ));
         }
         if started.elapsed() >= timeout {
+            // Killing the child closes the captured write ends, so the reader
+            // threads reach EOF and finish; drop them implicitly without waiting.
             let _ = child.kill();
             let _ = child.wait();
             return Err(ProtocolError::new(
@@ -2265,6 +2315,16 @@ where
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// Collect a finished git reader's output, collapsing the drained and
+/// timed-out outcomes to the bytes read (the daemon uses whatever git already
+/// wrote for the error message). Mirrors `hitch-git`'s `drain_pipe_reader_bounded`.
+fn drain_git_reader_bounded(reader: PipeReader) -> Vec<u8> {
+    reader
+        .drain_bounded(GIT_READER_DRAIN_GRACE)
+        .map(DrainOutcome::into_inner)
+        .unwrap_or_default()
 }
 
 fn close_session(

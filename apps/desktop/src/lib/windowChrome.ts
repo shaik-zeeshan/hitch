@@ -49,6 +49,14 @@ export function watchMaximized(onChange: (maximized: boolean) => void): () => vo
 /// to the webview origin) so the native side can park its transparent hit-test
 /// overlay exactly over the button — that overlay is what makes Windows 11 show
 /// its Snap Layouts flyout on hover.
+///
+/// We map CSS px → physical px via `devicePixelRatio`. This is only correct while
+/// `devicePixelRatio` equals the monitor's native scale factor. WebView2 *user*
+/// zoom (Ctrl+wheel / Ctrl+±) would change `devicePixelRatio` independently of
+/// the scale factor and skew the rect, parking the overlay off the real button.
+/// That gesture is disabled by `zoomHotkeysEnabled: false` (WebView2
+/// `IsZoomControlEnabled = false`) in tauri.windows.conf.json — keep it that way,
+/// or switch this to send CSS px and multiply by `window.scale_factor()` natively.
 export async function reportMaxButtonRect(el: HTMLElement): Promise<void> {
   const r = el.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;

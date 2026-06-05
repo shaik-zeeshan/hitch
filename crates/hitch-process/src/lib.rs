@@ -458,14 +458,41 @@ mod pipe_reader {
     /// safe to consume, while a `TimedOut` value is only the bytes collected
     /// before the grace elapsed — possibly truncated — so the caller must decide
     /// whether partial output is acceptable rather than treating it as complete.
-    pub enum DrainOutcome {
+    ///
+    /// The payload type defaults to the raw `Vec<u8>` [`drain_bounded`] produces;
+    /// [`DrainOutcome::map`] lets a caller decode it (e.g. to a lossy `String`)
+    /// while preserving the load-bearing `Drained`/`TimedOut` distinction.
+    ///
+    /// [`drain_bounded`]: PipeReader::drain_bounded
+    pub enum DrainOutcome<T = Vec<u8>> {
         /// The reader reached EOF (or a read error) within the grace period; the
         /// bytes are the complete output.
-        Drained(Vec<u8>),
+        Drained(T),
         /// The grace elapsed with the reader still parked (a descendant held the
         /// captured write end open). The bytes are whatever arrived so far and may
         /// be truncated.
-        TimedOut(Vec<u8>),
+        TimedOut(T),
+    }
+
+    impl<T> DrainOutcome<T> {
+        /// Transform the collected payload while preserving the variant, so a
+        /// caller can decode the raw bytes (e.g. `String::from_utf8_lossy`)
+        /// without losing the `Drained`/`TimedOut` distinction.
+        pub fn map<U>(self, f: impl FnOnce(T) -> U) -> DrainOutcome<U> {
+            match self {
+                DrainOutcome::Drained(value) => DrainOutcome::Drained(f(value)),
+                DrainOutcome::TimedOut(value) => DrainOutcome::TimedOut(f(value)),
+            }
+        }
+
+        /// The collected payload regardless of whether the drain completed. Use
+        /// only where partial output is acceptable (e.g. stderr context on the
+        /// failure path).
+        pub fn into_inner(self) -> T {
+            match self {
+                DrainOutcome::Drained(value) | DrainOutcome::TimedOut(value) => value,
+            }
+        }
     }
 
     impl PipeReader {

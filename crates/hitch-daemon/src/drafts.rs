@@ -4,7 +4,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hitch_process::{PipeReader, ProcessTree, ProcessTreeRegistration};
+use hitch_process::{DrainOutcome, PipeReader, ProcessTree, ProcessTreeRegistration};
 use hitch_proto::{
     CommitDraft, DraftGenerationSettings, DraftProvider, ErrorCode, ProtocolError, PullRequestDraft,
 };
@@ -34,6 +34,15 @@ const READER_DRAIN_GRACE: Duration = Duration::from_millis(500);
 /// truncated one to the parser. If even this longer bound elapses we surface a
 /// provider error rather than parse a partial payload (see `drain_reader_bounded`).
 const SUCCESS_DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// Settle window used on the SUCCESS path once [`SUCCESS_DRAIN_GRACE`] elapses with
+/// the stdout reader still parked: if no new bytes arrive within this window, a
+/// lingering descendant is only *passively* holding the inherited write end (the
+/// provider's output is already complete) and we can safely force EOF; if bytes are
+/// still arriving, a descendant is actively writing and forcing EOF would truncate
+/// the payload. Kept short — the same order as `READER_DRAIN_GRACE`. See
+/// `drain_success_stdout`.
+const SETTLE_WINDOW: Duration = Duration::from_millis(500);
 
 /// Standalone sanity bound on a draft provider timeout (ten minutes). Draft
 /// generation now runs as an async **Job** (ADR 0008), so it is no longer
@@ -530,51 +539,30 @@ fn run_provider_command(
             // mirroring the timeout path. The `start_job` runner reports the Job
             // as cancelled regardless of this error.
             Ok(None) if cancel.is_some_and(|control| control.is_cancelled()) => {
-                terminate_process_tree(&process_tree, &mut child);
-                let _ = child.wait();
-                // Disarm the external canceller before draining the threads: the
-                // child is now reaped, so a concurrent cancel calling
-                // `tree.terminate()` would target a possibly-recycled pgid (see
-                // `ProcessTreeRegistration`). We already terminated the tree above.
-                registration.disarm();
-                // Don't join the stdin writer on the abort path: its result is
-                // unused here, and a `write_all` parked on a full pipe could
-                // otherwise wedge cancellation/timeout if a descendant that
-                // escaped the process tree still holds the read end open. The
-                // thread exits on its own once the killed tree drops that end.
-                // (The readers below are bounded by EOF, which the kill delivers.)
-                drop(stdin_writer);
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(provider_error(format!(
-                    "{} draft provider cancelled",
-                    config.kind.label()
-                ))
-                .retryable(true));
+                return Err(abort_provider_run(
+                    &process_tree,
+                    &mut child,
+                    &mut registration,
+                    stdin_writer,
+                    stdout_reader,
+                    stderr_reader,
+                    format!("{} draft provider cancelled", config.kind.label()),
+                ));
             }
             Ok(None) if Instant::now() >= deadline => {
-                terminate_process_tree(&process_tree, &mut child);
-                let _ = child.wait();
-                // Disarm before draining, same as the cancel branch: the child
-                // is reaped, so a concurrent cancel calling `tree.terminate()`
-                // would target a possibly-recycled pgid (see
-                // `ProcessTreeRegistration`). We already terminated the tree.
-                registration.disarm();
-                // Don't join the stdin writer on the abort path: its result is
-                // unused here, and a `write_all` parked on a full pipe could
-                // otherwise wedge cancellation/timeout if a descendant that
-                // escaped the process tree still holds the read end open. The
-                // thread exits on its own once the killed tree drops that end.
-                // (The readers below are bounded by EOF, which the kill delivers.)
-                drop(stdin_writer);
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(provider_error(format!(
-                    "{} draft provider timed out after {}s",
-                    config.kind.label(),
-                    config.timeout.as_secs()
-                ))
-                .retryable(true));
+                return Err(abort_provider_run(
+                    &process_tree,
+                    &mut child,
+                    &mut registration,
+                    stdin_writer,
+                    stdout_reader,
+                    stderr_reader,
+                    format!(
+                        "{} draft provider timed out after {}s",
+                        config.kind.label(),
+                        config.timeout.as_secs()
+                    ),
+                ));
             }
             Ok(None) => thread::sleep(Duration::from_millis(25)),
             Err(err) => return Err(provider_error(format!("draft provider failed: {err}"))),
@@ -588,29 +576,20 @@ fn run_provider_command(
     // completed provider run, and can otherwise keep reader joins or a stdin
     // write parked forever.
     registration.disarm();
-    if !stdout_reader.is_finished()
-        || !stderr_reader.is_finished()
-        || stdin_writer
-            .as_ref()
-            .is_some_and(|writer| !writer.is_finished())
-    {
-        // The leader was reaped by the `try_wait` above, so a plain
-        // `terminate()` here would be the recycled-pgid hazard the cancel/timeout
-        // branches and `ProcessTreeRegistration` guard against: on Unix it is
-        // `kill(-pgid)`, and the reaped leader's pgid can already belong to an
-        // unrelated group. Use the post-reap-safe form, which skips the Unix
-        // group signal but still tears down a Windows Job Object holding a
-        // detached descendant that inherited one of our captured pipes.
-        let _ = process_tree.terminate_after_leader_reaped();
-        let _ = child.kill();
-    }
 
-    // Drain the readers with a bounded wait. Normally the provider's pipes are
-    // already at EOF (readers finished), so this returns the complete output
-    // immediately. When a same-group descendant inherited a captured write end and
-    // outlives the provider, `terminate_after_leader_reaped` cannot force EOF on
-    // Unix (the recycled-pgid no-op above), so without a bound a plain reader join
-    // would block until that descendant exits.
+    // Drain the readers with a bounded wait *before* tearing down the tree for
+    // cleanup. Normally the provider's pipes are already at EOF (readers
+    // finished), so this returns the complete output immediately. When a
+    // same-group descendant inherited a captured write end and is still writing,
+    // the bounded drain gives it up to `grace` to finish and reach EOF on its own.
+    //
+    // It is important not to terminate the tree first: on Windows the Job Object
+    // kill would force EOF mid-write on a legitimately-still-writing descendant,
+    // and the drain would then report a truncated payload as `Drained` (complete),
+    // bypassing the `TimedOut` truncation guard on the success path below. By
+    // draining first, a descendant that holds the pipe past the grace yields
+    // `TimedOut` (a hard error), never a silently truncated `Drained`. The
+    // post-reap cleanup terminate happens afterwards via `terminate_for_cleanup`.
     //
     // The grace differs by exit status. On a NONZERO exit the provider's status is
     // authoritative and stderr is only diagnostic context, so the short
@@ -619,27 +598,54 @@ fn run_provider_command(
     // partial JSON draft, so use the much longer `SUCCESS_DRAIN_GRACE` to give a
     // lingering inherited-pipe holder time to close, and treat a drain that still
     // times out as a hard error rather than parsing a possibly-truncated payload.
+    //
+    // The leader was reaped by the `try_wait` above, so a plain `terminate()`
+    // would be the recycled-pgid hazard the cancel/timeout branches and
+    // `ProcessTreeRegistration` guard against: on Unix it is `kill(-pgid)`, and the
+    // reaped leader's pgid can already belong to an unrelated group. Use the
+    // post-reap-safe form, which skips the Unix group signal but still tears down a
+    // Windows Job Object holding a detached descendant that inherited one of our
+    // captured pipes.
+    let mut terminate_for_cleanup = || {
+        let _ = process_tree.terminate_after_leader_reaped();
+        let _ = child.kill();
+    };
+
     if !status.success() {
         // The provider's exit status is authoritative on failure. Do not wait
         // for the stdin writer: a descendant may have inherited the pipe read
         // end, and the nonzero provider result already carries the failure.
         // Drain stdout too (short grace) so its reader thread is detached and
         // doesn't leak, but only stderr feeds the error message.
-        let _stdout = drain_reader_bounded(stdout_reader, READER_DRAIN_GRACE)?.into_string();
-        let stderr = drain_reader_bounded(stderr_reader, READER_DRAIN_GRACE)?.into_string();
+        let _stdout = drain_reader_bounded(stdout_reader, READER_DRAIN_GRACE)?.into_inner();
+        let stderr = drain_reader_bounded(stderr_reader, READER_DRAIN_GRACE)?.into_inner();
+        terminate_for_cleanup();
         drop(stdin_writer);
         return Err(nonzero_provider_error(config.kind.label(), status, &stderr).retryable(true));
     }
 
-    let stdout = drain_reader_bounded(stdout_reader, SUCCESS_DRAIN_GRACE)?;
+    // Give stdout the success grace to reach EOF *before* terminating, then tear
+    // the tree down for cleanup. The outcome distinguishes three cases:
+    //   * EOF within the grace -> `Drained`, the complete output.
+    //   * No EOF, but the bytes stopped growing -> a descendant only passively
+    //     inherited the write end (it isn't producing output); the provider's own
+    //     output is already complete, so terminating to force EOF is safe and we
+    //     keep the bytes as `Drained`.
+    //   * No EOF and the bytes were still growing when the grace elapsed -> a
+    //     descendant is actively writing; forcing EOF now would truncate the
+    //     payload, so report `TimedOut` instead of parsing a partial JSON draft.
+    let stdout = drain_success_stdout(stdout_reader, SUCCESS_DRAIN_GRACE, &mut terminate_for_cleanup);
     // stderr is only diagnostic context on the success path; partial is fine and
     // we don't want to wait the full success grace for a stderr pipe a descendant
     // happens to hold open, so use the short grace.
-    let _stderr = drain_reader_bounded(stderr_reader, READER_DRAIN_GRACE)?.into_string();
-    let stdout = match stdout {
+    let _stderr = drain_reader_bounded(stderr_reader, READER_DRAIN_GRACE)?.into_inner();
+    // Tear down any descendant still holding a pipe open so it doesn't leak (a
+    // no-op if `drain_success_stdout` already terminated to force EOF).
+    terminate_for_cleanup();
+    let stdout = match stdout? {
         DrainOutcome::Drained(stdout) => stdout,
-        // The provider exited 0 but a descendant kept the stdout write end open
-        // past `SUCCESS_DRAIN_GRACE`, so the bytes we have may be a truncated JSON
+        // The provider exited 0 but a descendant was still writing to the stdout
+        // pipe past `SUCCESS_DRAIN_GRACE`, so the bytes we have are a truncated JSON
         // draft. Surface that explicitly instead of handing partial output to the
         // parser (which would either fail with a misleading "no JSON" message or,
         // worse, match an earlier incomplete object).
@@ -679,6 +685,35 @@ fn run_provider_command(
 fn terminate_process_tree(process_tree: &ProcessTree, child: &mut std::process::Child) {
     let _ = process_tree.terminate();
     let _ = child.kill();
+}
+
+/// Shared teardown for the cancel and timeout abort paths, which are otherwise
+/// identical (only the guard and the message differ). Kill the provider tree, reap
+/// the child, then disarm the external canceller *before* draining the threads: the
+/// child is now reaped, so a concurrent cancel calling `tree.terminate()` would
+/// target a possibly-recycled pgid (see `ProcessTreeRegistration`); we already
+/// terminated the tree, so the terminate-then-disarm order keeps that invariant.
+/// Don't join the stdin writer: its result is unused here, and a `write_all` parked
+/// on a full pipe could otherwise wedge cancellation/timeout if a descendant that
+/// escaped the process tree still holds the read end open. The thread exits on its
+/// own once the killed tree drops that end. (The readers are bounded by EOF, which
+/// the kill delivers.) Returns the retryable provider error to return to the caller.
+fn abort_provider_run<F: FnMut()>(
+    process_tree: &ProcessTree,
+    child: &mut std::process::Child,
+    registration: &mut ProcessTreeRegistration<F>,
+    stdin_writer: Option<thread::JoinHandle<io::Result<()>>>,
+    stdout_reader: PipeReader,
+    stderr_reader: PipeReader,
+    message: String,
+) -> ProtocolError {
+    terminate_process_tree(process_tree, child);
+    let _ = child.wait();
+    registration.disarm();
+    drop(stdin_writer);
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    provider_error(message).retryable(true)
 }
 
 /// Spawn a provider stdout/stderr reader. Thin wrapper over the shared
@@ -722,52 +757,82 @@ fn join_writer_if_finished(handle: thread::JoinHandle<io::Result<()>>) -> Option
     }
 }
 
-/// Outcome of a bounded reader drain on the normal-exit path, at the lossy-string
-/// level this crate works in. A thin wrapper over
-/// [`hitch_process::DrainOutcome`]'s byte-level outcome.
-///
-/// The distinction matters on the SUCCESS path: a `Drained` result is the
-/// complete provider output and safe to parse, while a `TimedOut` result is only
-/// the bytes collected before the grace elapsed — possibly a truncated JSON
-/// payload — so the caller must not feed it to the parser as if it were complete.
-enum DrainOutcome {
-    /// The reader reached EOF (or a read error) within the grace period; the
-    /// returned string is the complete output.
-    Drained(String),
-    /// The grace elapsed with the reader still parked (a descendant held the
-    /// captured write end open). The string is whatever bytes arrived so far and
-    /// may be truncated.
-    TimedOut(String),
-}
-
-impl DrainOutcome {
-    /// The collected bytes regardless of whether the drain completed. Use only
-    /// where partial output is acceptable (e.g. stderr context on the failure
-    /// path).
-    fn into_string(self) -> String {
-        match self {
-            DrainOutcome::Drained(text) | DrainOutcome::TimedOut(text) => text,
-        }
-    }
-}
-
 /// Drain a reader on the NORMAL-EXIT path with a bounded wait, decoding the shared
-/// reader's byte-level outcome into this crate's lossy-`String` [`DrainOutcome`]
-/// and surfacing read/panic failures as a [`ProtocolError`]. The
+/// reader's byte-level outcome into a lossy `String` while preserving the
+/// observable `Drained`/`TimedOut` distinction the SUCCESS path relies on, and
+/// surfacing read/panic failures as a [`ProtocolError`]. The
 /// chunk-loop/grace/recycled-pgid logic lives once in
-/// [`hitch_process::PipeReader::drain_bounded`]; the observable
-/// `Drained`/`TimedOut` distinction the SUCCESS path relies on is preserved here.
-fn drain_reader_bounded(reader: PipeReader, grace: Duration) -> Result<DrainOutcome, ProtocolError> {
-    match reader.drain_bounded(grace) {
-        Ok(hitch_process::DrainOutcome::Drained(bytes)) => Ok(DrainOutcome::Drained(
-            String::from_utf8_lossy(&bytes).into_owned(),
-        )),
-        Ok(hitch_process::DrainOutcome::TimedOut(bytes)) => Ok(DrainOutcome::TimedOut(
-            String::from_utf8_lossy(&bytes).into_owned(),
-        )),
-        Err(err) => Err(provider_error(format!(
-            "failed reading draft provider output: {err}"
-        ))),
+/// [`hitch_process::PipeReader::drain_bounded`].
+fn drain_reader_bounded(
+    reader: PipeReader,
+    grace: Duration,
+) -> Result<DrainOutcome<String>, ProtocolError> {
+    reader
+        .drain_bounded(grace)
+        .map(|outcome| outcome.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+        .map_err(|err| provider_error(format!("failed reading draft provider output: {err}")))
+}
+
+/// Collect the provider's stdout on the SUCCESS path, where the bytes *are* the
+/// result and truncation must never be silently accepted.
+///
+/// The provider already exited 0, so its own pipe is at EOF; the reader normally
+/// finishes immediately. A same-group descendant can, however, inherit the stdout
+/// write end and outlive the provider. We must not just kill that descendant up
+/// front: on Windows the Job Object kill forces EOF mid-write, so a descendant
+/// that is *actively writing* would have its output truncated yet reported as
+/// complete. We must also not block the whole `grace` on a descendant that only
+/// *passively* inherited the write end (it writes nothing) — the provider's output
+/// is already complete and the caller should return promptly.
+///
+/// So we watch the reader in short settle windows:
+///   * EOF at any point -> [`DrainOutcome::Drained`], the complete output.
+///   * No EOF but the bytes stopped growing across a settle window -> only a
+///     passive holder remains; the output is complete, so `terminate` to force EOF
+///     and return the bytes as [`DrainOutcome::Drained`]. This returns quickly
+///     rather than waiting out the full `grace`.
+///   * The bytes keep growing each window -> a descendant is actively writing;
+///     keep waiting up to `grace`. If it never settles or reaches EOF within the
+///     grace, forcing EOF would truncate, so return [`DrainOutcome::TimedOut`].
+///
+/// `terminate` is the post-reap-safe tree teardown the caller also uses for
+/// cleanup; calling it here forces EOF so the final join cannot block.
+fn drain_success_stdout(
+    reader: PipeReader,
+    grace: Duration,
+    terminate: &mut impl FnMut(),
+) -> Result<DrainOutcome<String>, ProtocolError> {
+    let to_string = |bytes: Vec<u8>| String::from_utf8_lossy(&bytes).into_owned();
+    let join = |reader: PipeReader| {
+        reader
+            .join()
+            .map(|bytes| to_string(bytes))
+            .map_err(|err| provider_error(format!("failed reading draft provider output: {err}")))
+    };
+
+    let deadline = Instant::now() + grace;
+    let mut last_len = reader.collected().len();
+    loop {
+        if reader.is_finished() {
+            // EOF reached on its own: the complete output.
+            return Ok(DrainOutcome::Drained(join(reader)?));
+        }
+        if Instant::now() >= deadline {
+            // A descendant held the pipe and kept writing for the whole grace;
+            // forcing EOF now would truncate the payload.
+            return Ok(DrainOutcome::TimedOut(to_string(reader.collected())));
+        }
+
+        thread::sleep(SETTLE_WINDOW.min(deadline.saturating_duration_since(Instant::now())));
+        let len = reader.collected().len();
+        if len == last_len && !reader.is_finished() {
+            // No EOF, but the bytes stopped growing across a settle window: only a
+            // passive inherited-pipe holder remains and the provider's output is
+            // already complete. Force EOF and return the complete bytes promptly.
+            terminate();
+            return Ok(DrainOutcome::Drained(join(reader)?));
+        }
+        last_len = len;
     }
 }
 
@@ -1975,7 +2040,9 @@ fn main() {
 
     #[cfg(windows)]
     fn powershell_literal(path: &Path) -> String {
-        format!("'{}'", path.display().to_string().replace('\'', "''"))
+        // Thin `&Path` convenience wrapper; the canonical escaper lives in
+        // `hitch_core::powershell_single_quoted`.
+        hitch_core::powershell_single_quoted(&path.display().to_string())
     }
 
     #[cfg(windows)]
