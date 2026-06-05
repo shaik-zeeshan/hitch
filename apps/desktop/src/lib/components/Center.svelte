@@ -28,9 +28,30 @@
     worktrees,
   } from "../daemon";
   import { sessionBelongsTo } from "../types";
+  import { theme as themeStore } from "../theme";
+  import {
+    terminalSurfaceOverride,
+    terminalThemeDark,
+    terminalThemeLight,
+  } from "../terminal-themes";
   import SessionTabs from "./SessionTabs.svelte";
   import Terminal from "./Terminal.svelte";
   import DiffTab from "./DiffTab.svelte";
+
+  // Re-theme every --term-* consumer in the center column at one bind point: the
+  // tab strip's active tab, the terminal panels' insets/overlays, and the diff
+  // view all read --term-bg2/--term-fg/--term-dim/--term-line, and .center is the
+  // tightest box that scopes them as a group (the empty states use only paper/ink
+  // vars, so they're unaffected). Without this the active tab would keep the
+  // built-in surface color while the terminal below shows the theme background,
+  // leaving a visible seam. Re-derives on every app-mode flip and either selection
+  // change (same axes as Terminal's palette $effect): $themeStore picks the
+  // data-theme, the two selection stores pick the id; "" for the built-in theme.
+  const surfaceOverride = $derived.by(() => {
+    void $themeStore;
+    const dark = document.documentElement.getAttribute("data-theme") === "dark";
+    return terminalSurfaceOverride(dark ? $terminalThemeDark : $terminalThemeLight);
+  });
 
   const parentLabel = $derived(
     $selectedParent?.kind === "worktree"
@@ -40,7 +61,7 @@
   );
 </script>
 
-<main class="center">
+<main class="center" style={surfaceOverride}>
   {#if $selectedParent}
     <SessionTabs parent={$selectedParent} />
   {/if}

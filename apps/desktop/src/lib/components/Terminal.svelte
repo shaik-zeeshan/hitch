@@ -20,12 +20,19 @@
   // and let the ring repopulate. Keystrokes go straight to the daemon; a
   // ResizeObserver fits the grid and reports the new cols/rows.
   import { onDestroy, onMount, tick } from "svelte";
+  import { get } from "svelte/store";
   import {
     Terminal as Xterm,
     type IDisposable,
     type ITheme,
   } from "@xterm/xterm";
   import { theme as themeStore } from "../theme";
+  import {
+    HITCH_THEME_ID,
+    getTerminalTheme,
+    terminalThemeDark,
+    terminalThemeLight,
+  } from "../terminal-themes";
   import { FitAddon } from "@xterm/addon-fit";
   import { WebLinksAddon } from "@xterm/addon-web-links";
   import { SearchAddon } from "@xterm/addon-search";
@@ -236,6 +243,24 @@
     return theme;
   }
 
+  // Resolve the ITheme to actually apply, honoring the user's per-mode terminal
+  // theme selection. Dark mode reads `terminalThemeDark`, light reads
+  // `terminalThemeLight` (same data-theme axis resolveTheme() keys off, kept in
+  // sync via the app theme store). The default — and the fallback for the Hitch
+  // sentinel OR any unknown/stale id — is the built-in palette, so this can
+  // never break the out-of-box look. A curated theme's `colors` is already an
+  // ITheme-shaped hex map covering every field resolveTheme() sets, so a straight
+  // spread produces a complete ITheme.
+  function currentTheme(): ITheme {
+    const dark =
+      document.documentElement.getAttribute("data-theme") === "dark";
+    const id = dark ? get(terminalThemeDark) : get(terminalThemeLight);
+    if (id === HITCH_THEME_ID) return resolveTheme();
+    const def = getTerminalTheme(id);
+    if (!def) return resolveTheme();
+    return { ...def.colors };
+  }
+
   // Coalesce PTY output to one xterm write per animation frame. The daemon
   // delivers bytes as many small tails per frame (one per channel message);
   // writing each tail separately thrashes xterm's parser under bursty output.
@@ -426,18 +451,29 @@
     wasActive = active;
   });
 
-  // Re-resolve and reapply the xterm palette whenever the theme flips. The
-  // surface tokens (--term-bg2/--term-fg/--term-dim) differ per theme, so a
-  // light↔dark swap must repaint every mounted terminal — including hidden ones,
-  // so they're already correct when re-shown. Reading $themeStore here registers
-  // the dependency. No first-run gating: the effect's first run happens before
-  // onMount creates `term` (so it bails on !term), and `term` isn't reactive —
-  // gating on "first real change" here would swallow the first toggle instead.
-  // Reapplying is idempotent and cheap, so every store change just repaints.
+  // The surface CSS vars (--term-bg2/--term-fg/--term-dim/--term-line) that the
+  // panel inset + on-surface overlays read are re-themed for a custom terminal
+  // theme one level up, in Center.svelte: it binds terminalSurfaceOverride() on
+  // .center so the same override reaches the tab strip, every terminal panel, and
+  // the diff view from a single point. We only repaint the xterm PALETTE here.
+
+  // Re-resolve and reapply the xterm palette whenever the theme flips OR the
+  // user picks a different terminal theme for the current mode. The surface
+  // tokens (--term-bg2/--term-fg/--term-dim) differ per theme, so a light↔dark
+  // swap must repaint every mounted terminal — including hidden ones, so they're
+  // already correct when re-shown; a per-mode selection change must too. Reading
+  // $themeStore and BOTH selection stores here registers all three dependencies
+  // (currentTheme() reads the stores via get(), which doesn't register, so we
+  // touch them explicitly). No first-run gating: the effect's first run happens
+  // before onMount creates `term` (so it bails on !term), and `term` isn't
+  // reactive — gating on "first real change" here would swallow the first toggle
+  // instead. Reapplying is idempotent and cheap, so every store change repaints.
   $effect(() => {
     void $themeStore;
+    void $terminalThemeDark;
+    void $terminalThemeLight;
     if (!term) return;
-    term.options.theme = resolveTheme();
+    term.options.theme = currentTheme();
   });
 
   onMount(() => {
@@ -446,7 +482,7 @@
       // 0.8125rem / 13px body type from doc-design/components.md.
       fontFamily: '"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace',
       fontSize: 13,
-      theme: resolveTheme(),
+      theme: currentTheme(),
       cursorBlink: true,
       scrollback: 5000,
     });
@@ -604,6 +640,8 @@
      border-box — padding on the host makes fit() over-count by ~a row/col and
      the grid's bottom row clips past the panel. Keep all inset on the wrapper
      so fit reads the true content area. -->
+<!-- --term-* surface vars are re-themed by Center.svelte (.center binds the
+     override once for the tab strip, every panel, and the diff view). -->
 <div class="terminal">
   <!-- data-session-id lets the app-wide file-drop listener hit-test a drop
        point back to this session (see fileDrop.ts); the drop-target ring shows

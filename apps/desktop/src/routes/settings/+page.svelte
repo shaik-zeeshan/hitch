@@ -22,8 +22,23 @@
     SYSTEM_DEFAULT_EDITOR,
     type DraftProvider,
   } from "$lib/settings";
+  import {
+    HITCH_THEME_ID,
+    TERMINAL_THEMES,
+    terminalThemeDark,
+    terminalThemeLight,
+  } from "$lib/terminal-themes";
 
-  type Section = "editor" | "drafts" | "git" | "about";
+  type Section = "editor" | "themes" | "drafts" | "git" | "about";
+
+  // Split the curated palettes by app mode. Each group is the 10 themes for that
+  // mode plus the built-in "Hitch (default)" sentinel, which renders from the
+  // app's own CSS variables rather than a fixed hex palette.
+  const darkThemes = TERMINAL_THEMES.filter((theme) => theme.mode === "dark");
+  const lightThemes = TERMINAL_THEMES.filter((theme) => theme.mode === "light");
+  // The 7 ANSI colors we strip across each preview swatch (drawn on the theme's
+  // own background hex) — bright enough to read the palette at a glance.
+  const swatchKeys = ["red", "green", "yellow", "blue", "magenta", "cyan", "foreground"] as const;
   // Title-bar integration mirrors TopNav (ADR 0006): macOS reserves room for
   // the native traffic lights on the left; Windows reserves the caption-control
   // strip on the right (WindowControls stays mounted on this route).
@@ -244,6 +259,9 @@
       <button class="nav-row" class:active={section === "editor"} onclick={() => (section = "editor")}>
         Editor
       </button>
+      <button class="nav-row" class:active={section === "themes"} onclick={() => (section = "themes")}>
+        Themes
+      </button>
       <button class="nav-row" class:active={section === "drafts"} onclick={() => (section = "drafts")}>
         Drafts
       </button>
@@ -306,6 +324,97 @@
           {:else if saved}
             <span class="saved" role="status">Saved</span>
           {/if}
+        </section>
+      {:else if section === "themes"}
+        <section class="panel themes-panel">
+          <div class="panel-head">
+            <h2>Themes</h2>
+            <p class="help">
+              Choose the color palette for terminal panes. <b>Dark</b> and <b>Light</b> are picked
+              separately — each applies when the app is in that mode (toggle the mode from the top
+              nav). <b>Hitch (default)</b> uses the built-in palette tuned to the app's chrome.
+            </p>
+          </div>
+
+          <div class="theme-group" role="radiogroup" aria-label="Dark terminal theme">
+            <span class="theme-group-label">Dark</span>
+            <div class="theme-grid">
+              <button
+                type="button"
+                class="theme-card"
+                class:selected={$terminalThemeDark === HITCH_THEME_ID}
+                role="radio"
+                aria-checked={$terminalThemeDark === HITCH_THEME_ID}
+                onclick={() => terminalThemeDark.set(HITCH_THEME_ID)}
+              >
+                <span class="theme-name">Hitch (default)</span>
+                <span class="swatch hitch" aria-hidden="true">
+                  <span style="background: var(--term-line)"></span>
+                  <span style="background: var(--term-dim)"></span>
+                  <span style="background: var(--term-fg)"></span>
+                  <span style="background: var(--term-bg2)"></span>
+                  <span style="background: var(--term-bg)"></span>
+                </span>
+              </button>
+              {#each darkThemes as theme (theme.id)}
+                <button
+                  type="button"
+                  class="theme-card"
+                  class:selected={$terminalThemeDark === theme.id}
+                  role="radio"
+                  aria-checked={$terminalThemeDark === theme.id}
+                  onclick={() => terminalThemeDark.set(theme.id)}
+                >
+                  <span class="theme-name">{theme.name}</span>
+                  <span class="swatch" style="background: {theme.colors.background}" aria-hidden="true">
+                    {#each swatchKeys as key}
+                      <span style="background: {theme.colors[key]}"></span>
+                    {/each}
+                  </span>
+                </button>
+              {/each}
+            </div>
+          </div>
+
+          <div class="theme-group" role="radiogroup" aria-label="Light terminal theme">
+            <span class="theme-group-label">Light</span>
+            <div class="theme-grid">
+              <button
+                type="button"
+                class="theme-card"
+                class:selected={$terminalThemeLight === HITCH_THEME_ID}
+                role="radio"
+                aria-checked={$terminalThemeLight === HITCH_THEME_ID}
+                onclick={() => terminalThemeLight.set(HITCH_THEME_ID)}
+              >
+                <span class="theme-name">Hitch (default)</span>
+                <span class="swatch hitch" aria-hidden="true">
+                  <span style="background: var(--term-line)"></span>
+                  <span style="background: var(--term-dim)"></span>
+                  <span style="background: var(--term-fg)"></span>
+                  <span style="background: var(--term-bg2)"></span>
+                  <span style="background: var(--term-bg)"></span>
+                </span>
+              </button>
+              {#each lightThemes as theme (theme.id)}
+                <button
+                  type="button"
+                  class="theme-card"
+                  class:selected={$terminalThemeLight === theme.id}
+                  role="radio"
+                  aria-checked={$terminalThemeLight === theme.id}
+                  onclick={() => terminalThemeLight.set(theme.id)}
+                >
+                  <span class="theme-name">{theme.name}</span>
+                  <span class="swatch" style="background: {theme.colors.background}" aria-hidden="true">
+                    {#each swatchKeys as key}
+                      <span style="background: {theme.colors[key]}"></span>
+                    {/each}
+                  </span>
+                </button>
+              {/each}
+            </div>
+          </div>
         </section>
       {:else if section === "drafts"}
         <section class="panel">
@@ -616,6 +725,79 @@
   .saved {
     font-size: var(--r0);
     color: var(--ink-2);
+  }
+
+  /* Themes — the card grid needs more width than the default 520px column. */
+  .themes-panel {
+    max-width: 640px;
+    gap: 22px;
+  }
+  .theme-group {
+    display: grid;
+    gap: 10px;
+  }
+  .theme-group-label {
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: var(--ink-2);
+  }
+  .theme-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .theme-card {
+    display: grid;
+    gap: 8px;
+    text-align: left;
+    padding: 10px 12px;
+    border-radius: 0;
+    background: var(--paper-1);
+    border: 1px solid var(--line);
+    color: var(--ink-1);
+    font: inherit;
+    cursor: pointer;
+    transition:
+      background 0.18s ease-out,
+      border-color 0.18s ease-out,
+      color 0.18s ease-out;
+  }
+  .theme-card:hover {
+    border-color: var(--ink-3);
+    color: var(--ink-0);
+  }
+  .theme-card:focus-visible {
+    outline: 2px solid var(--iris);
+    outline-offset: 1px;
+  }
+  .theme-card.selected {
+    background: var(--iris-wash);
+    border-color: var(--iris-line);
+    color: var(--iris-ink);
+  }
+  .theme-name {
+    font-size: var(--r0);
+    font-weight: 540;
+  }
+  /* Swatch strip: equal-width color cells on the theme's own background, framed
+     by a hairline so light palettes still read against the paper card. */
+  .swatch {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
+    height: 18px;
+    border: 1px solid var(--line);
+    overflow: hidden;
+  }
+  .swatch > span {
+    display: block;
+    height: 100%;
+  }
+  /* Hitch (default) has no fixed background; sit its cells on a paper fill. */
+  .swatch.hitch {
+    background: var(--term-bg);
   }
 
   .about {
