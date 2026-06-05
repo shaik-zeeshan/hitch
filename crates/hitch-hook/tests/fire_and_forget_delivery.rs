@@ -34,7 +34,9 @@ fn fire_and_forget_report_reaches_polling_accept_loop() {
     let listener = DaemonListener::bind(&socket).expect("bind listener");
     // Mirror the daemon: a non-blocking accept loop that only sees a connection
     // when it polls. A hook that closes before the poll is invisible to it.
-    listener.set_nonblocking(true).expect("set listener non-blocking");
+    listener
+        .set_nonblocking(true)
+        .expect("set listener non-blocking");
 
     let (tx, rx) = mpsc::channel::<ControlMessage>();
     let server = thread::spawn(move || {

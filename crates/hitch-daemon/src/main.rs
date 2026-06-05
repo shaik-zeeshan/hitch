@@ -876,12 +876,13 @@ struct ClientSink {
     /// this under the lock before opening the gate, so late-attaching clients see
     /// running-job snapshots before any raced completion/cancellation.
     pending_job_events: Mutex<Vec<Event>>,
-    /// Agent-state readiness gate. `false` until reconnect replay has sent the
-    /// per-session agent snapshots embedded in `SessionOpened`; raced live
-    /// `AgentState` events wait here so a stale replay snapshot cannot regress
-    /// the attaching client's newer view.
+    /// Session-snapshot readiness gate. `false` until reconnect replay has sent
+    /// the per-session snapshots embedded in `SessionOpened`; raced live events
+    /// for fields carried by that snapshot (`AgentState`, `OutputActive`) wait
+    /// here so a stale replay snapshot cannot regress the attaching client's
+    /// newer view.
     agent_state_live: AtomicBool,
-    /// Agent-state events buffered while `agent_state_live` is closed.
+    /// Snapshot-dependent events buffered while `agent_state_live` is closed.
     pending_agent_state_events: Mutex<Vec<Event>>,
 }
 
@@ -2918,10 +2919,12 @@ fn spawn_command_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool
 /// rising edge is emitted inline on the dispatcher thread when a frame arrives;
 /// the falling edge has no triggering event, so this thread checks once per
 /// [`OUTPUT_ACTIVE_POLL_INTERVAL`] whether any active session has been quiet for
-/// [`OUTPUT_ACTIVE_QUIET`] and broadcasts its `active: false` transition. The
-/// daemon only ever watches WHETHER frames arrived (the timestamp), never their
-/// content — ADR 0011's no-text-inference rule. Spawned on all platforms: it
-/// reads only the in-memory gate, with no dependence on `foreground_command()`.
+/// [`OUTPUT_ACTIVE_QUIET`] and broadcasts its `active: false` transition through
+/// the same replay gate as agent state, because `SessionOpened` carries an
+/// output-active snapshot. The daemon only ever watches WHETHER frames arrived
+/// (the timestamp), never their content — ADR 0011's no-text-inference rule.
+/// Spawned on all platforms: it reads only the in-memory gate, with no dependence
+/// on `foreground_command()`.
 fn spawn_output_activity_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>) {
     thread::Builder::new()
         .name("hitch-output-active-poll".into())
@@ -2934,7 +2937,7 @@ fn spawn_output_activity_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<At
                     Err(_) => Vec::new(),
                 };
                 for edge in edges {
-                    let _ = broadcast_event(&state, edge);
+                    let _ = broadcast_output_active_event(&state, edge);
                 }
                 thread::sleep(OUTPUT_ACTIVE_POLL_INTERVAL);
             }
@@ -3041,7 +3044,7 @@ fn record_and_broadcast_output(
     };
     let _ = broadcast_session_output(state, session_id, bytes);
     if let Some(edge) = rising_edge {
-        let _ = broadcast_event(state, edge);
+        let _ = broadcast_output_active_event(state, edge);
     }
 }
 
@@ -3467,7 +3470,7 @@ fn replay_sessions_to_client(
         )?;
     }
 
-    drain_pending_agent_state_events(state, client_id)?;
+    drain_pending_snapshot_ordered_events(state, client_id)?;
 
     for (job_id, message, kind) in &jobs {
         send_event_to_client(
@@ -3980,7 +3983,21 @@ fn broadcast_event(state: &Arc<Mutex<DaemonState>>, event: Event) -> Result<(), 
     Ok(())
 }
 
+fn broadcast_output_active_event(
+    state: &Arc<Mutex<DaemonState>>,
+    event: Event,
+) -> Result<(), ProtocolError> {
+    broadcast_snapshot_ordered_event(state, event)
+}
+
 fn broadcast_agent_state_event(
+    state: &Arc<Mutex<DaemonState>>,
+    event: Event,
+) -> Result<(), ProtocolError> {
+    broadcast_snapshot_ordered_event(state, event)
+}
+
+fn broadcast_snapshot_ordered_event(
     state: &Arc<Mutex<DaemonState>>,
     event: Event,
 ) -> Result<(), ProtocolError> {
@@ -4001,7 +4018,7 @@ fn broadcast_agent_state_event(
             let mut pending = sink
                 .pending_agent_state_events
                 .lock()
-                .map_err(|_| internal("agent-state replay buffer lock poisoned"))?;
+                .map_err(|_| internal("session replay buffer lock poisoned"))?;
             if sink.agent_state_live.load(Ordering::SeqCst) {
                 drop(pending);
                 write_control_to_sink(&sink, &ControlMessage::event(event.clone()))
@@ -4027,7 +4044,7 @@ fn broadcast_agent_state_event(
     Ok(())
 }
 
-fn drain_pending_agent_state_events(
+fn drain_pending_snapshot_ordered_events(
     state: &Arc<Mutex<DaemonState>>,
     client_id: u64,
 ) -> Result<(), ProtocolError> {
@@ -4035,12 +4052,14 @@ fn drain_pending_agent_state_events(
     let mut pending = sink
         .pending_agent_state_events
         .lock()
-        .map_err(|_| internal("agent-state replay buffer lock poisoned"))?;
+        .map_err(|_| internal("session replay buffer lock poisoned"))?;
     for event in pending.drain(..) {
         write_control_to_sink(&sink, &ControlMessage::event(event)).map_err(|err| {
             ProtocolError::new(
                 ErrorCode::Unavailable,
-                format!("failed to write buffered agent-state event to client {client_id}: {err}"),
+                format!(
+                    "failed to write buffered replay-ordered event to client {client_id}: {err}"
+                ),
             )
             .retryable(true)
         })?;
@@ -4500,7 +4519,7 @@ mod tests {
         assert!(!sink.agent_state_live.load(Ordering::SeqCst));
         assert_eq!(sink.pending_agent_state_events.lock().unwrap().len(), 1);
 
-        super::drain_pending_agent_state_events(&state, 1).unwrap();
+        super::drain_pending_snapshot_ordered_events(&state, 1).unwrap();
         assert!(sink.agent_state_live.load(Ordering::SeqCst));
         assert!(sink.pending_agent_state_events.lock().unwrap().is_empty());
 
@@ -4531,6 +4550,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn output_active_before_replay_waits_until_session_snapshot_is_sent() {
+        use hitch_core::WorktreeId;
+        use hitch_proto::{ControlLineDecoder, ControlMessage, Event};
+        use std::io::Read as _;
+        use std::os::unix::net::UnixStream;
+        use std::path::PathBuf;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-output-active-replay-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("state.db");
+        let config = super::DaemonConfig {
+            socket_path: dir.join("daemon.sock"),
+            store_path: store_path.clone(),
+            managed_root: dir.join("managed"),
+            hook_helper: dir.join("hook"),
+            git: PathBuf::from("git"),
+            gh: PathBuf::from("gh"),
+            draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+        };
+        let store = hitch_store::Store::open(&store_path).unwrap();
+        let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
+            store, config,
+        )));
+
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        let sink = Arc::new(super::ClientSink {
+            writer: Mutex::new(super::DaemonStream::new(writer)),
+            live: AtomicBool::new(true),
+            jobs_live: AtomicBool::new(true),
+            agent_state_live: AtomicBool::new(false),
+            pending: Mutex::new(Vec::new()),
+            pending_job_events: Mutex::new(Vec::new()),
+            pending_agent_state_events: Mutex::new(Vec::new()),
+        });
+        {
+            let mut guard = state.lock().unwrap();
+            guard.clients.insert(1, Arc::clone(&sink));
+        }
+
+        let event = Event::OutputActive {
+            session_id: SessionId::new(),
+            worktree_id: Some(WorktreeId::new()),
+            active: false,
+        };
+
+        super::broadcast_output_active_event(&state, event.clone()).unwrap();
+        assert!(!sink.agent_state_live.load(Ordering::SeqCst));
+        assert_eq!(sink.pending_agent_state_events.lock().unwrap().len(), 1);
+
+        super::drain_pending_snapshot_ordered_events(&state, 1).unwrap();
+        assert!(sink.agent_state_live.load(Ordering::SeqCst));
+        assert!(sink.pending_agent_state_events.lock().unwrap().is_empty());
+
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut decoder = ControlLineDecoder::new();
+        let mut buf = [0u8; 8192];
+        let delivered = loop {
+            let n = reader.read(&mut buf).expect("read buffered output-active");
+            assert!(n > 0, "client sink closed before delivering the event");
+            if let Some(delivered) =
+                decoder
+                    .push(&buf[..n])
+                    .unwrap()
+                    .into_iter()
+                    .find_map(|message| match message {
+                        ControlMessage::Event { event } => Some(event),
+                        _ => None,
+                    })
+            {
+                break delivered;
+            }
+        };
+        assert_eq!(delivered, event);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn installing_hooks_for_worktree_writes_agent_configs() {
         use hitch_core::{Project, ProjectKind, Worktree};

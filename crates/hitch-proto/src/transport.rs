@@ -19,9 +19,7 @@ use interprocess::{
         prelude::*, GenericNamespaced, ListenerNonblockingMode, ListenerOptions,
         Name as LocalSocketName,
     },
-    os::windows::{
-        local_socket::ListenerOptionsExt, security_descriptor::SecurityDescriptor,
-    },
+    os::windows::{local_socket::ListenerOptionsExt, security_descriptor::SecurityDescriptor},
     TryClone as _,
 };
 
@@ -638,7 +636,8 @@ mod tests {
         // Case- and separator-equivalent spellings of one Windows path must hash
         // to the same pipe name, or a daemon and a client that derived their
         // socket path from differently-spelled overrides would never rendezvous.
-        let canonical = logical_socket_name(Path::new(r"C:\Users\pc\AppData\Local\Hitch\daemon.sock"));
+        let canonical =
+            logical_socket_name(Path::new(r"C:\Users\pc\AppData\Local\Hitch\daemon.sock"));
 
         for variant in [
             r"c:\users\pc\appdata\local\hitch\daemon.sock", // lowercased drive + path

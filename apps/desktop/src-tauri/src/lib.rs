@@ -10,6 +10,8 @@ use hitch_proto::transport::{connect_daemon as connect_transport, is_endpoint_bu
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,8 +22,6 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(feature = "packaged-smoke")]
 use std::{env, fs};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
 // `CREATE_NO_WINDOW` is taken from windows-sys here rather than the canonical
@@ -46,9 +46,9 @@ use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 #[cfg(feature = "packaged-smoke")]
 use tauri::RunEvent;
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 
 /// Per-session bound on the bytes we stage before the webview registers that
 /// session's output channel. Mirrors the daemon's `DEFAULT_SCROLLBACK_CAPACITY`
@@ -315,8 +315,7 @@ fn process_image_file_name(pid: u32) -> Option<String> {
     // SAFETY: `handle` is a live process handle; `buf`/`len` describe a valid
     // writable buffer and its capacity in WCHARs. dwFlags `0` (PROCESS_NAME_WIN32)
     // asks for the Win32 path form.
-    let ok =
-        unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) } != 0;
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) } != 0;
     // SAFETY: close the handle acquired above exactly once.
     unsafe {
         CloseHandle(handle);
@@ -336,10 +335,8 @@ fn process_image_file_name(pid: u32) -> Option<String> {
 /// our force-kill fired) fails this and must not be terminated.
 #[cfg(windows)]
 fn process_is_daemon(pid: u32) -> bool {
-    process_image_file_name(pid).is_some_and(|name| {
-        name.to_ascii_lowercase()
-            .starts_with(DAEMON_IMAGE_PREFIX)
-    })
+    process_image_file_name(pid)
+        .is_some_and(|name| name.to_ascii_lowercase().starts_with(DAEMON_IMAGE_PREFIX))
 }
 
 #[cfg(windows)]
@@ -429,8 +426,7 @@ enum ProbeError {
 /// connect/hello/shutdown threads: at most one leaked worker per name may exist
 /// at a time, and the next same-name probe waits for it to drain before
 /// spawning a replacement.
-static PROBE_INFLIGHT: Mutex<Option<HashMap<&'static str, mpsc::Receiver<()>>>> =
-    Mutex::new(None);
+static PROBE_INFLIGHT: Mutex<Option<HashMap<&'static str, mpsc::Receiver<()>>>> = Mutex::new(None);
 
 /// Park the receiver half of a still-blocked probe worker so the next same-name
 /// probe can detect it (and wait it out) instead of spawning a second thread.
@@ -1106,49 +1102,47 @@ impl HitchClient {
             // probe wrote nothing, so the connection is at protocol start). Any
             // non-`Ok` classification leaves no reusable connection — and the
             // spawn arm starts a *fresh* daemon — so those paths connect anew.
-            let reusable = match connect_transport_bounded(
-                &self.0.socket_path,
-                Duration::from_millis(500),
-            ) {
-                Ok(probe_stream) => {
-                    // The probe connected, so the daemon is reachable even if the
-                    // upcoming Hello times out. On Windows the cached pipe-server
-                    // pid is the *only* handle on a wedged daemon (no pidfile,
-                    // ADR 0012), so capture it now from the connected handle —
-                    // otherwise a daemon that accepts connections but never
-                    // answers Hello leaves the pid None and `restart_daemon`'s
-                    // force-kill dead-ends with "cached daemon pid is unknown".
-                    #[cfg(windows)]
-                    if let Ok(pid) = probe_stream.connected_pipe_server_pid() {
-                        self.set_windows_daemon_pid(Some(pid));
+            let reusable =
+                match connect_transport_bounded(&self.0.socket_path, Duration::from_millis(500)) {
+                    Ok(probe_stream) => {
+                        // The probe connected, so the daemon is reachable even if the
+                        // upcoming Hello times out. On Windows the cached pipe-server
+                        // pid is the *only* handle on a wedged daemon (no pidfile,
+                        // ADR 0012), so capture it now from the connected handle —
+                        // otherwise a daemon that accepts connections but never
+                        // answers Hello leaves the pid None and `restart_daemon`'s
+                        // force-kill dead-ends with "cached daemon pid is unknown".
+                        #[cfg(windows)]
+                        if let Ok(pid) = probe_stream.connected_pipe_server_pid() {
+                            self.set_windows_daemon_pid(Some(pid));
+                        }
+                        Some(probe_stream)
                     }
-                    Some(probe_stream)
-                }
-                Err(err) if err.kind() == io::ErrorKind::TimedOut => None,
-                // A busy endpoint (`ERROR_PIPE_BUSY`: every pipe instance is
-                // momentarily occupied while the daemon's accept loop re-arms a
-                // fresh instance, ADR 0012) is a *live* daemon, not an absent
-                // one — exactly as `wait_for_socket_release`/`is_endpoint_busy`
-                // classify it. Spawning here would burn crash-loop budget over a
-                // healthy daemon, and a subsequent force-restart (line below)
-                // would kill it. Fall through to the Hello attempt and let its
-                // own bounded connect retry once an instance frees up.
-                Err(ref err) if is_endpoint_busy(err) => None,
-                Err(_) => {
-                    self.record_spawn_attempt(app)?;
-                    self.set_status(app, DaemonStatus::Starting, None);
-                    self.spawn_daemon()
-                        .map_err(|err| self.record_startup_failure(app, err))?;
-                    // Wait for the freshly spawned daemon to start accepting
-                    // connections before attempting Hello; otherwise the not-yet-ready
-                    // endpoint is mistaken for an incompatible daemon and force-killed,
-                    // double-spawning on every cold start.
-                    let _ = self
-                        .wait_for_daemon()
-                        .map_err(|err| self.record_startup_failure(app, err))?;
-                    None
-                }
-            };
+                    Err(err) if err.kind() == io::ErrorKind::TimedOut => None,
+                    // A busy endpoint (`ERROR_PIPE_BUSY`: every pipe instance is
+                    // momentarily occupied while the daemon's accept loop re-arms a
+                    // fresh instance, ADR 0012) is a *live* daemon, not an absent
+                    // one — exactly as `wait_for_socket_release`/`is_endpoint_busy`
+                    // classify it. Spawning here would burn crash-loop budget over a
+                    // healthy daemon, and a subsequent force-restart (line below)
+                    // would kill it. Fall through to the Hello attempt and let its
+                    // own bounded connect retry once an instance frees up.
+                    Err(ref err) if is_endpoint_busy(err) => None,
+                    Err(_) => {
+                        self.record_spawn_attempt(app)?;
+                        self.set_status(app, DaemonStatus::Starting, None);
+                        self.spawn_daemon()
+                            .map_err(|err| self.record_startup_failure(app, err))?;
+                        // Wait for the freshly spawned daemon to start accepting
+                        // connections before attempting Hello; otherwise the not-yet-ready
+                        // endpoint is mistaken for an incompatible daemon and force-killed,
+                        // double-spawning on every cold start.
+                        let _ = self
+                            .wait_for_daemon()
+                            .map_err(|err| self.record_startup_failure(app, err))?;
+                        None
+                    }
+                };
 
             let request_id = self.0.next_request_id.fetch_add(1, Ordering::SeqCst);
             let hello_result = match reusable {
@@ -1234,10 +1228,13 @@ impl HitchClient {
                 let _ = app.emit("hitch-reconnected", ());
                 Ok(())
             }
-            Ok(Response::Error { error }) => {
-                fail(format!("daemon hello failed after restart: {}", error.message))
-            }
-            Ok(other) => fail(format!("unexpected hello response after restart: {other:?}")),
+            Ok(Response::Error { error }) => fail(format!(
+                "daemon hello failed after restart: {}",
+                error.message
+            )),
+            Ok(other) => fail(format!(
+                "unexpected hello response after restart: {other:?}"
+            )),
             Err(err) => fail(format!("daemon hello failed after restart: {err}")),
         }
     }
@@ -2242,9 +2239,7 @@ impl WindowsEditorProgram {
 #[cfg(windows)]
 fn windows_candidate_has_path_components(candidate: &OsString) -> bool {
     let path = Path::new(candidate);
-    path.parent()
-        .is_some_and(|parent| parent != Path::new(""))
-        || path.file_name().is_none()
+    path.parent().is_some_and(|parent| parent != Path::new("")) || path.file_name().is_none()
 }
 
 #[cfg(windows)]
@@ -2681,8 +2676,8 @@ mod tests {
         build_editor_launch_spec, describe_handshake_failure, encode_control_message,
         parse_spawned_daemon_pid, read_control_message, read_log_tail, recovery_mode_for_loss,
         run_probe, should_force_kill_daemon, tray_status_text, ControlMessage, CrashLoopGuard,
-        DaemonStatus, ErrorCode, HitchClient, OutputRouter, ProbeError, ProtocolError, RecoveryMode,
-        Request, Response, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
+        DaemonStatus, ErrorCode, HitchClient, OutputRouter, ProbeError, ProtocolError,
+        RecoveryMode, Request, Response, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
     };
     #[cfg(windows)]
     use super::{
@@ -3346,10 +3341,14 @@ mod tests {
     #[test]
     fn run_probe_reports_timeout_when_worker_outlasts_deadline() {
         // Worker blocks well past the caller's deadline.
-        let res = run_probe("hitch-test-probe-timeout", Duration::from_millis(50), || {
-            std::thread::sleep(Duration::from_millis(400));
-            1u8
-        });
+        let res = run_probe(
+            "hitch-test-probe-timeout",
+            Duration::from_millis(50),
+            || {
+                std::thread::sleep(Duration::from_millis(400));
+                1u8
+            },
+        );
         assert!(matches!(res, Err(ProbeError::Timeout)));
     }
 

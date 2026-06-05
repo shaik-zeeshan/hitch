@@ -290,26 +290,67 @@ fn install_claude_hooks(
     Ok(())
 }
 
+fn codex_identity_announce_supported() -> bool {
+    // Codex has no SessionEnd hook, and Windows has no foreground-command
+    // backstop. Without a clear path, an identity-only SessionStart announce can
+    // strand the Codex mark until the terminal session closes. Unix keeps the
+    // announce because the daemon foreground poller clears identity when Codex
+    // exits back to the shell.
+    !cfg!(windows)
+}
+
+fn codex_hooks_overlay(helper_path: &Path, include_identity_announce: bool) -> Value {
+    let mut hooks = Map::new();
+    if include_identity_announce {
+        // Identity-only announce, same shape as Claude's. Codex's `SessionStart`
+        // is a documented, valid event (ADR 0011 amendment 2026-06-05), but only
+        // install it when this platform also has a clear path.
+        hooks.insert(
+            "SessionStart".to_string(),
+            json!([codex_announce_hook_entry(helper_path, "session-start")]),
+        );
+    }
+    hooks.insert(
+        "UserPromptSubmit".to_string(),
+        json!([codex_hook_entry(
+            helper_path,
+            "user-prompt-submit",
+            AgentState::Running
+        )]),
+    );
+    hooks.insert(
+        "PermissionRequest".to_string(),
+        json!([codex_hook_entry(
+            helper_path,
+            "permission-request",
+            AgentState::NeedsApproval
+        )]),
+    );
+    hooks.insert(
+        "PostToolUse".to_string(),
+        json!([codex_hook_entry(
+            helper_path,
+            "post-tool-use",
+            AgentState::Running
+        )]),
+    );
+    hooks.insert(
+        "Stop".to_string(),
+        json!([codex_hook_entry(helper_path, "stop", AgentState::Waiting)]),
+    );
+    // No `SessionEnd`: the event does not exist in Codex (the old install's entry
+    // was silently ignored). It is still pruned by `install_codex_hooks` so
+    // re-installing over an old config migrates it away.
+    json!({ "hooks": hooks })
+}
+
 fn install_codex_hooks(
     worktree_path: &Path,
     helper_path: &Path,
     installed_configs: &mut Vec<InstalledHookConfig>,
 ) -> Result<(), AgentHookError> {
     let path = worktree_path.join(".codex/hooks.json");
-    let overlay = json!({
-        "hooks": {
-            // Identity-only announce, same shape as Claude's. Codex's `SessionStart`
-            // is a documented, valid event (ADR 0011 amendment 2026-06-05).
-            "SessionStart": [codex_announce_hook_entry(helper_path, "session-start")],
-            "UserPromptSubmit": [codex_hook_entry(helper_path, "user-prompt-submit", AgentState::Running)],
-            "PermissionRequest": [codex_hook_entry(helper_path, "permission-request", AgentState::NeedsApproval)],
-            "PostToolUse": [codex_hook_entry(helper_path, "post-tool-use", AgentState::Running)],
-            "Stop": [codex_hook_entry(helper_path, "stop", AgentState::Waiting)]
-            // No `SessionEnd`: the event does not exist in Codex (the old install's
-            // entry was silently ignored). It is still pruned below so re-installing
-            // over an old config migrates it away.
-        }
-    });
+    let overlay = codex_hooks_overlay(helper_path, codex_identity_announce_supported());
     merge_json_file(
         &path,
         overlay,
@@ -1078,16 +1119,23 @@ mod tests {
                 && value.to_string().contains("user-prompt-submit")
                 && value.to_string().contains("--state running")
         }));
-        // Codex SessionStart is now the identity announce (replacing the stale
-        // hitch session-start entry), NOT null.
-        let codex_session_start = codex["hooks"]["SessionStart"].as_array().unwrap();
-        assert_eq!(codex_session_start.len(), 1);
-        assert!(codex_session_start.iter().any(|value| {
-            value.to_string().contains("--agent codex")
-                && value.to_string().contains("session-start")
-                && value.to_string().contains("--announce")
-                && !value.to_string().contains("--state")
-        }));
+        if codex_identity_announce_supported() {
+            // Codex SessionStart is the identity announce on platforms where the
+            // daemon has a clear path (Unix foreground-command backstop).
+            let codex_session_start = codex["hooks"]["SessionStart"].as_array().unwrap();
+            assert_eq!(codex_session_start.len(), 1);
+            assert!(codex_session_start.iter().any(|value| {
+                value.to_string().contains("--agent codex")
+                    && value.to_string().contains("session-start")
+                    && value.to_string().contains("--announce")
+                    && !value.to_string().contains("--state")
+            }));
+        } else {
+            assert!(
+                codex["hooks"]["SessionStart"].is_null(),
+                "Codex SessionStart identity announce must not be installed without a clear path"
+            );
+        }
         // The dead Codex SessionEnd is pruned on re-install and not re-added: the
         // event does not exist in Codex.
         assert!(
@@ -1119,6 +1167,22 @@ mod tests {
             "'/opt/hitch/hitch-hook' --agent codex --event 'session-start' --announce"
         );
         assert!(!command.contains("--state"));
+    }
+
+    #[test]
+    fn codex_overlay_can_omit_unclearable_identity_announce() {
+        let overlay = codex_hooks_overlay(Path::new("/opt/hitch/hitch-hook"), false);
+
+        assert!(
+            overlay["hooks"]["SessionStart"].is_null(),
+            "omitting the identity announce also prunes stale SessionStart entries"
+        );
+        assert!(overlay["hooks"]["UserPromptSubmit"]
+            .to_string()
+            .contains("--state running"));
+        assert!(overlay["hooks"]["Stop"]
+            .to_string()
+            .contains("--state waiting"));
     }
 
     #[test]
@@ -1276,9 +1340,18 @@ mod tests {
 
         let codex = fs::read_to_string(worktree.join(".codex/hooks.json")).unwrap();
         assert!(!codex.contains("/old/target/debug/hitch-hook"));
-        // SessionStart, UserPromptSubmit, PermissionRequest, PostToolUse, Stop = 5
-        // (no SessionEnd).
-        assert_eq!(codex.matches("/new/target/debug/hitch-hook").count(), 5);
+        let expected_codex_hooks = if codex_identity_announce_supported() {
+            // SessionStart, UserPromptSubmit, PermissionRequest, PostToolUse, Stop.
+            5
+        } else {
+            // UserPromptSubmit, PermissionRequest, PostToolUse, Stop. No
+            // SessionStart without a clear path; no SessionEnd in Codex.
+            4
+        };
+        assert_eq!(
+            codex.matches("/new/target/debug/hitch-hook").count(),
+            expected_codex_hooks
+        );
 
         fs::remove_dir_all(worktree).unwrap();
     }

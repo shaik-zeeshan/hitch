@@ -149,14 +149,17 @@ Identity's *clearing* paths must mirror its announce-time exemptions:
 **Codex notes (docs-verified 2026-06-05).** Codex CLI's hooks are real and GA
 (May 2026): `<repo>/.codex/hooks.json` with the Claude-style schema is a
 documented config layer, and `SessionStart`, `UserPromptSubmit`,
-`PermissionRequest`, `PostToolUse`, `Stop` are all valid events — so the
-identity announce works for both agents. Three accepted gaps: (1) **no
-`SessionEnd` event exists in Codex** — the installed entry is silently ignored;
-drop it from the Codex overlay at implementation (clean-exit clearing falls to
-the Unix backstop; lingers on Windows). (2) **Project-local hooks run only once
-the user trusts the project's `.codex` layer** (`/hooks`); Hitch cannot
-auto-trust, so Codex state is silently absent until then. (3) **No idle
-notification** — the `idle_prompt` heal is Claude-only. Also verify at
+`PermissionRequest`, `PostToolUse`, `Stop` are all valid events. The identity
+announce works for Codex only where Hitch also has a clear path: Unix installs
+`SessionStart` and relies on the foreground-poller backstop; Windows skips the
+Codex identity announce because Codex has no `SessionEnd` and ConPTY has no
+foreground-command backstop. Three accepted gaps: (1) **no `SessionEnd` event
+exists in Codex** — the installed entry is silently ignored; drop it from the
+Codex overlay at implementation. Clean-exit clearing falls to the Unix backstop;
+Windows avoids the mark-stranding identity announce instead. (2) **Project-local
+hooks run only once the user trusts the project's `.codex` layer** (`/hooks`);
+Hitch cannot auto-trust, so Codex state is silently absent until then. (3) **No
+idle notification** — the `idle_prompt` heal is Claude-only. Also verify at
 implementation that Codex hook subprocesses inherit the session environment
 (`HITCH_SESSION_ID` is load-bearing; inheritance is undocumented).
 
@@ -167,9 +170,9 @@ Agent State when an agent dies without firing `SessionEnd`) is **unavailable on
 Windows**. It relies on resolving the PTY's foreground process group leader, but
 the Windows PTY backend is ConPTY (ADR 0012), which exposes no foreground
 process group — `hitch_pty::ManagedPty::foreground_command()` returns `None`
-unconditionally there. We **document this gap rather than implement** an
-equivalent: ConPTY offers no reliable, supported API for the currently-focused
-child, and the cases the poller covers are already largely handled elsewhere.
+unconditionally there. We do not implement an equivalent: ConPTY offers no
+reliable, supported API for the currently-focused child, and the cases the
+poller covers are already largely handled elsewhere.
 
 Consequently, on Windows Agent State relies on (a) the agent's own hooks —
 notably `SessionEnd` for a clean exit — and (b) session-exit cleanup, which
@@ -177,5 +180,7 @@ clears state to `None` when the PTY/session itself goes away (including the
 Job-Object tree-kill on Session close, ADR 0012). The uncovered residue is a
 dirty agent-process exit that leaves the surrounding shell session alive; on
 Windows such state may linger until the next hook report or until the session
-closes. This is an accepted limitation, consistent with the Codex `error`-state
-gap already noted above.
+closes. Codex is narrower: because it has no `SessionEnd`, Hitch does not install
+Codex's identity-only `SessionStart` announce on Windows, so a clean Codex exit
+cannot strand the Codex Session mark there. This is an accepted limitation,
+consistent with the Codex `error`-state gap already noted above.

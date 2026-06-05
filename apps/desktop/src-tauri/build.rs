@@ -28,7 +28,8 @@ fn main() {
             if path.is_absolute() {
                 path
             } else {
-                target_dir_from_out_dir(&target, &profile).unwrap_or_else(|| workspace_root.join(path))
+                target_dir_from_out_dir(&target, &profile)
+                    .unwrap_or_else(|| workspace_root.join(path))
             }
         })
         .unwrap_or_else(|| workspace_root.join("target"));
@@ -60,7 +61,11 @@ fn main() {
         if let Some(src) = candidates
             .iter()
             .filter(|path| path.exists())
-            .max_by_key(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
+            .max_by_key(|path| {
+                std::fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+            })
         {
             std::fs::create_dir_all(&binaries_dir).unwrap();
             let dst = binaries_dir.join(format!("{binary}-{target}{exe_suffix}"));

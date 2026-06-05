@@ -411,8 +411,10 @@ fn daemon_unavailable(err: &io::Error) -> bool {
 /// occupied or not yet armed; after the retry deadline it is equivalent to
 /// daemon-unavailable for a best-effort hook report.
 fn daemon_transiently_unavailable(err: &io::Error) -> bool {
-    matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
-        || hitch_proto::transport::is_endpoint_busy(err)
+    matches!(
+        err.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ) || hitch_proto::transport::is_endpoint_busy(err)
 }
 
 /// True when a (hand-configured) event should send an identity announce rather

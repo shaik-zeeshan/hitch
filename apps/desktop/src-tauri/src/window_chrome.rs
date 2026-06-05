@@ -77,8 +77,19 @@ mod imp {
     const SUBCLASS_ID: usize = 0x4849_5443;
     /// UTF-16, null-terminated window class name for the overlay.
     const CLASS_NAME: [u16; 13] = [
-        b'H' as u16, b'i' as u16, b't' as u16, b'c' as u16, b'h' as u16, b'M' as u16, b'a' as u16,
-        b'x' as u16, b'S' as u16, b'n' as u16, b'a' as u16, b'p' as u16, 0,
+        b'H' as u16,
+        b'i' as u16,
+        b't' as u16,
+        b'c' as u16,
+        b'h' as u16,
+        b'M' as u16,
+        b'a' as u16,
+        b'x' as u16,
+        b'S' as u16,
+        b'n' as u16,
+        b'a' as u16,
+        b'p' as u16,
+        0,
     ];
 
     pub fn set_max_button_rect(left: i32, top: i32, right: i32, bottom: i32) {

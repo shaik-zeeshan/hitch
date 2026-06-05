@@ -13,8 +13,8 @@ use hitch_core::{Project, Session, SessionId, SessionParent, Worktree};
 use hitch_proto::transport::{connect_daemon, DaemonStream};
 #[cfg(any(unix, windows))]
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, CommitDraft, Event, FileDiff,
-    GitStatus, JobRequest, JobStatus, PullRequestDraft, WorktreeCreateMode,
+    encode_control_message, encode_pty_frame, CommitDraft, Event, FileDiff, GitStatus, JobRequest,
+    JobStatus, PullRequestDraft, WorktreeCreateMode,
 };
 use hitch_proto::{ControlMessage, ErrorCode, KnownAgent, Request, Response, PROTOCOL_VERSION};
 
