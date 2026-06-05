@@ -1,16 +1,339 @@
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io;
+#[cfg(any(unix, windows))]
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use hitch_core::SESSION_ID_ENV;
+#[cfg(any(unix, windows))]
 use hitch_core::{Project, Session, SessionId, SessionParent, Worktree};
+use hitch_proto::transport::{connect_daemon, DaemonStream};
+#[cfg(any(unix, windows))]
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, CommitDraft, ControlMessage, ErrorCode, Event,
-    GitStatus, JobRequest, PullRequestDraft, Request, Response, PROTOCOL_VERSION,
+    encode_control_message, encode_pty_frame, CommitDraft, DraftProvider, Event, FileDiff,
+    GitStatus, JobRequest, JobStatus, PullRequestDraft, WorktreeCreateMode,
 };
+use hitch_proto::{ControlMessage, ErrorCode, KnownAgent, Request, Response, PROTOCOL_VERSION};
 
+#[test]
+fn daemon_transport_answers_hello_ping_and_shutdown() {
+    let socket = test_socket_path("transport-basic");
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut stream = connect_test_daemon(&socket);
+    send_transport_request(
+        &mut stream,
+        1,
+        Request::Hello {
+            client_name: "reattach-test".into(),
+            protocol_version: PROTOCOL_VERSION,
+        },
+    );
+    expect_transport_response(&mut stream, 1, |response| {
+        matches!(response, Response::Hello { .. })
+    });
+    send_transport_request(&mut stream, 2, Request::Ping);
+    expect_transport_response(&mut stream, 2, |response| {
+        matches!(response, Response::Pong)
+    });
+    send_transport_request(&mut stream, 3, Request::ShutdownDaemon);
+    expect_transport_response(&mut stream, 3, |response| matches!(response, Response::Ack));
+    daemon.wait_for_exit();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_default_shell_session_accepts_input_resize_and_kills_descendants() {
+    let socket = test_socket_path("windows-session");
+    let project_root = test_dir_path("windows-session-project");
+    let orphan_marker = project_root.join("hitch-orphan-marker.txt");
+    let _ = std::fs::remove_file(&orphan_marker);
+    std::fs::create_dir_all(&project_root).unwrap();
+    let _daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &project_root);
+    let session = client.open_default_session(3, SessionParent::Project(project.id));
+
+    let input = format!(
+        "echo \"{env}=$env:{env}\"\r\n\
+         Start-Process -NoNewWindow -FilePath cmd.exe -ArgumentList '/d','/q','/c','echo HITCH_CHILD_STARTED & ping -n 5 127.0.0.1 >nul & echo HITCH_ORPHANED>hitch-orphan-marker.txt'\r\n",
+        env = SESSION_ID_ENV,
+    );
+    client.send_session_input(4, session.id, input.as_bytes());
+
+    let output =
+        client.read_output_until(session.id, "HITCH_CHILD_STARTED", Duration::from_secs(5));
+    assert!(
+        output.contains(&format!("{SESSION_ID_ENV}={}", session.id)),
+        "default shell did not inherit {SESSION_ID_ENV}; saw {output:?}"
+    );
+    assert!(
+        output.contains("HITCH_CHILD_STARTED"),
+        "descendant process did not start; saw {output:?}"
+    );
+
+    client.resize_session(5, session.id, 100, 30);
+    client.close_session(6, session.id, true);
+    client.read_session_closed(session.id, Duration::from_secs(5));
+
+    assert!(
+        !wait_for_file_result(&orphan_marker, Duration::from_secs(7)),
+        "closing a Windows PTY session left a shell descendant running long enough to write {}",
+        orphan_marker.display()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_agent_state_reports_store_broadcast_replay_and_clear_by_session_id() {
+    let socket = test_socket_path("windows-agent-state");
+    let project_root = std::env::temp_dir().join(format!(
+        "hitch daemon windows agent state {}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&project_root).unwrap();
+    init_git_repo(&project_root);
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &project_root);
+    let worktree = client
+        .list_worktrees(3, project.id)
+        .into_iter()
+        .find(|worktree| same_path(&worktree.path, &project_root))
+        .expect("main worktree");
+    let session = client.open_default_session(4, SessionParent::Worktree(worktree.id));
+
+    let claude = std::fs::read_to_string(project_root.join(".claude/settings.local.json")).unwrap();
+    assert!(
+        claude.contains("hitch-hook.exe") || claude.contains("hitch-hook"),
+        "Claude config should contain hook helper command: {claude}"
+    );
+    let codex = std::fs::read_to_string(project_root.join(".codex/hooks.json")).unwrap();
+    assert!(
+        codex.contains("--state running") && codex.contains("--agent codex"),
+        "Codex config should contain explicit Hitch state hooks: {codex}"
+    );
+
+    let nested_cwd = project_root.join("nested dir").join("from hook");
+    std::fs::create_dir_all(&nested_cwd).unwrap();
+    drop(client);
+
+    let mut reporter = TestClient::connect(&socket);
+    reporter.hello(5);
+    reporter.read_session_opened_with_agent_state(
+        session.id,
+        None,
+        None,
+        None,
+        Duration::from_secs(5),
+    );
+    reporter.read_session_command(session.id, Duration::from_secs(5));
+
+    reporter.send_request(
+        6,
+        Request::ReportAgentState {
+            agent: KnownAgent::Codex,
+            state: Some(hitch_core::AgentState::Running),
+            session_id: Some(session.id),
+            cwd: Some(nested_cwd.clone()),
+            detail: Some("working from Windows cwd".into()),
+        },
+    );
+    let event = reporter.read_agent_state_event(Duration::from_secs(5));
+    assert_eq!(
+        event,
+        Event::AgentState {
+            session_id: Some(session.id),
+            worktree_id: Some(worktree.id),
+            agent: KnownAgent::Codex,
+            state: Some(hitch_core::AgentState::Running),
+            detail: Some("working from Windows cwd".into()),
+        }
+    );
+    reporter.read_ack(6);
+
+    {
+        let mut reattached = TestClient::connect(&socket);
+        reattached.hello(7);
+        reattached.read_session_opened_with_agent_state(
+            session.id,
+            Some(KnownAgent::Codex),
+            Some(hitch_core::AgentState::Running),
+            Some("working from Windows cwd"),
+            Duration::from_secs(5),
+        );
+        reattached.read_session_command(session.id, Duration::from_secs(5));
+    }
+
+    reporter.send_request(
+        8,
+        Request::ReportAgentState {
+            agent: KnownAgent::Codex,
+            state: None,
+            session_id: Some(session.id),
+            cwd: Some(nested_cwd),
+            detail: None,
+        },
+    );
+    let cleared = reporter.read_agent_state_event(Duration::from_secs(5));
+    assert_eq!(
+        cleared,
+        Event::AgentState {
+            session_id: Some(session.id),
+            worktree_id: Some(worktree.id),
+            agent: KnownAgent::Codex,
+            state: None,
+            detail: None,
+        }
+    );
+    reporter.read_ack(8);
+
+    reporter.shutdown(9);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(project_root);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_cancel_git_job_kills_process_tree_and_reports_cancelled() {
+    let socket = test_socket_path("windows-cancel-git");
+    let started = test_file_path("windows-git-started", "txt");
+    let heartbeat = test_file_path("windows-git-heartbeat", "txt");
+    let git = write_windows_hanging_git_stub(&started, &heartbeat);
+    let clone_destination = test_dir_path("windows-cancel-git-clone");
+    let mut daemon = DaemonGuard::start_with_git(&socket, &git);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    client.send_request(
+        2,
+        Request::StartJob {
+            request: JobRequest::CloneProject {
+                remote_url: "https://example.invalid/hitch.git".into(),
+                destination: clone_destination.clone(),
+                name: None,
+            },
+        },
+    );
+    let job_id = client.read_job_started(2);
+    client.read_job_progress_status(job_id, JobStatus::Running, Duration::from_secs(5));
+    wait_for_file(&started, Duration::from_secs(5));
+    wait_for_heartbeat(&heartbeat, Duration::from_secs(5));
+
+    client.send_request(3, Request::CancelJob { job_id });
+    client.read_cancel_ack_and_progress(3, job_id, Duration::from_secs(5));
+    assert_job_completed_with_cancel_error(client.read_job_completed(job_id));
+    assert_heartbeat_stopped(&heartbeat);
+
+    client.shutdown(4);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(clone_destination);
+    let _ = std::fs::remove_file(git.with_extension("ps1"));
+    let _ = std::fs::remove_file(git.with_extension("child.ps1"));
+    let _ = std::fs::remove_file(git);
+    let _ = std::fs::remove_file(started);
+    let _ = std::fs::remove_file(heartbeat);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_cancel_draft_provider_job_kills_process_tree_and_reports_cancelled() {
+    let socket = test_socket_path("windows-cancel-draft-provider");
+    let started = test_file_path("windows-codex-started", "txt");
+    let heartbeat = test_file_path("windows-codex-heartbeat", "txt");
+    let codex = write_windows_hanging_codex_stub(&started, &heartbeat);
+    let mut daemon = DaemonGuard::start_with_codex(&socket, &codex);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    client.send_request(
+        2,
+        Request::StartJob {
+            request: JobRequest::ListDraftModels {
+                provider: DraftProvider::Codex,
+                settings: None,
+            },
+        },
+    );
+    let job_id = client.read_job_started(2);
+    client.read_job_progress_status(job_id, JobStatus::Running, Duration::from_secs(5));
+    wait_for_file(&started, Duration::from_secs(5));
+    wait_for_heartbeat(&heartbeat, Duration::from_secs(5));
+
+    client.send_request(3, Request::CancelJob { job_id });
+    client.read_cancel_ack_and_progress(3, job_id, Duration::from_secs(5));
+    assert_job_completed_with_cancel_error(client.read_job_completed(job_id));
+    assert_heartbeat_stopped(&heartbeat);
+
+    client.shutdown(4);
+    daemon.wait_for_exit();
+
+    let _ = std::fs::remove_file(codex.with_extension("ps1"));
+    let _ = std::fs::remove_file(codex.with_extension("child.ps1"));
+    let _ = std::fs::remove_file(codex);
+    let _ = std::fs::remove_file(started);
+    let _ = std::fs::remove_file(heartbeat);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_successful_draft_generation_reports_job_progress_and_completion() {
+    let socket = test_socket_path("windows-draft-success");
+    let repo = test_dir_path("windows-draft-success-repo");
+    let codex = write_windows_success_codex_stub();
+    init_git_repo(&repo);
+    let mut daemon = DaemonGuard::start_with_codex(&socket, &codex);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &repo);
+    let worktree = client.list_worktrees(3, project.id).remove(0);
+
+    std::fs::write(repo.join("tracked.txt"), "staged windows draft\n").unwrap();
+    client.ack(
+        4,
+        Request::StageFiles {
+            worktree_id: worktree.id,
+            paths: vec!["tracked.txt".into()],
+        },
+    );
+    client.send_request(
+        5,
+        Request::GenerateCommitDraft {
+            worktree_id: worktree.id,
+            settings: None,
+        },
+    );
+    let job_id = client.read_job_started(5);
+    client.read_job_progress_status(job_id, JobStatus::Running, Duration::from_secs(5));
+    let draft = match client.read_job_completed(job_id) {
+        Response::CommitDraft { draft } => draft,
+        Response::Error { error } => panic!("generate commit draft failed: {error:?}"),
+        other => panic!("unexpected draft job response: {other:?}"),
+    };
+    assert_eq!(draft.subject, "test: windows job draft");
+    assert_eq!(draft.body, "Generated through job");
+
+    client.shutdown(6);
+    daemon.wait_for_exit();
+
+    let _ = std::fs::remove_dir_all(repo);
+    if let Some(parent) = codex.parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn reconnect_replays_scrollback_and_receives_live_output() {
     let socket = test_socket_path("reattach");
@@ -58,6 +381,7 @@ fn reconnect_replays_scrollback_and_receives_live_output() {
     let _ = std::fs::remove_dir_all(project_root);
 }
 
+#[cfg(unix)]
 #[test]
 fn simulated_reboot_restores_persisted_session_layout_as_fresh_session() {
     let socket = test_socket_path("restore-one");
@@ -97,6 +421,7 @@ fn simulated_reboot_restores_persisted_session_layout_as_fresh_session() {
     let _ = std::fs::remove_dir_all(project_root);
 }
 
+#[cfg(unix)]
 #[test]
 fn graceful_quit_preserves_layout_for_next_launch() {
     // A menu-bar "Quit Hitch" sends ShutdownDaemon, which kills live PTYs. Those
@@ -138,6 +463,7 @@ fn graceful_quit_preserves_layout_for_next_launch() {
     let _ = std::fs::remove_dir_all(project_root);
 }
 
+#[cfg(unix)]
 #[test]
 fn worktree_branch_tracks_unborn_head_renames() {
     let socket = test_socket_path("unborn-branch");
@@ -163,6 +489,147 @@ fn worktree_branch_tracks_unborn_head_renames() {
     let _ = std::fs::remove_dir_all(repo);
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn git_project_with_spaces_persists_statuses_diffs_and_dirty_events() {
+    let socket = test_socket_path("windows-paths");
+    let store = test_file_path("windows paths store", "sqlite");
+    let managed_root = test_dir_path("windows paths managed");
+    let repo_parent = test_dir_path("windows paths parent");
+    let repo = repo_parent.join("repo with spaces");
+    init_git_repo(&repo);
+    let spaced_file = PathBuf::from("file with spaces.txt");
+    std::fs::write(repo.join(&spaced_file), "initial\n").unwrap();
+    run_git(&repo, ["add", spaced_file.to_str().unwrap()]);
+    run_git(&repo, ["commit", "-m", "add spaced file"]);
+
+    let mut first = spawn_daemon_full(&socket, &store, &managed_root, None);
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &repo);
+    let mut worktrees = client.list_worktrees(3, project.id);
+    assert_eq!(worktrees.len(), 1);
+    let worktree = worktrees.remove(0);
+    assert!(worktree.is_main);
+    assert!(same_path(&worktree.path, &repo));
+    client.shutdown(4);
+    wait_for_process_exit(&mut first, Duration::from_secs(3));
+
+    let mut second = spawn_daemon_full(&socket, &store, &managed_root, None);
+    let mut reconnected = TestClient::connect(&socket);
+    reconnected.hello(5);
+    let projects = reconnected.list_projects(6);
+    assert!(
+        projects
+            .iter()
+            .any(|stored| stored.id == project.id && same_path(&stored.root, &project.root)),
+        "persisted projects were {projects:?}"
+    );
+    let restored = reconnected.list_worktrees(7, project.id);
+    assert!(
+        restored.iter().any(|stored| {
+            stored.id == worktree.id && same_path(&stored.path, &worktree.path) && stored.is_main
+        }),
+        "persisted worktrees were {restored:?}"
+    );
+
+    thread::sleep(Duration::from_millis(1200));
+    std::fs::write(repo.join(&spaced_file), "initial\nchanged\n").unwrap();
+    let dirty = reconnected.read_worktree_dirty(worktree.id, Duration::from_secs(5));
+    assert!(dirty, "dirty event should mark the worktree dirty");
+
+    let status = reconnected.git_status(8, worktree.id);
+    assert!(status.dirty);
+    assert!(status
+        .files
+        .iter()
+        .any(|file| file.path == spaced_file && !file.staged));
+    let diff = reconnected.git_diff(9, worktree.id, repo.join(&spaced_file));
+    assert_eq!(diff.path, repo.join(&spaced_file));
+    assert!(
+        diff.diff.contains("file with spaces.txt"),
+        "diff was {:?}",
+        diff.diff
+    );
+    assert!(diff.diff.contains("+changed"), "diff was {:?}", diff.diff);
+
+    reconnected.shutdown(10);
+    wait_for_process_exit(&mut second, Duration::from_secs(3));
+    let _ = std::fs::remove_file(store);
+    let _ = std::fs::remove_dir_all(managed_root);
+    let _ = std::fs::remove_dir_all(repo_parent);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn forced_remove_managed_worktree_closes_sessions_and_clears_state() {
+    let socket = test_socket_path("worktree-remove");
+    let store = test_file_path("worktree remove store", "sqlite");
+    let managed_root = test_dir_path("worktree remove managed");
+    let repo_parent = test_dir_path("worktree remove parent");
+    let repo = repo_parent.join("repo with spaces");
+    init_git_repo(&repo);
+
+    let mut daemon = spawn_daemon_full(&socket, &store, &managed_root, None);
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let mut peer = TestClient::connect(&socket);
+    peer.hello(2);
+
+    let project = client.add_project(3, &repo);
+    let branch = "feature/windows/cleanup";
+    let worktree = client.create_worktree(4, project.id, branch);
+    assert!(worktree.is_hitch_managed);
+    assert_eq!(worktree.branch, branch);
+    assert!(worktree.path.starts_with(&managed_root));
+    assert!(git_worktree_paths(&repo)
+        .iter()
+        .any(|path| same_path(path, &worktree.path)));
+
+    #[cfg(unix)]
+    let session = Some(client.open_default_session(5, SessionParent::Worktree(worktree.id)));
+    #[cfg(windows)]
+    let session: Option<Session> = None;
+    client.ack(
+        6,
+        Request::RemoveWorktree {
+            worktree_id: worktree.id,
+            delete_branch: false,
+            force: true,
+        },
+    );
+
+    if let Some(session) = session {
+        peer.read_session_closed(session.id, Duration::from_secs(5));
+    }
+    peer.read_worktree_removed(worktree.id, Duration::from_secs(5));
+    assert!(
+        !worktree.path.exists(),
+        "removed worktree path still exists"
+    );
+    assert!(
+        !git_worktree_paths(&repo)
+            .iter()
+            .any(|path| same_path(path, &worktree.path)),
+        "git still reports removed worktree {:?}",
+        git_worktree_paths(&repo)
+    );
+    client.expect_error(
+        7,
+        Request::GitStatus {
+            worktree_id: worktree.id,
+        },
+        ErrorCode::NotFound,
+    );
+
+    client.shutdown(9);
+    wait_for_process_exit(&mut daemon, Duration::from_secs(3));
+    let _ = std::fs::remove_file(store);
+    let _ = std::fs::remove_dir_all(managed_root);
+    let _ = std::fs::remove_dir_all(repo_parent);
+}
+
+#[cfg(unix)]
 #[test]
 fn git_status_stage_and_unstage_round_trip_over_socket() {
     let socket = test_socket_path("git-flow");
@@ -207,6 +674,7 @@ fn git_status_stage_and_unstage_round_trip_over_socket() {
     let _ = std::fs::remove_dir_all(repo);
 }
 
+#[cfg(unix)]
 #[test]
 fn draft_generation_round_trips_over_socket() {
     let socket = test_socket_path("drafts");
@@ -254,6 +722,7 @@ fn draft_generation_round_trips_over_socket() {
     let _ = std::fs::remove_dir_all(repo);
 }
 
+#[cfg(unix)]
 #[test]
 fn slow_draft_generation_does_not_block_follow_up_requests() {
     let socket = test_socket_path("async-drafts");
@@ -311,6 +780,7 @@ fn slow_draft_generation_does_not_block_follow_up_requests() {
     let _ = std::fs::remove_file(codex);
 }
 
+#[cfg(unix)]
 #[test]
 fn cancel_job_kills_running_draft_and_completes_promptly() {
     // A draft Job spawns a slow provider child in its own process group.
@@ -366,6 +836,7 @@ fn cancel_job_kills_running_draft_and_completes_promptly() {
     let _ = std::fs::remove_file(codex);
 }
 
+#[cfg(unix)]
 #[test]
 fn discard_files_round_trip_over_socket_keeps_connection_open() {
     let socket = test_socket_path("git-discard");
@@ -400,6 +871,7 @@ fn discard_files_round_trip_over_socket_keeps_connection_open() {
     let _ = std::fs::remove_dir_all(repo);
 }
 
+#[cfg(unix)]
 #[test]
 fn invalid_request_returns_error_without_closing_connection() {
     let socket = test_socket_path("invalid-request");
@@ -433,6 +905,7 @@ fn invalid_request_returns_error_without_closing_connection() {
     daemon.wait_for_exit();
 }
 
+#[cfg(unix)]
 #[test]
 fn prior_protocol_is_rejected_at_hello() {
     let socket = test_socket_path("proto");
@@ -467,6 +940,7 @@ fn prior_protocol_is_rejected_at_hello() {
     daemon.wait_for_exit();
 }
 
+#[cfg(unix)]
 #[test]
 fn stage_commit_push_and_create_pr_round_trip_over_socket() {
     let socket = test_socket_path("git-commit");
@@ -526,6 +1000,7 @@ fn stage_commit_push_and_create_pr_round_trip_over_socket() {
     let _ = std::fs::remove_file(gh_stub);
 }
 
+#[cfg(unix)]
 #[test]
 fn fetch_job_updates_behind_count_from_remote() {
     let socket = test_socket_path("git-fetch");
@@ -577,6 +1052,7 @@ fn fetch_job_updates_behind_count_from_remote() {
     let _ = std::fs::remove_dir_all(peer);
 }
 
+#[cfg(unix)]
 #[test]
 fn detach_mode_survives_spawning_process_exit() {
     let socket = test_socket_path("detach");
@@ -606,6 +1082,58 @@ fn detach_mode_survives_spawning_process_exit() {
     let _ = std::fs::remove_file(store);
     let _ = std::fs::remove_dir_all(managed_root);
 }
+fn connect_test_daemon(socket: &Path) -> DaemonStream {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match connect_daemon(socket) {
+            Ok(stream) => return stream,
+            Err(err) if Instant::now() < deadline => {
+                if err.kind() != io::ErrorKind::NotFound
+                    && err.kind() != io::ErrorKind::ConnectionRefused
+                {
+                    // The daemon may have bound the endpoint but not yet entered accept.
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => panic!("connect {}: {err}", socket.display()),
+        }
+    }
+}
+
+fn send_transport_request(stream: &mut DaemonStream, id: u64, request: Request) {
+    stream
+        .send_control(&ControlMessage::request(id, request))
+        .expect("send request");
+}
+
+fn expect_transport_response(
+    stream: &mut DaemonStream,
+    expected_id: u64,
+    expected: impl Fn(&Response) -> bool,
+) {
+    loop {
+        let messages = stream.read_control_messages().expect("read response");
+        for message in messages {
+            match message {
+                ControlMessage::Response { id, response }
+                    if id == expected_id && expected(&response) =>
+                {
+                    return;
+                }
+                ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                } => panic!("request failed: {error:?}"),
+                ControlMessage::Response { id, response } if id == expected_id => {
+                    panic!("unexpected response: {response:?}");
+                }
+                ControlMessage::Event { .. }
+                | ControlMessage::Request { .. }
+                | ControlMessage::Response { .. } => {}
+            }
+        }
+    }
+}
 
 struct DaemonGuard {
     child: Child,
@@ -618,14 +1146,28 @@ impl DaemonGuard {
         Self::start_inner(socket, None)
     }
 
+    #[cfg(unix)]
     fn start_with_gh(socket: &Path, gh: &Path) -> Self {
         Self::start_inner(socket, Some(gh))
     }
 
+    #[cfg(any(unix, windows))]
     fn start_with_codex(socket: &Path, codex: &Path) -> Self {
         let store = test_file_path("daemon-store", "sqlite");
         let managed_root = test_dir_path("daemon-managed");
         let child = spawn_daemon_with_codex(socket, &store, &managed_root, codex);
+        Self {
+            child,
+            store,
+            managed_root,
+        }
+    }
+
+    #[cfg(windows)]
+    fn start_with_git(socket: &Path, git: &Path) -> Self {
+        let store = test_file_path("daemon-store", "sqlite");
+        let managed_root = test_dir_path("daemon-managed");
+        let child = spawn_daemon_with_git(socket, &store, &managed_root, git);
         Self {
             child,
             store,
@@ -668,24 +1210,22 @@ impl Drop for DaemonGuard {
     }
 }
 
+#[cfg(any(unix, windows))]
 struct TestClient {
-    writer: UnixStream,
-    reader: BufReader<UnixStream>,
+    stream: BufReader<DaemonStream>,
 }
 
+#[cfg(any(unix, windows))]
+#[allow(dead_code)]
 impl TestClient {
     fn connect(socket: &Path) -> Self {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            match UnixStream::connect(socket) {
+            match connect_daemon(socket) {
                 Ok(stream) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .expect("set timeout");
-                    let reader_stream = stream.try_clone().expect("clone stream");
+                    stream.set_nonblocking(true).expect("set nonblocking");
                     return Self {
-                        writer: stream,
-                        reader: BufReader::new(reader_stream),
+                        stream: BufReader::new(stream),
                     };
                 }
                 Err(err) if Instant::now() < deadline => {
@@ -724,6 +1264,79 @@ impl TestClient {
         }
     }
 
+    fn ping(&mut self, id: u64) {
+        self.send_request(id, Request::Ping);
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::Pong,
+                }) if response_id == id => return,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("ping failed: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
+
+    fn create_worktree(
+        &mut self,
+        id: u64,
+        project_id: hitch_core::ProjectId,
+        branch: &str,
+    ) -> Worktree {
+        self.send_request(
+            id,
+            Request::StartJob {
+                request: JobRequest::CreateWorktree {
+                    project_id,
+                    branch: branch.into(),
+                    base: None,
+                    mode: WorktreeCreateMode::NewBranch,
+                },
+            },
+        );
+        let _ = self.read_job_started(id);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut request_id = id + 1_000;
+        while Instant::now() < deadline {
+            self.send_request(request_id, Request::ListWorktrees { project_id });
+            loop {
+                match self.read_packet_until(deadline) {
+                    Packet::Control(ControlMessage::Response {
+                        id: response_id,
+                        response: Response::Worktrees { worktrees },
+                    }) if response_id == request_id => {
+                        if let Some(worktree) = worktrees
+                            .into_iter()
+                            .find(|worktree| worktree.branch == branch && worktree.is_hitch_managed)
+                        {
+                            return worktree;
+                        }
+                        break;
+                    }
+                    Packet::Control(ControlMessage::Event {
+                        event: Event::WorktreeUpdated { worktree },
+                    }) if worktree.project_id == project_id && worktree.branch == branch => {
+                        return worktree
+                    }
+                    Packet::Control(ControlMessage::Event {
+                        event: Event::JobCompleted { response, .. },
+                    }) => {
+                        if let Response::Error { error } = *response {
+                            panic!("create worktree failed: {error:?}");
+                        }
+                    }
+                    Packet::Control(_) | Packet::Output { .. } => continue,
+                }
+            }
+            request_id += 1;
+        }
+        panic!("timed out waiting for created worktree");
+    }
+
     fn add_project(&mut self, id: u64, root: &Path) -> Project {
         self.send_request(id, Request::AddProject { root: root.into() });
         loop {
@@ -736,6 +1349,23 @@ impl TestClient {
                     response: Response::Error { error },
                     ..
                 }) => panic!("add project failed: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
+
+    fn list_projects(&mut self, id: u64) -> Vec<Project> {
+        self.send_request(id, Request::ListProjects);
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::Projects { projects },
+                }) if response_id == id => return projects,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("list projects failed: {error:?}"),
                 Packet::Control(_) | Packet::Output { .. } => continue,
             }
         }
@@ -790,6 +1420,53 @@ impl TestClient {
                 Packet::Control(_) | Packet::Output { .. } => continue,
             }
         }
+    }
+
+    fn git_diff(
+        &mut self,
+        id: u64,
+        worktree_id: hitch_core::WorktreeId,
+        path: PathBuf,
+    ) -> FileDiff {
+        self.send_request(id, Request::GitDiff { worktree_id, path });
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::FileDiff { diff },
+                }) if response_id == id => return diff,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("git diff failed: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
+
+    fn read_worktree_dirty(
+        &mut self,
+        worktree_id: hitch_core::WorktreeId,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::WorktreeDirty {
+                            worktree_id: changed,
+                            dirty,
+                        },
+                }) if changed == worktree_id => return dirty,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("daemon error while waiting for dirty event: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for worktree dirty event");
     }
 
     fn generate_commit_draft(
@@ -862,8 +1539,13 @@ impl TestClient {
 
     fn ack(&mut self, id: u64, request: Request) {
         self.send_request(id, request);
-        loop {
-            match self.read_packet() {
+        self.read_ack(id);
+    }
+
+    fn read_ack(&mut self, id: u64) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
                 Packet::Control(ControlMessage::Response {
                     id: response_id,
                     response: Response::Ack,
@@ -875,10 +1557,125 @@ impl TestClient {
                 Packet::Control(_) | Packet::Output { .. } => continue,
             }
         }
+        panic!("timed out waiting for ack to request {id}");
+    }
+
+    fn report_agent_state(
+        &mut self,
+        id: u64,
+        agent: KnownAgent,
+        state: Option<hitch_core::AgentState>,
+        session_id: Option<SessionId>,
+        cwd: Option<PathBuf>,
+        detail: Option<String>,
+    ) {
+        self.ack(
+            id,
+            Request::ReportAgentState {
+                agent,
+                state,
+                session_id,
+                cwd,
+                detail,
+            },
+        );
+    }
+
+    fn read_agent_state_event(&mut self, timeout: Duration) -> Event {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Event {
+                    event: event @ Event::AgentState { .. },
+                }) => return event,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("daemon error while waiting for agent-state event: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for agent-state event");
+    }
+
+    fn read_session_opened_with_agent_state(
+        &mut self,
+        session_id: SessionId,
+        expected_agent: Option<KnownAgent>,
+        expected_state: Option<hitch_core::AgentState>,
+        expected_detail: Option<&str>,
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::SessionOpened {
+                            session,
+                            agent,
+                            agent_state,
+                            agent_detail,
+                        },
+                }) if session.id == session_id => {
+                    assert_eq!(agent, expected_agent);
+                    assert_eq!(agent_state, expected_state);
+                    assert_eq!(agent_detail.as_deref(), expected_detail);
+                    return;
+                }
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("daemon error while waiting for replayed session state: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for replayed agent state on session {session_id}");
+    }
+
+    fn read_session_command(&mut self, session_id: SessionId, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::SessionCommand {
+                            session_id: command_session_id,
+                            ..
+                        },
+                }) if command_session_id == session_id => return,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("daemon error while waiting for replayed session command: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for replayed session command on session {session_id}");
     }
 
     // ---- Job helpers (ADR 0008) ------------------------------------------
     //
+
+    fn expect_error(&mut self, id: u64, request: Request, code: ErrorCode) {
+        self.send_request(id, request);
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::Error { error },
+                }) if response_id == id => {
+                    assert_eq!(error.code, code);
+                    return;
+                }
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response,
+                }) if response_id == id => panic!("expected error response, got {response:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
     // Long-running ops (push/pull/PR/drafts) now reply `JobStarted { job_id }`
     // synchronously and deliver their real `Response` later inside a
     // `JobCompleted` event. These mirror the desktop client's StartJob ->
@@ -903,8 +1700,9 @@ impl TestClient {
 
     /// Read the `JobCompleted` event for `job_id`, returning the wrapped response.
     fn read_job_completed(&mut self, job_id: hitch_core::JobId) -> Response {
-        loop {
-            match self.read_packet() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
                 Packet::Control(ControlMessage::Event {
                     event:
                         Event::JobCompleted {
@@ -915,6 +1713,66 @@ impl TestClient {
                 Packet::Control(_) | Packet::Output { .. } => continue,
             }
         }
+        panic!("timed out waiting for job {job_id} completion");
+    }
+
+    fn read_job_progress_status(
+        &mut self,
+        job_id: hitch_core::JobId,
+        expected: JobStatus,
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::JobProgress {
+                            job_id: progressed,
+                            status,
+                            ..
+                        },
+                }) if progressed == job_id && status == expected => return,
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for job {job_id} progress {expected:?}");
+    }
+
+    fn read_cancel_ack_and_progress(
+        &mut self,
+        request_id: u64,
+        job_id: hitch_core::JobId,
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
+        let mut saw_ack = false;
+        let mut saw_cancelled = false;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Response {
+                    id,
+                    response: Response::Ack,
+                }) if id == request_id => saw_ack = true,
+                Packet::Control(ControlMessage::Response {
+                    id,
+                    response: Response::Error { error },
+                }) if id == request_id => panic!("cancel job failed: {error:?}"),
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::JobProgress {
+                            job_id: progressed,
+                            status: JobStatus::Cancelled,
+                            ..
+                        },
+                }) if progressed == job_id => saw_cancelled = true,
+                Packet::Control(_) | Packet::Output { .. } => {}
+            }
+            if saw_ack && saw_cancelled {
+                return;
+            }
+        }
+        panic!("timed out waiting for cancel ack and cancelled progress for job {job_id}");
     }
 
     /// Send a `StartJob` wrapper and block until its Job completes, returning
@@ -926,12 +1784,25 @@ impl TestClient {
     }
 
     fn open_session(&mut self, id: u64, parent: SessionParent, command: Vec<String>) -> Session {
+        self.open_session_with_command(id, parent, Some(command))
+    }
+
+    fn open_default_session(&mut self, id: u64, parent: SessionParent) -> Session {
+        self.open_session_with_command(id, parent, None)
+    }
+
+    fn open_session_with_command(
+        &mut self,
+        id: u64,
+        parent: SessionParent,
+        command: Option<Vec<String>>,
+    ) -> Session {
         self.send_request(
             id,
             Request::OpenSession {
                 parent,
                 name: "test-shell".into(),
-                command: Some(command),
+                command,
                 cols: 80,
                 rows: 24,
             },
@@ -952,6 +1823,80 @@ impl TestClient {
         }
     }
 
+    fn read_worktree_removed(&mut self, worktree_id: hitch_core::WorktreeId, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::WorktreeRemoved {
+                            worktree_id: removed,
+                        },
+                }) if removed == worktree_id => return,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("daemon error while waiting for worktree removal: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for worktree {worktree_id} removal");
+    }
+
+    fn send_session_input(&mut self, id: u64, session_id: SessionId, payload: &[u8]) {
+        self.send_request_with_pty_frame(
+            id,
+            Request::SendSessionInput {
+                session_id,
+                byte_count: payload.len() as u32,
+            },
+            payload,
+        );
+        self.read_ack(id);
+    }
+
+    fn resize_session(&mut self, id: u64, session_id: SessionId, cols: u16, rows: u16) {
+        self.ack(
+            id,
+            Request::ResizeSession {
+                session_id,
+                cols,
+                rows,
+            },
+        );
+    }
+
+    fn close_session(&mut self, id: u64, session_id: SessionId, kill_process: bool) {
+        self.ack(
+            id,
+            Request::CloseSession {
+                session_id,
+                kill_process,
+            },
+        );
+    }
+
+    fn read_session_closed(&mut self, session_id: SessionId, timeout: Duration) -> Option<i32> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Event {
+                    event:
+                        Event::SessionClosed {
+                            session_id: closed,
+                            exit_code,
+                        },
+                }) if closed == session_id => return exit_code,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("daemon error while waiting for session close: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for session {session_id} to close");
+    }
+
     fn read_output_until(
         &mut self,
         session_id: SessionId,
@@ -961,7 +1906,7 @@ impl TestClient {
         let deadline = Instant::now() + timeout;
         let mut bytes = Vec::new();
         while Instant::now() < deadline {
-            match self.read_packet() {
+            match self.read_packet_until(deadline) {
                 Packet::Output {
                     session_id: packet_session_id,
                     bytes: packet_bytes,
@@ -989,7 +1934,7 @@ impl TestClient {
         self.send_request(id, Request::ShutdownDaemon);
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            match self.read_packet() {
+            match self.read_packet_until(deadline) {
                 Packet::Control(ControlMessage::Response {
                     id: response_id,
                     response: Response::Ack,
@@ -1002,28 +1947,45 @@ impl TestClient {
 
     fn send_request(&mut self, id: u64, request: Request) {
         let bytes = encode_control_message(&ControlMessage::request(id, request)).unwrap();
-        self.writer.write_all(&bytes).unwrap();
-        self.writer.flush().unwrap();
+        self.stream.get_mut().write_all(&bytes).unwrap();
+        self.stream.get_mut().flush().unwrap();
     }
 
     fn send_raw_control(&mut self, bytes: &[u8]) {
-        self.writer.write_all(bytes).unwrap();
-        self.writer.flush().unwrap();
+        self.stream.get_mut().write_all(bytes).unwrap();
+        self.stream.get_mut().flush().unwrap();
     }
 
     #[allow(dead_code)]
     fn send_request_with_pty_frame(&mut self, id: u64, request: Request, payload: &[u8]) {
         let control = encode_control_message(&ControlMessage::request(id, request)).unwrap();
         let frame = encode_pty_frame(payload).unwrap();
-        self.writer.write_all(&control).unwrap();
-        self.writer.write_all(&frame).unwrap();
-        self.writer.flush().unwrap();
+        self.stream.get_mut().write_all(&control).unwrap();
+        self.stream.get_mut().write_all(&frame).unwrap();
+        self.stream.get_mut().flush().unwrap();
     }
 
     fn read_packet(&mut self) -> Packet {
+        self.read_packet_until(Instant::now() + Duration::from_secs(5))
+    }
+
+    fn read_packet_until(&mut self, deadline: Instant) -> Packet {
         let mut line = Vec::new();
-        let len = self.reader.read_until(b'\n', &mut line).unwrap();
-        assert!(len > 0, "daemon closed connection");
+        loop {
+            match self.stream.read_until(b'\n', &mut line) {
+                Ok(0) if cfg!(windows) && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(0) => panic!("daemon closed connection"),
+                Ok(_) => break,
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("read control line: {err}"),
+            }
+        }
         if line.last() == Some(&b'\n') {
             line.pop();
         }
@@ -1038,21 +2000,41 @@ impl TestClient {
         } = message
         {
             let mut prefix = [0_u8; 4];
-            self.reader.read_exact(&mut prefix).unwrap();
+            self.read_exact_until(&mut prefix, deadline);
             let len = u32::from_be_bytes(prefix);
             assert_eq!(
                 len, byte_count,
                 "event byte_count and frame length should match"
             );
             let mut bytes = vec![0_u8; len as usize];
-            self.reader.read_exact(&mut bytes).unwrap();
+            self.read_exact_until(&mut bytes, deadline);
             Packet::Output { session_id, bytes }
         } else {
             Packet::Control(message)
         }
     }
+
+    fn read_exact_until(&mut self, buf: &mut [u8], deadline: Instant) {
+        let mut read = 0;
+        while read < buf.len() {
+            match self.stream.read(&mut buf[read..]) {
+                Ok(0) if cfg!(windows) && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(0) => panic!("daemon closed connection"),
+                Ok(len) => read += len,
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("read pty frame: {err}"),
+            }
+        }
+    }
 }
 
+#[cfg(any(unix, windows))]
 enum Packet {
     Control(ControlMessage),
     Output {
@@ -1065,6 +2047,7 @@ fn daemon_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hitch-daemon"))
 }
 
+#[cfg(unix)]
 fn spawn_daemon(socket: &Path, store: &Path, managed_root: &Path) -> Child {
     spawn_daemon_full(socket, store, managed_root, None)
 }
@@ -1077,6 +2060,7 @@ fn spawn_daemon_full(socket: &Path, store: &Path, managed_root: &Path, gh: Optio
     spawn_daemon_command(command)
 }
 
+#[cfg(any(unix, windows))]
 fn spawn_daemon_with_codex(
     socket: &Path,
     store: &Path,
@@ -1091,6 +2075,13 @@ fn spawn_daemon_with_codex(
         .arg(codex)
         .arg("--draft-timeout-secs")
         .arg("5");
+    spawn_daemon_command(command)
+}
+
+#[cfg(windows)]
+fn spawn_daemon_with_git(socket: &Path, store: &Path, managed_root: &Path, git: &Path) -> Child {
+    let mut command = daemon_command(socket, store, managed_root);
+    command.arg("--git").arg(git);
     spawn_daemon_command(command)
 }
 
@@ -1120,6 +2111,25 @@ fn spawn_daemon_command(mut command: Command) -> Child {
         .expect("spawn hitch-daemon")
 }
 
+#[cfg(any(unix, windows))]
+fn git_worktree_paths(repo: &Path) -> Vec<PathBuf> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git worktree list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree ").map(PathBuf::from))
+        .collect()
+}
+
+#[cfg(any(unix, windows))]
 fn init_git_repo(path: &Path) {
     std::fs::create_dir_all(path).unwrap();
     run_git(path, ["init", "--initial-branch=main"]);
@@ -1130,6 +2140,7 @@ fn init_git_repo(path: &Path) {
     run_git(path, ["commit", "-m", "initial"]);
 }
 
+#[cfg(unix)]
 fn init_bare_remote(path: &Path) {
     std::fs::create_dir_all(path).unwrap();
     run_git(path, ["init", "--bare", "--initial-branch=main"]);
@@ -1137,6 +2148,7 @@ fn init_bare_remote(path: &Path) {
 
 /// Write an executable shell script that impersonates `gh`, echoing a fixed PR
 /// URL so create-PR can be exercised over the socket without hitting GitHub.
+#[cfg(unix)]
 fn write_gh_stub() -> PathBuf {
     let path = test_file_path("gh-stub", "sh");
     write_executable_script(
@@ -1146,6 +2158,7 @@ fn write_gh_stub() -> PathBuf {
     path
 }
 
+#[cfg(unix)]
 fn write_slow_codex_stub() -> PathBuf {
     let path = test_file_path("codex-stub", "sh");
     write_executable_script(
@@ -1155,6 +2168,7 @@ fn write_slow_codex_stub() -> PathBuf {
     path
 }
 
+#[cfg(unix)]
 fn write_executable_script(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
     #[cfg(unix)]
@@ -1166,6 +2180,122 @@ fn write_executable_script(path: &Path, contents: &str) {
     }
 }
 
+#[cfg(windows)]
+fn write_windows_hanging_git_stub(started: &Path, heartbeat: &Path) -> PathBuf {
+    write_windows_hanging_command_stub(
+        "git-stub",
+        "if ($Args.Count -eq 0 -or $Args[0] -ne 'clone') { exit 64 }",
+        started,
+        heartbeat,
+    )
+}
+
+#[cfg(windows)]
+fn write_windows_success_codex_stub() -> PathBuf {
+    let dir = test_dir_path("windows codex provider path with spaces");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = dir.join("provider.rs");
+    let exe_path = dir.join("codex provider.exe");
+    std::fs::write(
+        &source_path,
+        r###"
+use std::{
+    env,
+    io::{self, Read},
+    process, thread,
+    time::Duration,
+};
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.len() != 4 { process::exit(11); }
+    if args[0] != "exec" { process::exit(13); }
+    if args[1] != "--sandbox" { process::exit(14); }
+    if args[2] != "read-only" { process::exit(15); }
+    // The daemon must pass the prompt through stdin with `-` as the explicit
+    // sentinel so large diffs never hit the 32 KiB Windows command-line cap.
+    if args[3] != "-" { process::exit(16); }
+    let mut prompt = String::new();
+    io::stdin().read_to_string(&mut prompt).unwrap();
+    if prompt.is_empty() { process::exit(17); }
+    thread::sleep(Duration::from_millis(250));
+    println!("{}", "{\"subject\":\"test: windows job draft\",\"body\":\"Generated through job\"}");
+}
+"###,
+    )
+    .unwrap();
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = Command::new(rustc)
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&exe_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "rustc failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    exe_path
+}
+#[cfg(windows)]
+fn write_windows_hanging_codex_stub(started: &Path, heartbeat: &Path) -> PathBuf {
+    write_windows_hanging_command_stub(
+        "codex-stub",
+        "if ($Args.Count -lt 2 -or $Args[0] -ne 'debug' -or $Args[1] -ne 'models') { exit 64 }",
+        started,
+        heartbeat,
+    )
+}
+
+#[cfg(windows)]
+fn write_windows_hanging_command_stub(
+    name: &str,
+    validation: &str,
+    started: &Path,
+    heartbeat: &Path,
+) -> PathBuf {
+    let cmd = test_file_path(name, "cmd");
+    let script = cmd.with_extension("ps1");
+    let child_script = cmd.with_extension("child.ps1");
+    std::fs::write(
+        &cmd,
+        "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%~dpn0.ps1\" \"%~1\" \"%~2\"\r\nexit /b %ERRORLEVEL%\r\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &script,
+        format!(
+            "$ErrorActionPreference = 'Stop'\r\n\
+             {validation}\r\n\
+             Set-Content -LiteralPath {started} -Value 'started'\r\n\
+             $child = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',{child}) -PassThru\r\n\
+             while ($true) {{ Start-Sleep -Milliseconds 100 }}\r\n",
+            started = powershell_literal(started),
+            child = powershell_literal(&child_script),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &child_script,
+        format!(
+            "$ErrorActionPreference = 'SilentlyContinue'\r\n\
+             while ($true) {{ Add-Content -LiteralPath {heartbeat} -Value ([DateTime]::UtcNow.Ticks); Start-Sleep -Milliseconds 100 }}\r\n",
+            heartbeat = powershell_literal(heartbeat),
+        ),
+    )
+    .unwrap();
+    cmd
+}
+
+#[cfg(windows)]
+fn powershell_literal(path: &Path) -> String {
+    // Thin `&Path` convenience wrapper; the canonical escaper lives in
+    // `hitch_core::powershell_single_quoted`.
+    hitch_core::powershell_single_quoted(&path.display().to_string())
+}
+
+#[cfg(any(unix, windows))]
 fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) {
     let output = Command::new("git")
         .current_dir(cwd)
@@ -1199,6 +2329,87 @@ fn test_dir_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("hitch-daemon-{name}-{nonce}"))
 }
 
+#[cfg(windows)]
+fn assert_job_completed_with_cancel_error(response: Response) {
+    match response {
+        Response::Error { error } => {
+            assert_eq!(error.code, ErrorCode::Unavailable);
+            assert!(error.retryable, "cancelled job error should be retryable");
+        }
+        other => panic!("cancelled job should complete with an error: {other:?}"),
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_file(path: &Path, timeout: Duration) {
+    if !wait_for_file_result(path, timeout) {
+        panic!("timed out waiting for {}", path.display());
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_file_result(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    false
+}
+
+#[cfg(windows)]
+fn wait_for_heartbeat(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if heartbeat_count(path) > 0 {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for heartbeat {}", path.display());
+}
+
+#[cfg(windows)]
+fn assert_heartbeat_stopped(path: &Path) {
+    thread::sleep(Duration::from_millis(250));
+    let first = heartbeat_count(path);
+    thread::sleep(Duration::from_millis(600));
+    let second = heartbeat_count(path);
+    assert_eq!(
+        first,
+        second,
+        "cancelled job left a descendant process writing {}",
+        path.display()
+    );
+}
+
+#[cfg(windows)]
+fn heartbeat_count(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|contents| contents.lines().count())
+        .unwrap_or(0)
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    left == right
+}
+
+fn wait_for_process_exit(child: &mut Child, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("try_wait daemon") {
+            assert!(status.success(), "daemon exited with {status}");
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("daemon did not exit after shutdown");
+}
+#[cfg(unix)]
 fn wait_for_socket_gone(socket: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {

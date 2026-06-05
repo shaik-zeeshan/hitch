@@ -1,7 +1,7 @@
 <script lang="ts">
   // Clone-remote dialog. Adding a LOCAL project no longer uses a dialog — it
   // opens the native folder picker directly (pickAndAddProject); this surface
-  // is only the remote-clone path, opened from the ⌘K palette and the left-rail
+  // is only the remote-clone path, opened from the command palette and the left-rail
   // Add-project menu. Clone maps to the daemon's clone-project Job. The
   // "Browse…" button opens a native directory picker for the clone destination.
   // Throws surface inline; success dismisses.

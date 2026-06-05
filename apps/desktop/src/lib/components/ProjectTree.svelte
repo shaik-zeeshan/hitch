@@ -5,7 +5,8 @@
   // when collapsed). Dirty worktrees show their aggregate +/− line stat next
   // to the branch name.
   import { ContextMenu } from "bits-ui";
-  import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+  import { invoke } from "@tauri-apps/api/core";
+  import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { get } from "svelte/store";
   import { DEFAULT_EDITOR, editorApp } from "../settings";
   import {
@@ -21,6 +22,11 @@
     worktrees,
   } from "../daemon";
   import { createWorktreeFor, removeProjectTarget, removeWorktreeTarget } from "../overlays";
+  import {
+    currentDesktopPlatform,
+    revealItemLabel,
+    shellSessionShortcutLabel,
+  } from "../desktopPlatform";
   import { AGENT_LABEL, type Id, type PrInfo, type Project, type Worktree } from "../types";
 
   // The three kinds of worktree, distinguished only visually here — never
@@ -67,22 +73,25 @@
     }
   }
 
-  // Reveal the worktree in the OS file manager (Finder) via the opener plugin.
-  async function revealInFinder(path: string) {
+  const desktopPlatform = currentDesktopPlatform();
+  const revealMenuLabel = revealItemLabel(desktopPlatform);
+  const shellShortcutLabel = shellSessionShortcutLabel(desktopPlatform);
+
+  // Reveal the worktree in the OS file manager via the opener plugin.
+  async function revealInFileManager(path: string) {
     try {
       await revealItemInDir(path);
     } catch (err) {
       // No file manager / denied — log and no-op rather than crash the menu.
-      console.error("Reveal in Finder failed:", err);
+      console.error(`${revealMenuLabel} failed:`, err);
     }
   }
 
-  // Open the worktree in the configured editor (settings.ts). openPath's second
-  // arg is the OS application name, so an uninstalled/misnamed editor just
-  // fails gracefully — the context menu has no inline error surface.
+  // Open the worktree in the configured editor via the backend so Windows can
+  // resolve common editor install locations and pass spaced paths as one arg.
   async function openInEditor(path: string) {
     try {
-      await openPath(path, get(editorApp).trim() || DEFAULT_EDITOR);
+      await invoke("open_in_editor", { path, editor: get(editorApp).trim() || DEFAULT_EDITOR });
     } catch (err) {
       console.error("Open in editor failed:", err);
     }
@@ -102,7 +111,7 @@
     collapsed = { ...collapsed, [p.id]: !collapsed[p.id] };
   }
 
-  // Clicking a project row selects it (for ⌘K context + the quick-add target)
+  // Clicking a project row selects it (for palette context + the quick-add target)
   // and ensures its worktree list is visible. It MUST also clear the selected
   // worktree so even re-clicking the SAME project row returns the UI to the
   // project-level “choose a worktree” state instead of leaving the prior branch
@@ -217,11 +226,11 @@
             </ContextMenu.Item>
             <ContextMenu.Separator class="m-sep" />
           {/if}
-          <ContextMenu.Item class="mi" onSelect={() => void revealInFinder(project.root)}>
+          <ContextMenu.Item class="mi" onSelect={() => void revealInFileManager(project.root)}>
             <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
               ><path d="M1.5 4.5a2 2 0 0 1 2-2h3l1.5 1.6h4.5a2 2 0 0 1 2 2v5.4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z" /></svg
             >
-            Reveal in Finder
+            {revealMenuLabel}
           </ContextMenu.Item>
           <ContextMenu.Item class="mi" onSelect={() => void openInEditor(project.root)}>
             <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
@@ -304,18 +313,18 @@
                   <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
                     ><path d="M3 4l3.5 4L3 12M8 12h5" /></svg
                   >
-                  Open shell session<span class="mi-k">⌘T</span>
+                  Open shell session<span class="mi-k">{shellShortcutLabel}</span>
                 </ContextMenu.Item>
                 <ContextMenu.Item class="mi" onSelect={() => launch(worktree, ["claude"], "claude")}>
                   <span class="mi-ico" style="color:var(--warn); display:grid; place-items:center">✳</span>
                   Launch Claude
                 </ContextMenu.Item>
                 <ContextMenu.Separator class="m-sep" />
-                <ContextMenu.Item class="mi" onSelect={() => void revealInFinder(worktree.path)}>
+                <ContextMenu.Item class="mi" onSelect={() => void revealInFileManager(worktree.path)}>
                   <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
                     ><path d="M1.5 4.5a2 2 0 0 1 2-2h3l1.5 1.6h4.5a2 2 0 0 1 2 2v5.4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z" /></svg
                   >
-                  Reveal in Finder
+                  {revealMenuLabel}
                 </ContextMenu.Item>
                 <ContextMenu.Item class="mi" onSelect={() => void openInEditor(worktree.path)}>
                   <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"

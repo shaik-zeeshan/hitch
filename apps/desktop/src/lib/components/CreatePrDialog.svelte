@@ -35,7 +35,7 @@
   // the freshly-reset blank form (or flipping `generating` for the new session).
   let generationSeq = 0;
 
-  // Open state is shared (the ⌘K palette can open this too); reset the form on
+  // Open state is shared (the command palette can open this too); reset the form on
   // each open, whether triggered here or externally.
   let wasOpen = $state(false);
   $effect(() => {

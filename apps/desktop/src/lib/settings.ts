@@ -6,11 +6,12 @@ import { writable, type Writable } from "svelte/store";
 const EDITOR_KEY = "hitch.editorApp";
 const DRAFT_PROVIDER_KEY = "hitch.draftProvider";
 const DRAFT_MODEL_KEY = "hitch.draftModel";
+const DRAFT_CLAUDE_PATH_KEY = "hitch.draftClaudePath";
+const DRAFT_CODEX_PATH_KEY = "hitch.draftCodexPath";
 const AUTO_COMMIT_PUSH_KEY = "hitch.autoCommitPush";
 
-// Application name handed to the OS "open with" (macOS: `open -a <app>`). An
-// app name — not a `code`-style CLI shim — so it's PATH-independent and works
-// for any installed editor (Cursor, Zed, Sublime…) by name.
+// Editor preference passed to the desktop backend. It may be a display name
+// (Visual Studio Code, Cursor, Zed…) or an explicit executable path.
 export const DEFAULT_EDITOR = "Visual Studio Code";
 
 export type DraftProvider = "stub" | "claude" | "codex";
@@ -92,4 +93,6 @@ function persistedBool(key: string, initial: boolean): Writable<boolean> {
 export const editorApp = persisted(EDITOR_KEY, DEFAULT_EDITOR);
 export const draftProvider = persistedDraftProvider();
 export const draftModel = persisted(DRAFT_MODEL_KEY, DEFAULT_DRAFT_MODEL);
+export const draftClaudePath = persisted(DRAFT_CLAUDE_PATH_KEY, "");
+export const draftCodexPath = persisted(DRAFT_CODEX_PATH_KEY, "");
 export const autoCommitPush = persistedBool(AUTO_COMMIT_PUSH_KEY, false);

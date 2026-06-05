@@ -11,12 +11,12 @@
 
 use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
 use hitch_core::{ProjectId, Worktree};
+use hitch_process::{DrainOutcome, PipeReader, ProcessTree, ProcessTreeRegistration};
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
-use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -140,12 +140,11 @@ pub struct GitClient {
     gh: PathBuf,
 }
 /// Hooks a long-running `git`/`gh` child into a higher-level cancellation path.
-///
 /// The daemon's Job registry implements this so `ShutdownDaemon`/`CancelJob`
-/// can kill the subprocess group and wait for the worker to drain before exit.
+/// can kill the subprocess tree and wait for the worker to drain before exit.
 pub trait CommandControl {
     fn is_cancelled(&self) -> bool;
-    fn set_child_pgid(&self, pgid: Option<i32>);
+    fn set_process_tree(&self, tree: Option<ProcessTree>);
 }
 
 impl Default for GitClient {
@@ -1052,9 +1051,10 @@ pub fn diff_file(
     target: DiffTarget,
 ) -> Result<String> {
     let repo = Repository::discover(repo_path.as_ref())?;
+    let pathspec = diff_pathspec(&repo, path.as_ref());
     let mut options = DiffOptions::new();
     options
-        .pathspec(path.as_ref())
+        .pathspec(pathspec.as_ref())
         .include_untracked(true)
         .recurse_untracked_dirs(true)
         .show_untracked_content(true);
@@ -1072,6 +1072,17 @@ pub fn diff_file(
     };
 
     diff_to_string(&diff)
+}
+
+fn diff_pathspec<'a>(repo: &Repository, path: &'a Path) -> Cow<'a, Path> {
+    if path.is_absolute() {
+        if let Some(workdir) = repo.workdir() {
+            if let Ok(relative) = path.strip_prefix(workdir) {
+                return Cow::Owned(relative.to_path_buf());
+            }
+        }
+    }
+    Cow::Borrowed(path)
 }
 
 /// Read the complete staged diff using libgit2.
@@ -1247,8 +1258,11 @@ pub fn discover_worktrees(repo_path: impl AsRef<Path>) -> Result<Vec<DiscoveredW
             continue;
         };
         let path = worktree.path().to_path_buf();
-        // Skip linked worktrees whose directory is gone (prunable but not pruned).
-        if !path.is_dir() {
+        // Skip linked worktrees whose directory is gone (prunable but not
+        // pruned). Probe via the extended-length form so a deep managed-worktree
+        // path isn't wrongly treated as missing under MAX_PATH on Windows. The
+        // normal `path` is what we store and hand back to callers/GUI.
+        if !path_is_dir_fs(&path) {
             continue;
         }
         let branch = Repository::open(&path)
@@ -1285,7 +1299,11 @@ fn create_worktree_with_client(
 ) -> Result<Worktree> {
     let target = request.target_path();
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
+        // Filesystem access goes through the extended-length (`\\?\`) form on
+        // Windows so a deep managed-worktree root can't trip MAX_PATH; the
+        // normal `target` is still what's handed to the git CLI and returned to
+        // callers below (ADR 0012).
+        fs::create_dir_all(fs_path(parent)?)?;
     }
 
     let mut args = vec![os("worktree"), os("add")];
@@ -1347,7 +1365,10 @@ fn remove_worktree_with_client(
 }
 
 fn already_removed_worktree(err: &GitError, path: &Path) -> bool {
-    !path.exists()
+    // Probe existence through the extended-length form on Windows: a managed
+    // worktree path long enough to trip MAX_PATH must not be misread as "already
+    // gone" and silently swallow a real removal failure.
+    !path_exists_fs(path)
         && matches!(
             err,
             GitError::CommandFailed { stderr, .. } if stderr.contains("is not a working tree")
@@ -1593,6 +1614,15 @@ fn branch_target_oid(branch: &git2::Branch<'_>) -> Result<Oid> {
         .ok_or_else(|| GitError::Git(git2::Error::from_str("branch has no direct target")))
 }
 
+/// Grace period for draining a command's stdout/stderr reader on the normal-exit
+/// path before detaching a reader still parked on an inherited pipe. The command
+/// already exited, so its own pipes are at EOF and the readers finish well within
+/// this window; the bound only caps the wait when a same-group descendant kept a
+/// captured write end open (see `drain_pipe_reader_bounded`). Kept short and on
+/// the same order as the `try_wait` poll interval so a completed run returns
+/// promptly.
+const READER_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
 fn run_command(
     program: &Path,
     cwd: &Path,
@@ -1600,10 +1630,14 @@ fn run_command(
     control: Option<&dyn CommandControl>,
 ) -> Result<CommandOutput> {
     let Some(control) = control else {
-        let output = Command::new(program)
-            .current_dir(cwd)
-            .args(&args)
-            .output()?;
+        let mut command = Command::new(program);
+        command.current_dir(cwd).args(&args);
+        // Match the cancellable path's windowless behaviour: the control-less
+        // branch never reaches `ProcessTree::spawn`, so without this a
+        // console-attached caller (CLI, tests, a stale shim) would flash a console
+        // window for each git invocation. See `hitch_process::configure_windowless`.
+        hitch_process::configure_windowless(&mut command);
+        let output = command.output()?;
         let stdout = String::from_utf8(output.stdout)?;
         let stderr = String::from_utf8(output.stderr)?;
         if output.status.success() {
@@ -1637,18 +1671,18 @@ fn run_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let mut child = command.spawn()?;
-    control.set_child_pgid(Some(child.id() as i32));
-    let stdout_reader = spawn_pipe_reader(
+    let (mut child, tree) = ProcessTree::spawn(&mut command)?;
+    let registration = ProcessTreeRegistration::new(
+        || control.set_process_tree(Some(tree.clone())),
+        || control.set_process_tree(None),
+    );
+    let stdout_reader = PipeReader::spawn(
         child
             .stdout
             .take()
             .ok_or_else(|| std::io::Error::other("failed to capture command stdout"))?,
     );
-    let stderr_reader = spawn_pipe_reader(
+    let stderr_reader = PipeReader::spawn(
         child
             .stderr
             .take()
@@ -1661,23 +1695,50 @@ fn run_command(
             Some(status) => break status,
             None if control.is_cancelled() => {
                 cancelled = true;
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(-(child.id() as i32), libc::SIGKILL);
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = child.kill();
-                }
+                let _ = tree.terminate();
+                let _ = child.kill();
                 break child.wait()?;
             }
             None => thread::sleep(Duration::from_millis(25)),
         }
     };
-    control.set_child_pgid(None);
+    // Disarm the external canceller before draining the pipe readers. Once the
+    // child (the process-group leader) is reaped, the registered tree's
+    // `terminate()` is no longer safe to call from a concurrent cancel: on Unix
+    // it is `kill(-pgid)`, and the leader's pgid can be recycled to an unrelated
+    // group as soon as the group empties. The cancel-before-exit branch above
+    // already terminated the tree itself while the group was alive, so clearing
+    // the registration here loses no intended kill — it only closes the window
+    // where a late cancel could signal a recycled process group.
+    drop(registration);
 
-    let stdout = String::from_utf8(join_pipe_reader(stdout_reader)?)?;
-    let stderr = String::from_utf8(join_pipe_reader(stderr_reader)?)?;
+    let (stdout_result, stderr_result) = if cancelled {
+        // The cancel branch group-killed the tree while the leader was still
+        // alive, so the captured pipes get EOF and the readers finish on their
+        // own. Join them unconditionally to collect the partial output.
+        (stdout_reader.join(), stderr_reader.join())
+    } else {
+        // NORMAL-EXIT path: the child exited on its own. If a same-group
+        // descendant inherited a captured write end and outlives it, the readers
+        // never see EOF, and once the leader is reaped we cannot group-kill that
+        // descendant on Unix to force it (the recycled-pgid hazard —
+        // `terminate_after_leader_reaped` is a deliberate no-op there; on Windows
+        // the owned Job Object handle still tears down the descendant and closes
+        // the pipe). Use the post-reap-safe teardown, then drain with a bounded
+        // wait so a slightly-late EOF still lands while a truly stuck reader is
+        // detached with whatever the command already wrote.
+        if !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+            let _ = tree.terminate_after_leader_reaped();
+            let _ = child.kill();
+        }
+        (
+            drain_pipe_reader_bounded(stdout_reader, READER_DRAIN_GRACE),
+            drain_pipe_reader_bounded(stderr_reader, READER_DRAIN_GRACE),
+        )
+    };
+
+    let stdout = String::from_utf8(stdout_result?)?;
+    let stderr = String::from_utf8(stderr_result?)?;
     if status.success() && !cancelled {
         Ok(CommandOutput { stdout, stderr })
     } else {
@@ -1696,23 +1757,14 @@ fn run_command(
     }
 }
 
-fn spawn_pipe_reader<R: Read + Send + 'static>(
-    mut pipe: R,
-) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
-    thread::spawn(move || {
-        let mut output = Vec::new();
-        pipe.read_to_end(&mut output)?;
-        Ok(output)
-    })
-}
-
-fn join_pipe_reader(
-    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
-) -> std::io::Result<Vec<u8>> {
-    match handle.join() {
-        Ok(result) => result,
-        Err(_) => Err(std::io::Error::other("command output reader panicked")),
-    }
+/// Drain a command stdout/stderr reader on the NORMAL-EXIT path with a bounded
+/// wait, collapsing both the drained and timed-out outcomes to the bytes
+/// collected. `run_command` treats a slightly-late or stuck reader identically —
+/// it uses whatever the command already wrote — so the distinction
+/// [`DrainOutcome`] preserves for the daemon's success path is not meaningful
+/// here; see [`PipeReader::drain_bounded`] for the shared chunk-loop/grace logic.
+fn drain_pipe_reader_bounded(reader: PipeReader, grace: Duration) -> std::io::Result<Vec<u8>> {
+    reader.drain_bounded(grace).map(DrainOutcome::into_inner)
 }
 
 fn command_failed(
@@ -1789,8 +1841,10 @@ fn worktree_state(status: Status) -> FileState {
     }
 }
 
+const MAX_SAFE_PATH_COMPONENT_PREFIX_CHARS: usize = 96;
+
 fn safe_path_component(value: &str) -> String {
-    let sanitized: String = value
+    let mut sanitized: String = value
         .chars()
         .map(|ch| match ch {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
@@ -1799,10 +1853,75 @@ fn safe_path_component(value: &str) -> String {
         })
         .collect();
 
-    match sanitized.trim_matches(['.', ' ']) {
-        "" => "_".to_string(),
-        trimmed => trimmed.to_string(),
+    let trimmed = sanitized.trim_matches(['.', ' ']);
+    if trimmed.is_empty() {
+        sanitized.clear();
+        sanitized.push('_');
+    } else if trimmed.len() != sanitized.len() {
+        sanitized = trimmed.to_string();
     }
+
+    if sanitized.chars().count() > MAX_SAFE_PATH_COMPONENT_PREFIX_CHARS {
+        sanitized = sanitized
+            .chars()
+            .take(MAX_SAFE_PATH_COMPONENT_PREFIX_CHARS)
+            .collect();
+        let trimmed = sanitized.trim_matches(['.', ' ']);
+        if trimmed.is_empty() {
+            sanitized.clear();
+            sanitized.push('_');
+        } else if trimmed.len() != sanitized.len() {
+            sanitized = trimmed.to_string();
+        }
+    }
+
+    if is_windows_reserved_device_name(&sanitized) {
+        sanitized.insert(0, '_');
+    }
+
+    format!("{sanitized}-{:016x}", stable_path_hash(value))
+}
+
+fn is_windows_reserved_device_name(value: &str) -> bool {
+    let stem = value
+        .split_once('.')
+        .map_or(value, |(stem, _)| stem)
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// Stable, collision-resistant suffix for a sanitized worktree directory name.
+///
+/// Hashes the *original* (pre-sanitization) value so two branches that sanitize
+/// to the same on-disk component still land in distinct directories. Uses the
+/// shared leaf-crate FNV-1a so the suffix stays byte-for-byte stable across
+/// builds — existing managed worktrees must keep resolving to the same path.
+fn stable_path_hash(value: &str) -> u64 {
+    hitch_core::fnv1a_64(value.as_bytes())
 }
 
 fn os(value: impl AsRef<OsStr>) -> OsString {
@@ -1813,11 +1932,113 @@ fn path_os(path: impl AsRef<Path>) -> OsString {
     path.as_ref().as_os_str().to_os_string()
 }
 
+/// Return the path to hand to std::fs / libgit2 for managed-worktree lifecycle
+/// filesystem access.
+///
+/// On Windows the std `CreateFileW`-backed APIs are still subject to the legacy
+/// MAX_PATH (260) limit unless the path is given in extended-length (`\\?\`)
+/// form. Managed worktrees live deep under `%LOCALAPPDATA%\Hitch\worktrees\…`
+/// (ADR 0012), so a long project/branch can push a checkout past 260 even though
+/// each component is already capped (ADR 0001). Prefixing the *filesystem* path
+/// with `\\?\` opts that single call out of MAX_PATH regardless of the OS
+/// `LongPathsEnabled` policy. The normal form is kept everywhere else — git CLI
+/// arguments, display strings, and paths stored / sent to the GUI — so only the
+/// raw filesystem syscall sees the prefix.
+///
+/// Returns a clear error (rather than a silently truncated path) when the
+/// absolute path still can't be represented in extended-length form.
+#[cfg(windows)]
+fn fs_path(path: &Path) -> Result<Cow<'_, Path>> {
+    extended_length_path(path)
+}
+
+/// On non-Windows targets there is no MAX_PATH and no `\\?\` form; the path is
+/// used verbatim.
+#[cfg(not(windows))]
+fn fs_path(path: &Path) -> Result<Cow<'_, Path>> {
+    Ok(Cow::Borrowed(path))
+}
+
+/// `Path::exists` but routed through [`fs_path`] so a managed-worktree path past
+/// MAX_PATH is probed correctly on Windows. Falls back to the normal form if the
+/// extended-length conversion isn't possible (e.g. a relative path), so the
+/// answer is never worse than `Path::exists`.
+fn path_exists_fs(path: &Path) -> bool {
+    match fs_path(path) {
+        Ok(probe) => probe.exists(),
+        Err(_) => path.exists(),
+    }
+}
+
+/// `Path::is_dir` routed through [`fs_path`] (see [`path_exists_fs`]).
+fn path_is_dir_fs(path: &Path) -> bool {
+    match fs_path(path) {
+        Ok(probe) => probe.is_dir(),
+        Err(_) => path.is_dir(),
+    }
+}
+
+/// Convert an absolute Windows path to its extended-length (`\\?\`) form,
+/// mapping UNC paths (`\\server\share\…`) to `\\?\UNC\server\share\…`.
+///
+/// Paths already in extended-length form (e.g. anything that came back from
+/// `std::fs::canonicalize`, which returns `\\?\` paths on Windows) are returned
+/// unchanged. A relative path can't be prefixed safely (`\\?\` disables the
+/// `.`/`..` and drive-relative resolution that would be needed), so callers must
+/// pass an absolute path; a non-absolute or otherwise non-representable path is
+/// reported as a clear error instead of being truncated.
+#[cfg(windows)]
+fn extended_length_path(path: &Path) -> Result<Cow<'_, Path>> {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    match components.next() {
+        // Already `\\?\…` (verbatim) — including what canonicalize() returns.
+        Some(Component::Prefix(prefix))
+            if matches!(
+                prefix.kind(),
+                Prefix::VerbatimDisk(_) | Prefix::Verbatim(_) | Prefix::VerbatimUNC(_, _)
+            ) =>
+        {
+            Ok(Cow::Borrowed(path))
+        }
+        // `C:\…` → `\\?\C:\…`. The `\\?\` namespace does *not* accept forward
+        // slashes (it skips path normalization), and libgit2 hands back
+        // forward-slash paths on Windows, so the separators are normalized to
+        // backslashes first.
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_)) => {
+            let raw = path.as_os_str().to_string_lossy().replace('/', "\\");
+            Ok(Cow::Owned(PathBuf::from(format!(r"\\?\{raw}"))))
+        }
+        // `\\server\share\…` → `\\?\UNC\server\share\…` (separators normalized to
+        // backslashes, as the `\\?\` namespace requires).
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::UNC(_, _)) => {
+            let raw = path.as_os_str().to_string_lossy().replace('/', "\\");
+            let rest = raw.strip_prefix(r"\\").ok_or_else(|| {
+                GitError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("cannot form extended-length path for {}", path.display()),
+                ))
+            })?;
+            Ok(Cow::Owned(PathBuf::from(format!(r"\\?\UNC\{rest}"))))
+        }
+        // No drive/UNC prefix — a relative or drive-relative path can't be made
+        // extended-length without resolution. Surface a clear error (ADR 0012)
+        // rather than hand a path that MAX_PATH might truncate.
+        _ => Err(GitError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "managed worktree path must be absolute to use the extended-length form: {}",
+                path.display()
+            ),
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use tempfile::TempDir;
@@ -1837,6 +2058,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn pr_list_for_branches_queries_ored_heads_without_author_filter() {
         let fixture = RepoFixture::new();
         let bin = TempDir::new().unwrap();
@@ -1907,6 +2129,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn pr_list_for_branches_drops_fork_prs_sharing_a_local_branch_name() {
         let fixture = RepoFixture::new();
         // Anchor the project on a known owner; a same-named fork PR from another
@@ -1975,6 +2198,64 @@ mod tests {
         );
         let staged = diff_file(fixture.path(), "tracked.txt", DiffTarget::Staged).unwrap();
         assert!(staged.contains("changed"), "staged diff was {staged:?}");
+    }
+
+    #[test]
+    fn status_and_diff_accept_repo_and_file_paths_with_spaces() {
+        let fixture = RepoFixture::new_in_dir("repo with spaces");
+        let file = PathBuf::from("dir with spaces/file with spaces.txt");
+        fs::create_dir(fixture.path().join("dir with spaces")).unwrap();
+        fs::write(fixture.path().join(&file), "initial\n").unwrap();
+        run_real_git(
+            fixture.path(),
+            ["add", "dir with spaces/file with spaces.txt"],
+        );
+        run_real_git(fixture.path(), ["commit", "-m", "add spaced path"]);
+
+        fs::write(fixture.path().join(&file), "changed\n").unwrap();
+
+        let summary = status(fixture.path()).unwrap();
+        let entry = summary.entry_for(&file).unwrap();
+        assert_eq!(entry.working_tree, FileState::Modified);
+
+        let relative = diff_file(fixture.path(), &file, DiffTarget::Worktree).unwrap();
+        assert!(
+            relative.contains("changed"),
+            "relative diff was {relative:?}"
+        );
+
+        let absolute = diff_file(
+            fixture.path(),
+            fixture.path().join(&file),
+            DiffTarget::Worktree,
+        )
+        .unwrap();
+        assert!(
+            absolute.contains("changed"),
+            "absolute diff was {absolute:?}"
+        );
+    }
+
+    #[test]
+    fn staged_diff_accepts_absolute_file_path_with_spaces() {
+        let fixture = RepoFixture::new_in_dir("repo with spaces");
+        let file = PathBuf::from("file with spaces.txt");
+        fs::write(fixture.path().join(&file), "initial\n").unwrap();
+        run_real_git(fixture.path(), ["add", "file with spaces.txt"]);
+        run_real_git(fixture.path(), ["commit", "-m", "add spaced path"]);
+
+        fs::write(fixture.path().join(&file), "staged\n").unwrap();
+        GitClient::default()
+            .stage_files(fixture.path(), std::slice::from_ref(&file))
+            .unwrap();
+
+        let diff = diff_file(
+            fixture.path(),
+            fixture.path().join(&file),
+            DiffTarget::Staged,
+        )
+        .unwrap();
+        assert!(diff.contains("staged"), "staged diff was {diff:?}");
     }
 
     #[test]
@@ -2059,7 +2340,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            fs::read_to_string(fixture.path().join("tracked.txt")).unwrap(),
+            fs::read_to_string(fixture.path().join("tracked.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
             "initial\n"
         );
         assert!(!fixture.path().join("staged.txt").exists());
@@ -2166,6 +2449,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn commit_uses_system_git_and_fires_repo_hooks() {
         let fixture = RepoFixture::new();
         let marker = fixture.path().join("hook-ran");
@@ -2175,9 +2459,7 @@ mod tests {
             format!("#!/bin/sh\necho hook > {}\n", marker.display()),
         )
         .unwrap();
-        let mut permissions = fs::metadata(&hook).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&hook, permissions).unwrap();
+        make_executable(&hook);
 
         fixture.write("tracked.txt", "hooked\n");
         let client = GitClient::default();
@@ -2521,6 +2803,7 @@ mod tests {
         assert!(worktree_path.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn create_pr_pushes_first_when_needed_and_invokes_gh_with_default_base() {
         let fixture = RepoFixture::new();
@@ -2557,12 +2840,118 @@ mod tests {
 
     #[test]
     fn managed_path_sanitizes_project_and_branch_components() {
+        let path = managed_worktree_path("/tmp/root", "my/project", "feature/test");
+        let components = path
+            .strip_prefix("/tmp/root")
+            .unwrap()
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
         assert_eq!(
-            managed_worktree_path("/tmp/root", "my/project", "feature/test")
-                .strip_prefix("/tmp/root")
-                .unwrap(),
-            Path::new("my_project/feature_test")
+            components,
+            [
+                "my_project-ab25a1fcafb8fb99",
+                "feature_test-05b3fea2f0a81a1e"
+            ]
         );
+    }
+
+    #[test]
+    fn managed_path_components_are_windows_safe_and_collision_resistant() {
+        let branch_a = safe_path_component(r#"feature/a:bad*name? " <x>|"#);
+        assert_eq!(branch_a, "feature_a_bad_name_ _ _x__-2d0df6d4ab28ba66");
+
+        let branch_b = safe_path_component("feature\\a:bad*name? \" <x>|");
+        assert_eq!(branch_b, "feature_a_bad_name_ _ _x__-c2fc782d233557a7");
+        assert_ne!(branch_a, branch_b);
+
+        for value in [
+            "CON",
+            "prn",
+            "AUX.",
+            "nul ",
+            "COM1",
+            "LPT9.txt",
+            "...",
+            "   ",
+            "\u{0000}\u{001f}",
+        ] {
+            let component = safe_path_component(value);
+            assert_windows_safe_component(&component);
+        }
+
+        let long = safe_path_component(&format!("{}.", "a".repeat(300)));
+        assert_windows_safe_component(&long);
+        assert_eq!(
+            long.chars().count(),
+            MAX_SAFE_PATH_COMPONENT_PREFIX_CHARS + 17
+        );
+    }
+
+    fn assert_windows_safe_component(component: &str) {
+        assert!(!component.is_empty());
+        assert!(!component.ends_with(['.', ' ']));
+        assert!(!component.chars().any(|ch| matches!(
+            ch,
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+        ) || ch.is_control()));
+
+        let stem = component
+            .split_once('.')
+            .map_or(component, |(stem, _)| stem)
+            .to_ascii_uppercase();
+        assert!(!matches!(
+            stem.as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extended_length_path_prefixes_only_real_drive_and_unc_paths() {
+        // Drive path gains the verbatim prefix.
+        let drive = extended_length_path(Path::new(r"C:\Users\me\.hitch\worktrees\p\b")).unwrap();
+        assert_eq!(drive.as_os_str(), r"\\?\C:\Users\me\.hitch\worktrees\p\b");
+
+        // UNC path maps to the \\?\UNC\ form.
+        let unc = extended_length_path(Path::new(r"\\server\share\worktrees\p")).unwrap();
+        assert_eq!(unc.as_os_str(), r"\\?\UNC\server\share\worktrees\p");
+
+        // An already-extended path (what canonicalize returns) is untouched.
+        let already = Path::new(r"\\?\C:\already\verbatim");
+        assert_eq!(
+            extended_length_path(already).unwrap().as_os_str(),
+            already.as_os_str()
+        );
+        let already_unc = Path::new(r"\\?\UNC\server\share\x");
+        assert_eq!(
+            extended_length_path(already_unc).unwrap().as_os_str(),
+            already_unc.as_os_str()
+        );
+
+        // A relative path can't be made extended-length: clear error, not truncation.
+        assert!(extended_length_path(Path::new(r"worktrees\p\b")).is_err());
     }
 
     struct RepoFixture {
@@ -2572,8 +2961,12 @@ mod tests {
 
     impl RepoFixture {
         fn new() -> Self {
+            Self::new_in_dir("repo")
+        }
+
+        fn new_in_dir(name: &str) -> Self {
             let temp = TempDir::new().unwrap();
-            let path = temp.path().join("repo");
+            let path = temp.path().join(name);
             fs::create_dir(&path).unwrap();
             run_real_git(&path, ["init", "--initial-branch=main"]);
             run_real_git(&path, ["config", "user.name", "Hitch Test"]);
@@ -2610,6 +3003,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn fake_program(path: PathBuf, log: &Path, stdout: &str) -> PathBuf {
         let script = format!(
             "#!/bin/sh\nprintf '%s ' \"$(basename $0)\" >> {log}\nfor arg in \"$@\"; do printf '%s ' \"$arg\" >> {log}; done\nprintf '\\n' >> {log}\nprintf '{stdout}'\n",
@@ -2617,31 +3011,46 @@ mod tests {
             stdout = stdout.replace('\\', "\\\\").replace('\'', "'\\''")
         );
         fs::write(&path, script).unwrap();
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).unwrap();
+        make_executable(&path);
         path
     }
 
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
     }
+    #[cfg(any(unix, windows))]
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Mutex,
     };
 
+    #[cfg(any(unix, windows))]
     struct TestControl {
         cancelled: AtomicBool,
-        pgids: Mutex<Vec<Option<i32>>>,
+        registrations: Mutex<Vec<bool>>,
+        current: Mutex<Option<ProcessTree>>,
         cancel_on_clear: bool,
     }
 
+    #[cfg(any(unix, windows))]
     impl TestControl {
         fn new(cancel_on_clear: bool) -> Self {
             Self {
                 cancelled: AtomicBool::new(false),
-                pgids: Mutex::new(Vec::new()),
+                registrations: Mutex::new(Vec::new()),
+                current: Mutex::new(None),
                 cancel_on_clear,
             }
         }
@@ -2651,27 +3060,29 @@ mod tests {
         }
     }
 
+    #[cfg(any(unix, windows))]
     impl CommandControl for TestControl {
         fn is_cancelled(&self) -> bool {
             self.cancelled.load(Ordering::SeqCst)
         }
 
-        fn set_child_pgid(&self, pgid: Option<i32>) {
-            self.pgids.lock().unwrap().push(pgid);
-            if self.cancel_on_clear && pgid.is_none() {
+        fn set_process_tree(&self, tree: Option<ProcessTree>) {
+            let registered = tree.is_some();
+            *self.current.lock().unwrap() = tree;
+            self.registrations.lock().unwrap().push(registered);
+            if self.cancel_on_clear && !registered {
                 self.cancel();
             }
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_command_keeps_success_when_cancellation_arrives_after_exit() {
         let temp = TempDir::new().unwrap();
         let script = temp.path().join("git-success");
         fs::write(&script, "#!/bin/sh\nprintf 'done'\n").unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
+        make_executable(&script);
 
         let control = TestControl::new(true);
         let output = run_command(&script, temp.path(), Vec::new(), Some(&control)).unwrap();
@@ -2682,9 +3093,123 @@ mod tests {
             control.is_cancelled(),
             "test precondition: cancel should flip after exit"
         );
-        let pgids = control.pgids.lock().unwrap();
-        assert!(pgids.first().is_some_and(|pgid| pgid.is_some()));
-        assert_eq!(pgids.last().copied(), Some(None));
+        let registrations = control.registrations.lock().unwrap();
+        assert_eq!(registrations.first().copied(), Some(true));
+        assert_eq!(registrations.last().copied(), Some(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_does_not_wait_for_grandchild_holding_stdout() {
+        use std::time::Instant;
+
+        // Regression: a command that exits 0 on its own (the NORMAL-EXIT path)
+        // after backgrounding a child that inherited stdout must not keep the
+        // reader join blocked until that child exits. The post-reap drain cannot
+        // group-kill on Unix (recycled-pgid hazard — `terminate_after_leader_reaped`
+        // is a deliberate no-op there), so the reader gets no EOF; the bounded
+        // post-reap wait must detach the stuck reader and return the output the
+        // command already printed.
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("git-backgrounds-child");
+        fs::write(
+            &script,
+            "#!/bin/sh\n# Background child inherits stdout (fd 1) and holds it open past our wait.\nsleep 30 &\nprintf 'done'\n",
+        )
+        .unwrap();
+        make_executable(&script);
+
+        // A live control routes run_command through the spawn/pipe-reader path
+        // (the `None` path uses `Command::output`, which never has this hazard).
+        let control = TestControl::new(false);
+        let started = Instant::now();
+        let output = run_command(&script, temp.path(), Vec::new(), Some(&control)).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(output.stdout, "done");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "run_command blocked on inherited stdout pipe for {elapsed:?}; \
+             the post-reap reader drain should be bounded"
+        );
+    }
+
+    /// Regression: the external cancellation handle must be disarmed
+    /// (`set_process_tree(None)`) *before* the stdout/stderr pipe readers are
+    /// joined, not after. Otherwise a concurrent cancel arriving during the
+    /// drain calls `tree.terminate()` on a child that has already been reaped;
+    /// on Unix that is `kill(-pgid)` against a process group whose pgid the OS
+    /// may have recycled.
+    ///
+    /// The recycled-pgid race itself depends on OS pid reuse timing and cannot
+    /// be triggered deterministically, so this test instead pins the ordering
+    /// the fix guarantees. A signalling control creates a sentinel file the
+    /// moment the tree is disarmed; the child writes one line, then blocks until
+    /// that sentinel exists before exiting (keeping its stdout pipe open). If the
+    /// disarm runs before the join (correct), the sentinel appears, the child
+    /// exits, the pipe closes, and the join completes. If the disarm ran only
+    /// after the join (the pre-fix ordering), the join would wait on the child
+    /// while the child waits on the sentinel — a deadlock the watchdog catches.
+    #[cfg(unix)]
+    #[test]
+    fn run_command_disarms_cancel_handle_before_joining_pipe_readers() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        struct SignalOnDisarm {
+            sentinel: PathBuf,
+        }
+        impl CommandControl for SignalOnDisarm {
+            fn is_cancelled(&self) -> bool {
+                false
+            }
+            fn set_process_tree(&self, tree: Option<ProcessTree>) {
+                if tree.is_none() {
+                    // Disarm: release the child blocking on this sentinel.
+                    let _ = fs::write(&self.sentinel, b"go");
+                }
+            }
+        }
+
+        let temp = TempDir::new().unwrap();
+        let sentinel = temp.path().join("disarm-sentinel");
+        let script = temp.path().join("git-blocks-until-disarm");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf 'done'\nwhile [ ! -e {sentinel} ]; do sleep 0.01; done\n",
+                sentinel = shell_quote(&sentinel),
+            ),
+        )
+        .unwrap();
+        make_executable(&script);
+
+        let control = Arc::new(SignalOnDisarm {
+            sentinel: sentinel.clone(),
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = {
+            let control = Arc::clone(&control);
+            let script = script.clone();
+            let cwd = temp.path().to_path_buf();
+            thread::spawn(move || {
+                let result = run_command(&script, &cwd, Vec::new(), Some(control.as_ref()));
+                let _ = tx.send(());
+                result
+            })
+        };
+
+        // Watchdog: a disarm-after-join ordering deadlocks here.
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("run_command deadlocked: cancel handle was not disarmed before pipe join");
+
+        let output = runner.join().unwrap().unwrap();
+        assert_eq!(output.stdout, "done");
+        assert!(
+            sentinel.exists(),
+            "disarm should have created the sentinel that releases the child"
+        );
     }
 
     #[cfg(unix)]
@@ -2695,9 +3220,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let script = temp.path().join("git-sleep");
         fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
+        make_executable(&script);
 
         let control = std::sync::Arc::new(TestControl::new(false));
         let cancel = std::sync::Arc::clone(&control);
@@ -2714,9 +3237,9 @@ mod tests {
             GitError::CommandFailed { stderr, .. } => assert!(stderr.contains("command cancelled")),
             other => panic!("unexpected error: {other:?}"),
         }
-        let pgids = control.pgids.lock().unwrap();
-        assert!(pgids.first().is_some_and(|pgid| pgid.is_some()));
-        assert_eq!(pgids.last().copied(), Some(None));
+        let registrations = control.registrations.lock().unwrap();
+        assert_eq!(registrations.first().copied(), Some(true));
+        assert_eq!(registrations.last().copied(), Some(false));
     }
 
     #[cfg(unix)]
@@ -2727,9 +3250,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let script = temp.path().join("git-sleep");
         fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
+        make_executable(&script);
 
         let client = GitClient::with_programs(&script, &script);
         let control = Arc::new(TestControl::new(false));
@@ -2759,9 +3280,56 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
 
-        let pgids = control.pgids.lock().unwrap();
-        assert!(pgids.first().is_some_and(|pgid| pgid.is_some()));
-        assert_eq!(pgids.last().copied(), Some(None));
+        let registrations = control.registrations.lock().unwrap();
+        assert_eq!(registrations.first().copied(), Some(true));
+        assert_eq!(registrations.last().copied(), Some(false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn controlled_clone_cancellation_kills_windows_job_tree_with_grandchild() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("git-sleep.cmd");
+        fs::write(
+            &script,
+            "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -Command \"Start-Process powershell -ArgumentList '-NoProfile','-Command','while ($true) { Write-Output grandchild; Write-Error grandchild; Start-Sleep -Seconds 1 }' -NoNewWindow; while ($true) { Start-Sleep -Seconds 1 }\"\r\n",
+        )
+        .unwrap();
+
+        let client = GitClient::with_programs(&script, &script);
+        let control = Arc::new(TestControl::new(false));
+        let cancel = Arc::clone(&control);
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel.cancel();
+        });
+        let started = Instant::now();
+        let err = client
+            .clone_repo_with_control(
+                "https://example.com/repo.git",
+                temp.path().join("target"),
+                control.as_ref(),
+            )
+            .unwrap_err();
+        trigger.join().unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancellation should not wait for a stdout/stderr-inheriting grandchild"
+        );
+        match err {
+            GitError::CommandFailed { stderr, .. } => {
+                assert!(stderr.contains("command cancelled"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let registrations = control.registrations.lock().unwrap();
+        assert_eq!(registrations.first().copied(), Some(true));
+        assert_eq!(registrations.last().copied(), Some(false));
     }
 
     #[allow(dead_code)]

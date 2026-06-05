@@ -125,6 +125,13 @@ export type Request = { type: string; [key: string]: unknown };
 // name this variant so the frontend emits exactly the agreed shape.
 export type RepaintSessionRequest = { type: "repaint-session"; session_id: Id };
 
+export type DraftGenerationSettings = {
+  provider: string;
+  model: string | null;
+  claude_path: string | null;
+  codex_path: string | null;
+};
+
 // Shared allowlist accepted inside `start-job`. Keep this in lockstep with
 // hitch-proto's `JobRequest` so the desktop cannot advertise unsupported work.
 export type JobRequest =
@@ -141,17 +148,21 @@ export type JobRequest =
       base: string | null;
       mode: "new-branch" | "existing-branch";
     }
-  | { type: "list-draft-models"; provider: string }
+  | {
+      type: "list-draft-models";
+      provider: string;
+      settings: DraftGenerationSettings | null;
+    }
   | {
       type: "generate-commit-draft";
       worktree_id: Id;
-      settings: { provider: string; model: string | null } | null;
+      settings: DraftGenerationSettings | null;
     }
   | {
       type: "generate-pull-request-draft";
       worktree_id: Id;
       base: string | null;
-      settings: { provider: string; model: string | null } | null;
+      settings: DraftGenerationSettings | null;
     }
   | { type: "push"; worktree_id: Id }
   | { type: "fetch"; worktree_id: Id }
@@ -169,7 +180,8 @@ export type JobRequest =
 
 export type StartJobRequest = { type: "start-job"; request: JobRequest };
 export type Response = { type: string; [key: string]: unknown };
-export type HitchEvent = { type: string; [key: string]: unknown };
+export type WorktreeRemovedEvent = { type: "worktree-removed"; worktree_id: Id };
+export type HitchEvent = WorktreeRemovedEvent | { type: string; [key: string]: unknown };
 
 // ---- display maps ---------------------------------------------------------
 

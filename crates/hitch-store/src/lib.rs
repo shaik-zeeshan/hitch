@@ -135,7 +135,7 @@ impl Store {
             params![
                 id_to_string(project.id.as_uuid()),
                 project.name,
-                path_to_string(&project.root),
+                path_to_string(&project.root)?,
                 project_kind_to_db(project.kind),
             ],
         )?;
@@ -149,7 +149,7 @@ impl Store {
             params![
                 id_to_string(project.id.as_uuid()),
                 project.name,
-                path_to_string(&project.root),
+                path_to_string(&project.root)?,
                 project_kind_to_db(project.kind),
             ],
         )?;
@@ -212,7 +212,7 @@ impl Store {
             params![
                 id_to_string(worktree.id.as_uuid()),
                 id_to_string(worktree.project_id.as_uuid()),
-                path_to_string(&worktree.path),
+                path_to_string(&worktree.path)?,
                 worktree.branch,
                 bool_to_i64(worktree.is_main),
                 bool_to_i64(worktree.is_hitch_managed),
@@ -228,7 +228,7 @@ impl Store {
             params![
                 id_to_string(worktree.id.as_uuid()),
                 id_to_string(worktree.project_id.as_uuid()),
-                path_to_string(&worktree.path),
+                path_to_string(&worktree.path)?,
                 worktree.branch,
                 bool_to_i64(worktree.is_main),
                 bool_to_i64(worktree.is_hitch_managed),
@@ -284,7 +284,7 @@ impl Store {
                 session.name,
                 parent_kind,
                 parent_id,
-                path_to_string(&session.cwd),
+                path_to_string(&session.cwd)?,
             ],
         )?;
         Ok(())
@@ -301,7 +301,7 @@ impl Store {
                 session.name,
                 parent_kind,
                 parent_id,
-                path_to_string(&session.cwd),
+                path_to_string(&session.cwd)?,
             ],
         )?;
         ensure_changed(rows, EntityKind::Session)
@@ -424,6 +424,7 @@ pub enum StoreError {
     InvalidSessionParentKind(String),
     InvalidSessionParent(SessionParent),
     InvalidUuid { value: String, source: uuid::Error },
+    InvalidPathEncoding { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,6 +451,9 @@ impl fmt::Display for StoreError {
                 write!(f, "session parent does not exist: {parent:?}")
             }
             Self::InvalidUuid { value, source } => write!(f, "invalid UUID {value:?}: {source}"),
+            Self::InvalidPathEncoding { path } => {
+                write!(f, "path cannot be persisted as UTF-8: {}", path.display())
+            }
         }
     }
 }
@@ -463,7 +467,8 @@ impl std::error::Error for StoreError {
             | Self::NotFound(_)
             | Self::InvalidProjectKind(_)
             | Self::InvalidSessionParentKind(_)
-            | Self::InvalidSessionParent(_) => None,
+            | Self::InvalidSessionParent(_)
+            | Self::InvalidPathEncoding { .. } => None,
         }
     }
 }
@@ -582,8 +587,13 @@ fn id_to_string(id: Uuid) -> String {
     id.to_string()
 }
 
-fn path_to_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+fn path_to_string(path: &Path) -> Result<String> {
+    path.as_os_str()
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| StoreError::InvalidPathEncoding {
+            path: path.to_path_buf(),
+        })
 }
 
 fn bool_to_i64(value: bool) -> i64 {
@@ -874,6 +884,43 @@ mod tests {
         assert_eq!(
             reopened.load_scrollback(session.id).unwrap(),
             Some(b"previous output".to_vec())
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_preserves_windows_native_paths_with_spaces() {
+        let path = temp_db_path("windows-paths-with-spaces");
+        let project_root = PathBuf::from(r"C:\Users\Ada Lovelace\Code\Hitch Repo");
+        let worktree_path =
+            PathBuf::from(r"C:\Users\Ada Lovelace\.hitch\worktrees\Hitch Repo\feature branch");
+        let session_cwd = worktree_path.join("nested dir");
+        let project = Project::new("Hitch Repo", project_root, ProjectKind::GitBacked);
+        let worktree = Worktree::new(
+            project.id,
+            worktree_path,
+            "feature/windows-paths",
+            false,
+            true,
+        );
+        let session = Session::new("shell", SessionParent::Worktree(worktree.id), session_cwd);
+
+        {
+            let store = Store::open(&path).unwrap();
+            store.insert_project(&project).unwrap();
+            store.insert_worktree(&worktree).unwrap();
+            store.insert_session(&session).unwrap();
+        }
+
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(
+            reopened.load_layout().unwrap(),
+            StoredLayout {
+                projects: vec![project],
+                worktrees: vec![worktree],
+                sessions: vec![session],
+            }
         );
 
         let _ = fs::remove_file(path);

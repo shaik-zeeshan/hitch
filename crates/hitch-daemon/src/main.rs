@@ -6,11 +6,13 @@
 //! the socket API consumed by the desktop client and `hitch-hook`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,15 +30,20 @@ use hitch_core::{
 };
 use hitch_git::{
     staged_diff, CommandControl, CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState,
-    GitClient, GitRepository, RemoveWorktreeRequest, StatusEntry, WorktreeCheckout,
+    GitClient, GitRepository, StatusEntry, WorktreeCheckout,
 };
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, ChangedFile, CommitDraft, ControlMessage,
-    DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
-    JobRequest, JobStatus, KnownAgent, PrInfo, ProtocolError, PullRequestDraft, Request, Response,
-    WorktreeCreateMode, WorktreePr, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
+    encode_control_message, encode_pty_frame,
+    transport::{connect_daemon, DaemonListener, DaemonStream},
+    ChangedFile, CommitDraft, ControlMessage, DraftGenerationSettings, DraftProvider, ErrorCode,
+    Event, FileDiff, FileStatus, GitStatus, JobRequest, JobStatus, KnownAgent, PrInfo,
+    ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode, WorktreePr,
+    MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
-use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY};
+use hitch_process::{DrainOutcome, PipeReader, ProcessTree};
+use hitch_pty::{
+    ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY,
+};
 use hitch_store::Store;
 
 fn main() {
@@ -226,6 +233,13 @@ impl From<Args> for DaemonConfig {
 fn detach_spawn(args: &Args) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let mut child = Command::new(exe);
+    // Keep the detached daemon's console invisible no matter who launched this
+    // `--detach` shim. The GUI client already spawns the shim windowless, but a
+    // stale or manually launched shim could carry a visible console — and the
+    // daemon would inherit it and pin the window open for its whole lifetime.
+    // Giving the daemon its own hidden console here also keeps its console
+    // children (git, draft providers) windowless.
+    hitch_process::configure_windowless(&mut child);
     child
         .arg("--socket")
         .arg(&args.socket_path)
@@ -275,7 +289,7 @@ fn detach_spawn(args: &Args) -> io::Result<()> {
 }
 
 /// Path to the daemon's log, beside the socket and store. Computed from the same
-/// `home_dir()` the store/managed-root defaults use so the Tauri client's
+/// [`data_dir`] the store/managed-root defaults use so the Tauri client's
 /// `read_daemon_log_tail` and this writer never drift onto different files
 /// (ADR 0009).
 fn daemon_log_path() -> PathBuf {
@@ -338,7 +352,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     install_panic_hook();
-    remove_stale_socket(&config.socket_path)?;
+
     if let Some(parent) = config.socket_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -347,21 +361,34 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     }
     fs::create_dir_all(&config.managed_root)?;
 
-    let listener = UnixListener::bind(&config.socket_path)?;
-    listener.set_nonblocking(true)?;
-    // Record our pid beside the socket so the GUI can force-kill us even when it
-    // never completed a `Hello` handshake (e.g. a protocol mismatch — the path
-    // that returns no pid in the response). Best-effort: a missing pidfile only
-    // costs the client its force-kill fast path, it does not break startup.
-    let pid_lock = write_pidfile(&config.socket_path);
+    let listener = DaemonListener::bind(&config.socket_path)?;
+    // The listener stays in blocking mode: a dedicated accept thread parks in
+    // `accept()` so no poll gap exists in which a connect-write-close client is
+    // dropped (see the accept thread below and ADR 0012). The old nonblocking
+    // poll loop is gone, not cfg-switched.
+    #[cfg(unix)]
+    let pid_lock = {
+        // Record our pid beside the socket so the GUI can force-kill us even when it
+        // never completed a `Hello` handshake (e.g. a protocol mismatch — the path
+        // that returns no pid in the response). Best-effort: a missing pidfile only
+        // costs the client its force-kill fast path, it does not break startup.
+        match write_pidfile(&config.socket_path) {
+            Ok(pid_lock) => pid_lock,
+            Err(err) => {
+                eprintln!("hitch-daemon: pidfile recovery disabled: {err}");
+                None
+            }
+        }
+    };
+    #[cfg(windows)]
+    let pid_lock = None;
     // The setup that follows (`Store::open`, `restore_layout`, the accept loop)
-    // can early-return via `?`. Own the pidfile + socket with a guard so they are
-    // cleared on *every* exit path: otherwise a failed startup would leave a
-    // pidfile pointing at our now-dead pid, which the GUI could later SIGKILL once
-    // the OS reuses that pid. Normal shutdown cleanup runs before the guard drops.
-    // The guard also holds the pidfile's advisory lock for our whole lifetime, so a
-    // client can tell a live daemon from a stale pidfile before force-killing a pid.
+    // can early-return via `?`. Own Unix pidfile + socket cleanup with a guard so
+    // every exit path clears filesystem rendezvous state. Windows local sockets
+    // are named-pipe endpoints owned by the listener; there is no socket path or
+    // pidfile to unlink.
     let _daemon_files = DaemonFileGuard {
+        #[cfg(unix)]
         socket_path: config.socket_path.clone(),
         _pid_lock: pid_lock,
     };
@@ -381,43 +408,153 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
 
     restore_layout(&state, &pty_tx).map_err(|err| io::Error::other(err.message))?;
     spawn_pty_dispatcher(Arc::clone(&state), dispatch_rx, Arc::clone(&shutdown));
+    // Unix-only: the command poller drives the ADR 0011 dirty-exit backstop via
+    // ManagedPty::foreground_command(), which is hard-coded to `None` on Windows
+    // (ConPTY exposes no foreground process group — see hitch-pty and ADR 0011's
+    // "Windows note"). With no resolvable command the poller can only re-broadcast
+    // the same `None` already delivered on attach, while clear_stale_agent_state
+    // returns early. Don't spawn the per-second no-op there.
+    #[cfg(unix)]
     spawn_command_poller(Arc::clone(&state), Arc::clone(&shutdown));
     spawn_dirty_poller(Arc::clone(&state), Arc::clone(&shutdown));
 
-    while !shutdown.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                stream.set_nonblocking(false)?;
-                let client_id = register_client(&state, &stream)?;
-                let state = Arc::clone(&state);
-                let shutdown = Arc::clone(&shutdown);
-                let channels = DispatchChannels {
-                    pty_tx: pty_tx.clone(),
-                    dispatch_tx: dispatch_tx.clone(),
-                };
-                thread::Builder::new()
-                    .name(format!("hitch-client-{client_id}"))
-                    .spawn(move || handle_client(client_id, stream, state, shutdown, channels))
-                    .map_err(io::Error::other)?;
+    // A dedicated thread parks in the blocking `accept()` and forwards each
+    // accepted stream over this channel. Parking (rather than polling a
+    // nonblocking listener) removes the poll-gap window in which a Windows
+    // named-pipe client that connects, writes, and closes between polls was
+    // silently dropped — there is always an armed accept waiting. The accept
+    // thread re-checks `shutdown` after every `accept()` return and exits when it
+    // is set; `ShutdownDaemon` wakes the parked accept with a best-effort
+    // self-connect to its own endpoint (see the handler). A residual re-arm gap
+    // remains between an `accept()` returning and the next one being issued, so a
+    // concurrent connect can still see `ERROR_PIPE_BUSY` — clients keep their
+    // busy-retry for that, and the hook keeps its ack-wait for stale daemons that
+    // still poll (ADR 0012).
+    let (accept_tx, accept_rx) = mpsc::channel::<DaemonStream>();
+    let accept_shutdown = Arc::clone(&shutdown);
+    let accept_thread = thread::Builder::new()
+        .name("hitch-accept".to_string())
+        .spawn(move || {
+            // Exponential backoff for the error path: a hard, persistent failure
+            // (e.g. fd/handle exhaustion — EMFILE/ENFILE/ERROR_NO_SYSTEM_RESOURCES)
+            // leaves the listener handle valid and the shutdown flag unset, so
+            // re-arming immediately would peg a CPU core and flood the log. Start
+            // small, grow to a 1s ceiling, and reset on the next successful accept.
+            const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(25);
+            const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+            let mut backoff = ACCEPT_BACKOFF_MIN;
+            loop {
+                match listener.accept() {
+                    Ok(stream) => {
+                        backoff = ACCEPT_BACKOFF_MIN;
+                        if accept_shutdown.load(Ordering::SeqCst) {
+                            // A shutdown self-connect (or a real client racing the
+                            // flag) unparked us; stop arming new accepts.
+                            break;
+                        }
+                        // The sole receiver is the main loop below; if it has gone
+                        // (daemon already tearing down) the send fails and we exit.
+                        if accept_tx.send(stream).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        if accept_shutdown.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        // A per-accept failure (e.g. a transient named-pipe error)
+                        // must not kill the daemon. Log and re-arm after a backoff
+                        // sleep so a persistent failure (handle exhaustion) cannot
+                        // spin a busy loop. Re-check shutdown after the sleep so a
+                        // concurrent `ShutdownDaemon` is honored within one backoff
+                        // interval rather than blocked behind it.
+                        eprintln!("hitch-daemon: accept failed: {err}");
+                        thread::sleep(backoff);
+                        if accept_shutdown.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+                    }
+                }
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(err) => return Err(err),
+        })
+        .map_err(io::Error::other)?;
+
+    for stream in &accept_rx {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
         }
+        // Each accepted stream is switched to blocking for its per-client thread.
+        // A failure here is per-connection (e.g. a Windows named-pipe handle
+        // transiently rejecting the mode switch) and MUST NOT propagate out of
+        // the accept loop — doing so would tear down the entire daemon (every PTY
+        // session and all agent-state tracking) over one bad client. Log and drop
+        // just this connection instead.
+        if let Err(err) = stream.set_nonblocking(false) {
+            eprintln!("hitch-daemon: dropping client, set_nonblocking failed: {err}");
+            continue;
+        }
+        let client_id = register_client(&state, &stream)?;
+        let state = Arc::clone(&state);
+        let shutdown = Arc::clone(&shutdown);
+        let channels = DispatchChannels {
+            pty_tx: pty_tx.clone(),
+            dispatch_tx: dispatch_tx.clone(),
+        };
+        thread::Builder::new()
+            .name(format!("hitch-client-{client_id}"))
+            .spawn(move || handle_client(client_id, stream, state, shutdown, channels))
+            .map_err(io::Error::other)?;
     }
+
+    // The accept thread observes the same `shutdown` flag and exits after its
+    // current parked `accept()` is woken by the self-connect. Join it so a clean
+    // shutdown does not race the listener's drop; detaching would also be safe
+    // since the process exits, but joining keeps the lifecycle explicit.
+    let _ = accept_thread.join();
 
     cancel_active_jobs(&state);
     wait_for_jobs_to_finish(&state);
     kill_all_sessions(&state);
-    // Pidfile + socket are removed by `DaemonFileGuard` as it drops on return.
+    // Unix pidfile + socket are removed by `DaemonFileGuard` as it drops on return.
     Ok(())
 }
 
-/// Removes the daemon's pidfile and socket whenever `run_daemon` returns — by
-/// normal shutdown or by an early `?` during startup. Created right after the
-/// pidfile is written so no exit path can leak a stale pid (see `write_pidfile`).
+/// Unblock the parked accept thread after the shutdown flag is set.
+///
+/// The accept thread sits in a blocking `accept()`; flipping `shutdown` is
+/// invisible to it until a connection completes the pending accept. We complete
+/// it ourselves with a best-effort connect to our own endpoint, then drop the
+/// stream immediately. The accept thread wakes, re-reads `shutdown`, sees it set,
+/// and exits without arming another accept. Failures are ignored: if the connect
+/// loses a race with the listener already tearing down, the thread is exiting
+/// anyway, and the daemon process exit reclaims the pipe regardless.
+fn wake_accept_thread(socket_path: &Path) {
+    // A few short attempts: the accept thread re-arms a fresh pipe instance after
+    // each accepted connection, so a momentary `ERROR_PIPE_BUSY` (no armed
+    // instance at this instant) clears as soon as it loops back into `accept()`.
+    // Bounded so a daemon that already lost its endpoint never spins here.
+    for _ in 0..10 {
+        match connect_daemon(socket_path) {
+            Ok(stream) => {
+                drop(stream);
+                return;
+            }
+            Err(err) if hitch_proto::transport::is_endpoint_busy(&err) => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            // NotFound / refused: the listener is already gone, so the accept
+            // thread has already unblocked and exited. Nothing to wake.
+            Err(_) => return,
+        }
+    }
+}
+
+/// Removes Unix daemon files whenever `run_daemon` returns — by normal shutdown
+/// or by an early `?` during startup. Created right after the pidfile is written
+/// so no exit path can leak a stale pid (see `write_pidfile`).
 struct DaemonFileGuard {
+    #[cfg(unix)]
     socket_path: PathBuf,
     // Held open for the daemon's whole lifetime so the advisory pidfile lock stays
     // taken; dropping it (clean exit or unwind) releases the lock, and the OS
@@ -427,8 +564,11 @@ struct DaemonFileGuard {
 
 impl Drop for DaemonFileGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(hitch_proto::transport::pidfile_path(&self.socket_path));
-        let _ = fs::remove_file(&self.socket_path);
+        #[cfg(unix)]
+        {
+            let _ = fs::remove_file(hitch_proto::transport::pidfile_path(&self.socket_path));
+            let _ = fs::remove_file(&self.socket_path);
+        }
     }
 }
 
@@ -445,25 +585,25 @@ impl Drop for DaemonFileGuard {
 /// the bind that precedes this call guarantees we are the sole owner of this
 /// socket path. Any failure here only disables forced recovery; it never blocks
 /// startup, so we return `None` and carry on.
-fn write_pidfile(socket_path: &Path) -> Option<File> {
+#[cfg(unix)]
+fn write_pidfile(socket_path: &Path) -> io::Result<Option<File>> {
     let path = hitch_proto::transport::pidfile_path(socket_path);
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(&path)
-        .ok()?;
+        .open(&path)?;
     // SAFETY: `flock` on a freshly opened, valid fd. `LOCK_NB` so a contended lock
     // fails fast instead of blocking startup. We already own the socket bind, so
     // contention is not expected; if it happens, skip writing a pid we can't defend
     // with the lock rather than leave a kill-target we don't own.
     let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
     if !locked {
-        return None;
+        return Ok(None);
     }
-    let _ = write!(file, "{}", std::process::id());
-    let _ = file.flush();
-    Some(file)
+    write!(file, "{}", std::process::id())?;
+    file.flush()?;
+    Ok(Some(file))
 }
 
 struct DaemonState {
@@ -511,16 +651,15 @@ struct ActiveJob {
 
 /// Shared control handle for one running **Job** (ADR 0008). The Job registry on
 /// `DaemonState` and the Job worker thread both hold an `Arc<JobControl>`:
-/// `CancelJob` flips `cancelled` and kills any registered child process group;
-/// the worker checks `is_cancelled()` and registers the pid of a cancellable
-/// child (the Draft Generator's provider tree) so the kill reaches grandchildren.
+/// `CancelJob` flips `cancelled` and terminates any registered process tree;
+/// the worker checks `is_cancelled()` and registers the cancellable child tree
+/// (the Draft Generator's provider tree, or git/gh commands) so cancellation
+/// reaches grandchildren. On Windows the tree is a Job Object; on Unix it is a
+/// process group.
 #[derive(Default)]
 struct JobControl {
     cancelled: AtomicBool,
-    /// Process-group leader pid of the Job's currently-running child, if any.
-    /// Drafts spawn their provider as its own group leader (see `drafts.rs`), so
-    /// signalling the negated pid reaches the whole tree.
-    child_pgid: Mutex<Option<i32>>,
+    process_tree: Mutex<Option<ProcessTree>>,
 }
 
 impl JobControl {
@@ -528,42 +667,38 @@ impl JobControl {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    /// Register (or clear) the pid of the child process group the Job is running,
-    /// so a concurrent cancel can kill it. The worker sets it just after spawn and
-    /// clears it on exit.
-    fn set_child_pgid(&self, pgid: Option<i32>) {
-        if let Ok(mut guard) = self.child_pgid.lock() {
-            *guard = pgid;
+    /// Register (or clear) the process tree the Job is running, so a concurrent
+    /// cancel can terminate it. The worker sets it just after spawn and clears it
+    /// on exit.
+    fn set_process_tree(&self, process_tree: Option<ProcessTree>) {
+        if let Ok(mut guard) = self.process_tree.lock() {
+            *guard = process_tree;
         }
     }
 
-    /// Signal cancellation and, if a child process group is registered, SIGKILL it
-    /// (process-group kill, mirroring `drafts::kill_process_tree`). Jobs that run
-    /// a subprocess-backed `git`/`gh` command register that group too, so daemon
-    /// shutdown can cancel them before exit rather than orphaning background work.
+    /// Signal cancellation and, if a child process tree is registered, terminate
+    /// it. Jobs that run a subprocess-backed `git`/`gh` command register that
+    /// tree too, so daemon shutdown can cancel them before exit rather than
+    /// orphaning background work.
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
-        if let Ok(guard) = self.child_pgid.lock() {
-            if let Some(pgid) = *guard {
-                // SAFETY: `kill(2)` with a negative pid signals the process group;
-                // it has no memory-safety preconditions and an already-gone group
-                // returns ESRCH, which we ignore.
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(-pgid, libc::SIGKILL);
-                }
-            }
+        let process_tree = self
+            .process_tree
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(process_tree) = process_tree {
+            let _ = process_tree.terminate();
         }
     }
 }
-
 impl CommandControl for JobControl {
     fn is_cancelled(&self) -> bool {
         JobControl::is_cancelled(self)
     }
 
-    fn set_child_pgid(&self, pgid: Option<i32>) {
-        JobControl::set_child_pgid(self, pgid);
+    fn set_process_tree(&self, process_tree: Option<ProcessTree>) {
+        JobControl::set_process_tree(self, process_tree);
     }
 }
 
@@ -699,7 +834,7 @@ struct DispatchChannels {
 }
 
 struct ClientSink {
-    writer: Mutex<UnixStream>,
+    writer: Mutex<DaemonStream>,
     /// Output readiness gate. `false` until the replay thread has delivered the
     /// full scrollback snapshot and drained any output buffered in `pending`.
     /// and writes directly once it is open. Job events use their own gate below;
@@ -752,6 +887,18 @@ fn restore_layout(
         if !session.cwd.is_dir() {
             continue;
         }
+        // Restored sessions must reinstall agent hooks just like freshly opened
+        // ones (`open_session`): the hook configs live on disk in the worktree
+        // and can be deleted between runs (the agent rewriting its config dir, a
+        // clean checkout, manual cleanup). Without this, a restored session runs
+        // agents that never report state until the user happens to open a new
+        // session in the same worktree. Best-effort for the same reason as every
+        // other install site: a broken config must not block restoring terminals.
+        if let SessionParent::Worktree(worktree_id) = session.parent {
+            if let Err(err) = install_agent_hooks_for_worktree_id(state, worktree_id) {
+                eprintln!("hitch-daemon: {}", err.message);
+            }
+        }
         // ADR 0003: across a daemon restart the live PTY processes are gone, so
         // each saved session reopens as a FRESH terminal. We deliberately do NOT
         // replay the previous run's persisted scrollback. The respawned shell
@@ -781,7 +928,7 @@ fn restore_layout(
     Ok(())
 }
 
-fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &UnixStream) -> io::Result<u64> {
+fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &DaemonStream) -> io::Result<u64> {
     let writer = stream.try_clone()?;
     let mut state = state.lock().map_err(|_| poisoned("state"))?;
     let client_id = state.next_client_id;
@@ -810,7 +957,7 @@ fn unregister_client(state: &Arc<Mutex<DaemonState>>, client_id: u64) {
 
 fn handle_client(
     client_id: u64,
-    stream: UnixStream,
+    stream: DaemonStream,
     state: Arc<Mutex<DaemonState>>,
     shutdown: Arc<AtomicBool>,
     channels: DispatchChannels,
@@ -993,8 +1140,18 @@ fn handle_request<R: Read>(
             delete_branch,
             force,
         } => {
-            remove_worktree(state, worktree_id, delete_branch, force)?;
+            let closed_session_ids = remove_worktree(state, worktree_id, delete_branch, force)?;
             send_response(state, client_id, request_id, Response::Ack)?;
+            for session_id in closed_session_ids {
+                broadcast_event(
+                    state,
+                    Event::SessionClosed {
+                        session_id,
+                        exit_code: None,
+                    },
+                )?;
+            }
+            broadcast_event(state, Event::WorktreeRemoved { worktree_id })?;
         }
         Request::ListSessions { parent } => {
             let sessions = {
@@ -1217,7 +1374,14 @@ fn handle_request<R: Read>(
         }
         Request::ShutdownDaemon => {
             send_response(state, client_id, request_id, Response::Ack)?;
+            // Resolve the endpoint before flipping the flag so the wake connect
+            // below targets our own listener.
+            let socket_path = {
+                let guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+                guard.config.socket_path.clone()
+            };
             shutdown.store(true, Ordering::SeqCst);
+            wake_accept_thread(&socket_path);
         }
     }
 
@@ -1489,9 +1653,11 @@ fn prune_missing_worktree(state: &Arc<Mutex<DaemonState>>, worktree_id: Worktree
         }
     }
 
-    let Ok(mut state) = state.lock() else { return };
-    if state.store.delete_worktree(worktree_id).is_ok() {
-        state.worktrees.remove(&worktree_id);
+    let Ok(mut guard) = state.lock() else { return };
+    if guard.store.delete_worktree(worktree_id).is_ok() {
+        guard.worktrees.remove(&worktree_id);
+        drop(guard);
+        let _ = broadcast_event(state, Event::WorktreeRemoved { worktree_id });
     }
 }
 
@@ -1752,8 +1918,8 @@ fn remove_worktree(
     worktree_id: WorktreeId,
     delete_branch: bool,
     force: bool,
-) -> Result<(), ProtocolError> {
-    let (project, worktree, git, live_session_ids) = {
+) -> Result<Vec<SessionId>, ProtocolError> {
+    let (project, worktree, git_path, live_session_ids) = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
         let worktree = state
             .worktrees
@@ -1771,7 +1937,12 @@ fn remove_worktree(
             .filter(|session| session.session.parent == SessionParent::Worktree(worktree_id))
             .map(|session| session.session.id)
             .collect::<Vec<_>>();
-        (project, worktree, state.git.clone(), live_session_ids)
+        (
+            project,
+            worktree,
+            state.config.git.clone(),
+            live_session_ids,
+        )
     };
 
     if worktree.is_main {
@@ -1804,33 +1975,125 @@ fn remove_worktree(
         ));
     }
 
-    for session_id in live_session_ids {
-        match close_session(state, session_id, true) {
-            Ok(()) => {}
+    // Tear down every session that lives in this worktree, then run git. We kill
+    // the PTYs BEFORE git removal because on Windows a live shell holds the
+    // worktree directory open and `git worktree remove` would fail. The
+    // destructive teardown must be SURVIVABLE: git removal can still fail (the
+    // directory is busy, the branch has unmerged commits), and a failed removal
+    // must leave the worktree usable rather than orphaning its sessions. We
+    // therefore capture each closed session's layout row and, on git failure,
+    // re-insert those rows so the next daemon launch's `restore_layout` revives
+    // them as fresh terminals (ADR 0003). We rely on restore rather than keeping
+    // the dead PTYs in memory because killing a PTY makes its in-memory session
+    // unusable anyway, and the PTY-exit dispatcher deletes such rows on its own.
+    let mut closed = Vec::new();
+    {
+        let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        for session_id in live_session_ids {
             // Tolerate a session that vanished on its own (PTY-exit dispatcher)
             // or was closed by another client; a force-removal must continue.
-            Err(err) if err.code == ErrorCode::NotFound => {}
-            Err(err) => return Err(err),
+            if let Some(session) = state.sessions.remove(&session_id) {
+                closed.push(session);
+            }
+        }
+        let racing_ids = state
+            .sessions
+            .values()
+            .filter(|session| session.session.parent == SessionParent::Worktree(worktree_id))
+            .map(|session| session.session.id)
+            .collect::<Vec<_>>();
+        if !force && !racing_ids.is_empty() {
+            return Err(ProtocolError::new(
+                ErrorCode::LiveSessions,
+                "worktree has live sessions; retry with force to kill them",
+            ));
+        }
+        for session_id in racing_ids {
+            if let Some(session) = state.sessions.remove(&session_id) {
+                closed.push(session);
+            }
+        }
+        // Hide the worktree from new OpenSession requests while the bounded git
+        // removal runs without the global state mutex. Both the worktree and the
+        // session store rows are deleted only after git succeeds (below) so a
+        // failed removal can be restored.
+        state.worktrees.remove(&worktree_id);
+    }
+    // Kill the PTYs (their handles were removed from the map above). This fires
+    // the PTY-exit dispatcher, which deletes their store rows; the re-insert on
+    // git failure runs after the settle below, so it lands after the dispatcher
+    // has processed those exits.
+    let mut closed_session_ids = Vec::new();
+    let mut closed_sessions = Vec::new();
+    for session in closed {
+        let _ = session.pty.kill();
+        closed_session_ids.push(session.session.id);
+        closed_sessions.push(session.session);
+    }
+    if force && !closed_session_ids.is_empty() {
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    if let Err(err) = remove_git_worktree_bounded(
+        &git_path,
+        &project.root,
+        &worktree.path,
+        force,
+        delete_branch.then_some(worktree.branch.as_str()),
+    ) {
+        let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        // Restore the in-memory worktree row so the GUI shows it again, and
+        // re-insert the closed sessions' layout rows so the next daemon launch
+        // revives them as fresh terminals. The PTY-exit dispatcher has by now
+        // deleted those rows, so a plain insert is the expected path; tolerate a
+        // surviving row (a slow dispatcher) by replacing it.
+        state.worktrees.entry(worktree_id).or_insert(worktree);
+        for session in &closed_sessions {
+            let _ = state.store.delete_session(session.id);
+            if let Err(insert_err) = state.store.insert_session(session) {
+                eprintln!(
+                    "hitch-daemon: failed to restore session after git removal failed: {}",
+                    store_error(insert_err).message
+                );
+            }
+        }
+        return Err(err);
+    }
+
+    // Git removal succeeded: now delete the closed sessions' store rows. The
+    // PTY-exit dispatcher most likely already deleted them, so tolerate a
+    // missing row rather than treating it as an error.
+    {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        for session in &closed_sessions {
+            let _ = state.store.delete_session(session.id);
         }
     }
 
-    git.remove_worktree(
-        &project.root,
-        &RemoveWorktreeRequest {
-            path: worktree.path,
-            force,
-            delete_branch: delete_branch.then_some(worktree.branch),
-        },
-    )
-    .map_err(git_error)?;
+    let post_remove_orphans = {
+        let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        let racing_ids = state
+            .sessions
+            .values()
+            .filter(|session| session.session.parent == SessionParent::Worktree(worktree_id))
+            .map(|session| session.session.id)
+            .collect::<Vec<_>>();
+        state
+            .store
+            .delete_worktree(worktree_id)
+            .map_err(store_error)?;
+        state.worktrees.remove(&worktree_id);
+        racing_ids
+            .into_iter()
+            .filter_map(|id| state.sessions.remove(&id).map(|session| (id, session)))
+            .collect::<Vec<_>>()
+    };
 
-    let mut state = state.lock().map_err(|_| internal("state lock poisoned"))?;
-    state
-        .store
-        .delete_worktree(worktree_id)
-        .map_err(store_error)?;
-    state.worktrees.remove(&worktree_id);
-    Ok(())
+    for (session_id, session) in post_remove_orphans {
+        let _ = session.pty.kill();
+        closed_session_ids.push(session_id);
+    }
+    Ok(closed_session_ids)
 }
 
 fn open_session(
@@ -1885,6 +2148,183 @@ fn open_session(
         },
     );
     Ok(session)
+}
+
+fn remove_git_worktree_bounded(
+    git_path: &Path,
+    repo_root: &Path,
+    worktree_path: &Path,
+    force: bool,
+    delete_branch: Option<&str>,
+) -> Result<(), ProtocolError> {
+    if force {
+        remove_worktree_dir_after_forced_session_close(worktree_path)?;
+        run_git_with_timeout(
+            git_path,
+            repo_root,
+            [
+                OsArg::Borrowed("worktree"),
+                OsArg::Borrowed("prune"),
+                OsArg::Borrowed("--expire=now"),
+            ],
+            Duration::from_secs(5),
+        )?;
+    } else {
+        let args = [
+            OsArg::Borrowed("worktree"),
+            OsArg::Borrowed("remove"),
+            // Pass the path as an OsString so a non-UTF-8 path on Unix reaches
+            // git verbatim; a lossy String conversion would corrupt it and make
+            // `git worktree remove` fail to find the worktree.
+            OsArg::OwnedOs(worktree_path.as_os_str().to_owned()),
+        ];
+        match run_git_with_timeout(git_path, repo_root, args, Duration::from_secs(10)) {
+            Ok(()) => {}
+            Err(err)
+                if !worktree_path.exists() && err.message.contains("is not a working tree") => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    if let Some(branch) = delete_branch {
+        // Let `git branch -d` perform its own merged-safety check. It refuses to
+        // delete an unmerged branch and surfaces a descriptive error, while also
+        // honoring git's full safety semantics (merged into HEAD *or* its
+        // upstream) — broader than a local `merge-base --is-ancestor HEAD`
+        // preflight, which would reject deletions git itself allows.
+        run_git_with_timeout(
+            git_path,
+            repo_root,
+            [
+                OsArg::Borrowed("branch"),
+                OsArg::Borrowed("-d"),
+                OsArg::Borrowed(branch),
+            ],
+            Duration::from_secs(5),
+        )?;
+    }
+    Ok(())
+}
+
+fn remove_worktree_dir_after_forced_session_close(
+    worktree_path: &Path,
+) -> Result<(), ProtocolError> {
+    let mut last_error = None;
+    for attempt in 0..50 {
+        match fs::remove_dir_all(worktree_path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) if attempt < 49 => {
+                last_error = Some(err);
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => {
+                last_error = Some(err);
+                break;
+            }
+        }
+    }
+    Err(ProtocolError::new(
+        ErrorCode::GitFailed,
+        format!(
+            "failed to remove worktree directory {} after closing sessions: {}",
+            worktree_path.display(),
+            last_error
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "timed out".to_string())
+        ),
+    ))
+}
+
+enum OsArg<'a> {
+    Borrowed(&'a str),
+    OwnedOs(OsString),
+}
+
+/// Bounded wait for a git reader thread to reach EOF after the child exited.
+/// Matches `hitch-git::READER_DRAIN_GRACE`; the child is already reaped here, so
+/// a still-parked reader is detached with whatever git wrote.
+const GIT_READER_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+fn run_git_with_timeout<'a, I>(
+    git_path: &Path,
+    repo_root: &Path,
+    args: I,
+    timeout: Duration,
+) -> Result<(), ProtocolError>
+where
+    I: IntoIterator<Item = OsArg<'a>>,
+{
+    let mut command = Command::new(git_path);
+    command.current_dir(repo_root).stdin(Stdio::null());
+    // This git invocation does not go through `ProcessTree::spawn`, so suppress
+    // the console window explicitly. See `hitch_process::configure_windowless`.
+    hitch_process::configure_windowless(&mut command);
+    for arg in args {
+        match arg {
+            OsArg::Borrowed(arg) => {
+                command.arg(arg);
+            }
+            OsArg::OwnedOs(arg) => {
+                command.arg(arg);
+            }
+        };
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| ProtocolError::new(ErrorCode::GitFailed, err.to_string()))?;
+    // Drain stdout/stderr on reader threads while we poll. Without concurrent
+    // draining, git that writes more than the OS pipe buffer (~64KB) blocks on a
+    // full pipe and never exits, so the poll loop below would spuriously kill it
+    // at the deadline. `PipeReader` is the shared primitive used by `hitch-git`
+    // and `drafts.rs` for exactly this. We never read stdout's content (only
+    // stderr feeds the error message), but the reader must stay bound for the
+    // whole function so its thread keeps draining the pipe.
+    let _stdout_reader = child.stdout.take().map(PipeReader::spawn);
+    let stderr_reader = child.stderr.take().map(PipeReader::spawn);
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| ProtocolError::new(ErrorCode::GitFailed, err.to_string()))?
+        {
+            if status.success() {
+                return Ok(());
+            }
+            // The child exited on its own, so its write ends are closed and the
+            // readers reach EOF. Bounded-drain to collect stderr for the message
+            // without blocking on a stuck reader.
+            let stderr_bytes = stderr_reader.map(drain_git_reader_bounded).unwrap_or_default();
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
+            return Err(ProtocolError::new(
+                ErrorCode::GitFailed,
+                format!("git failed: {stderr}"),
+            ));
+        }
+        if started.elapsed() >= timeout {
+            // Killing the child closes the captured write ends, so the reader
+            // threads reach EOF and finish; drop them implicitly without waiting.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ProtocolError::new(
+                ErrorCode::GitFailed,
+                "git worktree remove timed out waiting for the worktree path to become removable",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Collect a finished git reader's output, collapsing the drained and
+/// timed-out outcomes to the bytes read (the daemon uses whatever git already
+/// wrote for the error message). Mirrors `hitch-git`'s `drain_pipe_reader_bounded`.
+fn drain_git_reader_bounded(reader: PipeReader) -> Vec<u8> {
+    reader
+        .drain_bounded(GIT_READER_DRAIN_GRACE)
+        .map(DrainOutcome::into_inner)
+        .unwrap_or_default()
 }
 
 fn close_session(
@@ -2077,12 +2517,13 @@ fn git_diff(
             .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?
     };
     let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
+    let diff_path = diff_path_for_worktree(&worktree.path, &path);
     let mut diff = repo
-        .diff_file(&path, DiffTarget::Worktree)
+        .diff_file(&diff_path, DiffTarget::Worktree)
         .map_err(git_error)?;
     if diff.is_empty() {
         diff = repo
-            .diff_file(&path, DiffTarget::Staged)
+            .diff_file(&diff_path, DiffTarget::Staged)
             .map_err(git_error)?;
     }
     Ok(FileDiff {
@@ -2092,13 +2533,28 @@ fn git_diff(
     })
 }
 
+fn diff_path_for_worktree<'a>(worktree_path: &Path, path: &'a Path) -> std::borrow::Cow<'a, Path> {
+    if path.is_absolute() {
+        if let Ok(relative) = path.strip_prefix(worktree_path) {
+            return std::borrow::Cow::Owned(relative.to_path_buf());
+        }
+        if let (Ok(root), Ok(file)) = (worktree_path.canonicalize(), path.canonicalize()) {
+            if let Ok(relative) = file.strip_prefix(root) {
+                return std::borrow::Cow::Owned(relative.to_path_buf());
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
 fn list_draft_models(
     state: &Arc<Mutex<DaemonState>>,
     provider: DraftProvider,
+    settings: Option<DraftGenerationSettings>,
     cancel: Option<&JobControl>,
 ) -> Result<Vec<String>, ProtocolError> {
     let config = draft_provider_config(state)?;
-    drafts::list_models(&config, provider, cancel)
+    drafts::list_models(&config, provider, settings, cancel)
 }
 
 fn generate_commit_draft(
@@ -2323,6 +2779,12 @@ fn spawn_dirty_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>)
 /// keeps idle terminals quiet. Agent-state exit detection is deliberately
 /// conservative: tools spawned by an agent can become the foreground process,
 /// so only returning to an interactive shell is treated as "agent gone".
+///
+/// Unix-only: ManagedPty::foreground_command() always returns `None` on Windows
+/// (ConPTY exposes no foreground process group — see hitch-pty and ADR 0011's
+/// "Windows note"), so this poller would be a per-second no-op there and is not
+/// spawned on non-Unix platforms.
+#[cfg(unix)]
 fn spawn_command_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>) {
     thread::Builder::new()
         .name("hitch-cmd-poll".into())
@@ -2589,6 +3051,9 @@ fn store_agent_report(
     }
 }
 
+// Only the Unix command poller calls this (the ADR 0011 dirty-exit backstop).
+// On Windows foreground_command() is always `None`, so the poller is not spawned.
+#[cfg(unix)]
 fn clear_stale_agent_state(
     state: &Arc<Mutex<DaemonState>>,
     session_id: SessionId,
@@ -2618,6 +3083,8 @@ fn clear_stale_agent_state(
     })
 }
 
+// Used by the Unix-only clear_stale_agent_state and by tests on all platforms.
+#[cfg(any(unix, test))]
 fn agent_command_matches(agent: KnownAgent, command: &str) -> bool {
     let executable = command.split_whitespace().next().unwrap_or(command);
     let executable = Path::new(executable)
@@ -2629,6 +3096,8 @@ fn agent_command_matches(agent: KnownAgent, command: &str) -> bool {
         KnownAgent::Codex => executable == "codex",
     }
 }
+// Used by the Unix-only clear_stale_agent_state and by tests on all platforms.
+#[cfg(any(unix, test))]
 fn foreground_command_is_shell(command: &str) -> bool {
     let executable = command.split_whitespace().next().unwrap_or(command);
     let executable = Path::new(executable)
@@ -3058,7 +3527,7 @@ fn dispatch_job(
                 do_create_pr(state, worktree_id, title, body, base, draft, control)
             },
         ),
-        JobRequest::ListDraftModels { provider } => start_job(
+        JobRequest::ListDraftModels { provider, settings } => start_job(
             "hitch-draft-models",
             state,
             client_id,
@@ -3066,7 +3535,7 @@ fn dispatch_job(
             Some("draft-models"),
             None,
             move |state, control| {
-                let models = list_draft_models(state, provider, Some(control))?;
+                let models = list_draft_models(state, provider, settings, Some(control))?;
                 Ok(Response::DraftModels { provider, models })
             },
         ),
@@ -3503,24 +3972,11 @@ fn kill_all_sessions(state: &Arc<Mutex<DaemonState>>) {
     }
 }
 
-fn remove_stale_socket(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path),
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("{} exists and is not a socket", path.display()),
-        )),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
-/// Per-instance data directory under `$HOME`. `.hitch` for release builds,
-/// `.hitch-dev` for debug builds, so a dev daemon never shares a store, managed
-/// worktrees, or log with an installed release daemon (see
-/// `hitch_proto::transport::instance_dir_name`).
+/// Per-instance data directory. The cross-platform layout is owned by
+/// [`hitch_proto::transport::default_data_dir`] so the daemon and the GUI's
+/// `daemon_log_path` never drift onto different roots.
 fn data_dir() -> PathBuf {
-    home_dir().join(hitch_proto::transport::instance_dir_name())
+    hitch_proto::transport::default_data_dir()
 }
 
 fn default_store_path() -> PathBuf {
@@ -3547,12 +4003,6 @@ fn hook_helper_path_for_daemon_exe(exe: &Path) -> PathBuf {
     };
     let suffix = file_name.strip_prefix("hitch-daemon").unwrap_or_default();
     parent.join(format!("hitch-hook{suffix}"))
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
 }
 
 fn store_error(err: hitch_store::StoreError) -> ProtocolError {
@@ -3711,6 +4161,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn agent_state_before_replay_waits_until_session_snapshot_is_sent() {
         use hitch_core::{AgentState, WorktreeId};
@@ -4237,25 +4688,24 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn job_control_cancel_kills_registered_child_process_group() {
-        use std::os::unix::process::CommandExt;
+        use hitch_process::ProcessTree;
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
 
-        // A long-lived child in its own process group, exactly as the Draft
-        // Generator spawns its provider. `CancelJob` must reach it via the
-        // process-group SIGKILL path so it dies promptly rather than running its
+        // A long-lived child in a registered process tree, exactly as the Draft
+        // Generator spawns its provider. On Unix the tree is a process group;
+        // `CancelJob` must reach it so it dies promptly rather than running its
         // full sleep.
         let control = super::JobControl::default();
-        let mut child = {
+        let (mut child, process_tree) = {
             let mut cmd = Command::new("sleep");
             cmd.arg("30")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            cmd.process_group(0);
-            cmd.spawn().expect("spawn sleep")
+            ProcessTree::spawn(&mut cmd).expect("spawn sleep")
         };
-        control.set_child_pgid(Some(child.id() as i32));
+        control.set_process_tree(Some(process_tree));
 
         control.cancel();
         assert!(control.is_cancelled());
@@ -4273,6 +4723,52 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn job_control_cancel_kills_registered_windows_process_tree() {
+        use hitch_process::ProcessTree;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        // A PowerShell provider that starts a long-lived child and then stays
+        // alive itself. On Windows the registered `ProcessTree` is a Job Object;
+        // `CancelJob` must terminate it promptly instead of waiting for either
+        // sleep to finish.
+        let control = super::JobControl::default();
+        let (mut child, process_tree) = {
+            let mut cmd = Command::new("powershell.exe");
+            cmd.arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-Command")
+                .arg(
+                    "$child = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -PassThru; Start-Sleep -Seconds 30",
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            ProcessTree::spawn(&mut cmd).expect("spawn powershell")
+        };
+        control.set_process_tree(Some(process_tree));
+
+        control.cancel();
+        assert!(control.is_cancelled());
+
+        let started = Instant::now();
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(_) => break,
+                None if started.elapsed() > Duration::from_secs(5) => {
+                    let _ = child.kill();
+                    panic!("cancel did not kill the registered Windows process tree");
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn start_job_releases_worker_before_running_broadcast() {
         use std::os::unix::net::UnixStream;
@@ -4542,6 +5038,7 @@ mod tests {
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[cfg(unix)]
     #[test]
     fn list_worktrees_broadcasts_external_branch_change() {
         use hitch_core::{Project, ProjectKind, Worktree};

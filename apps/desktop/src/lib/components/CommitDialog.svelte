@@ -11,6 +11,7 @@
     setFilesStaged,
   } from "../daemon";
   import { commitOpen } from "../overlays";
+  import { currentDesktopPlatform, isShortcutModifier, shortcutLabel } from "../desktopPlatform";
 
   // `triggerless`: mount the dialog without its own trigger button, so another
   // surface (the Changes-panel action menu) can open it via the commitOpen store.
@@ -32,6 +33,9 @@
   const canCommit = $derived(staged.length > 0 && subject.trim().length > 0 && !$gitBusy && !submitting);
   const canGenerate = $derived(staged.length > 0 && !$gitBusy && !generating);
   const canStageAllAndGenerate = $derived(staged.length === 0 && unstaged.length > 0 && !$gitBusy && !generating);
+
+  const desktopPlatform = currentDesktopPlatform();
+  const commitShortcut = shortcutLabel(desktopPlatform, desktopPlatform === "macos" ? "⏎" : "Enter");
 
   // Bumped on each open-reset so an in-flight draft request that resolves after
   // the dialog was closed and reopened can detect it's stale and skip clobbering
@@ -118,7 +122,7 @@
   }
 
   function onSubjectKey(event: KeyboardEvent) {
-    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+    if (event.key === "Enter" && isShortcutModifier(event, desktopPlatform)) {
       event.preventDefault();
       if (canCommit) void submit();
     }
@@ -172,7 +176,7 @@
         <Dialog.Close class="btn">Cancel</Dialog.Close>
         <button class="btn primary" disabled={!canCommit} onclick={() => void submit()}>
           {submitting ? "Committing…" : "Commit"}
-          <span class="kbd">⌘⏎</span>
+          <span class="kbd">{commitShortcut}</span>
         </button>
       </div>
     </Dialog.Content>

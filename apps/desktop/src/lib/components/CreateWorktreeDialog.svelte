@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Create-worktree dialog. Opened from the "+" on a project row and the ⌘K
-  // palette via the createWorktreeFor store (the project it creates under).
+  // Create-worktree dialog. Opened from the "+" on a project row and the
+  // command palette via the createWorktreeFor store (the project it creates under).
   //
   // There is no "new branch / existing branch" mode toggle. A single search
   // field drives a palette-style list: the top row always offers to CREATE a

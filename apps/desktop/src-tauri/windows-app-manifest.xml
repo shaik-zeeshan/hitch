@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Hitch Windows application manifest.
+
+  Starts from tauri-build's default manifest (the Microsoft.Windows.Common-Controls
+  v6 dependency that Tauri/wry require for themed common controls) and adds the
+  long-path-aware Windows setting so managed worktrees deep under
+  %LOCALAPPDATA%\Hitch\worktrees\… are not capped at the legacy MAX_PATH (260).
+  See ADR 0012 (MAX_PATH mitigation) and docs/windows-packaging.md.
+
+  longPathAware only takes effect when the OS LongPathsEnabled policy is also on;
+  hitch-git additionally `\\?\`-prefixes its own filesystem access so the daemon's
+  worktree lifecycle works regardless of either setting (see docs/windows-packaging.md).
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>

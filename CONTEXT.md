@@ -43,7 +43,7 @@ Hitch's built-in set of known Agents (Claude Code, Codex to start), each with a 
 _Avoid_: Plugins, Providers.
 
 **Hook helper**:
-A small `hitch` CLI invoked by an Agent's installed hook; it reports the Agent's state to the **Daemon**'s local socket, which **owns** the current value (see ADR 0011). Hitch installs the hook by merging it into a per-Worktree, gitignored agent-local config (e.g. `.claude/settings.local.json`, `.codex/hooks.json`) without overwriting the user's own keys. Every installed hook carries an explicit state; the helper never infers state from payload text. It resolves to a Session by `HITCH_SESSION_ID` (injected into every PTY) only — a report that cannot be resolved is logged and dropped, never smeared onto a Worktree.
+A small `hitch` CLI invoked by an Agent's installed hook; it reports the Agent's state to the **Daemon**'s local socket, which **owns** the current value (see ADR 0011). Hitch installs the hook by merging it into a per-Worktree, gitignored agent-local config (e.g. `.claude/settings.local.json`, `.codex/hooks.json`) without overwriting the user's own keys. Every installed hook carries an explicit state; the helper never infers state from payload text. It resolves to a Session by `HITCH_SESSION_ID` (injected into every PTY) only — a report that cannot be resolved is logged and dropped, never smeared onto a Worktree. The helper never breaks the Agent: any failure exits 0, unknown args are ignored, a `--session-id` flag is rejected, and `HITCH_HOOK_DEBUG` gates a diagnostic log (ADR 0002 amendment 2026-06-04).
 _Avoid_: Notifier, Bridge.
 
 **Job**:
@@ -51,7 +51,7 @@ A long-running **Daemon** operation dispatched off the per-client request loop o
 _Avoid_: Task (a Job is not a tracked tree work-item — see Session's avoided terms), Background process (that is the Daemon itself).
 
 **Draft Generator**:
-A non-interactive generation run that drafts commit messages, commit bodies, or PR descriptions from git context. It is one kind of **Job** — dispatched off the request loop rather than blocking a synchronous request as it does today.
+A non-interactive generation run that drafts commit messages, commit bodies, or PR descriptions from git context. It is one kind of **Job** — dispatched off the request loop rather than blocking a synchronous request as it does today. Its provider binaries (claude/codex) are user-configurable paths, needed where they aren't on the service PATH (ADR 0007 amendment 2026-06-04).
 _Avoid_: Agent harness, Agent.
 
 ## Relationships

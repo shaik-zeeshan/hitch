@@ -12,6 +12,12 @@
     restartDaemon,
   } from "../daemon";
   import { commandOpen } from "../overlays";
+  import { currentDesktopPlatform, shortcutLabel } from "../desktopPlatform";
+
+  // Title-bar integration differs per OS (ADR 0006): macOS reserves space for
+  // the native Overlay traffic lights on the left; Windows is frameless and
+  // draws its own caption controls on the right.
+  const platform = currentDesktopPlatform();
 
   let {
     rightCollapsed = false,
@@ -25,6 +31,8 @@
 
   const ahead = $derived($gitStatus?.ahead ?? 0);
   const behind = $derived($gitStatus?.behind ?? 0);
+
+  const commandPaletteShortcut = shortcutLabel(currentDesktopPlatform(), "K");
 
   // Daemon Status indicator (ADR 0009). Always a colored dot + a word — never
   // color alone (design principle #3) — and a click-to-open popover carrying the
@@ -52,7 +60,12 @@
   }
 </script>
 
-<nav class="topnav" data-tauri-drag-region>
+<nav
+  class="topnav"
+  class:mac={platform === "macos"}
+  class:win={platform === "windows"}
+  data-tauri-drag-region
+>
   <button class="iconbtn" title="Toggle sidebar" aria-label="Toggle sidebar" onclick={onToggleLeft}>
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
       ><rect x="1.5" y="2.5" width="13" height="11" rx="2" /><line x1="6" y1="2.5" x2="6" y2="13.5" /></svg
@@ -66,7 +79,7 @@
       ><circle cx="7" cy="7" r="4.5" /><line x1="10.5" y1="10.5" x2="14" y2="14" /></svg
     >
     <span class="cmdk-label">Search or jump to…</span>
-    <span class="k">⌘K</span>
+    <span class="k">{commandPaletteShortcut}</span>
   </button>
 
   <div class="nav-grow" data-tauri-drag-region></div>
@@ -130,9 +143,6 @@
 </nav>
 
 <style>
-  /* macOS traffic lights are inset to x 16 / y 23 in tauri.conf.json so their
-     centers sit on the 44px top-nav row, level with the sidebar toggle icon;
-     this reserves their horizontal room. */
   .topnav {
     display: flex;
     align-items: center;
@@ -140,8 +150,21 @@
     height: 100%;
     background: var(--bg-2);
     border-bottom: 1px solid var(--line);
-    padding: 0 12px 0 78px;
+    padding: 0 12px;
     user-select: none;
+  }
+  /* macOS traffic lights are inset to x 16 / y 23 in tauri.conf.json so their
+     centers sit on the 44px top-nav row, level with the sidebar toggle icon;
+     this reserves their horizontal room. */
+  .topnav.mac {
+    padding-left: 78px;
+  }
+  /* Windows is frameless: the caption controls (WindowControls) are rendered as
+     a fixed top-right layer at the layout level (so they stay visible on routes
+     that hide the shell, e.g. /settings). The nav reserves their width on the
+     right (3 × 46px) so its own content never slides under the controls. */
+  .topnav.win {
+    padding-right: 138px;
   }
 
   .nav-grow {

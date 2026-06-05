@@ -20,6 +20,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import {
+  addProject,
   activeSessionId,
   agentStateByProject,
   agentStateByWorktree,
@@ -34,30 +35,43 @@ import {
   connection,
   createWorktree,
   daemonReason,
+  dismissedSessionAgentStates,
   dismissedWorktreeAgentStates,
   diffActive,
-  dismissedSessionAgentStates,
+  diffPath,
+  diffText,
+  dirtyWorktrees,
   daemonStatus,
   disposeDaemon,
   error,
   fetchRemote,
+  generateCommitDraft,
+  gitStatus,
   initDaemon,
   isJobCancellable,
   jobs,
+  listDraftModels,
   loadPrStatus,
   loadProjectPrStatuses,
   prByWorktree,
   prInfo,
+  prUrl,
   projects,
+  refreshAll,
   push,
   reconnect,
   restartDaemon,
   runJob,
+  selectedProjectId,
   selectedWorktreeId,
+  sessionCommands,
   sessions,
   worktrees,
   visibleAgentStates,
+  viewDiff,
+  worktreeLineStats,
 } from "./daemon";
+import { draftClaudePath, draftCodexPath, draftModel, draftProvider } from "./settings";
 
 // Flush the StartJob promise chain (runJob -> daemonRequest -> invoke) so the
 // pending resolver is registered before we deliver the JobCompleted event.
@@ -79,6 +93,20 @@ beforeEach(() => {
   agentStates.set({});
   dismissedSessionAgentStates.set({});
   dismissedWorktreeAgentStates.set({});
+  dirtyWorktrees.set({});
+  worktreeLineStats.set({});
+  gitStatus.set(null);
+  diffPath.set(null);
+  prByWorktree.set({});
+  prInfo.set(null);
+  prUrl.set(null);
+  sessionCommands.set({});
+  diffText.set(null);
+  diffActive.set(false);
+  draftProvider.set(null);
+  draftModel.set("");
+  draftClaudePath.set("");
+  draftCodexPath.set("");
 });
 
 describe("daemon status mapping", () => {
@@ -521,7 +549,7 @@ describe("connect snapshot refresh failures", () => {
 
     invokeMock.mockImplementation(async (invokedCommand: string, payload?: { request?: { type: string } }) => {
       if (includeStatusProbe && invokedCommand === "get_daemon_status") {
-        return { log_path: "/tmp/hitch-daemon.log" };
+        return { status: "starting", reason: null, log_path: "/tmp/hitch-daemon.log" };
       }
       if (invokedCommand === command) {
         return undefined;
@@ -540,6 +568,262 @@ describe("connect snapshot refresh failures", () => {
     expect(get(error)).toBe("snapshot blew up");
     expect(get(jobs)["j-keep"]).toBeTruthy();
     expect(rejected).toBe(false);
+  });
+
+
+  it("hydrates daemon status from the startup snapshot before connect returns", async () => {
+    let finishConnect!: () => void;
+    const connectPromise = new Promise<void>((resolve) => {
+      finishConnect = resolve;
+    });
+    invokeMock.mockImplementation(async (invokedCommand: string, payload?: { request?: { type: string } }) => {
+      if (invokedCommand === "get_daemon_status") {
+        return { status: "running", reason: null, log_path: "/tmp/hitch-daemon.log" };
+      }
+      if (invokedCommand === "connect_daemon") {
+        return connectPromise;
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-projects") {
+        return { type: "projects", projects: [] };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-sessions") {
+        return { type: "sessions", sessions: [] };
+      }
+      throw new Error(`unexpected invoke ${invokedCommand}`);
+    });
+
+    const init = initDaemon();
+    await flush();
+
+    expect(get(daemonStatus)).toBe("running");
+    expect(get(connection)).toBe("ready");
+
+    finishConnect();
+    await init;
+  });
+
+
+  it("registers output channels for sessions returned by the startup snapshot", async () => {
+    const session = {
+      id: "s-live",
+      name: "shell",
+      parent: { kind: "project", id: "p1" },
+      cwd: "C:/repo",
+    };
+
+    invokeMock.mockImplementation(async (invokedCommand: string, payload?: { request?: { type: string } }) => {
+      if (invokedCommand === "get_daemon_status") {
+        return { status: "running", reason: null, log_path: "/tmp/hitch-daemon.log" };
+      }
+      if (invokedCommand === "connect_daemon") {
+        return undefined;
+      }
+      if (invokedCommand === "register_session_output") {
+        return undefined;
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-projects") {
+        return {
+          type: "projects",
+          projects: [{ id: "p1", name: "Repo", root: "C:/repo", kind: "plain" }],
+        };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-sessions") {
+        return { type: "sessions", sessions: [session] };
+      }
+      throw new Error(`unexpected invoke ${invokedCommand}`);
+    });
+
+    await initDaemon();
+
+    expect(get(sessions)).toEqual([session]);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "register_session_output",
+      expect.objectContaining({ sessionId: "s-live" }),
+    );
+  });
+  it("selects the parent of a live snapshot session on startup", async () => {
+    const session = {
+      id: "s-worktree",
+      name: "shell",
+      parent: { kind: "worktree", id: "w2" },
+      cwd: "C:/repo/feature",
+    };
+
+    invokeMock.mockImplementation(async (invokedCommand: string, payload?: { request?: { type: string } }) => {
+      if (invokedCommand === "get_daemon_status") {
+        return { status: "running", reason: null, log_path: "/tmp/hitch-daemon.log" };
+      }
+      if (invokedCommand === "connect_daemon" || invokedCommand === "register_session_output") {
+        return undefined;
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-projects") {
+        return {
+          type: "projects",
+          projects: [{ id: "p1", name: "Repo", root: "C:/repo", kind: "git-backed" }],
+        };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-worktrees") {
+        return {
+          type: "worktrees",
+          worktrees: [
+            {
+              id: "w1",
+              project_id: "p1",
+              path: "C:/repo",
+              branch: "main",
+              is_main: true,
+              is_hitch_managed: false,
+            },
+            {
+              id: "w2",
+              project_id: "p1",
+              path: "C:/repo/feature",
+              branch: "feature",
+              is_main: false,
+              is_hitch_managed: true,
+            },
+          ],
+        };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-sessions") {
+        return { type: "sessions", sessions: [session] };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "git-status") {
+        return {
+          type: "git-status",
+          status: {
+            worktree_id: (payload.request as unknown as { worktree_id: string }).worktree_id,
+            branch: "feature",
+            dirty: false,
+            ahead: 0,
+            behind: 0,
+            additions: 0,
+            deletions: 0,
+            files: [],
+          },
+        };
+      }
+      throw new Error(`unexpected invoke ${invokedCommand}`);
+    });
+
+    await initDaemon();
+
+    expect(get(selectedProjectId)).toBe("p1");
+    expect(get(selectedWorktreeId)).toBe("w2");
+    expect(get(activeSessionId)).toBe("s-worktree");
+  });
+
+  it("keeps the current selection on reconnect when it has no live session", async () => {
+    // The user is looking at worktree w2, which has no live session; the only
+    // live session belongs to a different worktree (w1). The reconnect snapshot
+    // must not yank the selection over to w1.
+    //
+    // Seed the project/worktree stores the way a live window already holds them
+    // before reconnect; otherwise the selection-fixup subscription transiently
+    // clears `selectedWorktreeId` when `refreshAll` re-sets `projects` ahead of
+    // `worktrees`, which would mask the behavior under test.
+    const liveWorktrees = [
+      {
+        id: "w1",
+        project_id: "p1",
+        path: "C:/repo",
+        branch: "main",
+        is_main: true,
+        is_hitch_managed: false,
+      },
+      {
+        id: "w2",
+        project_id: "p1",
+        path: "C:/repo/feature",
+        branch: "feature",
+        is_main: false,
+        is_hitch_managed: true,
+      },
+    ];
+    projects.set([{ id: "p1", name: "Repo", root: "C:/repo", kind: "git-backed" } as never]);
+    worktrees.set(liveWorktrees as never);
+    selectedProjectId.set("p1");
+    selectedWorktreeId.set("w2");
+    activeSessionId.set(null);
+
+    const session = {
+      id: "s-on-w1",
+      name: "shell",
+      parent: { kind: "worktree", id: "w1" },
+      cwd: "C:/repo",
+    };
+
+    invokeMock.mockImplementation(async (invokedCommand: string, payload?: { request?: { type: string } }) => {
+      if (invokedCommand === "connect_daemon" || invokedCommand === "register_session_output") {
+        return undefined;
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-projects") {
+        return {
+          type: "projects",
+          projects: [{ id: "p1", name: "Repo", root: "C:/repo", kind: "git-backed" }],
+        };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-worktrees") {
+        return { type: "worktrees", worktrees: liveWorktrees };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-sessions") {
+        return { type: "sessions", sessions: [session] };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "git-status") {
+        return {
+          type: "git-status",
+          status: {
+            worktree_id: (payload.request as unknown as { worktree_id: string }).worktree_id,
+            branch: "feature",
+            dirty: false,
+            ahead: 0,
+            behind: 0,
+            additions: 0,
+            deletions: 0,
+            files: [],
+          },
+        };
+      }
+      throw new Error(`unexpected invoke ${invokedCommand}`);
+    });
+
+    await reconnect();
+
+    expect(get(selectedProjectId)).toBe("p1");
+    expect(get(selectedWorktreeId)).toBe("w2");
+    expect(get(activeSessionId)).toBeNull();
+  });
+
+
+  it("does not reset an output channel already registered by a session-opened replay", async () => {
+    const session = {
+      id: "s-replayed",
+      name: "shell",
+      parent: { kind: "project", id: "p1" },
+      cwd: "C:/repo",
+    };
+    invokeMock.mockResolvedValue(undefined);
+    applyHitchEvent({ type: "session-opened", session });
+    invokeMock.mockClear();
+    invokeMock.mockImplementation(async (invokedCommand: string, payload?: { request?: { type: string } }) => {
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-projects") {
+        return {
+          type: "projects",
+          projects: [{ id: "p1", name: "Repo", root: "C:/repo", kind: "plain" }],
+        };
+      }
+      if (invokedCommand === "hitch_request" && payload?.request?.type === "list-sessions") {
+        return { type: "sessions", sessions: [session] };
+      }
+      throw new Error(`unexpected invoke ${invokedCommand}`);
+    });
+
+    await refreshAll();
+
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "register_session_output",
+      expect.objectContaining({ sessionId: "s-replayed" }),
+    );
   });
 
   it("marks the daemon failed when reconnect cannot reach it", async () => {
@@ -611,6 +895,65 @@ describe("job store: StartJob -> JobCompleted", () => {
 
     completeJob("j-fetch", { type: "ack" });
     await expect(promise).resolves.toBeUndefined();
+  });
+
+  it("passes configured draft provider executable paths to model discovery", async () => {
+    invokeMock.mockResolvedValueOnce({ type: "job-started", job_id: "j-models" });
+
+    const promise = listDraftModels("codex", { codexPath: "C:\\Program Files\\Codex\\codex.exe" });
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "list-draft-models",
+          provider: "codex",
+          settings: {
+            provider: "codex",
+            model: null,
+            claude_path: null,
+            codex_path: "C:\\Program Files\\Codex\\codex.exe",
+          },
+        },
+      },
+    });
+
+    completeJob("j-models", { type: "draft-models", provider: "codex", models: ["gpt-5-codex"] });
+    await expect(promise).resolves.toEqual(["gpt-5-codex"]);
+  });
+
+  it("passes saved draft provider executable paths to generation jobs", async () => {
+    draftProvider.set("claude");
+    draftModel.set("sonnet");
+    draftClaudePath.set("C:\\Program Files\\Claude\\claude.exe");
+    draftCodexPath.set("C:\\Program Files\\Codex\\codex.exe");
+    invokeMock.mockResolvedValueOnce({ type: "job-started", job_id: "j-draft" });
+
+    const promise = generateCommitDraft("w-draft");
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "generate-commit-draft",
+          worktree_id: "w-draft",
+          settings: {
+            provider: "claude",
+            model: "sonnet",
+            claude_path: "C:\\Program Files\\Claude\\claude.exe",
+            codex_path: "C:\\Program Files\\Codex\\codex.exe",
+          },
+        },
+      },
+    });
+
+    completeJob("j-draft", {
+      type: "commit-draft",
+      draft: { subject: "feat: generated", body: "- Generated" },
+    });
+    await expect(promise).resolves.toEqual({ subject: "feat: generated", body: "- Generated" });
   });
 
   it("rebuilds a replayed running job so its later completion is applied", () => {
@@ -905,6 +1248,233 @@ describe("job store: StartJob -> JobCompleted", () => {
   });
 
 });
+describe("Windows project paths", () => {
+  const projectRoot = String.raw`C:\Users\Ada Lovelace\Repo With Spaces`;
+  const filePath = String.raw`src\folder with spaces\file name.ts`;
+  const worktreePath = String.raw`C:\Users\Ada Lovelace\Repo With Spaces`;
+  const project = {
+    id: "project-win",
+    name: "Repo With Spaces",
+    root: projectRoot,
+    kind: "git-backed",
+  } as const;
+  const worktree = {
+    id: "worktree-win",
+    project_id: "project-win",
+    path: worktreePath,
+    branch: "main",
+    is_main: true,
+    is_hitch_managed: false,
+  } as const;
+
+  function windowsStatus(additions = 12, deletions = 5) {
+    return {
+      worktree_id: worktree.id,
+      branch: "main",
+      dirty: true,
+      ahead: 0,
+      behind: 0,
+      additions,
+      deletions,
+      files: [{ path: filePath, status: "modified" as const, staged: false }],
+    };
+  }
+
+  it("adds and refreshes a git-backed project without changing a Windows root with spaces", async () => {
+    const requests: unknown[] = [];
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; project_id?: string } }) => {
+        requests.push(request);
+        if (request.type === "add-project") return { type: "ack" };
+        if (request.type === "list-projects") return { type: "list-projects", projects: [project] };
+        if (request.type === "list-worktrees") {
+          expect(request.project_id).toBe(project.id);
+          return { type: "list-worktrees", worktrees: [worktree] };
+        }
+        if (request.type === "list-sessions") return { type: "list-sessions", sessions: [] };
+        if (request.type === "git-status") return { type: "git-status", status: windowsStatus() };
+        if (request.type === "start-job") return { type: "job-started", job_id: "j-pr" };
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await addProject(projectRoot);
+
+    expect(requests[0]).toEqual({ type: "add-project", root: projectRoot });
+    expect(get(projects)[0]?.root).toBe(projectRoot);
+    expect(get(worktrees)[0]?.path).toBe(worktreePath);
+    expect(get(dirtyWorktrees)[worktree.id]).toBe(true);
+    expect(get(worktreeLineStats)[worktree.id]).toEqual({ additions: 12, deletions: 5 });
+
+    projects.set([]);
+    worktrees.set([]);
+    dirtyWorktrees.set({});
+    worktreeLineStats.set({});
+
+    await refreshAll();
+
+    expect(get(projects)[0]?.root).toBe(projectRoot);
+    expect(get(worktrees)[0]?.path).toBe(worktreePath);
+  });
+
+  it("refreshes dirty state and line stats from a worktree-dirty event for a Windows worktree path", async () => {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; worktree_id?: string } }) => {
+        expect(request).toEqual({ type: "git-status", worktree_id: worktree.id });
+        return { type: "git-status", status: windowsStatus(7, 3) };
+      },
+    );
+
+    applyHitchEvent({ type: "worktree-dirty", worktree_id: worktree.id, dirty: true });
+    await flush();
+
+    expect(get(dirtyWorktrees)[worktree.id]).toBe(true);
+    expect(get(worktreeLineStats)[worktree.id]).toEqual({ additions: 7, deletions: 3 });
+    expect(get(gitStatus)?.files[0]?.path).toBe(filePath);
+  });
+
+  it("sends the exact Windows file path when requesting a diff", async () => {
+    const requests: unknown[] = [];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string } }) => {
+        requests.push(request);
+        if (request.type === "git-diff") return { type: "git-diff", diff: { diff: "diff --git" } };
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await viewDiff(filePath);
+
+    expect(requests).toEqual([{ type: "git-diff", worktree_id: worktree.id, path: filePath }]);
+    expect(get(diffPath)).toBe(filePath);
+    expect(get(diffText)).toBe("diff --git");
+  });
+
+  it("creates a Windows managed worktree through a job and reflects the daemon worktree event", async () => {
+    const managedBranch = "feature/windows/worktree-safe-dir";
+    const managedWorktree = {
+      id: "worktree-managed-win",
+      project_id: project.id,
+      path: String.raw`C:\Users\Ada Lovelace\AppData\Local\Hitch\worktrees\repo-with-spaces\feature-windows-worktree-safe-dir`,
+      branch: managedBranch,
+      is_main: false,
+      is_hitch_managed: true,
+    } as const;
+    const requests: unknown[] = [];
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; request?: unknown } }) => {
+        requests.push(request);
+        if (request.type === "start-job") return { type: "job-started", job_id: "j-create-win" };
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    projects.set([project]);
+    worktrees.set([worktree]);
+
+    const promise = createWorktree(project.id, ` ${managedBranch} `, "main", "new-branch");
+    await flush();
+
+    expect(requests).toEqual([
+      {
+        type: "start-job",
+        request: {
+          type: "create-worktree",
+          project_id: project.id,
+          branch: managedBranch,
+          base: "main",
+          mode: "new-branch",
+        },
+      },
+    ]);
+
+    applyHitchEvent({ type: "worktree-updated", worktree: managedWorktree });
+    expect(get(worktrees).map((item) => item.path)).toContain(managedWorktree.path);
+
+    completeJob("j-create-win", { type: "worktrees", worktrees: [managedWorktree] });
+    await expect(promise).resolves.toMatchObject({
+      id: managedWorktree.id,
+      branch: managedBranch,
+      path: managedWorktree.path,
+    });
+    expect(get(selectedWorktreeId)).toBe(managedWorktree.id);
+    expect(get(worktrees).filter((item) => item.id === managedWorktree.id)).toHaveLength(1);
+  });
+
+  it("removes a Windows managed worktree event from the tree and clears worktree-scoped frontend state", () => {
+    const removed = {
+      id: "worktree-remove-win",
+      project_id: project.id,
+      path: String.raw`C:\Users\Ada Lovelace\AppData\Local\Hitch\worktrees\repo-with-spaces\bugfix-win-safe-dir`,
+      branch: "bugfix/windows/worktree-safe-dir",
+      is_main: false,
+      is_hitch_managed: true,
+    } as const;
+    projects.set([project]);
+    worktrees.set([worktree, removed]);
+    sessions.set([
+      { id: "session-remove", name: "claude", parent: { kind: "worktree", id: removed.id }, cwd: removed.path },
+      { id: "session-keep", name: "shell", parent: { kind: "worktree", id: worktree.id }, cwd: worktree.path },
+    ]);
+    selectedWorktreeId.set(removed.id);
+    activeSessionId.set("session-remove");
+    agentStates.set({ "session-remove": "waiting", "session-keep": "running" });
+    dismissedSessionAgentStates.set({ "session-remove": "waiting" });
+    dismissedWorktreeAgentStates.set({ [removed.id]: "waiting" });
+    sessionCommands.set({ "session-remove": "claude", "session-keep": "pwsh" });
+    dirtyWorktrees.set({ [removed.id]: true, [worktree.id]: false });
+    worktreeLineStats.set({
+      [removed.id]: { additions: 9, deletions: 4 },
+      [worktree.id]: { additions: 0, deletions: 0 },
+    });
+    gitStatus.set({
+      worktree_id: removed.id,
+      branch: removed.branch,
+      dirty: true,
+      ahead: 0,
+      behind: 0,
+      additions: 9,
+      deletions: 4,
+      files: [{ path: filePath, status: "modified", staged: false }],
+    });
+    diffPath.set(filePath);
+    diffText.set("diff --git a/file b/file");
+    diffActive.set(true);
+    prByWorktree.set({
+      [removed.id]: { number: 7, url: "https://example.test/pr/7", state: "OPEN", draft: false },
+    });
+    prInfo.set({ number: 7, url: "https://example.test/pr/7", state: "OPEN", draft: false });
+    prUrl.set("https://example.test/pr/7");
+
+    applyHitchEvent({ type: "worktree-removed", worktree_id: removed.id });
+
+    expect(get(worktrees).map((item) => item.id)).toEqual([worktree.id]);
+    expect(get(sessions).map((item) => item.id)).toEqual(["session-keep"]);
+    expect(get(selectedWorktreeId)).toBeNull();
+    expect(get(activeSessionId)).toBeNull();
+    expect(get(gitStatus)).toBeNull();
+    expect(get(diffPath)).toBeNull();
+    expect(get(diffText)).toBeNull();
+    expect(get(diffActive)).toBe(false);
+    expect(get(dirtyWorktrees)).toEqual({ [worktree.id]: false });
+    expect(get(worktreeLineStats)).toEqual({ [worktree.id]: { additions: 0, deletions: 0 } });
+    expect(get(prByWorktree)).toEqual({});
+    expect(get(prInfo)).toBeNull();
+    expect(get(prUrl)).toBeNull();
+    expect(get(agentStates)).toEqual({ "session-keep": "running" });
+    expect(get(dismissedSessionAgentStates)).toEqual({});
+    expect(get(dismissedWorktreeAgentStates)).toEqual({});
+    expect(get(sessionCommands)).toEqual({ "session-keep": "pwsh" });
+    expect(get(agentStateByWorktree)).toEqual({ [worktree.id]: "running" });
+  });
+});
+
 
 describe("worktree-scoped git actions", () => {
   it("keeps a commit-then-push sequence on the triggering worktree after selection changes", async () => {

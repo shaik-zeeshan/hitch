@@ -1,5 +1,5 @@
 <script lang="ts">
-  // ⌘K command palette (mockup #cmdk-modal). A bits-ui Dialog (focus trap,
+  // Command palette (mockup #cmdk-modal). A bits-ui Dialog (focus trap,
   // escape, overlay) hosting a bits-ui Command (fuzzy filter + arrow nav).
   // "Jump to" lists every worktree and live session; "Actions" are one-shot
   // triggers — opening a dialog (new worktree, local-path fallback, create PR,

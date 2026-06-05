@@ -12,6 +12,13 @@ description = "Hitch desktop app — thin Tauri client (ADR 0005)."
 name = "hitch_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Compiles in the destructive packaged smoke-test harness (creates a temp
+# project, opens/closes a session, removes the project, shuts down the daemon,
+# then exits the process). Off by default so it never ships in production
+# builds; CI enables it for the Windows package smoke build.
+packaged-smoke = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -30,6 +37,20 @@ serde_json.workspace = true
 hitch-core.workspace = true
 hitch-proto.workspace = true
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# Frameless-window subclassing reads the raw HWND from the Tauri window handle
+# (window_chrome.rs); raw-window-handle 0.6 is the version Tauri 2 already uses.
+raw-window-handle = "0.6"
 
 # macOS-only: at startup we register `ApplePressAndHoldEnabled = NO` via Cocoa so
 # WKWebView lets keys repeat (see lib.rs `run`). These are already in the tree

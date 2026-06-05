@@ -14,6 +14,8 @@
     DEFAULT_DRAFT_PROVIDER,
     DEFAULT_EDITOR,
     DRAFT_MODEL_OPTIONS,
+    draftClaudePath,
+    draftCodexPath,
     draftModel,
     draftProvider,
     editorApp,
@@ -36,6 +38,8 @@
   let draftProviderValue = $state<DraftProvider>(DEFAULT_DRAFT_PROVIDER);
   let selectedDraftModel = $state(DEFAULT_MODEL_VALUE);
   let modelOptions = $state<string[]>(DRAFT_MODEL_OPTIONS[DEFAULT_DRAFT_PROVIDER]);
+  let claudePath = $state("");
+  let codexPath = $state("");
   let modelsLoading = $state(false);
   let modelsError = $state<string | null>(null);
   let modelLoadSeq = 0;
@@ -52,10 +56,12 @@
   onMount(() => {
     editor = $editorApp;
     // `$draftProvider` is null until the user explicitly picks one; show the
-    // default as the editable starting point. Saving it writes a concrete,
-    // explicit choice (see settings.ts).
+    // default as the editable starting point without turning an unchanged save
+    // into a concrete provider override.
     draftProviderValue = $draftProvider ?? DEFAULT_DRAFT_PROVIDER;
     selectedDraftModel = $draftModel || DEFAULT_MODEL_VALUE;
+    claudePath = $draftClaudePath;
+    codexPath = $draftCodexPath;
     lastDraftProvider = draftProviderValue;
     draftsHydrated = true;
   });
@@ -94,7 +100,7 @@
 
     modelsLoading = true;
     try {
-      const models = await withTimeout(listDraftModels(provider), 3500);
+      const models = await withTimeout(listDraftModels(provider, { claudePath, codexPath }), 3500);
       if (seq !== modelLoadSeq) return;
       modelOptions = models.length > 0 ? models : DRAFT_MODEL_OPTIONS[provider];
     } catch (err) {
@@ -119,9 +125,34 @@
   }
 
   function commitDraftSettings() {
-    draftProvider.set(draftProviderValue);
-    draftModel.set(selectedDraftModel === DEFAULT_MODEL_VALUE ? DEFAULT_DRAFT_MODEL : selectedDraftModel);
+    const model = selectedDraftModel === DEFAULT_MODEL_VALUE ? DEFAULT_DRAFT_MODEL : selectedDraftModel;
+    const claude = claudePath.trim();
+    const codex = codexPath.trim();
+
+    // The provider store is `null` while the user has never explicitly chosen a
+    // provider, which tells draft requests to omit the override and let the
+    // daemon use its own configured default (settings.ts). The select can't show
+    // that "unset" state, so it always carries a concrete value (default: stub).
+    //
+    // Persist an explicit provider only when the user actually expresses intent:
+    // they picked a non-default provider, a provider was already stored, or they
+    // supplied a concrete model/executable path. Model and path are meaningless
+    // to the daemon while the provider is unset (draftGenerationSettings returns
+    // null and ignores them), so a concrete model/path is itself evidence the
+    // user means to pin the shown provider — otherwise those values would be
+    // saved but silently dead. When none of that holds (everything at defaults),
+    // we leave the provider unset rather than writing back "stub", which would
+    // override the daemon default.
+    const hasExplicitModelOrPath = model !== DEFAULT_DRAFT_MODEL || claude !== "" || codex !== "";
+    const wantExplicitProvider =
+      draftProviderValue !== DEFAULT_DRAFT_PROVIDER || $draftProvider !== null || hasExplicitModelOrPath;
+    draftProvider.set(wantExplicitProvider ? draftProviderValue : null);
+
+    draftModel.set(model);
+    draftClaudePath.set(claude);
+    draftCodexPath.set(codex);
     draftSaved = true;
+    void loadModels(draftProviderValue);
     setTimeout(() => (draftSaved = false), 1600);
   }
 
@@ -169,9 +200,9 @@
           <div class="panel-head">
             <h2>Editor</h2>
             <p class="help">
-              Application used by <b>Open in editor</b> on a worktree. Any installed editor by name —
+              Application used by <b>Open in editor</b> on a worktree. Use a common editor name —
               e.g. <span class="mono">Visual Studio Code</span>, <span class="mono">Cursor</span>,
-              <span class="mono">Zed</span>.
+              <span class="mono">Zed</span> — or an executable path.
             </p>
           </div>
           <label class="field">
@@ -253,6 +284,29 @@
             {:else}
               Choose default to omit <span class="mono">--model</span>.
             {/if}
+          </p>
+          <label class="field">
+            <span>Claude executable path</span>
+            <input
+              class="base mono"
+              bind:value={claudePath}
+              placeholder="Use daemon/PATH default"
+              autocomplete="off"
+            />
+          </label>
+          <label class="field">
+            <span>Codex executable path</span>
+            <input
+              class="base mono"
+              bind:value={codexPath}
+              placeholder="Use daemon/PATH default"
+              autocomplete="off"
+            />
+          </label>
+          <p class="help">
+            Leave paths empty to use the daemon default. Windows paths with spaces are supported:
+            paste the normal path, for example
+            <span class="mono">C:\Program Files\Claude\claude.exe</span>; do not wrap it in quotes.
           </p>
           <div class="row">
             <button class="btn primary" onclick={commitDraftSettings}>Save</button>

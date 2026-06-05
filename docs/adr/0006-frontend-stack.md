@@ -13,7 +13,11 @@ The `apps/desktop` frontend is built on **Svelte** (Svelte 5, runes) + **Vite** 
 
 ## Titlebar
 
-macOS window uses `titleBarStyle: "Overlay"` + `hiddenTitle: true` so the traffic lights sit inside the unified dark top nav the mockup draws, rather than a separate native bar. The app reserves left padding for the lights.
+The unified dark top nav the mockup draws is the title bar on every platform; how the OS chrome folds into it differs.
+
+- **macOS** uses `titleBarStyle: "Overlay"` + `hiddenTitle: true` so the traffic lights sit inside the top nav rather than a separate native bar. The app reserves left padding for the lights (`.topnav.mac`).
+- **Windows** has no equivalent title-bar-overlay mode, so the window is frameless (`decorations: false`, set in the platform override `tauri.windows.conf.json`) and the app draws its own caption controls (minimize / maximize / close) into the right of the top nav (`WindowControls.svelte`), using native Win11 metrics (full-height 46px buttons, red close-hover) themed with the app's tokens. Min/close are ordinary HTML buttons calling the Tauri window API. The maximize button keeps **Snap Layouts** working through a transparent native child window (`src-tauri/src/window_chrome.rs`) parked over the button that returns `HTMAXBUTTON` from `WM_NCHITTEST`. Subclassing the *top-level* window proc does **not** work — WebView2 hosts the page in a child HWND that consumes the client-area hit-testing — but a child overlay above it does, while staying visually transparent because WebView2 composites through DWM, not GDI (the technique `tauri-plugin-frame` uses). The overlay forwards its non-client hover/click back as `hitch-max-button-hover` / `hitch-max-button-click` events (highlight + maximize toggle, keeping Tauri's window state in sync), and the frontend reports the button rectangle via `set_max_button_rect` so the overlay tracks it across layout/resize/DPI changes.
+- **Linux** keeps the OS's native title bar above the top nav (the macOS-only `titleBarStyle` is ignored there); no custom caption controls.
 
 ## Considered Options
 

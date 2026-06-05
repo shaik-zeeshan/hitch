@@ -4,17 +4,40 @@
 //! socket connection, starts the daemon when needed, and relays `hitch-proto`
 //! requests/responses/events to Tauri IPC.
 
+mod window_chrome;
+
+use hitch_proto::transport::{connect_daemon as connect_transport, is_endpoint_busy, DaemonStream};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(feature = "packaged-smoke")]
+use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(feature = "packaged-smoke")]
+use std::{env, fs};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
+// `CREATE_NO_WINDOW` is taken from windows-sys here rather than the canonical
+// `hitch_process::configure_windowless` helper because this crate already depends
+// on windows-sys for its process-identity Win32 calls (OpenProcess etc.) but does
+// NOT depend on hitch-process, and one console flag does not justify adding that
+// dependency. Keep the windowless-spawn rationale in sync with that helper's docs.
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, CREATE_NO_WINDOW,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+};
 
 use hitch_core::SessionId;
+#[cfg(feature = "packaged-smoke")]
+use hitch_core::SessionParent;
 use hitch_proto::{
     encode_control_message, encode_pty_frame, ControlMessage, ErrorCode, Event, ProtocolError,
     Request, RequestId, Response, PROTOCOL_VERSION,
@@ -22,8 +45,10 @@ use hitch_proto::{
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
+#[cfg(feature = "packaged-smoke")]
+use tauri::RunEvent;
 
 /// Per-session bound on the bytes we stage before the webview registers that
 /// session's output channel. Mirrors the daemon's `DEFAULT_SCROLLBACK_CAPACITY`
@@ -38,6 +63,7 @@ const OUTPUT_STAGING_CAPACITY: usize = 1024 * 1024;
 /// requests, so a tight timeout would false-positive under load.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const HEARTBEAT_LOST_REASON: &str = "daemon stopped responding to heartbeat";
 const DAEMON_RESPONSE_TIMEOUT_REASON: &str = "timed out waiting for daemon response";
 const HANDSHAKE_FAILURE_PREFIX: &str = "daemon handshake failed: ";
@@ -142,6 +168,63 @@ fn read_log_tail(path: &Path, lines: usize) -> Option<String> {
     Some(all[start..].join("\n"))
 }
 
+fn parse_spawned_daemon_pid(stdout: &[u8]) -> Option<u32> {
+    std::str::from_utf8(stdout)
+        .ok()?
+        .split_whitespace()
+        .rev()
+        .find_map(|token| token.parse().ok())
+}
+
+fn run_detach_command(mut command: Command, label: &str) -> Result<u32, String> {
+    // The daemon launcher is a console-subsystem binary. Spawned plainly from
+    // the windowed GUI it would get a brand-new *visible* console, and the
+    // detached daemon inherits that console and keeps the window open for its
+    // entire lifetime. CREATE_NO_WINDOW gives the launcher an invisible console
+    // instead; the daemon — and every console child it spawns (git, draft
+    // providers) — inherits that hidden console, so nothing flashes either.
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to spawn {label}: {err}"))?;
+
+    let mut pid_line = String::new();
+    if let Some(stdout) = child.stdout.as_mut() {
+        BufReader::new(stdout)
+            .read_line(&mut pid_line)
+            .map_err(|err| format!("failed to read {label} daemon pid: {err}"))?;
+    }
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("failed to wait for {label}: {err}"))?;
+
+    if !status.success() {
+        // The `--detach` launcher points the *real* daemon's stdio at the log
+        // file (see `detach_spawn`), so its own stderr only carries failures
+        // that happen *before* the daemon is spawned — bad args, a log-open
+        // error, the spawn itself. Those never reach the daemon log, so surface
+        // the launcher's stderr instead of an opaque exit status. Safe to drain
+        // to EOF: the launcher is short-lived and the daemon does not inherit
+        // this pipe, so there is no long-lived writer to block on.
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        let stderr = stderr.trim();
+        return Err(if stderr.is_empty() {
+            format!("{label} failed with {status}")
+        } else {
+            format!("{label} failed with {status}: {stderr}")
+        });
+    }
+    parse_spawned_daemon_pid(pid_line.as_bytes())
+        .ok_or_else(|| format!("{label} did not print a daemon pid"))
+}
+
 fn recovery_mode_for_loss(reason: &str) -> RecoveryMode {
     if reason == HEARTBEAT_LOST_REASON || is_handshake_timeout(reason) {
         RecoveryMode::RestartDaemon
@@ -156,11 +239,19 @@ fn is_handshake_timeout(reason: &str) -> bool {
         .is_some_and(|inner| inner == DAEMON_RESPONSE_TIMEOUT_REASON)
 }
 fn should_force_kill_daemon(reason: &str) -> bool {
-    // A wedged daemon (missed heartbeat) and an incompatible one are both
-    // untrustworthy to shut themselves down on request — an incompatible daemon
-    // may not even parse our ShutdownDaemon message. SIGKILL by pid instead of
-    // asking nicely and waiting on a graceful unbind that may never come.
-    reason == HEARTBEAT_LOST_REASON || reason.starts_with(INCOMPATIBLE_DAEMON_PREFIX)
+    // A wedged daemon (missed heartbeat), timed-out handshake, and incompatible
+    // daemon are all untrustworthy to shut themselves down on request. Hard-kill
+    // by a platform-safe process identity instead of asking nicely and waiting on
+    // a graceful unbind that may never come.
+    reason == HEARTBEAT_LOST_REASON
+        || reason.starts_with(INCOMPATIBLE_DAEMON_PREFIX)
+        || is_handshake_timeout(reason)
+}
+#[cfg(windows)]
+fn windows_force_kill_pid_for_reason(reason: &str, cached_server_pid: Option<u32>) -> Option<u32> {
+    should_force_kill_daemon(reason)
+        .then_some(cached_server_pid)
+        .flatten()
 }
 
 /// Render a failed `Hello` exchange into a human reason for the daemon status.
@@ -183,6 +274,7 @@ fn describe_handshake_failure(outcome: &Result<Response, String>) -> String {
 /// its whole lifetime (see `write_pidfile`), so a *free* lock means the writer is
 /// gone and the pid is unsafe to target. Returns `None` if the file is absent,
 /// unparsable, or stale (lock free).
+#[cfg(unix)]
 fn read_daemon_pidfile(socket_path: &Path) -> Option<u32> {
     let path = hitch_proto::transport::pidfile_path(socket_path);
     let pid: u32 = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
@@ -192,8 +284,109 @@ fn read_daemon_pidfile(socket_path: &Path) -> Option<u32> {
     Some(pid)
 }
 
+#[cfg(unix)]
 fn daemon_pid_for_force_kill(socket_path: &Path, cached_pid: Option<u32>) -> Option<u32> {
     cached_pid.or_else(|| read_daemon_pidfile(socket_path))
+}
+
+/// The image file name we expect any daemon process to carry. Every binary we
+/// spawn or bundle is named `hitch-daemon…` (plain `hitch-daemon.exe`, or a
+/// target-suffixed sidecar like `hitch-daemon-x86_64-pc-windows-msvc.exe`), so a
+/// case-insensitive `hitch-daemon` prefix on the file stem identifies our daemon
+/// without needing to know which build flavour is on disk.
+#[cfg(windows)]
+const DAEMON_IMAGE_PREFIX: &str = "hitch-daemon";
+
+/// Resolve a live pid to its process image file name (the final path component),
+/// or `None` if the process is gone or its image can't be read. Used to confirm
+/// identity before a force-kill so a recycled pid never lets us terminate an
+/// unrelated process.
+#[cfg(windows)]
+fn process_image_file_name(pid: u32) -> Option<String> {
+    // SAFETY: query-only handle; closed on every path below after a successful
+    // OpenProcess. PROCESS_QUERY_LIMITED_INFORMATION is the least-privileged
+    // right that QueryFullProcessImageNameW accepts.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: `handle` is a live process handle; `buf`/`len` describe a valid
+    // writable buffer and its capacity in WCHARs. dwFlags `0` (PROCESS_NAME_WIN32)
+    // asks for the Win32 path form.
+    let ok =
+        unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) } != 0;
+    // SAFETY: close the handle acquired above exactly once.
+    unsafe {
+        CloseHandle(handle);
+    }
+    if !ok {
+        return None;
+    }
+    let full = String::from_utf16_lossy(&buf[..len as usize]);
+    // Take the final path component as the file name; the path uses backslashes
+    // on Windows but accept either separator defensively.
+    let file_name = full.rsplit(['\\', '/']).next().unwrap_or(&full);
+    Some(file_name.to_string())
+}
+
+/// Whether the image at `pid` looks like one of our daemon binaries. A reused pid
+/// (the daemon died and Windows handed its number to an unrelated process before
+/// our force-kill fired) fails this and must not be terminated.
+#[cfg(windows)]
+fn process_is_daemon(pid: u32) -> bool {
+    process_image_file_name(pid).is_some_and(|name| {
+        name.to_ascii_lowercase()
+            .starts_with(DAEMON_IMAGE_PREFIX)
+    })
+}
+
+#[cfg(windows)]
+fn terminate_process(pid: u32) -> Result<(), String> {
+    // The pid handed to us was cached at the last successful Hello and is *not*
+    // re-validated by the recovery path before we get here. If the daemon died and
+    // Windows recycled its pid before our force-kill fired, this number now names
+    // an unrelated process — TerminateProcess would kill the wrong thing. The Unix
+    // path guards the same hazard with the pidfile's advisory lock
+    // (`pidfile_is_stale`); Windows has no such lock, so we confirm the target's
+    // image is one of our daemon binaries before killing. A pid that no longer
+    // exists (or whose image we can't read) is treated as "already gone": there's
+    // nothing of ours to kill, so report success.
+    if !process_is_daemon(pid) {
+        return Ok(());
+    }
+    // SAFETY: Win32 process handle lifecycle is bounded to this function. The
+    // handle is opened only with PROCESS_TERMINATE and is closed on every path
+    // after a successful OpenProcess.
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            return Ok(());
+        }
+        return Err(format!(
+            "failed to open daemon process {pid} for termination: {err}"
+        ));
+    }
+
+    // SAFETY: `handle` is a live process handle from OpenProcess. Exit code 1 is
+    // arbitrary; the daemon is being force-terminated because graceful shutdown
+    // cannot be trusted.
+    let terminated = unsafe { TerminateProcess(handle, 1) } != 0;
+    let terminate_err = if terminated {
+        None
+    } else {
+        Some(io::Error::last_os_error())
+    };
+    // SAFETY: close the handle acquired above exactly once.
+    unsafe {
+        CloseHandle(handle);
+    }
+    if let Some(err) = terminate_err {
+        return Err(format!("failed to terminate daemon process {pid}: {err}"));
+    }
+    Ok(())
 }
 
 /// Whether the pidfile's advisory lock is free — i.e. no live daemon holds it, so
@@ -219,16 +412,141 @@ fn pidfile_is_stale(path: &Path) -> bool {
     acquired
 }
 
-#[cfg(not(unix))]
-fn pidfile_is_stale(_path: &Path) -> bool {
-    false
+/// Outcome of `run_probe` other than a delivered value: the worker thread could
+/// not be spawned, the wait timed out, or the worker exited without sending.
+enum ProbeError {
+    Spawn(io::Error),
+    Timeout,
+    Disconnected,
+}
+
+/// Tracks how many probe worker threads are still blocked after their caller
+/// gave up waiting (i.e. timed out). A blocked thread holds its `work` closure
+/// — typically a `connect_transport` call against a slow Windows pipe — and
+/// cannot be cancelled, so it lingers until the underlying connect unblocks.
+/// We don't try to kill it; we only refuse to pile on. Keyed by probe name so a
+/// crash-looping recovery cycle cannot accumulate an unbounded fan of blocked
+/// connect/hello/shutdown threads: at most one leaked worker per name may exist
+/// at a time, and the next same-name probe waits for it to drain before
+/// spawning a replacement.
+static PROBE_INFLIGHT: Mutex<Option<HashMap<&'static str, mpsc::Receiver<()>>>> =
+    Mutex::new(None);
+
+/// Park the receiver half of a still-blocked probe worker so the next same-name
+/// probe can detect it (and wait it out) instead of spawning a second thread.
+fn park_inflight_probe(name: &'static str, done: mpsc::Receiver<()>) {
+    if let Ok(mut guard) = PROBE_INFLIGHT.lock() {
+        guard.get_or_insert_with(HashMap::new).insert(name, done);
+    }
+}
+
+/// If a previous same-name probe worker is still blocked, take its completion
+/// receiver so we can wait for it to drain. Returns `None` when no worker is
+/// outstanding for `name`.
+fn take_inflight_probe(name: &'static str) -> Option<mpsc::Receiver<()>> {
+    PROBE_INFLIGHT
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.as_mut().and_then(|map| map.remove(name)))
+}
+
+/// Run `work` on a named probe thread and wait up to `timeout` for its result.
+/// Centralizes the spawn + channel + recv_timeout boilerplate shared by the
+/// bounded connect / hello / shutdown probes; callers map `ProbeError` to their
+/// own error type and messages.
+///
+/// On timeout the worker thread is abandoned (its `work` closure may still be
+/// blocked in a slow connect). To keep such leaks from accumulating across
+/// recovery loops, we park the abandoned worker's completion signal under
+/// `name`: a later same-name probe first drains that parked worker (within its
+/// own `timeout`) before spawning a fresh thread, so at most one leaked worker
+/// per name can be outstanding at any moment.
+fn run_probe<T, F>(name: &'static str, timeout: Duration, work: F) -> Result<T, ProbeError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    // Drain any worker abandoned by a previous timed-out probe of this name
+    // before spawning another, bounding leaked threads to one per name.
+    if let Some(prev_done) = take_inflight_probe(name) {
+        match prev_done.recv_timeout(timeout) {
+            // Previous worker is still blocked: re-park it and refuse to spawn a
+            // second thread for this name. The caller sees a timeout, exactly as
+            // if its own probe had timed out.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                park_inflight_probe(name, prev_done);
+                return Err(ProbeError::Timeout);
+            }
+            // Worker finished (sent or dropped) — slot is free again.
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+    }
+
+    let (tx, rx) = mpsc::channel();
+    // A separate signal that fires (via drop) when the worker returns, even if
+    // the result `tx` was already dropped; used to detect drain of a leaked
+    // worker without depending on `T`.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let _done = done_tx;
+            let _ = tx.send(work());
+        })
+        .map_err(ProbeError::Spawn)?;
+    match rx.recv_timeout(timeout) {
+        Ok(value) => Ok(value),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Abandon the still-running worker but remember it so the next
+            // same-name probe waits for it instead of stacking another thread.
+            park_inflight_probe(name, done_rx);
+            Err(ProbeError::Timeout)
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ProbeError::Disconnected),
+    }
+}
+
+fn connect_transport_bounded(path: &Path, timeout: Duration) -> io::Result<DaemonStream> {
+    let display_path = path.to_path_buf();
+    let conn_path = path.to_path_buf();
+    match run_probe("hitch-daemon-connect-probe", timeout, move || {
+        connect_transport(&conn_path)
+    }) {
+        Ok(result) => result,
+        Err(ProbeError::Spawn(err)) => Err(io::Error::new(io::ErrorKind::Other, err)),
+        Err(ProbeError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "timed out connecting to daemon at {}",
+                display_path.display()
+            ),
+        )),
+        Err(ProbeError::Disconnected) => Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "daemon connect probe exited without a result",
+        )),
+    }
 }
 
 fn wait_for_socket_release(path: &Path, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if UnixStream::connect(path).is_err() {
-            return Ok(());
+        match connect_transport_bounded(path, Duration::from_millis(250)) {
+            // A busy pipe (ERROR_PIPE_BUSY: all instances occupied) is a *live*
+            // daemon between accept polls, NOT a released endpoint. The probe
+            // connects for real, so a fast connect/close can land while every
+            // instance is momentarily busy; misreading that as released would let
+            // a replacement daemon race the live one. Keep waiting.
+            Err(ref err) if is_endpoint_busy(err) => {}
+            // Connect actively failed (NotFound / refused / aborted): the
+            // endpoint is gone, so the socket has been released.
+            Err(err) if err.kind() != io::ErrorKind::TimedOut => return Ok(()),
+            // Either a live connection (`Ok`) or a timed-out probe. A timeout
+            // does NOT mean release: a slow Windows daemon whose polling accept
+            // loop hasn't serviced us yet is still alive, and treating it as
+            // released would let a replacement daemon race the live one. Keep
+            // waiting and re-probe until the endpoint truly disappears.
+            Ok(_) | Err(_) => {}
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -241,7 +559,6 @@ fn wait_for_socket_release(path: &Path, timeout: Duration) -> Result<(), String>
 }
 
 /// Routes raw PTY bytes to the webview per session (ADR 0007).
-///
 /// Lives in the Tauri process. Channels are kept across an ordinary daemon
 /// disconnect, but a `SessionOpened` replay invalidates that session's channel
 /// until the webview has reset its byte ring and registered a fresh channel;
@@ -354,7 +671,7 @@ struct HitchClientInner {
     /// clobber a newer one (e.g. after a protocol-mismatch daemon restart).
     connection_generation: AtomicU64,
     connect_lock: Mutex<()>,
-    writer: Mutex<Option<UnixStream>>,
+    writer: Mutex<Option<DaemonStream>>,
     pending: Mutex<HashMap<RequestId, mpsc::Sender<Response>>>,
     /// Live sessions, mirrored from daemon session-opened/closed events so the
     /// menu-bar tray can show how many sessions are still running.
@@ -376,10 +693,15 @@ struct HitchClientInner {
     /// Set while the user-requested restart path intentionally drops the old
     /// socket. EOF from that socket is expected and must not start auto-recovery.
     suppress_recovery: AtomicBool,
-    /// Pid reported by the last successful Hello handshake. Auto-recovery uses
-    /// it to SIGKILL a heartbeat-wedged daemon before waiting on socket release.
+    /// Pid reported by the last successful Hello handshake. Recovery uses it to
+    /// terminate a heartbeat-wedged daemon before waiting on endpoint release.
     daemon_pid: Mutex<Option<u32>>,
-    /// Daemon log path, computed once from `$HOME` to match the daemon writer.
+    /// Windows copy of the last successful Hello pid. Do not query named-pipe
+    /// peer credentials during attach: on Windows that can block until the server
+    /// accepts the pipe, which leaves the GUI stuck in `starting`.
+    #[cfg(windows)]
+    windows_daemon_pid: Mutex<Option<u32>>,
+    /// Daemon log path, computed once to match the daemon writer.
     log_path: PathBuf,
     /// Ordered, fire-and-forget input lane (Slice 6, "input fast path"). Every
     /// keystroke is pushed here instead of riding the synchronous request path:
@@ -395,6 +717,92 @@ struct HitchClientInner {
 
 /// The tray's stable id, used to look it up for tooltip updates.
 const TRAY_ID: &str = "hitch-tray";
+
+/// Write the Hello request on an already-connected `stream` and block until the
+/// matching response arrives, returning the writer half plus the reader (whose
+/// buffer may already hold daemon frames sent right after the Hello). Pure
+/// blocking I/O with no timeout of its own — callers run this inside `run_probe`
+/// so the worker can be abandoned on deadline.
+fn hello_exchange(
+    mut stream: DaemonStream,
+    request_id: RequestId,
+) -> Result<(DaemonStream, BufReader<DaemonStream>, Response), String> {
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|err| format!("failed to clone daemon hello stream: {err}"))?,
+    );
+    let bytes = encode_control_message(&ControlMessage::request(
+        request_id,
+        Request::Hello {
+            client_name: "hitch-desktop".into(),
+            protocol_version: PROTOCOL_VERSION,
+        },
+    ))
+    .map_err(|err| err.to_string())?;
+    stream
+        .write_all(&bytes)
+        .map_err(|err| format!("failed to send daemon hello: {err}"))?;
+    stream
+        .flush()
+        .map_err(|err| format!("failed to flush daemon hello: {err}"))?;
+
+    loop {
+        match read_control_message(&mut reader) {
+            Ok(Some(ControlMessage::Response { id, response })) if id == request_id => {
+                return Ok((stream, reader, response));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err("daemon closed hello connection before response".to_string());
+            }
+            Err(err) => return Err(format!("failed to read daemon hello: {err}")),
+        }
+    }
+}
+
+/// Map a `run_probe` outcome for the Hello exchange to the handshake error
+/// strings the caller expects.
+fn finish_hello_probe(
+    result: Result<Result<(DaemonStream, BufReader<DaemonStream>, Response), String>, ProbeError>,
+) -> Result<(DaemonStream, BufReader<DaemonStream>, Response), String> {
+    match result {
+        Ok(result) => result,
+        Err(ProbeError::Spawn(err)) => Err(format!("failed to spawn daemon hello probe: {err}")),
+        Err(ProbeError::Timeout) => Err(DAEMON_RESPONSE_TIMEOUT_REASON.to_string()),
+        Err(ProbeError::Disconnected) => {
+            Err("daemon hello probe exited without a result".to_string())
+        }
+    }
+}
+
+/// Run the Hello exchange on an already-connected `stream` under `timeout`,
+/// reusing a connection a prior reachability probe opened. The connect-probe in
+/// `connect_and_handshake` already paid for this socket on the happy path, so
+/// carrying it forward avoids a second pipe connect (and a second probe thread)
+/// per attempt. The probe wrote nothing, so the stream is at protocol start.
+fn hello_over_connection(
+    stream: DaemonStream,
+    request_id: RequestId,
+    timeout: Duration,
+) -> Result<(DaemonStream, BufReader<DaemonStream>, Response), String> {
+    finish_hello_probe(run_probe("hitch-daemon-hello-probe", timeout, move || {
+        hello_exchange(stream, request_id)
+    }))
+}
+
+fn connect_and_hello_over_new_connection(
+    socket_path: &Path,
+    request_id: RequestId,
+    timeout: Duration,
+) -> Result<(DaemonStream, BufReader<DaemonStream>, Response), String> {
+    let socket_path = socket_path.to_path_buf();
+    finish_hello_probe(run_probe("hitch-daemon-hello-probe", timeout, move || {
+        let stream = connect_transport(&socket_path)
+            .map_err(|err| format!("failed to connect for daemon hello: {err}"))?;
+        hello_exchange(stream, request_id)
+    }))
+}
 
 impl HitchClient {
     fn new() -> Self {
@@ -421,6 +829,8 @@ impl HitchClient {
             recovering: AtomicBool::new(false),
             suppress_recovery: AtomicBool::new(false),
             daemon_pid: Mutex::new(None),
+            #[cfg(windows)]
+            windows_daemon_pid: Mutex::new(None),
             log_path: daemon_log_path(),
             input_tx,
         }));
@@ -541,11 +951,24 @@ impl HitchClient {
             *slot = daemon_pid;
         }
     }
-
+    #[cfg(unix)]
     fn cached_daemon_pid(&self) -> Option<u32> {
         self.0.daemon_pid.lock().ok().and_then(|slot| *slot)
     }
 
+    #[cfg(windows)]
+    fn set_windows_daemon_pid(&self, pid: Option<u32>) {
+        if let Ok(mut slot) = self.0.windows_daemon_pid.lock() {
+            *slot = pid;
+        }
+    }
+
+    #[cfg(windows)]
+    fn cached_windows_daemon_pid(&self) -> Option<u32> {
+        self.0.windows_daemon_pid.lock().ok().and_then(|slot| *slot)
+    }
+
+    #[cfg(unix)]
     fn force_kill_daemon(&self, preferred_pid: Option<u32>) -> Result<(), String> {
         // Heartbeat recovery has a trustworthy pid from the last successful Hello,
         // but `restart_daemon` must disconnect before it can respawn; pass that pid
@@ -554,7 +977,6 @@ impl HitchClient {
         // daemon could be stale while an upgraded daemon owns the socket.
         let daemon_pid = daemon_pid_for_force_kill(&self.0.socket_path, preferred_pid)
             .ok_or_else(|| "cannot force-restart daemon: daemon pid is unknown".to_string())?;
-        #[cfg(unix)]
         unsafe {
             if libc::kill(daemon_pid as i32, libc::SIGKILL) != 0 {
                 let err = io::Error::last_os_error();
@@ -563,10 +985,17 @@ impl HitchClient {
                 }
             }
         }
-        #[cfg(not(unix))]
-        {
-            return Err("force-restarting the daemon is unsupported on this platform".into());
-        }
+        wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)
+    }
+
+    #[cfg(windows)]
+    fn force_kill_daemon(&self, preferred_pid: Option<u32>) -> Result<(), String> {
+        let daemon_pid = preferred_pid
+            .or_else(|| self.cached_windows_daemon_pid())
+            .ok_or_else(|| {
+                "cannot force-restart daemon: cached daemon pid is unknown".to_string()
+            })?;
+        terminate_process(daemon_pid)?;
         wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)
     }
 
@@ -617,21 +1046,33 @@ impl HitchClient {
         if self.is_connected() {
             return Ok(());
         }
-
-        let stream = match UnixStream::connect(&self.0.socket_path) {
-            Ok(stream) => stream,
-            Err(_) => {
-                // Socket absent: we must (re)spawn. Guard against a crash loop —
-                // a daemon that dies on startup (corrupt store, bind failure)
-                // must not be respawned forever (ADR 0009).
-                self.record_spawn_attempt(app)?;
-                self.set_status(app, DaemonStatus::Starting, None);
-                self.spawn_daemon()
-                    .map_err(|err| self.record_startup_failure(app, err))?;
-                self.wait_for_daemon()
-                    .map_err(|err| self.record_startup_failure(app, err))?
-            }
-        };
+        let stream =
+            match connect_transport_bounded(&self.0.socket_path, Duration::from_millis(500)) {
+                Ok(stream) => stream,
+                Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+                    return Err(format!("timed out connecting to live daemon: {err}"));
+                }
+                // A busy endpoint (`ERROR_PIPE_BUSY`: every pipe instance is
+                // momentarily occupied while the daemon re-arms a fresh accept
+                // instance, ADR 0012) is a *live* daemon, not an absent socket —
+                // the same classification `wait_for_socket_release` already uses.
+                // Spawning a replacement here would race the live daemon, so
+                // surface a retryable error instead and let the caller re-probe.
+                Err(ref err) if is_endpoint_busy(err) => {
+                    return Err(format!("daemon endpoint momentarily busy: {err}"));
+                }
+                Err(_) => {
+                    // Socket absent: we must (re)spawn. Guard against a crash loop —
+                    // a daemon that dies on startup (corrupt store, bind failure)
+                    // must not be respawned forever (ADR 0009).
+                    self.record_spawn_attempt(app)?;
+                    self.set_status(app, DaemonStatus::Starting, None);
+                    self.spawn_daemon()
+                        .map_err(|err| self.record_startup_failure(app, err))?;
+                    self.wait_for_daemon()
+                        .map_err(|err| self.record_startup_failure(app, err))?
+                }
+            };
         self.attach_stream(app, stream)
     }
 
@@ -640,76 +1081,164 @@ impl HitchClient {
     /// `MAX_HANDSHAKE_ATTEMPTS`. On success the Daemon Status becomes `running`
     /// and the crash-loop budget resets. Shared by the `connect_daemon` command
     /// and the auto-recovery loop so both diagnose failures identically.
-    ///
-    /// The key invariant: *any* non-`Hello` outcome — a protocol-rejection
-    /// `Error`, an unexpected variant, a response this client can't even
-    /// deserialize, or a transport error — is treated as "the running daemon is
-    /// incompatible or wedged" and triggers a force-restart. A response we cannot
-    /// parse is itself proof of incompatibility, so it must take the restart path
-    /// rather than leak to the caller (the previous `Ok(Response::Error)`-only
-    /// branch let parse and transport errors surface as a bare mismatch).
     fn connect_and_handshake(&self, app: &AppHandle) -> Result<(), String> {
-        let hello = Request::Hello {
-            client_name: "hitch-desktop".into(),
-            protocol_version: PROTOCOL_VERSION,
-        };
+        let _guard = self
+            .0
+            .connect_lock
+            .lock()
+            .map_err(|_| "connection lock poisoned".to_string())?;
+        if self.is_connected() {
+            return Ok(());
+        }
+
         let mut last_err = String::new();
         for attempt in 0..MAX_HANDSHAKE_ATTEMPTS {
-            self.connect(app)?;
-            match self.send_request(app, hello.clone()) {
-                Ok(Response::Hello { daemon_pid, .. }) => {
+            // Distinguish "endpoint absent" from "endpoint slow". A genuine
+            // connect failure (NotFound / refused) means no daemon is listening,
+            // so we must (re)spawn one. A *timeout* means the probe couldn't be
+            // serviced in time — on Windows the daemon's polling accept loop can
+            // be slow, so the daemon is likely alive. Respawning on timeout would
+            // double-spawn a live daemon and burn crash-loop budget; instead we
+            // fall through to the Hello attempt (with its own HANDSHAKE_TIMEOUT)
+            // and let the slow accept complete.
+            // On the happy path the probe stream is carried forward to the Hello
+            // so the attempt makes a single pipe connect instead of two (the
+            // probe wrote nothing, so the connection is at protocol start). Any
+            // non-`Ok` classification leaves no reusable connection — and the
+            // spawn arm starts a *fresh* daemon — so those paths connect anew.
+            let reusable = match connect_transport_bounded(
+                &self.0.socket_path,
+                Duration::from_millis(500),
+            ) {
+                Ok(probe_stream) => {
+                    // The probe connected, so the daemon is reachable even if the
+                    // upcoming Hello times out. On Windows the cached pipe-server
+                    // pid is the *only* handle on a wedged daemon (no pidfile,
+                    // ADR 0012), so capture it now from the connected handle —
+                    // otherwise a daemon that accepts connections but never
+                    // answers Hello leaves the pid None and `restart_daemon`'s
+                    // force-kill dead-ends with "cached daemon pid is unknown".
+                    #[cfg(windows)]
+                    if let Ok(pid) = probe_stream.connected_pipe_server_pid() {
+                        self.set_windows_daemon_pid(Some(pid));
+                    }
+                    Some(probe_stream)
+                }
+                Err(err) if err.kind() == io::ErrorKind::TimedOut => None,
+                // A busy endpoint (`ERROR_PIPE_BUSY`: every pipe instance is
+                // momentarily occupied while the daemon's accept loop re-arms a
+                // fresh instance, ADR 0012) is a *live* daemon, not an absent
+                // one — exactly as `wait_for_socket_release`/`is_endpoint_busy`
+                // classify it. Spawning here would burn crash-loop budget over a
+                // healthy daemon, and a subsequent force-restart (line below)
+                // would kill it. Fall through to the Hello attempt and let its
+                // own bounded connect retry once an instance frees up.
+                Err(ref err) if is_endpoint_busy(err) => None,
+                Err(_) => {
+                    self.record_spawn_attempt(app)?;
+                    self.set_status(app, DaemonStatus::Starting, None);
+                    self.spawn_daemon()
+                        .map_err(|err| self.record_startup_failure(app, err))?;
+                    // Wait for the freshly spawned daemon to start accepting
+                    // connections before attempting Hello; otherwise the not-yet-ready
+                    // endpoint is mistaken for an incompatible daemon and force-killed,
+                    // double-spawning on every cold start.
+                    let _ = self
+                        .wait_for_daemon()
+                        .map_err(|err| self.record_startup_failure(app, err))?;
+                    None
+                }
+            };
+
+            let request_id = self.0.next_request_id.fetch_add(1, Ordering::SeqCst);
+            let hello_result = match reusable {
+                Some(stream) => hello_over_connection(stream, request_id, HANDSHAKE_TIMEOUT),
+                None => connect_and_hello_over_new_connection(
+                    &self.0.socket_path,
+                    request_id,
+                    HANDSHAKE_TIMEOUT,
+                ),
+            };
+            match hello_result {
+                Ok((stream, reader, Response::Hello { daemon_pid, .. })) => {
+                    self.attach_with_reader(app, stream, reader)?;
                     self.set_daemon_pid(Some(daemon_pid));
+                    #[cfg(windows)]
+                    self.set_windows_daemon_pid(Some(daemon_pid));
                     self.mark_running(app);
                     return Ok(());
                 }
-                other => {
-                    last_err = describe_handshake_failure(&other);
-                    // Don't burn the final attempt on a restart we won't retry.
-                    if attempt + 1 == MAX_HANDSHAKE_ATTEMPTS {
-                        break;
+                Ok((stream, reader, other)) => {
+                    // A response has been received on this connection, so on
+                    // Windows we may now query the pipe server pid without
+                    // blocking (ADR 0012). Cache it so the upcoming
+                    // `restart_daemon` can force-kill an incompatible daemon
+                    // that never completed a Hello — otherwise the cached pid
+                    // would be None and the force-restart would fail.
+                    #[cfg(windows)]
+                    if let Ok(pid) = stream.connected_pipe_server_pid() {
+                        self.set_windows_daemon_pid(Some(pid));
                     }
-                    self.restart_daemon(app, format!("{INCOMPATIBLE_DAEMON_PREFIX}: {last_err}"))?;
+                    let _ = &stream;
+                    drop(reader);
+                    last_err = describe_handshake_failure(&Ok(other));
+                }
+                Err(err) => {
+                    last_err = err;
                 }
             }
+            if attempt + 1 == MAX_HANDSHAKE_ATTEMPTS {
+                break;
+            }
+            self.restart_daemon(app, format!("{INCOMPATIBLE_DAEMON_PREFIX}: {last_err}"))?;
+        }
+        // In debug builds `spawn_daemon` execs prebuilt
+        // `target/debug/hitch-daemon`/`hitch-hook` rather than rebuilding them
+        // (see `spawn_daemon`). A protocol-mismatch handshake failure here almost
+        // always means those binaries are stale relative to the desktop crate, and
+        // restarting just respawns the same stale binary into a crash-loop. Surface
+        // the rebuild fix in the reason so the dev isn't left guessing. Release
+        // builds keep the daemon's own message untouched.
+        #[cfg(debug_assertions)]
+        if last_err.contains("protocol") {
+            last_err.push_str(
+                " (the debug hitch-daemon binary may be stale — rebuild with `cargo build -p hitch-daemon -p hitch-hook`)",
+            );
         }
         if self.is_connected() {
-            self.handle_connection_lost(app, &format!("daemon handshake failed: {last_err}"));
+            self.mark_disconnected(app, last_err.clone());
         }
         Err(last_err)
     }
 
     fn handshake_after_restart(&self, app: &AppHandle) -> Result<(), String> {
-        match self.send_request(
+        let fail = |reason: String| {
+            self.mark_disconnected(app, reason.clone());
+            self.set_status(app, DaemonStatus::Unreachable, Some(reason.clone()));
+            Err(reason)
+        };
+        match self.dispatch_request(
             app,
             Request::Hello {
                 client_name: "hitch-desktop".into(),
                 protocol_version: PROTOCOL_VERSION,
             },
+            None,
+            HANDSHAKE_TIMEOUT,
         ) {
             Ok(Response::Hello { daemon_pid, .. }) => {
                 self.set_daemon_pid(Some(daemon_pid));
+                #[cfg(windows)]
+                self.set_windows_daemon_pid(Some(daemon_pid));
                 self.mark_running(app);
                 let _ = app.emit("hitch-reconnected", ());
                 Ok(())
             }
             Ok(Response::Error { error }) => {
-                let reason = format!("daemon hello failed after restart: {}", error.message);
-                self.mark_disconnected(app, reason.clone());
-                self.set_status(app, DaemonStatus::Unreachable, Some(reason.clone()));
-                Err(reason)
+                fail(format!("daemon hello failed after restart: {}", error.message))
             }
-            Ok(other) => {
-                let reason = format!("unexpected hello response after restart: {other:?}");
-                self.mark_disconnected(app, reason.clone());
-                self.set_status(app, DaemonStatus::Unreachable, Some(reason.clone()));
-                Err(reason)
-            }
-            Err(err) => {
-                let reason = format!("daemon hello failed after restart: {err}");
-                self.mark_disconnected(app, reason.clone());
-                self.set_status(app, DaemonStatus::Unreachable, Some(reason.clone()));
-                Err(reason)
-            }
+            Ok(other) => fail(format!("unexpected hello response after restart: {other:?}")),
+            Err(err) => fail(format!("daemon hello failed after restart: {err}")),
         }
     }
 
@@ -718,23 +1247,47 @@ impl HitchClient {
         self.handshake_after_restart(app)
     }
 
-    fn attach_stream(&self, app: &AppHandle, stream: UnixStream) -> Result<(), String> {
-        stream
-            .set_nonblocking(false)
-            .map_err(|err| format!("failed to configure daemon socket: {err}"))?;
-
+    /// Attach a freshly connected stream with no buffered frames. Clones the
+    /// stream into a writer/reader pair and delegates to [`attach_with_reader`],
+    /// which owns the single implementation of the attach sequence.
+    fn attach_stream(&self, app: &AppHandle, stream: DaemonStream) -> Result<(), String> {
         let writer = stream
             .try_clone()
             .map_err(|err| format!("failed to clone daemon socket: {err}"))?;
+        let reader = BufReader::new(stream);
+        self.attach_with_reader(app, writer, reader)
+    }
+
+    /// Attach a connection, taking over its writer half and reader. Used both
+    /// for fresh connections (via [`attach_stream`]) and for connections whose
+    /// `Hello` was already read by a probe, reusing the probe's `BufReader`
+    /// rather than building a fresh one. The daemon enqueues `ReplayToClient`
+    /// (scrollback + live output) immediately after the Hello response, so
+    /// those frames can already be buffered inside the probe's reader. Building
+    /// a new reader here would drop the probe's buffer and lose (or desync on)
+    /// those frames; carrying the same reader forward preserves every byte read
+    /// past the Hello frame. `writer_stream` is the writer half; `reader`
+    /// already wraps a separate clone of the connection, so no extra clone is
+    /// needed.
+    fn attach_with_reader(
+        &self,
+        app: &AppHandle,
+        writer_stream: DaemonStream,
+        reader: BufReader<DaemonStream>,
+    ) -> Result<(), String> {
+        writer_stream
+            .set_nonblocking(false)
+            .map_err(|err| format!("failed to configure daemon socket: {err}"))?;
+
         *self
             .0
             .writer
             .lock()
-            .map_err(|_| "writer lock poisoned".to_string())? = Some(writer);
+            .map_err(|_| "writer lock poisoned".to_string())? = Some(writer_stream);
         self.0.connected.store(true, Ordering::SeqCst);
 
         let generation = self.0.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.start_reader(app.clone(), stream, generation);
+        self.start_reader(app.clone(), reader, generation);
         self.start_heartbeat(app.clone(), generation);
         Ok(())
     }
@@ -778,22 +1331,35 @@ impl HitchClient {
             // works across protocol versions.
             self.request_daemon_shutdown();
             let force_kill = should_force_kill_daemon(&reason);
+            #[cfg(unix)]
             let force_kill_pid = if reason == HEARTBEAT_LOST_REASON {
                 self.cached_daemon_pid()
             } else {
                 None
             };
+            #[cfg(windows)]
+            let force_kill_pid =
+                windows_force_kill_pid_for_reason(&reason, self.cached_windows_daemon_pid());
             self.mark_disconnected(app, reason.clone());
             self.record_spawn_attempt(app)?;
             self.set_status(app, DaemonStatus::Starting, None);
 
-            // For a wedged or incompatible daemon, SIGKILL by pid is the fast path
-            // — but it's best-effort: a daemon predating the pidfile (the very
-            // stale-daemon-across-an-upgrade case) reports no pid, so we must not
-            // hard-fail on it. In every case we then wait for the socket to be
-            // released so we never spawn a second daemon over a live one.
+            // Wedged daemons are torn down with the platform's non-cooperative
+            // kill primitive: Unix uses a verified pidfile/Hello pid, Windows uses
+            // the last successful Hello pid. In every successful case we then wait
+            // for the endpoint to stop accepting connections so we never spawn
+            // over a live daemon.
             if force_kill {
-                let _ = self.force_kill_daemon(force_kill_pid);
+                let kill_result = self.force_kill_daemon(force_kill_pid);
+                #[cfg(unix)]
+                {
+                    let _ = kill_result;
+                }
+                #[cfg(windows)]
+                if let Err(err) = kill_result {
+                    self.set_status(app, DaemonStatus::Failed, Some(err.clone()));
+                    return Err(err);
+                }
             }
             wait_for_socket_release(&self.0.socket_path, DAEMON_SHUTDOWN_GRACE)?;
 
@@ -878,7 +1444,7 @@ impl HitchClient {
             Ok(response) => Ok(response),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.remove_pending(request_id);
-                Err("timed out waiting for daemon response".into())
+                Err(DAEMON_RESPONSE_TIMEOUT_REASON.into())
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 Err("daemon response channel disconnected".into())
@@ -902,12 +1468,12 @@ impl HitchClient {
         }
     }
 
-    fn start_reader(&self, app: AppHandle, stream: UnixStream, generation: u64) {
+    fn start_reader(&self, app: AppHandle, reader: BufReader<DaemonStream>, generation: u64) {
         let client = self.clone();
         thread::Builder::new()
             .name("hitch-daemon-reader".into())
             .spawn(move || {
-                let result = reader_loop(&app, &client, stream);
+                let result = reader_loop(&app, &client, reader);
                 if let Err(err) = result {
                     // Only disconnect if this reader still owns the active connection.
                     // A stale reader from a superseded connection must not clobber
@@ -922,14 +1488,16 @@ impl HitchClient {
 
     fn clear_connection_state(&self, reason: &str, drop_writer: bool) {
         self.0.connected.store(false, Ordering::SeqCst);
-        // The cached pid is only meaningful while we're handshook with that exact
-        // daemon. Once disconnected it's stale — a daemon swapped underneath us
-        // (upgrade, crash+respawn) leaves an incompatible daemon at the socket
-        // whose pid lives only in the pidfile. Clearing here means `force_kill_daemon`
-        // falls through to the pidfile for the protocol-mismatch case instead of
-        // SIGKILLing a stale/reused pid while the real daemon keeps the socket.
+        // The cached Hello pid is only meaningful while we're handshook with that
+        // exact daemon. Once disconnected it's stale — a daemon swapped underneath
+        // us (upgrade, crash+respawn) could leave the old pid reused by another
+        // process. Clear it instead of risking an unrelated kill.
         if let Ok(mut slot) = self.0.daemon_pid.lock() {
             *slot = None;
+        }
+        #[cfg(windows)]
+        if drop_writer {
+            self.set_windows_daemon_pid(None);
         }
         if drop_writer {
             if let Ok(mut writer) = self.0.writer.lock() {
@@ -1093,31 +1661,86 @@ impl HitchClient {
         });
     }
 
-    /// Fire-and-forget a `ShutdownDaemon` request (full quit). We do not wait for
-    /// the Ack: the caller is about to exit the GUI process, and restart recovery
-    /// may still have a usable writer even after marking the connection unavailable.
-    fn request_daemon_shutdown(&self) {
+    fn request_daemon_shutdown_over_new_connection(
+        socket_path: &Path,
+        request_id: RequestId,
+    ) -> Result<(), String> {
+        let socket_path = socket_path.to_path_buf();
+        match run_probe(
+            "hitch-daemon-shutdown-probe",
+            Duration::from_secs(2),
+            move || {
+                (|| -> Result<(), String> {
+                    let mut stream = connect_transport(&socket_path)
+                        .map_err(|err| format!("failed to connect for daemon shutdown: {err}"))?;
+                    let bytes = encode_control_message(&ControlMessage::request(
+                        request_id,
+                        Request::ShutdownDaemon,
+                    ))
+                    .map_err(|err| err.to_string())?;
+                    stream
+                        .write_all(&bytes)
+                        .map_err(|err| format!("failed to send daemon shutdown: {err}"))?;
+                    stream
+                        .flush()
+                        .map_err(|err| format!("failed to flush daemon shutdown: {err}"))?;
+
+                    let mut reader = BufReader::new(stream);
+                    match read_control_message(&mut reader) {
+                        Ok(Some(ControlMessage::Response {
+                            id,
+                            response: Response::Ack,
+                        })) if id == request_id => Ok(()),
+                        Ok(Some(other)) => {
+                            Err(format!("unexpected daemon shutdown response: {other:?}"))
+                        }
+                        Ok(None) => Err("daemon closed shutdown connection before ack".to_string()),
+                        Err(err) => Err(format!("failed to read daemon shutdown ack: {err}")),
+                    }
+                })()
+            },
+        ) {
+            Ok(result) => result,
+            Err(ProbeError::Spawn(err)) => {
+                Err(format!("failed to spawn daemon shutdown probe: {err}"))
+            }
+            Err(ProbeError::Timeout) => {
+                Err("timed out waiting for daemon shutdown ack".to_string())
+            }
+            Err(ProbeError::Disconnected) => {
+                Err("daemon shutdown probe exited without a result".to_string())
+            }
+        }
+    }
+
+    /// Ask the daemon to shut down. When this client has not completed startup
+    /// yet, there may be no persistent writer even though the daemon endpoint is
+    /// live; in that case use a short-lived connection and wait for Ack so manual
+    /// restart can actually release the pipe before spawning.
+    fn request_daemon_shutdown(&self) -> bool {
         let request_id = self.0.next_request_id.fetch_add(1, Ordering::SeqCst);
         let Ok(bytes) = encode_control_message(&ControlMessage::request(
             request_id,
             Request::ShutdownDaemon,
         )) else {
-            return;
+            return false;
         };
         if let Ok(mut guard) = self.0.writer.lock() {
             if let Some(writer) = guard.as_mut() {
-                let _ = writer.write_all(&bytes);
-                let _ = writer.flush();
+                if writer.write_all(&bytes).is_ok() && writer.flush().is_ok() {
+                    return true;
+                }
             }
         }
+        Self::request_daemon_shutdown_over_new_connection(&self.0.socket_path, request_id).is_ok()
     }
 
     fn spawn_daemon(&self) -> Result<(), String> {
-        // In debug builds, always use `cargo run` so the daemon is compiled from
-        // current source. Relying on the sibling binary in target/debug risks using
-        // a stale build with a different protocol version when only one crate was
-        // rebuilt (e.g. `cargo tauri dev` recompiles hitch-desktop but not
-        // hitch-daemon).
+        // In debug builds, `cargo tauri dev` already runs the package-level dev
+        // script, which builds hitch-daemon and hitch-hook before launching the
+        // desktop. Do not run nested `cargo` here: the GUI itself is already
+        // under `cargo run`, and waiting on another cargo child during startup
+        // leaves daemon status stuck at `starting`.
         #[cfg(not(debug_assertions))]
         if let Some(path) = daemon_binary_path() {
             let hook_path = hook_binary_path_for_daemon(&path).ok_or_else(|| {
@@ -1126,68 +1749,64 @@ impl HitchClient {
                     path.display()
                 )
             })?;
-            let output = Command::new(&path)
+            let mut command = Command::new(&path);
+            command
                 .arg("--socket")
                 .arg(&self.0.socket_path)
                 .arg("--hook-helper")
                 .arg(&hook_path)
-                .arg("--detach")
-                .output()
-                .map_err(|err| format!("failed to spawn {}: {err}", path.display()))?;
-            if output.status.success() {
-                return Ok(());
-            }
-            return Err(format!(
-                "hitch-daemon failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
+                .arg("--detach");
+            let pid = run_detach_command(command, &path.display().to_string())?;
+            self.set_daemon_pid(Some(pid));
+            #[cfg(windows)]
+            self.set_windows_daemon_pid(Some(pid));
+            return Ok(());
         }
 
         #[cfg(debug_assertions)]
         {
-            let hook_output = Command::new("cargo")
-                .arg("build")
-                .arg("-p")
-                .arg("hitch-hook")
-                .output()
-                .map_err(|err| format!("failed to run `cargo build -p hitch-hook`: {err}"))?;
-            if !hook_output.status.success() {
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .ok_or_else(|| "failed to locate debug binary directory".to_string())?;
+            let daemon_path = exe_dir.join(debug_binary_name("hitch-daemon"));
+            if !daemon_path.is_file() {
                 return Err(format!(
-                    "`cargo build -p hitch-hook` failed: {}{}",
-                    String::from_utf8_lossy(&hook_output.stdout),
-                    String::from_utf8_lossy(&hook_output.stderr)
+                    "{} was not found; run `cargo build -p hitch-daemon -p hitch-hook`",
+                    daemon_path.display()
+                ));
+            }
+            let hook_path = exe_dir.join(debug_binary_name("hitch-hook"));
+            if !hook_path.is_file() {
+                return Err(format!(
+                    "{} was not found; run `cargo build -p hitch-daemon -p hitch-hook`",
+                    hook_path.display()
                 ));
             }
 
-            let output = Command::new("cargo")
-                .arg("run")
-                .arg("-p")
-                .arg("hitch-daemon")
-                .arg("--")
+            let mut command = Command::new(&daemon_path);
+            command
                 .arg("--socket")
                 .arg(&self.0.socket_path)
-                .arg("--detach")
-                .output()
-                .map_err(|err| format!("failed to run `cargo run -p hitch-daemon`: {err}"))?;
-            if output.status.success() {
-                return Ok(());
-            }
-            return Err(format!(
-                "`cargo run -p hitch-daemon` failed: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ));
+                .arg("--hook-helper")
+                .arg(&hook_path)
+                .arg("--detach");
+            let pid = run_detach_command(command, &daemon_path.display().to_string())?;
+            self.set_daemon_pid(Some(pid));
+            #[cfg(windows)]
+            self.set_windows_daemon_pid(Some(pid));
+            return Ok(());
         }
 
         #[cfg(not(debug_assertions))]
         Err("hitch-daemon binary was not found next to the app; set HITCH_DAEMON_PATH".into())
     }
 
-    fn wait_for_daemon(&self) -> Result<UnixStream, String> {
+    fn wait_for_daemon(&self) -> Result<DaemonStream, String> {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut last_error = None;
         while Instant::now() < deadline {
-            match UnixStream::connect(&self.0.socket_path) {
+            match connect_transport_bounded(&self.0.socket_path, Duration::from_millis(500)) {
                 Ok(stream) => return Ok(stream),
                 Err(err) => {
                     last_error = Some(err);
@@ -1214,8 +1833,11 @@ impl HitchClient {
     }
 }
 
-fn reader_loop(app: &AppHandle, client: &HitchClient, stream: UnixStream) -> io::Result<()> {
-    let mut reader = BufReader::new(stream);
+fn reader_loop(
+    app: &AppHandle,
+    client: &HitchClient,
+    mut reader: BufReader<DaemonStream>,
+) -> io::Result<()> {
     loop {
         let Some(message) = read_control_message(&mut reader)? else {
             return Err(io::Error::new(
@@ -1318,18 +1940,57 @@ fn daemon_binary_path() -> Option<PathBuf> {
 
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let sibling = dir.join("hitch-daemon");
-    if sibling.is_file() {
-        return Some(sibling);
+    let plain = dir.join(daemon_plain_name());
+    if plain.is_file() {
+        return Some(plain);
+    }
+    if let Some(name) = sidecar_daemon_name() {
+        let sidecar = dir.join(name);
+        if sidecar.is_file() {
+            return Some(sidecar);
+        }
     }
 
     None
 }
 
+#[cfg(not(debug_assertions))]
+fn daemon_plain_name() -> &'static str {
+    if cfg!(windows) {
+        "hitch-daemon.exe"
+    } else {
+        "hitch-daemon"
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_binary_name(stem: &str) -> String {
+    if cfg!(windows) {
+        format!("{stem}.exe")
+    } else {
+        stem.to_string()
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn sidecar_daemon_name() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => Some("hitch-daemon-x86_64-pc-windows-msvc.exe"),
+        ("windows", "aarch64") => Some("hitch-daemon-aarch64-pc-windows-msvc.exe"),
+        ("macos", "x86_64") => Some("hitch-daemon-x86_64-apple-darwin"),
+        ("macos", "aarch64") => Some("hitch-daemon-aarch64-apple-darwin"),
+        ("linux", "x86_64") => Some("hitch-daemon-x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64") => Some("hitch-daemon-aarch64-unknown-linux-gnu"),
+        _ => None,
+    }
+}
+
 #[cfg(any(not(debug_assertions), test))]
 fn hook_binary_path_for_daemon(daemon: &Path) -> Option<PathBuf> {
     let dir = daemon.parent()?;
-    let hook = dir.join("hitch-hook");
+    let file_name = daemon.file_name()?.to_str()?;
+    let suffix = file_name.strip_prefix("hitch-daemon").unwrap_or_default();
+    let hook = dir.join(format!("hitch-hook{suffix}"));
     hook.is_file().then_some(hook)
 }
 
@@ -1338,22 +1999,422 @@ struct DisconnectedPayload {
     reason: String,
 }
 
-/// Path to the daemon's log. MUST match the daemon's own `daemon_log_path`
-/// (same `$HOME`-based per-instance dir, `.hitch/daemon.log` for release and
-/// `.hitch-dev/daemon.log` for debug) so the tail the GUI reads is the file the
-/// daemon writes — never derived from the socket parent, to avoid drift. The
-/// GUI and the daemon agree on the namespace because both honour their own
-/// build profile (ADR 0009).
+/// Path to the daemon's log. The data root is owned by
+/// [`hitch_proto::transport::default_data_dir`] — the same resolver the daemon's
+/// `data_dir` uses — so the GUI tails the exact file the daemon writes and the
+/// two can never drift onto different roots. Never derived from the endpoint
+/// parent.
 fn daemon_log_path() -> PathBuf {
-    home_dir()
-        .join(hitch_proto::transport::instance_dir_name())
-        .join("daemon.log")
+    hitch_proto::transport::default_data_dir().join("daemon.log")
 }
 
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditorLaunchSpec {
+    program: OsString,
+    args: Vec<OsString>,
+    #[cfg(windows)]
+    command_processor_shim: bool,
+}
+
+impl EditorLaunchSpec {
+    fn new(program: impl Into<OsString>, path: &Path) -> Self {
+        Self {
+            program: program.into(),
+            args: vec![path.as_os_str().to_os_string()],
+            #[cfg(windows)]
+            command_processor_shim: false,
+        }
+    }
+
+    #[cfg(windows)]
+    fn command_shim(program: impl Into<OsString>, path: &Path) -> Self {
+        Self {
+            program: program.into(),
+            args: vec![path.as_os_str().to_os_string()],
+            command_processor_shim: true,
+        }
+    }
+}
+
+fn trim_configured_editor(editor: &str) -> &str {
+    let editor = editor.trim();
+    let unquoted = editor
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .or_else(|| {
+            editor
+                .strip_prefix('\'')
+                .and_then(|inner| inner.strip_suffix('\''))
+        });
+    unquoted.map(str::trim).unwrap_or(editor)
+}
+
+fn configured_executable(editor: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(editor);
+    path.is_file().then_some(path)
+}
+
+#[cfg(windows)]
+fn normalized_editor_name(editor: &str) -> String {
+    editor
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+#[cfg(windows)]
+fn push_editor_candidate(candidates: &mut Vec<OsString>, base: Option<&Path>, relative: &str) {
+    if let Some(base) = base {
+        candidates.push(base.join(relative).into_os_string());
+    }
+}
+
+#[cfg(windows)]
+fn push_program_files_candidates(
+    candidates: &mut Vec<OsString>,
+    program_files: Option<&Path>,
+    program_files_x86: Option<&Path>,
+    relative: &str,
+) {
+    push_editor_candidate(candidates, program_files, relative);
+    push_editor_candidate(candidates, program_files_x86, relative);
+}
+
+#[cfg(windows)]
+fn windows_editor_candidates_from_dirs(
+    editor: &str,
+    local_app_data: Option<&Path>,
+    program_files: Option<&Path>,
+    program_files_x86: Option<&Path>,
+) -> Vec<OsString> {
+    let mut candidates = Vec::new();
+
+    let normalized = match (normalized_editor_name(editor), editor.contains("++")) {
+        (name, true) if name == "notepad" => "notepadplusplus".to_string(),
+        (name, _) => name,
+    };
+    match normalized.as_str() {
+        "code" | "vscode" | "visualstudiocode" => {
+            push_editor_candidate(
+                &mut candidates,
+                local_app_data,
+                r"Programs\Microsoft VS Code\Code.exe",
+            );
+            push_program_files_candidates(
+                &mut candidates,
+                program_files,
+                program_files_x86,
+                r"Microsoft VS Code\Code.exe",
+            );
+            candidates.push(OsString::from("code"));
+        }
+        "cursor" => {
+            push_editor_candidate(
+                &mut candidates,
+                local_app_data,
+                r"Programs\Cursor\Cursor.exe",
+            );
+            push_program_files_candidates(
+                &mut candidates,
+                program_files,
+                program_files_x86,
+                r"Cursor\Cursor.exe",
+            );
+            candidates.push(OsString::from("cursor"));
+        }
+        "codium" | "vscodium" => {
+            push_editor_candidate(
+                &mut candidates,
+                local_app_data,
+                r"Programs\VSCodium\VSCodium.exe",
+            );
+            push_program_files_candidates(
+                &mut candidates,
+                program_files,
+                program_files_x86,
+                r"VSCodium\VSCodium.exe",
+            );
+            candidates.push(OsString::from("codium"));
+        }
+        "sublime" | "sublimetext" => {
+            push_editor_candidate(
+                &mut candidates,
+                local_app_data,
+                r"Programs\Sublime Text\sublime_text.exe",
+            );
+            push_program_files_candidates(
+                &mut candidates,
+                program_files,
+                program_files_x86,
+                r"Sublime Text\sublime_text.exe",
+            );
+            candidates.push(OsString::from("sublime_text"));
+            candidates.push(OsString::from("subl"));
+        }
+        "notepadplusplus" => {
+            push_program_files_candidates(
+                &mut candidates,
+                program_files,
+                program_files_x86,
+                r"Notepad++\notepad++.exe",
+            );
+            candidates.push(OsString::from("notepad++"));
+        }
+        "windsurf" => {
+            push_editor_candidate(
+                &mut candidates,
+                local_app_data,
+                r"Programs\Windsurf\Windsurf.exe",
+            );
+            push_program_files_candidates(
+                &mut candidates,
+                program_files,
+                program_files_x86,
+                r"Windsurf\Windsurf.exe",
+            );
+            candidates.push(OsString::from("windsurf"));
+        }
+        "zed" => {
+            push_editor_candidate(&mut candidates, local_app_data, r"Programs\Zed\Zed.exe");
+            push_program_files_candidates(
+                &mut candidates,
+                program_files,
+                program_files_x86,
+                r"Zed\Zed.exe",
+            );
+            candidates.push(OsString::from("zed"));
+        }
+        // Unknown editor: the table has no install-dir mapping, so fall back to
+        // treating the configured name itself as a bare-name PATH candidate. This
+        // routes through the same `resolve_windows_path_candidate` machinery the
+        // known bare-name entries use (which tries `.exe`/`.cmd` and applies the
+        // cmd-shim), so any editor resolvable on PATH works instead of dead-ending.
+        // Candidates that carry path components are left out here because
+        // `configured_executable` already handles absolute/relative paths, and
+        // `resolve_windows_path_candidate` only accepts bare names anyway.
+        _ => {
+            if !windows_candidate_has_path_components(&OsString::from(editor)) {
+                candidates.push(OsString::from(editor));
+            }
+        }
+    }
+
+    candidates
+}
+
+#[cfg(windows)]
+fn windows_editor_candidates(editor: &str) -> Vec<OsString> {
+    windows_editor_candidates_from_dirs(
+        editor,
+        std::env::var_os("LOCALAPPDATA").as_deref().map(Path::new),
+        std::env::var_os("ProgramFiles").as_deref().map(Path::new),
+        std::env::var_os("ProgramFiles(x86)")
+            .as_deref()
+            .map(Path::new),
+    )
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsEditorProgram {
+    program: OsString,
+    command_processor_shim: bool,
+}
+
+#[cfg(windows)]
+impl WindowsEditorProgram {
+    fn executable(program: impl Into<OsString>) -> Self {
+        Self {
+            program: program.into(),
+            command_processor_shim: false,
+        }
+    }
+
+    fn command_shim(program: impl Into<OsString>) -> Self {
+        Self {
+            program: program.into(),
+            command_processor_shim: true,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_candidate_has_path_components(candidate: &OsString) -> bool {
+    let path = Path::new(candidate);
+    path.parent()
+        .is_some_and(|parent| parent != Path::new(""))
+        || path.file_name().is_none()
+}
+
+#[cfg(windows)]
+fn windows_candidate_names(candidate: &OsString) -> Vec<OsString> {
+    if Path::new(candidate).extension().is_some() {
+        return vec![candidate.clone()];
+    }
+
+    let mut exe = candidate.clone();
+    exe.push(".exe");
+    let mut cmd = candidate.clone();
+    cmd.push(".cmd");
+    vec![exe, cmd]
+}
+
+#[cfg(windows)]
+fn windows_editor_program_from_path(path: PathBuf) -> WindowsEditorProgram {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
+    {
+        WindowsEditorProgram::command_shim(path.into_os_string())
+    } else {
+        WindowsEditorProgram::executable(path.into_os_string())
+    }
+}
+
+#[cfg(windows)]
+fn resolve_windows_path_candidate_from_dirs(
+    candidate: &OsString,
+    path_dirs: &[PathBuf],
+) -> Option<WindowsEditorProgram> {
+    if windows_candidate_has_path_components(candidate) {
+        return None;
+    }
+
+    let names = windows_candidate_names(candidate);
+
+    for dir in path_dirs {
+        for name in &names {
+            let path = dir.join(name);
+            if path.is_file() {
+                return Some(windows_editor_program_from_path(path));
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn resolve_windows_path_candidate(candidate: &OsString) -> Option<WindowsEditorProgram> {
+    let path_dirs = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    resolve_windows_path_candidate_from_dirs(candidate, &path_dirs)
+}
+
+#[cfg(windows)]
+fn first_available_windows_candidate(candidates: &[OsString]) -> Option<WindowsEditorProgram> {
+    candidates
+        .iter()
+        .find(|candidate| Path::new(candidate).is_file())
+        .map(|candidate| WindowsEditorProgram::executable(candidate.clone()))
+        .or_else(|| {
+            candidates
+                .iter()
+                .filter(|candidate| !Path::new(candidate).is_absolute())
+                .find_map(resolve_windows_path_candidate)
+        })
+}
+
+fn build_editor_launch_spec(editor: &str, path: &Path) -> Option<EditorLaunchSpec> {
+    let editor = trim_configured_editor(editor);
+    if editor.is_empty() {
+        return None;
+    }
+    if let Some(executable) = configured_executable(editor) {
+        return Some(EditorLaunchSpec::new(executable.into_os_string(), path));
+    }
+
+    // Windows resolution order: explicit configured path (handled above) → known
+    // install dirs + the editor's canonical bare name → the bare configured name
+    // on PATH (the table's `_` fallback). If nothing resolves we return None and
+    // the caller opens the path with the default viewer.
+    #[cfg(windows)]
+    {
+        let candidates = windows_editor_candidates(editor);
+        if let Some(program) = first_available_windows_candidate(&candidates) {
+            if program.command_processor_shim {
+                return Some(EditorLaunchSpec::command_shim(program.program, path));
+            }
+            return Some(EditorLaunchSpec::new(program.program, path));
+        }
+        if !candidates.is_empty() {
+            return None;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return Some(EditorLaunchSpec {
+            program: OsString::from("open"),
+            args: vec![
+                OsString::from("-a"),
+                OsString::from(editor),
+                path.as_os_str().to_os_string(),
+            ],
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    Some(EditorLaunchSpec::new(editor, path))
+}
+
+#[cfg(windows)]
+fn windows_command_processor() -> OsString {
+    std::env::var_os("SystemRoot")
+        .map(|root| Path::new(&root).join(r"System32\cmd.exe"))
+        .filter(|path| path.is_file())
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|| OsString::from("cmd.exe"))
+}
+
+#[cfg(windows)]
+fn spawn_windows_command_shim(spec: &EditorLaunchSpec) -> Result<(), String> {
+    Command::new(windows_command_processor())
+        .arg("/d")
+        .arg("/c")
+        .arg(&spec.program)
+        .args(&spec.args)
+        // The shim only exists to run `.cmd`/`.bat` editor launchers (e.g.
+        // VS Code's `code.cmd`), which hand off to a GUI process; without this
+        // flag the GUI parent would flash a visible cmd.exe console.
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("failed to open editor {:?}: {err}", spec.program))
+}
+
+fn spawn_editor(spec: EditorLaunchSpec) -> Result<(), String> {
+    #[cfg(windows)]
+    if spec.command_processor_shim {
+        return spawn_windows_command_shim(&spec);
+    }
+
+    Command::new(&spec.program)
+        .args(&spec.args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("failed to open editor {:?}: {err}", spec.program))
+}
+
+fn open_path_with_default_viewer(path: &Path) -> Result<(), String> {
+    tauri_plugin_opener::open_path(path.display().to_string(), None::<&str>)
+        .map_err(|err| format!("failed to open path with default viewer: {err}"))
+}
+
+#[tauri::command]
+async fn open_in_editor(path: String, editor: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(path);
+        match build_editor_launch_spec(&editor, &path) {
+            Some(spec) => spawn_editor(spec),
+            None => open_path_with_default_viewer(&path),
+        }
+    })
+    .await
+    .map_err(|err| format!("editor launch task failed: {err}"))?
 }
 
 #[tauri::command]
@@ -1472,6 +2533,14 @@ fn unregister_session_output(
     Ok(())
 }
 
+/// Report the maximize button's physical-pixel rectangle so the Windows window
+/// subclass can hit-test it as the native caption max button (driving Snap
+/// Layouts). A no-op off Windows; the frontend only calls it there.
+#[tauri::command]
+fn set_max_button_rect(left: i32, top: i32, right: i32, bottom: i32) {
+    window_chrome::set_max_button_rect(left, top, right, bottom);
+}
+
 /// Menu-bar status line mirroring the four-state Daemon Status (ADR 0009). The
 /// daemon keeps running after the window closes, so this is the honest signal
 /// that Hitch has a background presence (ADR 0003). Always word + state, never
@@ -1521,11 +2590,49 @@ fn handle_tray_menu_event(app: &AppHandle, event: MenuEvent) {
             });
         }
         "quit" => {
-            // Full quit: stop the daemon (kills sessions) and exit the GUI.
-            app.state::<HitchClient>().request_daemon_shutdown();
+            // Full quit: stop the daemon (kills sessions) and exit the GUI. Run the
+            // shutdown on a worker thread with a short bounded wait so a no-writer
+            // fallback (which connects and waits for an Ack) can't hang the UI thread.
+            let client = app.state::<HitchClient>().inner().clone();
+            let (tx, rx) = mpsc::channel();
+            thread::Builder::new()
+                .name("hitch-daemon-quit-shutdown".into())
+                .spawn(move || {
+                    let _ = tx.send(client.request_daemon_shutdown());
+                })
+                .ok();
+            let _ = rx.recv_timeout(Duration::from_secs(1));
             app.exit(0);
         }
         _ => {}
+    }
+}
+
+fn tray_icon_as_template() -> bool {
+    cfg!(target_os = "macos")
+}
+
+fn apply_platform_tray_behavior(builder: TrayIconBuilder<Wry>) -> TrayIconBuilder<Wry> {
+    #[cfg(windows)]
+    {
+        // Windows users expect left click to restore the app and right click to
+        // show the context menu. macOS keeps Tauri's default menu-bar behaviour.
+        builder
+            .show_menu_on_left_click(false)
+            .on_tray_icon_event(|tray, event| {
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    show_main_window(tray.app_handle());
+                }
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        builder
     }
 }
 
@@ -1558,8 +2665,8 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .tooltip(tray_status_text(DaemonStatus::Starting, 0))
         .icon(tauri::include_image!("icons/tray.png"))
-        .icon_as_template(true)
-        .on_menu_event(handle_tray_menu_event);
+        .icon_as_template(tray_icon_as_template());
+    let builder = apply_platform_tray_behavior(builder).on_menu_event(handle_tray_menu_event);
     builder.build(app)?;
 
     if let Ok(mut slot) = app.state::<HitchClient>().0.tray_status.lock() {
@@ -1571,13 +2678,21 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        describe_handshake_failure, read_control_message, read_log_tail, read_pty_payload,
-        recovery_mode_for_loss, should_force_kill_daemon, tray_status_text,
-        wait_for_socket_release, ControlMessage, CrashLoopGuard, DaemonStatus, ErrorCode,
-        HitchClient, OutputRouter, ProtocolError, RecoveryMode, Request, Response, CRASH_LOOP_MAX,
-        HEARTBEAT_LOST_REASON,
+        build_editor_launch_spec, describe_handshake_failure, encode_control_message,
+        parse_spawned_daemon_pid, read_control_message, read_log_tail, recovery_mode_for_loss,
+        run_probe, should_force_kill_daemon, tray_status_text, ControlMessage, CrashLoopGuard,
+        DaemonStatus, ErrorCode, HitchClient, OutputRouter, ProbeError, ProtocolError, RecoveryMode,
+        Request, Response, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
     };
+    #[cfg(windows)]
+    use super::{
+        first_available_windows_candidate, resolve_windows_path_candidate_from_dirs,
+        windows_editor_candidates_from_dirs, WindowsEditorProgram,
+    };
+    #[cfg(unix)]
+    use super::{read_pty_payload, wait_for_socket_release};
     use hitch_core::SessionId;
+    use hitch_proto::transport::{connect_daemon, DaemonListener};
     #[cfg(unix)]
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::{Arc, Mutex};
@@ -1592,6 +2707,178 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn configured_editor_path_with_spaces_is_preserved_as_program() {
+        let dir = std::env::temp_dir().join(format!(
+            "hitch-editor-test-{}-{}",
+            std::process::id(),
+            "path-with-spaces"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let editor = dir.join("Editor With Spaces.exe");
+        std::fs::write(&editor, b"").unwrap();
+        let worktree = std::path::Path::new(r"C:\repo with spaces");
+
+        let configured = format!(" \"{}\" ", editor.display());
+        let spec = build_editor_launch_spec(&configured, worktree).unwrap();
+
+        assert_eq!(spec.program, editor.as_os_str());
+        assert_eq!(spec.args, vec![worktree.as_os_str().to_os_string()]);
+
+        std::fs::remove_file(editor).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_display_names_resolve_to_installer_locations_and_path_fallbacks() {
+        let local = std::path::Path::new(r"C:\Users\Ada\AppData\Local");
+        let program_files = std::path::Path::new(r"C:\Program Files");
+        let program_files_x86 = std::path::Path::new(r"C:\Program Files (x86)");
+
+        let code = windows_editor_candidates_from_dirs(
+            "Visual Studio Code",
+            Some(local),
+            Some(program_files),
+            Some(program_files_x86),
+        );
+        assert!(code.contains(
+            &local
+                .join(r"Programs\Microsoft VS Code\Code.exe")
+                .into_os_string()
+        ));
+        assert!(code.contains(
+            &program_files
+                .join(r"Microsoft VS Code\Code.exe")
+                .into_os_string()
+        ));
+        assert!(code.contains(&std::ffi::OsString::from("code")));
+
+        let cursor =
+            windows_editor_candidates_from_dirs("Cursor", Some(local), Some(program_files), None);
+        assert!(cursor.contains(&local.join(r"Programs\Cursor\Cursor.exe").into_os_string()));
+        assert!(cursor.contains(&std::ffi::OsString::from("cursor")));
+
+        let notepad = windows_editor_candidates_from_dirs(
+            "Notepad++",
+            Some(local),
+            Some(program_files),
+            Some(program_files_x86),
+        );
+        assert!(notepad.contains(
+            &program_files_x86
+                .join(r"Notepad++\notepad++.exe")
+                .into_os_string()
+        ));
+        assert!(notepad.contains(&std::ffi::OsString::from("notepad++")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unknown_editor_falls_back_to_bare_name_on_path() {
+        let local = std::path::Path::new(r"C:\Users\Ada\AppData\Local");
+        let program_files = std::path::Path::new(r"C:\Program Files");
+        let program_files_x86 = std::path::Path::new(r"C:\Program Files (x86)");
+
+        // An editor with no match arm should still yield its bare configured name
+        // as a candidate so PATH resolution can find it (instead of an empty list
+        // that dead-ends to None).
+        let helix = windows_editor_candidates_from_dirs(
+            "helix",
+            Some(local),
+            Some(program_files),
+            Some(program_files_x86),
+        );
+        assert_eq!(helix, vec![std::ffi::OsString::from("helix")]);
+
+        // A configured name carrying path components is not added as a bare-name
+        // candidate (those are handled by `configured_executable`).
+        let with_path = windows_editor_candidates_from_dirs(
+            r"tools\helix",
+            Some(local),
+            Some(program_files),
+            Some(program_files_x86),
+        );
+        assert!(with_path.is_empty());
+
+        // And that bare name resolves through the normal PATH machinery, picking
+        // up a `.exe` from a PATH dir.
+        let dir = std::env::temp_dir().join(format!(
+            "hitch-editor-test-{}-{}",
+            std::process::id(),
+            "unknown-path-fallback"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("helix.exe");
+        std::fs::write(&exe, b"").unwrap();
+
+        assert_eq!(
+            resolve_windows_path_candidate_from_dirs(
+                &std::ffi::OsString::from("helix"),
+                &[dir.clone()],
+            ),
+            Some(WindowsEditorProgram::executable(
+                exe.as_os_str().to_os_string()
+            ))
+        );
+
+        std::fs::remove_file(exe).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_candidate_selection_prefers_existing_executable_before_path_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "hitch-editor-test-{}-{}",
+            std::process::id(),
+            "candidate-precedence"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let editor = dir.join("Code.exe");
+        std::fs::write(&editor, b"").unwrap();
+        let candidates = vec![
+            editor.as_os_str().to_os_string(),
+            std::ffi::OsString::from("code"),
+        ];
+
+        assert_eq!(
+            first_available_windows_candidate(&candidates),
+            Some(WindowsEditorProgram::executable(
+                editor.as_os_str().to_os_string()
+            ))
+        );
+
+        std::fs::remove_file(editor).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_fallback_resolves_cmd_shim_before_launch() {
+        let dir = std::env::temp_dir().join(format!(
+            "hitch-editor-test-{}-{}",
+            std::process::id(),
+            "path-cmd-shim"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("code.cmd");
+        std::fs::write(&shim, b"").unwrap();
+
+        assert_eq!(
+            resolve_windows_path_candidate_from_dirs(
+                &std::ffi::OsString::from("code"),
+                &[dir.clone()],
+            ),
+            Some(WindowsEditorProgram::command_shim(
+                shim.as_os_str().to_os_string()
+            ))
+        );
+
+        std::fs::remove_file(shim).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]
@@ -1789,6 +3076,22 @@ mod tests {
         std::fs::write(&hook, "").unwrap();
         assert_eq!(super::hook_binary_path_for_daemon(&daemon), Some(hook));
 
+        let suffixed_daemon = dir.join(format!(
+            "hitch-daemon-x86_64-pc-windows-msvc{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let suffixed_hook = dir.join(format!(
+            "hitch-hook-x86_64-pc-windows-msvc{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        std::fs::write(&suffixed_daemon, "").unwrap();
+        assert_eq!(super::hook_binary_path_for_daemon(&suffixed_daemon), None);
+        std::fs::write(&suffixed_hook, "").unwrap();
+        assert_eq!(
+            super::hook_binary_path_for_daemon(&suffixed_daemon),
+            Some(suffixed_hook)
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1875,6 +3178,28 @@ mod tests {
         let _ = std::fs::remove_file(&pidfile);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_force_kill_uses_cached_daemon_pid() {
+        let incompatible = "restarting incompatible daemon: unsupported protocol";
+        assert_eq!(
+            super::windows_force_kill_pid_for_reason(incompatible, Some(424242)),
+            Some(424242)
+        );
+        assert_eq!(
+            super::windows_force_kill_pid_for_reason(HEARTBEAT_LOST_REASON, Some(424242)),
+            Some(424242)
+        );
+        assert_eq!(
+            super::windows_force_kill_pid_for_reason("daemon socket closed", Some(424242)),
+            None
+        );
+        assert_eq!(
+            super::windows_force_kill_pid_for_reason(incompatible, None),
+            None
+        );
+    }
+
     #[test]
     fn crash_loop_guard_stops_after_max_attempts_in_window() {
         let window = Duration::from_secs(60);
@@ -1940,7 +3265,7 @@ mod tests {
             RecoveryMode::RestartDaemon
         );
         assert!(should_force_kill_daemon(HEARTBEAT_LOST_REASON));
-        assert!(!should_force_kill_daemon(
+        assert!(should_force_kill_daemon(
             "daemon handshake failed: timed out waiting for daemon response"
         ));
         assert_eq!(
@@ -1976,6 +3301,117 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shutdown_over_new_connection_waits_for_daemon_ack() {
+        use std::io::{BufReader, Write};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hitch-shutdown-new-connection-{}-{nonce}.sock",
+            std::process::id()
+        ));
+        let listener = hitch_proto::transport::DaemonListener::bind(&path).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let stream = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let message = read_control_message(&mut reader).unwrap().unwrap();
+            assert_eq!(
+                message,
+                ControlMessage::request(99, Request::ShutdownDaemon)
+            );
+            let mut stream = reader.into_inner();
+            let ack = encode_control_message(&ControlMessage::response(99, Response::Ack)).unwrap();
+            stream.write_all(&ack).unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        HitchClient::request_daemon_shutdown_over_new_connection(&path, 99).unwrap();
+        server.join().unwrap();
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_probe_returns_worker_value_within_timeout() {
+        let got = run_probe("hitch-test-probe-fast", Duration::from_secs(5), || 7).ok();
+        assert_eq!(got, Some(7));
+    }
+
+    #[test]
+    fn run_probe_reports_timeout_when_worker_outlasts_deadline() {
+        // Worker blocks well past the caller's deadline.
+        let res = run_probe("hitch-test-probe-timeout", Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(400));
+            1u8
+        });
+        assert!(matches!(res, Err(ProbeError::Timeout)));
+    }
+
+    #[test]
+    fn run_probe_bounds_leaked_workers_to_one_per_name() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // A worker that signals when it actually starts running, so the test can
+        // tell whether a *second* thread was spawned while the first is blocked.
+        static STARTS: AtomicUsize = AtomicUsize::new(0);
+        STARTS.store(0, Ordering::SeqCst);
+
+        let release = Arc::new(Mutex::new(()));
+        // Hold the lock so the first worker blocks inside `work`.
+        let held = release.lock().unwrap();
+
+        let name = "hitch-test-probe-leak-bound";
+        let release_1 = Arc::clone(&release);
+        // First probe: worker starts, increments STARTS, then blocks on the
+        // mutex the test is holding. Caller times out and parks the worker.
+        let first = run_probe(name, Duration::from_millis(80), move || {
+            STARTS.fetch_add(1, Ordering::SeqCst);
+            let _block = release_1.lock().unwrap();
+            0u8
+        });
+        assert!(matches!(first, Err(ProbeError::Timeout)));
+        assert_eq!(STARTS.load(Ordering::SeqCst), 1, "first worker should run");
+
+        // Second probe with the same name while the first is still blocked: it
+        // must NOT spawn another worker (STARTS stays 1) and must report timeout
+        // by waiting on the parked worker.
+        let release_2 = Arc::clone(&release);
+        let second = run_probe(name, Duration::from_millis(80), move || {
+            STARTS.fetch_add(1, Ordering::SeqCst);
+            let _block = release_2.lock().unwrap();
+            0u8
+        });
+        assert!(matches!(second, Err(ProbeError::Timeout)));
+        assert_eq!(
+            STARTS.load(Ordering::SeqCst),
+            1,
+            "second same-name probe must not spawn a second worker while the first is blocked",
+        );
+
+        // Release the blocked worker and let it drain so we don't leak across
+        // other tests sharing the process.
+        drop(held);
+        // Drain the parked worker: a fresh probe of the same name now waits for
+        // the previous one to finish, then runs its own work.
+        let third = run_probe(name, Duration::from_secs(5), || 9u8);
+        assert_eq!(third.ok(), Some(9));
+    }
+
+    #[test]
+    fn spawned_daemon_pid_is_parsed_from_detach_stdout() {
+        assert_eq!(parse_spawned_daemon_pid(b"12345\n"), Some(12345));
+        assert_eq!(
+            parse_spawned_daemon_pid(b"Finished dev profile\n9876\r\n"),
+            Some(9876)
+        );
+        assert_eq!(parse_spawned_daemon_pid(b""), None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn restart_refuses_to_spawn_over_a_live_socket() {
@@ -1998,6 +3434,50 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn final_handshake_failure_clears_attached_connection_state() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hitch-final-handshake-failure-{}-{nonce}.sock",
+            std::process::id()
+        ));
+        let listener = DaemonListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || listener.accept().unwrap());
+        let writer = connect_daemon(&path).unwrap();
+        let server_stream = server.join().unwrap();
+
+        let client = HitchClient::new();
+        client
+            .0
+            .connected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *client.0.writer.lock().unwrap() = Some(writer);
+        assert!(client.is_connected());
+
+        client.clear_connection_state(
+            "daemon hello failed after restart: unsupported protocol",
+            true,
+        );
+
+        assert!(
+            !client.is_connected(),
+            "failed final Hello must not leave the client treating a stale writer as connected"
+        );
+        assert!(
+            client.0.writer.lock().unwrap().is_none(),
+            "failed final Hello must drop the attached writer so the next call reconnects"
+        );
+
+        drop(server_stream);
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(unix)]
@@ -2142,6 +3622,186 @@ fn disable_press_and_hold() {
     }
 }
 
+#[cfg(feature = "packaged-smoke")]
+fn packaged_smoke_enabled() -> bool {
+    matches!(env::var("HITCH_PACKAGED_SMOKE_TEST").as_deref(), Ok("1"))
+}
+
+#[cfg(feature = "packaged-smoke")]
+fn smoke_temp_project_root() -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    env::temp_dir().join(format!(
+        "hitch-packaged-smoke-{}-{timestamp}",
+        std::process::id()
+    ))
+}
+
+#[cfg(feature = "packaged-smoke")]
+fn response_error(context: &str, response: Response) -> String {
+    match response {
+        Response::Error { error } => format!("{context}: {}", error.message),
+        other => format!("{context}: unexpected response {other:?}"),
+    }
+}
+
+#[cfg(feature = "packaged-smoke")]
+fn smoke_request(
+    client: &HitchClient,
+    app: &AppHandle,
+    request: Request,
+    context: &str,
+) -> Result<Response, String> {
+    client
+        .send_request(app, request)
+        .map_err(|err| format!("{context}: {err}"))
+}
+
+#[cfg(feature = "packaged-smoke")]
+fn run_packaged_smoke(app: AppHandle, client: HitchClient) -> Result<(), String> {
+    let project_root = smoke_temp_project_root();
+    let mut project_id = None;
+    let mut session_id = None;
+
+    let result = (|| {
+        fs::create_dir_all(&project_root).map_err(|err| {
+            format!(
+                "failed to create smoke project {}: {err}",
+                project_root.display()
+            )
+        })?;
+
+        client.connect_and_handshake(&app).map_err(|err| {
+            format!("failed to connect and handshake with packaged daemon: {err}")
+        })?;
+
+        let project = match smoke_request(
+            &client,
+            &app,
+            Request::AddProject {
+                root: project_root.clone(),
+            },
+            "failed to add smoke project",
+        )? {
+            Response::Projects { mut projects } if projects.len() == 1 => projects.remove(0),
+            other => return Err(response_error("failed to add smoke project", other)),
+        };
+        project_id = Some(project.id);
+
+        let parent = SessionParent::Project(project.id);
+        let session = match smoke_request(
+            &client,
+            &app,
+            Request::OpenSession {
+                parent,
+                name: "packaged-smoke-shell".into(),
+                command: None,
+                cols: 80,
+                rows: 24,
+            },
+            "failed to open smoke shell session",
+        )? {
+            Response::SessionOpened { session, .. } => session,
+            other => return Err(response_error("failed to open smoke shell session", other)),
+        };
+        session_id = Some(session.id);
+
+        match smoke_request(
+            &client,
+            &app,
+            Request::ListSessions {
+                parent: Some(parent),
+            },
+            "failed to list smoke sessions",
+        )? {
+            Response::Sessions { sessions }
+                if sessions.iter().any(|listed| listed.id == session.id) => {}
+            Response::Sessions { .. } => {
+                return Err("smoke shell session was not returned by ListSessions".to_string());
+            }
+            other => return Err(response_error("failed to list smoke sessions", other)),
+        }
+
+        match smoke_request(
+            &client,
+            &app,
+            Request::CloseSession {
+                session_id: session.id,
+                kill_process: true,
+            },
+            "failed to close smoke shell session",
+        )? {
+            Response::Ack => session_id = None,
+            other => return Err(response_error("failed to close smoke shell session", other)),
+        }
+
+        match smoke_request(
+            &client,
+            &app,
+            Request::RemoveProject {
+                project_id: project.id,
+                force: true,
+            },
+            "failed to remove smoke project",
+        )? {
+            Response::Ack => project_id = None,
+            other => return Err(response_error("failed to remove smoke project", other)),
+        }
+
+        match smoke_request(
+            &client,
+            &app,
+            Request::ShutdownDaemon,
+            "failed to shut down smoke daemon",
+        )? {
+            Response::Ack => Ok(()),
+            other => Err(response_error("failed to shut down smoke daemon", other)),
+        }
+    })();
+
+    if client.is_connected() {
+        if let Some(id) = session_id {
+            let _ = client.send_request(
+                &app,
+                Request::CloseSession {
+                    session_id: id,
+                    kill_process: true,
+                },
+            );
+        }
+        if let Some(id) = project_id {
+            let _ = client.send_request(
+                &app,
+                Request::RemoveProject {
+                    project_id: id,
+                    force: true,
+                },
+            );
+        }
+        if result.is_err() {
+            client.request_daemon_shutdown();
+        }
+    }
+    let _ = fs::remove_dir_all(&project_root);
+
+    result
+}
+
+fn start_daemon_connection_on_launch(app: &tauri::App) {
+    let app_handle = app.handle().clone();
+    let client = app.state::<HitchClient>().inner().clone();
+    thread::Builder::new()
+        .name("hitch-daemon-launch-connect".into())
+        .spawn(move || {
+            if let Err(err) = client.connect_and_handshake(&app_handle) {
+                client.set_status(&app_handle, DaemonStatus::Failed, Some(err));
+            }
+        })
+        .expect("failed to spawn daemon launch connection thread");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2158,7 +3818,14 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title("Hitch (dev)");
             }
+            // Frameless Windows window draws its own caption controls; subclass
+            // the window proc so the maximize button still drives Snap Layouts.
+            // No-op on macOS (native Overlay title bar) and Linux.
+            if let Some(window) = app.get_webview_window("main") {
+                window_chrome::install(&window);
+            }
             build_tray(app)?;
+            start_daemon_connection_on_launch(app);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -2170,6 +3837,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            open_in_editor,
             connect_daemon,
             hitch_request,
             send_session_input,
@@ -2177,8 +3845,29 @@ pub fn run() {
             unregister_session_output,
             get_daemon_status,
             get_daemon_log_tail,
-            restart_daemon_command
+            restart_daemon_command,
+            set_max_button_rect
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(move |_app_handle, _event| {
+            #[cfg(feature = "packaged-smoke")]
+            if matches!(_event, RunEvent::Ready) && packaged_smoke_enabled() {
+                let app_handle = _app_handle.clone();
+                let client = app_handle.state::<HitchClient>().inner().clone();
+                thread::Builder::new()
+                    .name("hitch-packaged-smoke".into())
+                    .spawn(move || {
+                        let exit_code = match run_packaged_smoke(app_handle.clone(), client) {
+                            Ok(()) => 0,
+                            Err(err) => {
+                                eprintln!("packaged smoke test failed: {err}");
+                                1
+                            }
+                        };
+                        std::process::exit(exit_code);
+                    })
+                    .expect("failed to spawn packaged smoke thread");
+            }
+        });
 }

@@ -8,6 +8,7 @@
     "dev:vite": "vite dev",
     "build": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && vite build",
     "prepare-daemon-sidecar": "node scripts/prepare-daemon-sidecar.mjs",
+    "stop-dev-daemon": "node scripts/stop-dev-daemon.mjs",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "preview": "vite preview",
     "test": "vitest run",

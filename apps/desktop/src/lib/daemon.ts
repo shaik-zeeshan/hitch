@@ -21,6 +21,7 @@ import {
   type ChangedFile,
   type CommitDraft,
   type DaemonStatus,
+  type DraftGenerationSettings,
   type FileStatus,
   type GitStatus,
   type HitchEvent,
@@ -40,7 +41,13 @@ import {
   type SessionParent,
   type Worktree,
 } from "./types";
-import { draftModel, draftProvider, type DraftProvider } from "./settings";
+import {
+  draftClaudePath,
+  draftCodexPath,
+  draftModel,
+  draftProvider,
+  type DraftProvider,
+} from "./settings";
 
 export type Connection = "connecting" | "ready" | "offline";
 
@@ -569,9 +576,51 @@ function upsert<T extends { id: Id }>(items: T[], item: T): T[] {
     : [...items, item];
 }
 
+function omitKey<T>(record: Record<Id, T>, id: Id): Record<Id, T> {
+  if (!(id in record)) return record;
+  const next = { ...record };
+  delete next[id];
+  return next;
+}
+
+function removeWorktreeLocal(worktreeId: Id): void {
+  const removedSessionIds = get(sessions)
+    .filter((session) => session.parent.kind === "worktree" && session.parent.id === worktreeId)
+    .map((session) => session.id);
+  for (const sessionId of removedSessionIds) {
+    clearDismissibleTabTimer(sessionId);
+    closeSessionOutput(sessionId);
+  }
+
+  sessions.update((items) =>
+    items.filter((session) => session.parent.kind !== "worktree" || session.parent.id !== worktreeId),
+  );
+  worktrees.update((items) => items.filter((worktree) => worktree.id !== worktreeId));
+  dirtyWorktrees.update((current) => omitKey(current, worktreeId));
+  worktreeLineStats.update((current) => omitKey(current, worktreeId));
+  dismissedWorktreeAgentStates.update((current) => omitKey(current, worktreeId));
+  prByWorktree.update((current) => omitKey(current, worktreeId));
+  prByWorktreeApplied.delete(worktreeId);
+  prByWorktreeStarted.delete(worktreeId);
+  const diffCachePrefix = `${worktreeId}\0`;
+  for (const key of diffCache.keys()) {
+    if (key.startsWith(diffCachePrefix)) diffCache.delete(key);
+  }
+
+  if (get(gitStatus)?.worktree_id === worktreeId) gitStatus.set(null);
+  if (get(gitWorktreeId) === worktreeId) {
+    selectedWorktreeId.set(null);
+    prInfo.set(null);
+    prUrl.set(null);
+    closeDiff();
+  }
+}
+
 // ---- snapshot / refresh ---------------------------------------------------
 
-export async function refreshAll(): Promise<void> {
+export async function refreshAll(
+  options: { restoreLiveSessionSelection?: boolean } = {},
+): Promise<void> {
   const projectResponse = await daemonRequest<Response & { projects: Project[] }>({
     type: "list-projects",
   });
@@ -605,6 +654,10 @@ export async function refreshAll(): Promise<void> {
     parent: null,
   });
   sessions.set(sessionResponse.sessions);
+  if (options.restoreLiveSessionSelection) {
+    restoreLiveSessionSelection(sessionResponse.sessions, allWorktrees);
+  }
+  reconcileSessionOutputs(sessionResponse.sessions);
 
   // Seed dirty indicators and line stats so the tree is useful before the Changes panel opens.
   const statusEntries = await Promise.all(
@@ -632,9 +685,36 @@ export async function refreshAll(): Promise<void> {
     ),
   );
 }
+
+function restoreLiveSessionSelection(liveSessions: Session[], allWorktrees: Worktree[]): void {
+  // The user already has a project/worktree selected — keep it. Whether or not
+  // that selection currently has a live session, stay put rather than yanking
+  // the user to an unrelated project/worktree. Only a fresh window with no
+  // selection auto-jumps to the first live session below.
+  if (get(selectedParent)) {
+    return;
+  }
+
+  for (const session of liveSessions) {
+    if (session.parent.kind === "project") {
+      if (!get(projects).some((project) => project.id === session.parent.id)) continue;
+      selectedProjectId.set(session.parent.id);
+      selectedWorktreeId.set(null);
+      activeSessionId.set(session.id);
+      return;
+    }
+
+    const worktree = allWorktrees.find((item) => item.id === session.parent.id);
+    if (!worktree) continue;
+    selectedProjectId.set(worktree.project_id);
+    selectedWorktreeId.set(worktree.id);
+    activeSessionId.set(session.id);
+    return;
+  }
+}
 async function refreshSnapshotAfterConnect(): Promise<void> {
   try {
-    await refreshAll();
+    await refreshAll({ restoreLiveSessionSelection: true });
   } catch (err) {
     error.set(toMessage(err));
   }
@@ -730,7 +810,9 @@ function openSessionOutput(sessionId: Id): void {
     subscribers.get(sessionId)?.onData(ringFor(sessionId).bytesSince(offsetBefore));
   };
   channels.set(sessionId, channel);
-  void invoke("register_session_output", { sessionId, channel });
+  void Promise.resolve(invoke("register_session_output", { sessionId, channel })).catch(() => {
+    if (channels.get(sessionId) === channel) channels.delete(sessionId);
+  });
 }
 
 // Tear down a session's output: drop the ring + channel and tell Tauri to stop
@@ -740,8 +822,19 @@ function closeSessionOutput(sessionId: Id): void {
   channels.delete(sessionId);
   // A closing session must not have a trailing resize fire against its dead PTY.
   clearResizeDebounce(sessionId);
-  void invoke("unregister_session_output", { sessionId });
+  void Promise.resolve(invoke("unregister_session_output", { sessionId })).catch(() => {});
 }
+
+function reconcileSessionOutputs(liveSessions: Session[]): void {
+  const liveIds = new Set(liveSessions.map((session) => session.id));
+  for (const sessionId of Array.from(channels.keys())) {
+    if (!liveIds.has(sessionId)) closeSessionOutput(sessionId);
+  }
+  for (const session of liveSessions) {
+    if (!channels.has(session.id)) openSessionOutput(session.id);
+  }
+}
+
 
 export function applyHitchEvent(event: HitchEvent): void {
   if (event.type === "project-updated") {
@@ -749,6 +842,9 @@ export function applyHitchEvent(event: HitchEvent): void {
   }
   if (event.type === "worktree-updated") {
     worktrees.update((items) => upsert(items, event.worktree as Worktree));
+  }
+  if (event.type === "worktree-removed") {
+    removeWorktreeLocal(event.worktree_id as Id);
   }
   if (event.type === "worktree-dirty") {
     const worktreeId = event.worktree_id as Id;
@@ -933,7 +1029,12 @@ export async function initDaemon(): Promise<void> {
     // Seed the log path up front so "View log" works even if the first connect
     // fails (the status events also carry it).
     try {
-      const snapshot = await invoke<{ log_path: string }>("get_daemon_status");
+      const snapshot = await invoke<{
+        status: DaemonStatus;
+        reason: string | null;
+        log_path: string;
+      }>("get_daemon_status");
+      applyDaemonStatus(snapshot.status, snapshot.reason);
       daemonLogPath.set(snapshot.log_path);
     } catch {
       // Non-fatal: the status events populate the path on the next transition.
@@ -976,6 +1077,10 @@ export function disposeDaemon(): void {
   for (const id of Array.from(dismissibleTabTimers.keys())) {
     clearDismissibleTabTimer(id);
   }
+  for (const sessionId of Array.from(channels.keys())) {
+    closeSessionOutput(sessionId);
+  }
+  rings.clear();
   booted = false;
 }
 
@@ -1330,8 +1435,10 @@ export async function createWorktree(
     "create-worktree",
   );
   const created = response.worktrees[0] ?? null;
-  if (created) selectedWorktreeId.set(created.id);
-  await refreshAll();
+  if (created) {
+    worktrees.update((items) => upsert(items, created));
+    selectedWorktreeId.set(created.id);
+  }
   return created;
 }
 
@@ -1350,8 +1457,7 @@ export async function removeWorktree(
     delete_branch: deleteBranch,
     force,
   });
-  if (get(selectedWorktreeId) === worktreeId) selectedWorktreeId.set(null);
-  await refreshAll();
+  removeWorktreeLocal(worktreeId);
 }
 
 // Last grid an active Terminal successfully fitted to, in cols/rows. Used to
@@ -1719,9 +1825,12 @@ export async function commit(
   }
 }
 
-export async function listDraftModels(provider: DraftProvider): Promise<string[]> {
+export async function listDraftModels(
+  provider: DraftProvider,
+  paths: { claudePath?: string; codexPath?: string } = {},
+): Promise<string[]> {
   const response = await runJob<Response & { models: string[] }>(
-    { type: "list-draft-models", provider },
+    { type: "list-draft-models", provider, settings: draftDiscoverySettings(provider, paths) },
     "draft-models",
   );
   return response.models;
@@ -1757,14 +1866,34 @@ export async function generatePullRequestDraft(base: string | null): Promise<Pul
   return response.draft;
 }
 
-function draftGenerationSettings(): { provider: string; model: string | null } | null {
+function draftDiscoverySettings(
+  provider: DraftProvider,
+  paths: { claudePath?: string; codexPath?: string } = {},
+): DraftGenerationSettings | null {
+  if (provider === "stub") return null;
+  return draftSettingsForProvider(provider, null, paths);
+}
+
+function draftGenerationSettings(): DraftGenerationSettings | null {
   const provider = get(draftProvider);
   // No explicit desktop choice → omit settings so the daemon keeps its own
-  // configured provider/model default instead of being forced to "stub".
+  // configured provider/model/path defaults instead of being forced to "stub".
   if (!provider) return null;
+  return draftSettingsForProvider(provider, get(draftModel).trim() || null);
+}
+
+function draftSettingsForProvider(
+  provider: DraftProvider,
+  model: string | null,
+  paths: { claudePath?: string; codexPath?: string } = {},
+): DraftGenerationSettings {
+  const claudePath = (paths.claudePath ?? get(draftClaudePath)).trim() || null;
+  const codexPath = (paths.codexPath ?? get(draftCodexPath)).trim() || null;
   return {
     provider,
-    model: get(draftModel).trim() || null,
+    model,
+    claude_path: claudePath,
+    codex_path: codexPath,
   };
 }
 

@@ -11,7 +11,7 @@
   //
   // This layout owns:
   //   - the daemon connection lifecycle (initDaemon is idempotent; see daemon.ts)
-  //   - the ⌘K command-palette keydown
+  //   - the platform command-palette shortcut (Cmd+K on macOS, Ctrl+K elsewhere)
   //   - the WKWebView keep-alive heartbeat
   //   - the overlay surfaces (palette + dialogs) that any route may open
   //   - the 3-pane shell (TopNav · LeftRail · Center · RightRail) + rail state
@@ -25,6 +25,8 @@
   import { disposeDaemon, initDaemon } from "$lib/daemon";
   import { initFileDrop } from "$lib/fileDrop";
   import { commandOpen } from "$lib/overlays";
+  import { currentDesktopPlatform, isShortcutModifier } from "$lib/desktopPlatform";
+  import WindowControls from "$lib/components/WindowControls.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import AddProjectDialog from "$lib/components/AddProjectDialog.svelte";
   import CloneProjectDialog from "$lib/components/CloneProjectDialog.svelte";
@@ -56,9 +58,11 @@
   // Heartbeat opacity for the keep-alive dot (see below). Toggled on a timer so
   // the WebContent process always has scheduled work to flush.
   let hbOpacity = $state(0.01);
+  const desktopPlatform = currentDesktopPlatform();
+
 
   function onKeydown(event: KeyboardEvent) {
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+    if (isShortcutModifier(event, desktopPlatform) && event.key.toLowerCase() === "k") {
       event.preventDefault();
       commandOpen.update((open) => !open);
     }
@@ -116,6 +120,16 @@
 </div>
 
 {@render children()}
+
+<!-- Windows is frameless (decorations:false). The caption controls live here,
+     OUTSIDE the `.window` shell, so they stay visible on full-window routes that
+     hide the shell with display:none (currently /settings) — otherwise Windows
+     users would lose every minimize/maximize/close button there. Rendered once
+     (a fixed top-right layer) to keep the single native Snap-Layouts overlay
+     parked over one max-button rectangle. -->
+{#if desktopPlatform === "windows"}
+  <WindowControls />
+{/if}
 
 <div class="wk-keepalive" aria-hidden="true" style="opacity:{hbOpacity}"></div>
 
