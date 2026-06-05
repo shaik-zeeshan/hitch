@@ -332,42 +332,6 @@ describe("agent state propagation", () => {
     expect(get(agentStateByWorktree)).toEqual({ w1: "needs-approval", w2: "error" });
   });
 
-  it("hides selected-worktree running only when the active tab is the running session", () => {
-    projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
-    worktrees.set([
-      { id: "w1", project_id: "p1", path: "/repo", branch: "main", is_main: true, is_hitch_managed: false },
-      {
-        id: "w2",
-        project_id: "p1",
-        path: "/repo/.hitch/worktrees/feature",
-        branch: "feature",
-        is_main: false,
-        is_hitch_managed: true,
-      },
-    ]);
-    sessions.set([
-      { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
-      { id: "s2", name: "shell", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
-    ]);
-    agentStates.set({ s1: "running" });
-    sessionOutputActive.set({ s1: true });
-
-    selectedWorktreeId.set("w1");
-    activeSessionId.set("s1");
-    expect(get(agentStateByWorktree)).toEqual({});
-
-    activeSessionId.set("s2");
-    expect(get(agentStateByWorktree)).toEqual({ w1: "running" });
-
-    diffActive.set(true);
-    activeSessionId.set("s1");
-    expect(get(agentStateByWorktree)).toEqual({ w1: "running" });
-
-    diffActive.set(false);
-    selectedWorktreeId.set("w2");
-    expect(get(agentStateByWorktree)).toEqual({ w1: "running" });
-  });
-
   it("rolls up a per-project act-state pill with its count, collapsing to the highest priority", () => {
     projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
     worktrees.set([

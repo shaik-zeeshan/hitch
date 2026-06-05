@@ -257,18 +257,9 @@ export const activeSession = derived(
 
 // Per-worktree rollup of the DISPLAY state (act states always; `running` only
 // while its output gate is open; `waiting` is unlabeled and never rolls up).
-// The single running word on the worktree you are actively looking at is
-// suppressed — you can see that agent live in the main pane.
 export const agentStateByWorktree = derived(
-  [worktrees, sessions, displaySessionStates, selectedWorktreeId, activeSessionId, diffActive],
-  ([$worktrees, $sessions, $display, $selectedWorktreeId, $activeSessionId, $diffActive]) => {
-    const activeSession = $sessions.find((session) => session.id === $activeSessionId);
-    const activeRunningWorktree =
-      !$diffActive &&
-      activeSession?.parent.kind === "worktree" &&
-      $display[activeSession.id] === "running"
-        ? activeSession.parent.id
-        : null;
+  [worktrees, sessions, displaySessionStates],
+  ([$worktrees, $sessions, $display]) => {
     const map: Record<Id, AgentState> = {};
     for (const worktree of $worktrees) {
       const agg = aggregateAgentState(
@@ -277,9 +268,6 @@ export const agentStateByWorktree = derived(
           .map((s) => $display[s.id]),
       );
       if (!agg) continue;
-      if (agg === "running" && worktree.id === $selectedWorktreeId && worktree.id === activeRunningWorktree) {
-        continue;
-      }
       map[worktree.id] = agg;
     }
     return map;
