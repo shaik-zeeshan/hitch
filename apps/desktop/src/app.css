@@ -61,6 +61,13 @@
   --st-stall: oklch(52.0% 0.075 75); /* ochre — only the `M` modified letter */
   --st-ok: oklch(50.0% 0.095 150); /* positive/ok (green-ink): daemon dot, ↑N, A */
   --st-ok-glow: oklch(50% 0.095 150 / 0.14); /* soft glow ring on ok dots */
+  --st-ok-wash: oklch(94.0% 0.035 150); /* wash behind the open-PR chip */
+  --st-ok-line: oklch(83.0% 0.080 150); /* border on the open-PR chip */
+
+  /* ---- PR merged (purple — a PR state, not an agent state) ---- */
+  --pr-merged: oklch(48.0% 0.140 300); /* merged-PR ink (chip text/icon) */
+  --pr-merged-wash: oklch(94.0% 0.035 300); /* wash behind the merged-PR chip */
+  --pr-merged-line: oklch(83.0% 0.080 300); /* border on the merged-PR chip */
 
   /* ---- diff numerals ---- */
   --diff-add: oklch(46.0% 0.095 150); /* +N additions */
@@ -140,6 +147,13 @@ html[data-theme="dark"] {
   --st-stall: oklch(78.0% 0.110 78);
   --st-ok: oklch(74.0% 0.120 152);
   --st-ok-glow: oklch(74% 0.120 152 / 0.18);
+  --st-ok-wash: oklch(28.0% 0.060 152);
+  --st-ok-line: oklch(42.0% 0.090 152);
+
+  /* ---- PR merged ---- */
+  --pr-merged: oklch(72.0% 0.130 300);
+  --pr-merged-wash: oklch(28.0% 0.060 300);
+  --pr-merged-line: oklch(42.0% 0.090 300);
 
   /* ---- diff numerals ---- */
   --diff-add: oklch(76.0% 0.120 152);

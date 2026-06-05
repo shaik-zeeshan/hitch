@@ -96,8 +96,21 @@ on paper; dark values are lifted for AA on dusk.
 | `--st-need-wash` | `oklch(94.0% 0.035 32)` | `oklch(28.0% 0.060 32)` | Wash behind rollup pill / awaiting chrome. |
 | `--st-need-line` | `oklch(83.0% 0.080 32)` | `oklch(42.0% 0.090 32)` | Border on the awaiting chrome. |
 | `--st-stall` | `oklch(52.0% 0.075 75)` | `oklch(78.0% 0.110 78)` | Ochre — only the `M` (modified) status letter. The stalled state was removed (2026-06-05). |
-| `--st-ok` | `oklch(50.0% 0.095 150)` | `oklch(74.0% 0.120 152)` | Positive/ok (green-ink): daemon dot, PR open dot, `↑N` ahead instrument, `A` added letter. Clean is no longer a labelled state. |
+| `--st-ok` | `oklch(50.0% 0.095 150)` | `oklch(74.0% 0.120 152)` | Positive/ok (green-ink): daemon dot, open-PR chip ink, `↑N` ahead instrument, `A` added letter. Clean is no longer a labelled state. |
 | `--st-ok-glow` | `oklch(50% 0.095 150 / .14)` | `oklch(74% 0.120 152 / .18)` | Soft glow ring on the daemon dot / ok dots. |
+| `--st-ok-wash` | `oklch(94.0% 0.035 150)` | `oklch(28.0% 0.060 152)` | Wash behind the open-PR chip. |
+| `--st-ok-line` | `oklch(83.0% 0.080 150)` | `oklch(42.0% 0.090 152)` | Border on the open-PR chip. |
+
+## PR merged
+
+Purple for the merged PR state (a PR state, not an agent state — hence not
+`--st-*`). Same wash/line construction as the state palette.
+
+| Token | Light | Dark | Usage |
+| --- | --- | --- | --- |
+| `--pr-merged` | `oklch(48.0% 0.140 300)` | `oklch(72.0% 0.130 300)` | Merged-PR ink (chip text/icon, tree `#N`). |
+| `--pr-merged-wash` | `oklch(94.0% 0.035 300)` | `oklch(28.0% 0.060 300)` | Wash behind the merged-PR chip. |
+| `--pr-merged-line` | `oklch(83.0% 0.080 300)` | `oklch(42.0% 0.090 300)` | Border on the merged-PR chip. |
 
 ## Diff numerals
 

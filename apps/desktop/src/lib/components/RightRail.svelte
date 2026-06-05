@@ -297,7 +297,6 @@
           }}
         >
           <GitPullRequest class="pric icon" />
-          <span class="state"><span class="dot"></span>{pr.draft ? "draft" : pr.state.toLowerCase()}</span>
           <span>PR</span><span class="num">#{pr.number}</span>
         </a>
       {/if}
@@ -682,7 +681,10 @@
     margin-left: 4px;
   }
 
-  /* PR chip — rectangular, hairline, paper fill; state-keyed accent color. */
+  /* PR chip — rectangular, hairline; the WHOLE chip is washed in the PR-state
+     color (open green / merged purple / closed oxide), draft stays faint
+     paper. No in-chip state word — that word lives in the title tooltip,
+     which is the non-color channel. */
   .pr {
     display: inline-flex;
     align-items: center;
@@ -696,45 +698,36 @@
     border-radius: 0;
     padding: 3px 10px 3px 8px;
     text-decoration: none;
-    transition: background 0.15s ease-out;
   }
-  .pr:hover {
-    background: var(--paper-3);
+  .pr:hover .num {
+    text-decoration: underline;
   }
   .pr :global(.pric) {
     width: 13px;
     height: 13px;
     flex: 0 0 13px;
-    color: var(--ink-2);
-  }
-  .pr .state {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    font-weight: 600;
-  }
-  .pr .state .dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: currentColor;
+    color: currentColor;
   }
   .pr .num {
-    color: var(--ink-0);
     font-weight: 600;
   }
-  /* State-color keying carried from the legacy badge, now on a rectangle. */
-  .pr.open .state {
+  .pr.open {
     color: var(--st-ok);
+    background: var(--st-ok-wash);
+    border-color: var(--st-ok-line);
   }
-  .pr.merged .state {
-    color: oklch(72% 0.13 300);
+  .pr.merged {
+    color: var(--pr-merged);
+    background: var(--pr-merged-wash);
+    border-color: var(--pr-merged-line);
   }
-  .pr.closed .state {
+  .pr.closed {
     color: var(--st-need);
+    background: var(--st-need-wash);
+    border-color: var(--st-need-line);
   }
-  .pr.draft .state {
-    color: var(--ink-3);
+  .pr.draft {
+    color: var(--ink-2);
   }
 
   /* ---- dynamic git action: ONE state-derived split button --------------- */

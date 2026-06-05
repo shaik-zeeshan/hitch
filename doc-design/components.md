@@ -180,11 +180,16 @@ Meta children: optional `.statetag` (uppercase `0.5625rem` weight 700,
 `letter-spacing: .04em`, colored by state class — present **only** for
 `AWAITING` / `ERROR` / `WORKING`; idle rows carry no state word); `.sep` `·`
 `--ink-3`; `.diffn .a/.d` colored `--diff-add`/`--diff-del` weight 600;
-`.prchip` (pr icon `12px` + `#N`, `--ink-1`).
+`.prchip` (pr icon `12px` + `#N`, weight 600, state-color keyed like the right
+rail's PR chip: `.open`→`--st-ok`, `.merged`→`--pr-merged`,
+`.closed`→`--st-need`, `.draft`→`--ink-3`; the state word lives in the `title`
+tooltip — that word, not color alone, is the non-color channel).
 
 **Selected (`.wrow.sel`):** `background: var(--iris-wash); box-shadow: inset 0 0
-0 1px var(--iris-line)`. Name/meta/branchic/pr-icon → `--iris-ink`; sep →
-`--iris-line`; pile ring → `--iris-wash`.
+0 1px var(--iris-line)`. Name/meta/branchic → `--iris-ink`; sep →
+`--iris-line`; pile ring → `--iris-wash`. The PR chip keeps its state color
+under selection (same rule as statetags); only the faint `.draft` chip lifts to
+`--iris-ink` so it stays legible on the wash.
 
 Statetag classes: `.statetag.need`→`--st-need` (awaiting **and** error),
 `.statetag.run`→`--st-run` (working). There are no glyph classes and no
@@ -289,24 +294,26 @@ not close the menu on select.
 
 ## PR chip (`.pr`)
 
+The whole chip is washed in the PR-state color (2026-06-05; the mockup's
+in-chip `open` word + dot were dropped in favor of the tint). The state word
+lives in the `title` tooltip — that word is the non-color channel.
+
 ```css
 .pr {
   display: inline-flex; align-items: center; gap: 7px; margin-top: 9px;
   font-family: var(--mono); font-size: var(--r0); color: var(--ink-1);
   background: var(--paper-2); border: 1px solid var(--line); border-radius: 0;
-  padding: 3px 10px 3px 8px;
+  padding: 3px 10px 3px 8px; text-decoration: none;
 }
-.pr .open { color: var(--st-ok); display: inline-flex; align-items: center; gap: 5px; font-weight: 600; }
-.pr .open .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--st-ok); }
-.pr .num { color: var(--ink-0); font-weight: 600; }
-.pr .pric { width: 13px; height: 13px; color: var(--ink-2); }
+.pr:hover .num { text-decoration: underline; }
+.pr .num { font-weight: 600; }
+.pr .pric { width: 13px; height: 13px; color: currentColor; }
+/* state tint: ink + wash + line per state; draft stays faint paper */
+.pr.open   { color: var(--st-ok);    background: var(--st-ok-wash);    border-color: var(--st-ok-line); }
+.pr.merged { color: var(--pr-merged); background: var(--pr-merged-wash); border-color: var(--pr-merged-line); }
+.pr.closed { color: var(--st-need);  background: var(--st-need-wash);  border-color: var(--st-need-line); }
+.pr.draft  { color: var(--ink-2); }
 ```
-
-Note: the existing `RightRail.svelte` renders the in-context PR badge as a
-pill (`border-radius: 99px`) keyed by state (`open` green / `merged` purple
-`oklch(72% 0.13 300)` / `closed` red / `draft` faint). The approved mockup
-makes it rectangular; ship the rectangular `.pr` chip and carry the state-color
-keying.
 
 ## State tags
 

@@ -85,11 +85,16 @@
     error: "error",
   };
 
-  // PR chip carries the GitHub-conventional state in a title tooltip; the chip
-  // itself is the rectangular `#N` mark from the mockup, neutral-inked.
+  // PR chip carries the GitHub-conventional state in a title tooltip and as a
+  // state-keyed accent color on the `#N` mark — the same keying the right
+  // rail's PR chip uses (open green / merged purple / closed oxide / draft
+  // faint), so the tree and the rail read the same at a glance.
   function prChipTitle(pr: PrInfo): string {
-    const state = pr.draft ? "draft" : pr.state.toLowerCase();
-    return `PR #${pr.number} (${state})`;
+    return `PR #${pr.number} (${prChipState(pr)})`;
+  }
+  function prChipState(pr: PrInfo): "draft" | "open" | "closed" | "merged" {
+    if (pr.draft) return "draft";
+    return pr.state.toLowerCase() as "open" | "closed" | "merged";
   }
 
   // Open a session under a worktree, selecting it first so the new session lands
@@ -337,7 +342,7 @@
                           {/if}
                           {#if pr}
                             {#if stateWord || hasLoc}<span class="sep">·</span>{/if}
-                            <span class="prchip" title={prChipTitle(pr)}>
+                            <span class="prchip {prChipState(pr)}" title={prChipTitle(pr)}>
                               <GitPullRequest class="pric icon" />#{pr.number}
                             </span>
                           {/if}
@@ -703,16 +708,29 @@
     display: inline-flex;
     align-items: center;
     gap: 3px;
-    color: var(--ink-1);
+    font-weight: 600;
     white-space: nowrap;
   }
   .prchip :global(.pric) {
     width: 12px;
     height: 12px;
-    color: var(--ink-1);
+    color: currentColor;
   }
-  .wrow.sel .prchip,
-  .wrow.sel .prchip :global(.pric) {
+  /* State-color keying mirrors the right rail's PR chip; like the state tags,
+     it survives row selection (the tooltip word is the non-color channel). */
+  .prchip.open {
+    color: var(--st-ok);
+  }
+  .prchip.merged {
+    color: var(--pr-merged);
+  }
+  .prchip.closed {
+    color: var(--st-need);
+  }
+  .prchip.draft {
+    color: var(--ink-3);
+  }
+  .wrow.sel .prchip.draft {
     color: var(--iris-ink);
   }
 
