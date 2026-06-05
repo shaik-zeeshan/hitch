@@ -6,35 +6,64 @@
   // sections include Editor, Drafts, and static About — no dead UI.
   import { goto } from "$app/navigation";
   import { listDraftModels } from "$lib/daemon";
+  import { currentDesktopPlatform } from "$lib/desktopPlatform";
   import { onMount } from "svelte";
   import { Select, Toggle } from "bits-ui";
   import {
     autoCommitPush,
     DEFAULT_DRAFT_MODEL,
     DEFAULT_DRAFT_PROVIDER,
-    DEFAULT_EDITOR,
     DRAFT_MODEL_OPTIONS,
     draftClaudePath,
     draftCodexPath,
     draftModel,
     draftProvider,
     editorApp,
+    SYSTEM_DEFAULT_EDITOR,
     type DraftProvider,
   } from "$lib/settings";
 
   type Section = "editor" | "drafts" | "git" | "about";
+  // Title-bar integration mirrors TopNav (ADR 0006): macOS reserves room for
+  // the native traffic lights on the left; Windows reserves the caption-control
+  // strip on the right (WindowControls stays mounted on this route).
+  const platform = currentDesktopPlatform();
   const DEFAULT_MODEL_VALUE = "__hitch_cli_default__";
+  // The select can't carry the stored sentinels directly (bits-ui treats an
+  // empty value as "no selection"), so System default and Custom get local
+  // placeholder values that commitEditor maps back to the stored string.
+  const SYSTEM_EDITOR_VALUE = "__hitch_system_editor__";
+  const CUSTOM_EDITOR_VALUE = "__hitch_custom_editor__";
   const providerOptions: Array<{ value: DraftProvider; label: string }> = [
     { value: "stub", label: "Stub (deterministic)" },
     { value: "claude", label: "Claude" },
     { value: "codex", label: "Codex" },
   ];
+  // System default resolves $VISUAL/$EDITOR in the backend at launch time.
+  // The named editors are the ones the backend resolves by display name —
+  // macOS via `open -a`, Windows via the install-dir table in
+  // build_editor_launch_spec. Notepad++ has no macOS app bundle, so it's
+  // offered on Windows only. "Custom…" keeps the free-text escape hatch for
+  // any other app name or executable path.
+  const editorOptions: Array<{ value: string; label: string }> = [
+    { value: SYSTEM_EDITOR_VALUE, label: "System default ($EDITOR)" },
+    { value: "Visual Studio Code", label: "Visual Studio Code" },
+    { value: "Cursor", label: "Cursor" },
+    { value: "VSCodium", label: "VSCodium" },
+    { value: "Sublime Text", label: "Sublime Text" },
+    { value: "Windsurf", label: "Windsurf" },
+    { value: "Zed", label: "Zed" },
+    ...(platform === "windows" ? [{ value: "Notepad++", label: "Notepad++" }] : []),
+    { value: CUSTOM_EDITOR_VALUE, label: "Custom…" },
+  ];
 
   let section = $state<Section>("editor");
 
-  // Staged editor value, committed (trimmed, with fallback) on Save / Enter /
-  // blur — mirroring the old dialog so an empty field can't wipe the setting.
-  let editor = $state("");
+  // Known editors commit on select; "Custom…" stages a free-text value,
+  // committed (trimmed, with fallback) on Save / Enter / blur — mirroring the
+  // old dialog so an empty field can't wipe the setting.
+  let selectedEditor = $state(SYSTEM_EDITOR_VALUE);
+  let customEditor = $state("");
   let draftProviderValue = $state<DraftProvider>(DEFAULT_DRAFT_PROVIDER);
   let selectedDraftModel = $state(DEFAULT_MODEL_VALUE);
   let modelOptions = $state<string[]>(DRAFT_MODEL_OPTIONS[DEFAULT_DRAFT_PROVIDER]);
@@ -54,7 +83,18 @@
   );
 
   onMount(() => {
-    editor = $editorApp;
+    // Empty stored value = System default; a value matching a known option
+    // selects it; anything else (a custom app name or executable path)
+    // hydrates the Custom field.
+    const storedEditor = $editorApp.trim();
+    if (storedEditor === SYSTEM_DEFAULT_EDITOR) {
+      selectedEditor = SYSTEM_EDITOR_VALUE;
+    } else if (editorOptions.some((option) => option.value === storedEditor)) {
+      selectedEditor = storedEditor;
+    } else {
+      selectedEditor = CUSTOM_EDITOR_VALUE;
+      customEditor = storedEditor;
+    }
     // `$draftProvider` is null until the user explicitly picks one; show the
     // default as the editable starting point without turning an unchanged save
     // into a concrete provider override.
@@ -75,13 +115,32 @@
   });
 
   function commitEditor() {
-    const next = editor.trim() || DEFAULT_EDITOR;
-    editor = next;
+    let next: string;
+    if (selectedEditor === SYSTEM_EDITOR_VALUE) {
+      next = SYSTEM_DEFAULT_EDITOR;
+    } else if (selectedEditor === CUSTOM_EDITOR_VALUE) {
+      next = customEditor.trim();
+      if (!next) {
+        // An empty Custom field falls back to System default; reflect it in
+        // the select so the UI shows what was actually saved.
+        next = SYSTEM_DEFAULT_EDITOR;
+        selectedEditor = SYSTEM_EDITOR_VALUE;
+      }
+    } else {
+      next = selectedEditor;
+    }
     if (next !== $editorApp) {
       editorApp.set(next);
       saved = true;
       setTimeout(() => (saved = false), 1600);
     }
+  }
+
+  function onEditorSelect(value: string) {
+    selectedEditor = value;
+    // Picking a known editor saves immediately; picking Custom… only reveals
+    // the input — the value commits on Save / Enter / blur.
+    if (value !== CUSTOM_EDITOR_VALUE) commitEditor();
   }
 
   async function loadModels(provider: DraftProvider) {
@@ -168,7 +227,7 @@
 <svelte:window on:keydown={onKeydown} />
 
 <div class="settings">
-  <header class="s-head">
+  <header class="s-head" class:mac={platform === "macos"} class:win={platform === "windows"} data-tauri-drag-region>
     <button class="back" onclick={back} aria-label="Back to workspace">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"
         ><path d="M10 3 5 8l5 5" stroke-linecap="round" stroke-linejoin="round" /></svg
@@ -176,10 +235,12 @@
       Back
     </button>
     <h1>Settings</h1>
+    <span class="esc-hint"><kbd>esc</kbd> to return</span>
   </header>
 
   <div class="s-body">
     <nav class="s-nav" aria-label="Settings sections">
+      <div class="s-nav-head"><span class="s-nav-title">Sections</span></div>
       <button class="nav-row" class:active={section === "editor"} onclick={() => (section = "editor")}>
         Editor
       </button>
@@ -200,25 +261,51 @@
           <div class="panel-head">
             <h2>Editor</h2>
             <p class="help">
-              Application used by <b>Open in editor</b> on a worktree. Use a common editor name —
-              e.g. <span class="mono">Visual Studio Code</span>, <span class="mono">Cursor</span>,
-              <span class="mono">Zed</span> — or an executable path.
+              Application used by <b>Open in editor</b> on a worktree. <b>System default</b> launches
+              your <span class="mono">$VISUAL</span>/<span class="mono">$EDITOR</span> (GUI editors
+              only — terminal editors like <span class="mono">vim</span> can't open from the app).
+              Pick a specific editor, or choose <b>Custom…</b> for any app name or executable path.
             </p>
           </div>
-          <label class="field">
+          <div class="field">
             <span>Editor application</span>
-            <input
-              class="base"
-              bind:value={editor}
-              placeholder={DEFAULT_EDITOR}
-              onblur={commitEditor}
-              onkeydown={(e) => e.key === "Enter" && commitEditor()}
-            />
-          </label>
-          <div class="row">
-            <button class="btn primary" onclick={commitEditor}>Save</button>
-            {#if saved}<span class="saved" role="status">Saved</span>{/if}
+            <Select.Root type="single" bind:value={selectedEditor} onValueChange={onEditorSelect}>
+              <Select.Trigger class="select-trigger base" aria-label="Editor application">
+                <Select.Value placeholder="Choose editor" />
+                <span class="select-chev" aria-hidden="true">⌄</span>
+              </Select.Trigger>
+              <Select.Portal>
+                <Select.Content class="select-content" sideOffset={6}>
+                  <Select.Viewport>
+                    {#each editorOptions as option}
+                      <Select.Item class="select-item" value={option.value} label={option.label}>
+                        {option.label}
+                      </Select.Item>
+                    {/each}
+                  </Select.Viewport>
+                </Select.Content>
+              </Select.Portal>
+            </Select.Root>
           </div>
+          {#if selectedEditor === CUSTOM_EDITOR_VALUE}
+            <label class="field">
+              <span>Custom editor name or path</span>
+              <input
+                class="base mono"
+                bind:value={customEditor}
+                placeholder="App name or /path/to/editor"
+                onblur={commitEditor}
+                onkeydown={(e) => e.key === "Enter" && commitEditor()}
+                autocomplete="off"
+              />
+            </label>
+            <div class="row">
+              <button class="btn primary" onclick={commitEditor}>Save</button>
+              {#if saved}<span class="saved" role="status">Saved</span>{/if}
+            </div>
+          {:else if saved}
+            <span class="saved" role="status">Saved</span>
+          {/if}
         </section>
       {:else if section === "drafts"}
         <section class="panel">
@@ -359,11 +446,15 @@
 </div>
 
 <style>
+  /* The page wears the shell's chrome: a 42px top bar on the same gradient as
+     TopNav, a paper-1 left rail with the shared 38px uppercase header, and the
+     paper-3 content well — so /settings reads as another face of the same
+     window, not a separate app. */
   .settings {
     height: 100%;
     width: 100%;
     display: grid;
-    grid-template-rows: 52px 1fr;
+    grid-template-rows: 42px 1fr;
     background: var(--paper-3);
     overflow: hidden;
   }
@@ -371,40 +462,65 @@
   .s-head {
     display: flex;
     align-items: center;
-    gap: 14px;
+    gap: 12px;
     padding: 0 16px;
+    background: linear-gradient(var(--paper-2), var(--paper-1));
     border-bottom: 1px solid var(--line);
-    /* leave room for the macOS traffic lights (overlay title bar) */
-    padding-left: 88px;
     -webkit-app-region: drag;
+    user-select: none;
   }
+  /* Reserve native title-bar room exactly like TopNav (ADR 0006). */
+  .s-head.mac {
+    padding-left: 78px;
+  }
+  .s-head.win {
+    padding-right: 138px;
+  }
+  /* Title matches the rails' uppercase letterspaced label voice. */
   .s-head h1 {
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--ink-0);
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: var(--ink-2);
     margin: 0;
+  }
+  .esc-hint {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--r0);
+    color: var(--ink-3);
+    -webkit-app-region: no-drag;
   }
   .back {
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    padding: 5px 10px 5px 7px;
+    height: 28px;
+    padding: 0 10px 0 7px;
     border-radius: 0;
-    background: var(--paper-3);
+    background: var(--paper-2);
     border: 1px solid var(--line);
-    color: var(--ink-1);
+    color: var(--ink-2);
     font: inherit;
-    font-size: 11.5px;
+    font-size: var(--r0);
     font-weight: 540;
     cursor: pointer;
     -webkit-app-region: no-drag;
     transition:
-      background 0.18s ease-out,
-      color 0.18s ease-out;
+      color 0.18s ease-out,
+      border-color 0.18s ease-out,
+      background 0.18s ease-out;
   }
   .back:hover {
-    background: var(--paper-2);
-    color: var(--ink-0);
+    color: var(--ink-1);
+    border-color: var(--ink-3);
+  }
+  .back:focus-visible {
+    outline: 2px solid var(--iris);
+    outline-offset: 1px;
   }
   .back svg {
     width: 13px;
@@ -420,13 +536,28 @@
   .s-nav {
     background: var(--paper-1);
     border-right: 1px solid var(--line);
-    padding: 12px 8px;
-    display: grid;
-    align-content: start;
-    gap: 1px;
+    display: flex;
+    flex-direction: column;
     overflow-y: auto;
   }
+  /* 38px header on the shared baseline grid, same anatomy as the shell rails. */
+  .s-nav-head {
+    flex: 0 0 38px;
+    height: 38px;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  .s-nav-title {
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: var(--ink-2);
+  }
   .nav-row {
+    margin: 0 8px 1px;
     text-align: left;
     padding: 7px 10px;
     border-radius: 0;
@@ -434,11 +565,14 @@
     border: 1px solid transparent;
     color: var(--ink-1);
     font: inherit;
-    font-size: 12px;
+    font-size: var(--r0);
     cursor: pointer;
     transition:
       background 0.18s ease-out,
       color 0.18s ease-out;
+  }
+  .nav-row:first-of-type {
+    margin-top: 12px;
   }
   .nav-row:hover {
     background: var(--paper-3);
@@ -465,7 +599,7 @@
     gap: 6px;
   }
   .panel-head h2 {
-    font-size: 15px;
+    font-size: var(--r2);
     font-weight: 600;
     color: var(--ink-0);
     margin: 0;
@@ -480,7 +614,7 @@
     gap: 12px;
   }
   .saved {
-    font-size: 11.5px;
+    font-size: var(--r0);
     color: var(--ink-2);
   }
 
@@ -495,12 +629,12 @@
     align-items: baseline;
   }
   .about dt {
-    font-size: 11px;
+    font-size: 0.6875rem;
     color: var(--ink-2);
   }
   .about dd {
     margin: 0;
-    font-size: 12.5px;
+    font-size: var(--r1);
     color: var(--ink-0);
   }
   .about dd.mono {
@@ -522,12 +656,12 @@
     gap: 4px;
   }
   .toggle-label {
-    font-size: 12.5px;
+    font-size: var(--r1);
     font-weight: 540;
     color: var(--ink-0);
   }
   .toggle-desc {
-    font-size: 11.5px;
+    font-size: var(--r0);
     color: var(--ink-2);
     line-height: 1.45;
   }

@@ -2313,6 +2313,60 @@ fn first_available_windows_candidate(candidates: &[OsString]) -> Option<WindowsE
         })
 }
 
+/// Launch spec for the "System default" editor setting (empty editor string):
+/// $VISUAL, then $EDITOR. Env editor values are command lines (`code -w`,
+/// `"/opt/My Editor/bin/edit" --flag`), not app display names, so they bypass
+/// the display-name table / `open -a` resolution entirely. Errors when neither
+/// variable is set — the frontend surfaces this so the user picks an editor in
+/// Settings instead of silently getting nothing.
+fn env_editor_launch_spec(path: &Path) -> Result<EditorLaunchSpec, String> {
+    let command = ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+        .ok_or_else(|| "$VISUAL/$EDITOR are not set; pick an editor in Settings".to_string())?;
+    Ok(env_editor_command_spec(&command, path))
+}
+
+/// Spec for a non-empty $VISUAL/$EDITOR command line.
+fn env_editor_command_spec(command: &str, path: &Path) -> EditorLaunchSpec {
+    // Unix: run the value through the shell, git-style, so quoting and
+    // arguments behave exactly as they would for git/crontab. The path rides
+    // in as "$@", never interpolated into the script.
+    #[cfg(unix)]
+    {
+        EditorLaunchSpec {
+            program: OsString::from("/bin/sh"),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from(format!("exec {command} \"$@\"")),
+                OsString::from("hitch-editor"),
+                path.as_os_str().to_os_string(),
+            ],
+        }
+    }
+
+    // Windows: no POSIX shell to lean on; split the command line on whitespace
+    // (program + args) and reuse the cmd shim for `.cmd` launchers so a GUI
+    // parent doesn't flash a console window.
+    #[cfg(windows)]
+    {
+        let mut parts = command.split_whitespace();
+        let program = parts.next().expect("non-empty after trim");
+        let mut args: Vec<OsString> = parts.map(OsString::from).collect();
+        args.push(path.as_os_str().to_os_string());
+        let command_processor_shim = Path::new(program)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"));
+        EditorLaunchSpec {
+            program: OsString::from(program),
+            args,
+            command_processor_shim,
+        }
+    }
+}
+
 fn build_editor_launch_spec(editor: &str, path: &Path) -> Option<EditorLaunchSpec> {
     let editor = trim_configured_editor(editor);
     if editor.is_empty() {
@@ -2403,6 +2457,12 @@ fn open_path_with_default_viewer(path: &Path) -> Result<(), String> {
 async fn open_in_editor(path: String, editor: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let path = PathBuf::from(path);
+        // An empty editor is the "System default" setting: resolve $VISUAL /
+        // $EDITOR instead of the display-name table, and fail loudly when
+        // neither is set so the user knows to pick an editor in Settings.
+        if trim_configured_editor(&editor).is_empty() {
+            return spawn_editor(env_editor_launch_spec(&path)?);
+        }
         match build_editor_launch_spec(&editor, &path) {
             Some(spec) => spawn_editor(spec),
             None => open_path_with_default_viewer(&path),
@@ -2674,6 +2734,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 mod tests {
     use super::{
         build_editor_launch_spec, describe_handshake_failure, encode_control_message,
+        env_editor_command_spec,
         parse_spawned_daemon_pid, read_control_message, read_log_tail, recovery_mode_for_loss,
         run_probe, should_force_kill_daemon, tray_status_text, ControlMessage, CrashLoopGuard,
         DaemonStatus, ErrorCode, HitchClient, OutputRouter, ProbeError, ProtocolError,
@@ -2724,6 +2785,49 @@ mod tests {
 
         std::fs::remove_file(editor).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_editor_command_runs_through_the_shell_with_path_as_positional() {
+        let worktree = std::path::Path::new("/repo with spaces");
+
+        let spec = env_editor_command_spec(r#""/opt/My Editor/bin/edit" -w"#, worktree);
+
+        // The command line lands in the script verbatim (shell semantics, like
+        // git's $EDITOR handling); the path only ever travels as a positional.
+        assert_eq!(spec.program, std::ffi::OsString::from("/bin/sh"));
+        assert_eq!(
+            spec.args,
+            vec![
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from(r#"exec "/opt/My Editor/bin/edit" -w "$@""#),
+                std::ffi::OsString::from("hitch-editor"),
+                worktree.as_os_str().to_os_string(),
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn env_editor_command_splits_args_and_shims_cmd_launchers() {
+        let worktree = std::path::Path::new(r"C:\repo");
+
+        let plain = env_editor_command_spec("notepad", worktree);
+        assert_eq!(plain.program, std::ffi::OsString::from("notepad"));
+        assert_eq!(plain.args, vec![worktree.as_os_str().to_os_string()]);
+        assert!(!plain.command_processor_shim);
+
+        let shimmed = env_editor_command_spec(r"C:\bin\code.CMD --wait", worktree);
+        assert_eq!(shimmed.program, std::ffi::OsString::from(r"C:\bin\code.CMD"));
+        assert_eq!(
+            shimmed.args,
+            vec![
+                std::ffi::OsString::from("--wait"),
+                worktree.as_os_str().to_os_string(),
+            ]
+        );
+        assert!(shimmed.command_processor_shim);
     }
 
     #[cfg(windows)]

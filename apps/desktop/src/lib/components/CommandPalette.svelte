@@ -4,6 +4,7 @@
   // "Jump to" lists every worktree and live session; "Actions" are one-shot
   // triggers — opening a dialog (new worktree, local-path fallback, create PR,
   // clone) or firing a session. Selecting any item closes the palette first.
+  import { goto } from "$app/navigation";
   import { Command, Dialog } from "bits-ui";
   import {
     activeSessionId,
@@ -200,6 +201,20 @@
                     /></svg
                   >
                   <span class="pi-label">Clone remote repository…</span>
+                </Command.Item>
+                <Command.Item
+                  class="p-item"
+                  value="open settings preferences editor drafts git"
+                  onSelect={() => run(() => void goto("/settings"))}
+                >
+                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
+                    ><path d="M2.5 5h6M12.5 5h1M2.5 11h1M7.5 11h6" /><circle cx="10.5" cy="5" r="1.8" /><circle
+                      cx="5.5"
+                      cy="11"
+                      r="1.8"
+                    /></svg
+                  >
+                  <span class="pi-label">Open settings…</span>
                 </Command.Item>
               </Command.GroupItems>
             </Command.Group>

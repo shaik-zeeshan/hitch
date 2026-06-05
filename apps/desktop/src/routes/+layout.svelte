@@ -11,7 +11,8 @@
   //
   // This layout owns:
   //   - the daemon connection lifecycle (initDaemon is idempotent; see daemon.ts)
-  //   - the platform command-palette shortcut (Cmd+K on macOS, Ctrl+K elsewhere)
+  //   - the platform shortcuts: command palette (Cmd/Ctrl+K) and settings
+  //     toggle (Cmd/Ctrl+,)
   //   - the WKWebView keep-alive heartbeat
   //   - the overlay surfaces (palette + dialogs) that any route may open
   //   - the 3-pane shell (TopNav · LeftRail · Center · RightRail) + rail state
@@ -21,6 +22,7 @@
   // the moment the user returns.
   import "../app.css";
   import { onMount } from "svelte";
+  import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import { disposeDaemon, initDaemon } from "$lib/daemon";
   import { initFileDrop } from "$lib/fileDrop";
@@ -63,9 +65,16 @@
 
 
   function onKeydown(event: KeyboardEvent) {
-    if (isShortcutModifier(event, desktopPlatform) && event.key.toLowerCase() === "k") {
+    if (!isShortcutModifier(event, desktopPlatform)) return;
+    if (event.key.toLowerCase() === "k") {
       event.preventDefault();
       commandOpen.update((open) => !open);
+    } else if (event.key === ",") {
+      // Cmd+, (Ctrl+, elsewhere) — the platform-conventional preferences
+      // shortcut. Toggles: from the shell it opens /settings, from /settings
+      // it returns to the shell (Escape on the page does the same).
+      event.preventDefault();
+      void goto(page.url.pathname === "/settings" ? "/" : "/settings");
     }
   }
 

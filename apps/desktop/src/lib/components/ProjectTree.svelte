@@ -21,7 +21,8 @@
   import Trash2 from "~icons/lucide/trash-2";
   import ClaudeMark from "~icons/hitch/claude";
   import CodexMark from "~icons/hitch/codex";
-  import { DEFAULT_EDITOR, editorApp } from "../settings";
+  import toast from "svelte-french-toast";
+  import { editorApp } from "../settings";
   import {
     agentActRollupByProject,
     agentStateByWorktree,
@@ -129,11 +130,15 @@
 
   // Open the worktree in the configured editor via the backend so Windows can
   // resolve common editor install locations and pass spaced paths as one arg.
+  // An empty editor means "System default": the backend resolves $VISUAL /
+  // $EDITOR and errors when neither is set, so failures must surface visibly.
   async function openInEditor(path: string) {
     try {
-      await invoke("open_in_editor", { path, editor: get(editorApp).trim() || DEFAULT_EDITOR });
+      await invoke("open_in_editor", { path, editor: get(editorApp).trim() });
     } catch (err) {
       console.error("Open in editor failed:", err);
+      const msg = (err instanceof Error ? err.message : String(err)).split("\n")[0].trim();
+      toast.error(msg.length > 80 ? msg.slice(0, 77) + "…" : msg);
     }
   }
 

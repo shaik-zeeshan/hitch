@@ -2,14 +2,16 @@
   // Paper Terminal top bar (doc-design/structure.md "Top bar"). One 42px bar,
   // three zones: OS traffic lights (left, drawn by the macOS Overlay titlebar —
   // ADR 0006, we only reserve their room), the window-centered command palette
-  // trigger, and a right cluster (theme toggle + daemon indicator). The whole
-  // bar is the window drag region; interactive children opt out via no-drag.
+  // trigger, and a right cluster (settings + theme toggle + daemon indicator).
+  // The whole bar is the window drag region; interactive children opt out via
+  // no-drag.
   //
   // There is NO app name, breadcrumb, or git ahead/behind status here — git
   // sync moved to the right rail. The left/right rail toggle buttons were also
   // removed (the design's bar has three zones only); the collapse props/
   // callbacks are kept so the layout's machinery still compiles and the buttons
   // can return elsewhere later.
+  import { goto } from "$app/navigation";
   import {
     daemonReason,
     daemonStatus,
@@ -20,6 +22,7 @@
   import { currentDesktopPlatform, shortcutLabel } from "../desktopPlatform";
   import { theme, toggleTheme } from "../theme";
   import Search from "~icons/lucide/search";
+  import SettingsIcon from "~icons/lucide/settings-2";
   import Sun from "~icons/lucide/sun";
   import Moon from "~icons/lucide/moon";
 
@@ -44,6 +47,7 @@
   } = $props();
 
   const commandPaletteShortcut = shortcutLabel(platform, "K");
+  const settingsShortcut = shortcutLabel(platform, ",");
 
   // Daemon Status indicator (ADR 0009). A standalone quiet instrument: dot +
   // "daemon" + a status word — never color alone (design principle #3) — with a
@@ -94,7 +98,16 @@
 
   <div class="right no-drag">
     <button
-      class="theme-toggle"
+      class="bar-btn"
+      title="Settings ({settingsShortcut})"
+      aria-label="Open settings"
+      onclick={() => void goto("/settings")}
+    >
+      <SettingsIcon class="icon" />
+    </button>
+
+    <button
+      class="bar-btn"
       title="Toggle theme"
       aria-label="Toggle theme"
       onclick={() => toggleTheme()}
@@ -229,9 +242,11 @@
   .right {
     display: flex;
     align-items: center;
+    gap: 4px;
   }
 
-  .theme-toggle {
+  /* Shared 28px square bar button (settings, theme toggle). */
+  .bar-btn {
     width: 28px;
     height: 28px;
     display: grid;
@@ -246,15 +261,15 @@
       border-color 0.18s ease-out,
       background 0.18s ease-out;
   }
-  .theme-toggle:hover {
+  .bar-btn:hover {
     color: var(--ink-1);
     border-color: var(--ink-3);
   }
-  .theme-toggle :global(svg) {
+  .bar-btn :global(svg) {
     width: 15px;
     height: 15px;
   }
-  .theme-toggle:focus-visible {
+  .bar-btn:focus-visible {
     outline: 2px solid var(--iris);
     outline-offset: 1px;
   }
@@ -264,7 +279,6 @@
     position: relative;
     display: flex;
     align-items: center;
-    margin-left: 4px;
   }
   .daemon {
     display: flex;
