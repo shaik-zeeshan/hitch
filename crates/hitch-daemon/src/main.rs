@@ -3339,15 +3339,12 @@ fn store_agent_announce(
     };
 
     // Identity only: do not touch agent_state / agent_detail / the late-arrival
-    // guard. Still refresh the run id when Claude reports one, even if the mark
-    // is unchanged, so a delayed SessionEnd from the previous process cannot
-    // clear this fresh announce.
+    // guard. Every announce defines a fresh process-identity boundary: store the
+    // supplied run id when present, and clear any prior run id when absent. That
+    // prevents an identity-only same-agent announce from leaving the previous
+    // process run id behind and rejecting the next real state report.
     let identity_changed = daemon_session.agent != Some(agent);
-    if let Some(run_id) = agent_run_id {
-        daemon_session.agent_run_id = Some(run_id);
-    } else if identity_changed {
-        daemon_session.agent_run_id = None;
-    }
+    daemon_session.agent_run_id = agent_run_id;
     if !identity_changed {
         return Ok(None);
     }
@@ -6061,6 +6058,62 @@ mod tests {
         assert_eq!(
             current_state(&state, session_id),
             (Some(KnownAgent::ClaudeCode), None)
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_identity_announce_without_run_id_clears_prior_run_id() {
+        use hitch_core::AgentState;
+        use hitch_proto::KnownAgent;
+
+        let (state, session_id, dir, _rx) = state_with_session();
+
+        super::store_agent_announce(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(session_id),
+            None,
+            Some("old-run".into()),
+        )
+        .unwrap();
+        let event = super::store_agent_announce(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(session_id),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            event.is_none(),
+            "same identity should clear run id without redundant broadcast"
+        );
+        {
+            let guard = state.lock().unwrap();
+            let s = guard.sessions.get(&session_id).unwrap();
+            assert_eq!(s.agent_run_id, None, "identity-only announce clears stale run id");
+        }
+
+        let fresh_report = super::store_agent_report(
+            &state,
+            KnownAgent::ClaudeCode,
+            Some(AgentState::Running),
+            Some(session_id),
+            None,
+            None,
+            Some("fresh-run".into()),
+        )
+        .unwrap();
+        assert!(
+            fresh_report.is_some(),
+            "fresh run id must not be rejected against the cleared old run id"
+        );
+        assert_eq!(
+            current_state(&state, session_id),
+            (Some(KnownAgent::ClaudeCode), Some(AgentState::Running))
         );
 
         drop(state);

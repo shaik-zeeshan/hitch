@@ -191,11 +191,6 @@ function writePrByWorktree(worktreeId: Id, pr: PrInfo | null, seq: number): bool
   prByWorktree.update((map) => ({ ...map, [worktreeId]: pr }));
   return true;
 }
-// True while no newer per-worktree write has landed — lets the failure path clear
-// the selected `prInfo` without clobbering a fresher success or touching the chip.
-function isFreshestPr(worktreeId: Id, seq: number): boolean {
-  return seq >= freshestPrSeq(worktreeId);
-}
 
 const diffCache = new Map<string, string>();
 let diffRequestSeq = 0;
@@ -1165,9 +1160,11 @@ export async function loadPrStatus(worktreeId: Id): Promise<void> {
       prInfo.set(response.pr ?? null);
     }
   } catch {
-    // Clear only if no newer lookup for this worktree has landed, so a slow
-    // failure can't wipe a fresher success. Leave the chip map untouched.
-    if (isFreshestPr(worktreeId, freshnessSeq) && get(gitWorktreeId) === worktreeId) {
+    // A failed lookup is authoritative for this worktree only if no newer lookup
+    // has started or landed. Keep the selected action state and sidebar chip in
+    // lockstep by clearing both through the same per-worktree freshness guard.
+    const applied = writePrByWorktree(worktreeId, null, freshnessSeq);
+    if (applied && get(gitWorktreeId) === worktreeId) {
       prInfo.set(null);
     }
   }

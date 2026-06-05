@@ -85,17 +85,20 @@ display of hook-reported `running` — it cannot invent a state. Hook state stay
 the stored truth (`running` until `Stop`/`SessionEnd`); the gate is display
 derivation, applied by the daemon so every window agrees.
 
-**Lifecycle additions (same date), closing the abandoned-prompt leak.** Esc *at
-a permission prompt* fires neither `PostToolUse` nor `Stop`, leaving
-`needs-approval` — the sticky, saturated signal — stale. Two hooks are added:
-`PermissionDenied` → `running` (symmetric with `PostToolUse`: after a deny the
-agent consumes the denial and finishes its turn) and `Notification` matcher
-`idle_prompt` → `waiting` (the agent's own "done and waiting for input" signal,
-~60s after input goes idle), which makes any stale state self-heal. The existing
-late-arrival guard (non-`running` reports are dropped until the first `running`)
-keeps a fresh, never-prompted agent at no-state even if an idle notification
-fires. Accepted residue: an abandoned prompt can show a wrong `AWAITING` for up
-to ~60s before the idle notification heals it.
+**Lifecycle additions (same date), closing the abandoned-prompt leak.** Esc or
+manual deny *at a permission prompt* fires neither `PostToolUse`, `Stop`, nor
+`PermissionDenied`; Claude Code documents `PermissionDenied` as auto-mode
+classifier denial only, not manual permission-dialog denial/Esc. Manual
+abandonment therefore leaves `needs-approval` — the sticky, saturated signal —
+stale until `Notification` matcher `idle_prompt` → `waiting` fires (the agent's
+own "done and waiting for input" signal, ~60s after input goes idle), which
+makes the stale prompt self-heal. `PermissionDenied` → `running` is still wired,
+but only for its documented scope: an auto-mode classifier denial has already
+occurred, the agent consumes that denial, and the turn continues or finishes.
+The existing late-arrival guard (non-`running` reports are dropped until the
+first `running`) keeps a fresh, never-prompted agent at no-state even if an idle
+notification fires. Accepted residue: an abandoned prompt can show a wrong
+`AWAITING` for up to ~60s before the idle notification heals it.
 
 **`waiting` stays in the taxonomy but renders unlabeled; dismissal machinery is
 removed.** The Paper Terminal shell (2026-06-05) labels only the act/inform

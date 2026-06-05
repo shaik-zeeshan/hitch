@@ -1473,11 +1473,43 @@ describe("PR status freshness across batched and per-worktree lookups", () => {
     });
     await batch;
 
-    // The fresher per-worktree lookup then fails; the stale chip must not survive.
+    // The fresher per-worktree lookup then fails; selected state and chip map must
+    // both reflect the freshest failed lookup.
     completeJob("j-pw", { type: "error", error: { message: "boom" } });
     await perWorktree;
 
-    expect(get(prByWorktree)["wt-1"]).toBeUndefined();
+    expect(get(prByWorktree)["wt-1"]).toBeNull();
     expect(get(prInfo)).toBeNull();
+  });
+
+  it("does not let a slow failed lookup clear a newer per-worktree success", async () => {
+    selectedWorktreeId.set("wt-1");
+    prByWorktree.set({
+      "wt-1": { number: 1, url: "old", state: "OPEN", draft: false },
+    });
+    prInfo.set({ number: 1, url: "old", state: "OPEN", draft: false });
+    let prJobCount = 0;
+
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { request: { type: string } } }) => {
+        const type = request.request.type;
+        if (type !== "pr-status") throw new Error(`unexpected request ${type}`);
+        return { type: "job-started", job_id: `j-pr-${++prJobCount}` };
+      },
+    );
+
+    const slowFailure = loadPrStatus("wt-1");
+    const newerSuccess = loadPrStatus("wt-1");
+    await flush();
+
+    const freshPr = { number: 2, url: "fresh", state: "OPEN", draft: false } as const;
+    completeJob("j-pr-2", { type: "pr-status", pr: freshPr });
+    await newerSuccess;
+
+    completeJob("j-pr-1", { type: "error", error: { message: "boom" } });
+    await slowFailure;
+
+    expect(get(prByWorktree)["wt-1"]).toEqual(freshPr);
+    expect(get(prInfo)).toEqual(freshPr);
   });
 });
