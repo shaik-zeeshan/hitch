@@ -1856,26 +1856,27 @@ fn main() {
 
     #[cfg(unix)]
     #[test]
-    fn successful_provider_errors_when_stdout_held_past_grace_instead_of_parsing_partial() {
+    fn successful_provider_errors_when_stdout_grows_past_grace_instead_of_parsing_partial() {
         // Regression for F3: a provider that exits 0 but whose same-group
-        // descendant keeps the inherited stdout write end open past
+        // descendant keeps WRITING to the inherited stdout write end past
         // `SUCCESS_DRAIN_GRACE` must NOT silently feed a possibly-truncated payload
-        // to the parser. Once the leader is reaped we cannot force EOF on Unix, so
-        // the bounded drain times out; the success path must surface a clear
-        // provider error rather than parse partial JSON.
+        // to the parser. The bytes never settle across a `SETTLE_WINDOW`, so the
+        // passive-holder fast path in `drain_success_stdout` must not fire; the
+        // drain times out at the grace and the success path surfaces a clear
+        // provider error rather than parsing partial JSON.
         //
-        // The provider prints NOTHING itself; the held-open pipe means the reader
-        // never sees EOF and the collected bytes are empty/partial. Use a short
-        // grace via a tiny timeout-independent path: the grandchild outlives the
-        // grace, so the drain must time out and error.
-        let script = temp_file("successful-provider-held-stdout", "sh");
+        // (A descendant that merely holds the pipe open WITHOUT writing is the
+        // passive case covered by
+        // `successful_provider_waits_for_briefly_held_stdout_and_returns_complete_output`:
+        // there the provider's own output is complete and trusted.)
+        let script = temp_file("successful-provider-growing-stdout", "sh");
         fs::write(
             &script,
-            "#!/bin/sh\n# Background child inherits stdout (fd 1) and holds it open well past SUCCESS_DRAIN_GRACE.\nsleep 30 &\n# Provider prints partial JSON then exits 0; the held pipe blocks EOF.\nprintf '%s' '{\"title\":\"Gen'\n",
+            "#!/bin/sh\n# Background child inherits stdout (fd 1) and keeps writing to it well past\n# SUCCESS_DRAIN_GRACE (bounded so it cannot leak forever: 100 * 0.2s = 20s).\n( i=0; while [ \"$i\" -lt 100 ]; do printf x; sleep 0.2; i=$((i+1)); done ) &\n# Provider prints partial JSON then exits 0; the still-growing pipe means\n# forcing EOF would truncate, so the drain must time out and error.\nprintf '%s' '{\"title\":\"Gen'\n",
         )
         .unwrap();
         make_executable(&script);
-        let cwd = temp_dir("successful-provider-held-stdout-cwd");
+        let cwd = temp_dir("successful-provider-growing-stdout-cwd");
         fs::create_dir_all(&cwd).unwrap();
         let config = DraftProviderConfig {
             kind: DraftProviderKind::Codex,
@@ -1894,8 +1895,8 @@ fn main() {
             "unexpected error message: {}",
             err.message
         );
-        // The drain must give up at the grace, not block until the 30s grandchild
-        // or the 60s provider timeout.
+        // The drain must give up at the grace, not block until the ~20s writer
+        // loop finishes or the 60s provider timeout.
         assert!(
             elapsed < SUCCESS_DRAIN_GRACE + Duration::from_secs(3),
             "success-path drain blocked for {elapsed:?}; should bound at SUCCESS_DRAIN_GRACE"
