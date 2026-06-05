@@ -1,0 +1,302 @@
+<script lang="ts">
+  // All-changes view (the special ALL_CHANGES_TAB diff tab): every changed file
+  // in one scroll, each as a collapsible section. Mirrors DiffTab's @pierre/diffs
+  // rendering, but one FileDiff instance per *expanded* file (the library
+  // supports many instances). Sections are expanded by default; collapsing a
+  // section unmounts its <diffs-container> so we only process diffs the user is
+  // looking at. Per-file diff text comes from `allChangesFiles` (fanned out by
+  // viewAllChanges in daemon.ts), not a single diff string — so this reuses the
+  // --diffs-* token bridge from DiffTab but its own data path.
+  import { FileDiff, processFile, type FileDiffOptions } from "@pierre/diffs";
+  import ChevronDown from "~icons/lucide/chevron-down";
+  import ChevronRight from "~icons/lucide/chevron-right";
+  import { allChangesFiles } from "../daemon";
+  import { parseDiff } from "../diff";
+  import { fileIconUrl } from "../file-icons";
+  import { theme } from "../theme";
+
+  // Collapsed sections by path. Absent / false = expanded (the default). Plain
+  // $state object to match the surrounding runes idiom; toggled on header click.
+  let collapsed = $state<Record<string, boolean>>({});
+
+  const options: FileDiffOptions<undefined> = {
+    diffStyle: "unified",
+    disableFileHeader: true, // each section renders its own header row.
+    disableLineNumbers: false,
+    diffIndicators: "classic",
+    hunkSeparators: "line-info",
+    lineDiffType: "word",
+    overflow: "scroll",
+    stickyHeader: false,
+    preferredHighlighter: "shiki-js", // no WASM, faster startup.
+    theme: { light: "pierre-light", dark: "pierre-dark" },
+    themeType: $theme,
+  };
+
+  function toggle(path: string) {
+    collapsed[path] = !collapsed[path];
+  }
+
+  // A single FileDiff per mounted (expanded, renderable) section. The Svelte
+  // action owns its instance: it renders on mount + on text/theme change and
+  // cleans up when the section unmounts (collapse) — cleanUp() detaching the
+  // <diffs-container> is fine here because Svelte is removing it too. Mirrors the
+  // teardown reasoning in DiffTab, but per section.
+  function fileDiffView(
+    node: HTMLElement,
+    params: { text: string; themeType: "light" | "dark" },
+  ) {
+    let instance: FileDiff<undefined> | undefined;
+    let lastText: string | null = null;
+
+    function render(text: string, themeType: "light" | "dark") {
+      const fileDiff = processFile(text, { isGitDiff: true });
+      if (!fileDiff) return;
+      if (!instance) instance = new FileDiff<undefined>({ ...options, themeType });
+      instance.setThemeType(themeType);
+      instance.render({ fileDiff, fileContainer: node, forceRender: true });
+      lastText = text;
+    }
+
+    render(params.text, params.themeType);
+
+    return {
+      update(next: { text: string; themeType: "light" | "dark" }) {
+        if (next.text !== lastText) render(next.text, next.themeType);
+        else instance?.setThemeType(next.themeType);
+      },
+      destroy() {
+        instance?.cleanUp();
+        instance = undefined;
+      },
+    };
+  }
+</script>
+
+<div class="diffall">
+  <div class="all-head">
+    <span class="glyph" aria-hidden="true">±</span>
+    <span class="path">All changes</span>
+    <span class="meta">{$allChangesFiles.length} files</span>
+  </div>
+
+  {#if $allChangesFiles.length === 0}
+    <div class="diff-empty"><p>No changes to show.</p></div>
+  {/if}
+
+  {#each $allChangesFiles as file (file.path)}
+    {@const parsed = file.text === null ? null : parseDiff(file.text)}
+    {@const isCollapsed = collapsed[file.path] === true}
+    <section class="file">
+      <button
+        class="file-head"
+        type="button"
+        aria-expanded={!isCollapsed}
+        onclick={() => toggle(file.path)}
+      >
+        <span class="chev" aria-hidden="true">
+          {#if isCollapsed}
+            <ChevronRight />
+          {:else}
+            <ChevronDown />
+          {/if}
+        </span>
+        <span class="ftype" aria-hidden="true"><img src={fileIconUrl(file.path)} alt="" /></span>
+        <span class="fpath">{file.path}</span>
+        {#if file.staged}
+          <span class="badge">staged</span>
+        {/if}
+        {#if parsed && !parsed.isEmpty}
+          <span class="counts">
+            <span class="add">+{parsed.additions}</span>
+            <span class="del">−{parsed.deletions}</span>
+          </span>
+        {/if}
+      </button>
+
+      {#if !isCollapsed}
+        {#if parsed === null}
+          <div class="diff-empty small"><p>Loading diff…</p></div>
+        {:else if parsed.isBinary}
+          <div class="diff-empty small"><p>Binary file — no text diff.</p></div>
+        {:else if parsed.isEmpty}
+          <div class="diff-empty small"><p>No textual changes.</p></div>
+        {:else}
+          <!-- One @pierre/diffs instance per expanded section, mounted only while
+               expanded so collapsed files are never processed. -->
+          <diffs-container
+            class="diffs"
+            use:fileDiffView={{ text: file.text!, themeType: $theme }}
+          ></diffs-container>
+        {/if}
+      {/if}
+    </section>
+  {/each}
+</div>
+
+<style>
+  /* Same edge-to-edge terminal surface as DiffTab so closing reveals the
+     terminal seamlessly. */
+  .diffall {
+    height: 100%;
+    width: 100%;
+    background: var(--term-bg2);
+    overflow-y: auto;
+  }
+  .all-head {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 9px 16px;
+    border-bottom: 1px solid var(--term-line);
+    position: sticky;
+    top: 0;
+    background: var(--term-bg2);
+    z-index: 2;
+  }
+  .all-head .glyph {
+    font-family: var(--mono);
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--term-dim);
+    flex: none;
+  }
+  .all-head .path {
+    font-family: var(--mono);
+    font-size: var(--r1);
+    color: var(--term-fg);
+    font-weight: 600;
+  }
+  .all-head .meta {
+    font-size: 0.6875rem;
+    color: var(--term-dim);
+    margin-left: auto;
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    flex: none;
+  }
+
+  .file {
+    border-bottom: 1px solid var(--term-line);
+  }
+  /* Collapsible section header: chevron + file icon + path + counts. Sticks just
+     under the all-changes head so the current file's name stays visible while
+     scrolling its body. */
+  .file-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 7px 16px;
+    background: var(--term-bg2);
+    border: 0;
+    border-radius: 0;
+    cursor: pointer;
+    text-align: left;
+    position: sticky;
+    top: 38px;
+    z-index: 1;
+    transition: color 0.15s ease-out;
+  }
+  .file-head:hover {
+    color: var(--term-fg);
+  }
+  .file-head:focus-visible {
+    outline: 1px solid var(--iris-ink);
+    outline-offset: -2px;
+  }
+  .file-head .chev {
+    display: inline-grid;
+    place-items: center;
+    width: 14px;
+    height: 14px;
+    flex: none;
+    color: var(--term-dim);
+  }
+  .file-head .chev :global(svg) {
+    width: 14px;
+    height: 14px;
+    stroke-width: 1.5px;
+  }
+  .file-head .ftype {
+    display: inline-grid;
+    place-items: center;
+    width: 16px;
+    height: 16px;
+    flex: none;
+  }
+  .file-head .ftype img {
+    width: 16px;
+    height: 16px;
+    display: block;
+  }
+  .file-head .fpath {
+    font-family: var(--mono);
+    font-size: var(--r1);
+    color: var(--term-fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .file-head .badge {
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--term-dim);
+    border: 1px solid var(--term-line);
+    padding: 1px 5px;
+    flex: none;
+  }
+  .file-head .counts {
+    margin-left: auto;
+    font-size: 0.6875rem;
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    flex: none;
+  }
+  .file-head .add {
+    color: var(--diff-add);
+    font-weight: 600;
+  }
+  .file-head .del {
+    color: var(--diff-del);
+    font-weight: 600;
+    margin-left: 4px;
+  }
+
+  /* The @pierre/diffs container — same chrome→terminal token bridge as DiffTab. */
+  .diffs {
+    display: block;
+    --diffs-font-family: var(--mono);
+    --diffs-font-size: var(--r1);
+    --diffs-light-bg: var(--term-bg2);
+    --diffs-dark-bg: var(--term-bg2);
+    --diffs-bg-context-override: var(--term-bg2);
+    --diffs-bg-addition-override: oklch(from var(--diff-add) l c h / 0.1);
+    --diffs-bg-deletion-override: oklch(from var(--diff-del) l c h / 0.1);
+    --diffs-bg-addition-emphasis-override: oklch(from var(--diff-add) l c h / 0.22);
+    --diffs-bg-deletion-emphasis-override: oklch(from var(--diff-del) l c h / 0.22);
+    --diffs-addition-color-override: var(--diff-add);
+    --diffs-deletion-color-override: var(--diff-del);
+    --diffs-fg-number-override: var(--term-dim);
+    --diffs-bg-hover-override: oklch(from var(--term-fg) l c h / 0.06);
+  }
+
+  .diff-empty {
+    display: grid;
+    place-content: center;
+    height: calc(100% - 38px);
+    padding: 24px;
+  }
+  .diff-empty.small {
+    height: auto;
+    place-content: start;
+    padding: 12px 16px 16px 38px;
+  }
+  .diff-empty p {
+    font-family: var(--ui);
+    font-size: var(--r0);
+    color: var(--term-dim);
+  }
+</style>

@@ -30,14 +30,20 @@ import {
   applyJobProgress,
   cancellableJobForSelectedWorktree,
   cancelJob,
+  closeDiff,
   commit,
   completeJob,
   connection,
+  ALL_CHANGES_TAB,
+  allChangesFiles,
+  viewAllChanges,
   createWorktree,
   daemonReason,
   displaySessionStates,
+  activeDiffPath,
   diffActive,
   diffPath,
+  diffTabs,
   diffText,
   dirtyWorktrees,
   daemonStatus,
@@ -72,6 +78,7 @@ import {
   worktrees,
 } from "./daemon";
 import { draftClaudePath, draftCodexPath, draftModel, draftProvider } from "./settings";
+import type { ChangedFile } from "./types";
 
 // Flush the StartJob promise chain (runJob -> daemonRequest -> invoke) so the
 // pending resolver is registered before we deliver the JobCompleted event.
@@ -96,12 +103,13 @@ beforeEach(() => {
   dirtyWorktrees.set({});
   worktreeLineStats.set({});
   gitStatus.set(null);
-  diffPath.set(null);
+  diffTabs.set([]);
+  activeDiffPath.set(null);
+  allChangesFiles.set([]);
   prByWorktree.set({});
   prInfo.set(null);
   prUrl.set(null);
   sessionCommands.set({});
-  diffText.set(null);
   diffActive.set(false);
   draftProvider.set(null);
   draftModel.set("");
@@ -1229,8 +1237,66 @@ describe("Windows project paths", () => {
     await viewDiff(filePath);
 
     expect(requests).toEqual([{ type: "git-diff", worktree_id: worktree.id, path: filePath }]);
+    expect(get(diffTabs)).toEqual([{ path: filePath, text: "diff --git" }]);
+    expect(get(activeDiffPath)).toBe(filePath);
     expect(get(diffPath)).toBe(filePath);
     expect(get(diffText)).toBe("diff --git");
+  });
+
+  it("opens each clicked file as its own diff tab and re-uses an existing tab", async () => {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          return { type: "git-diff", diff: { diff: `diff for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await viewDiff("src/a.ts");
+    await viewDiff("src/b.ts");
+
+    // Two distinct files → two tabs, the most recent active.
+    expect(get(diffTabs)).toEqual([
+      { path: "src/a.ts", text: "diff for src/a.ts" },
+      { path: "src/b.ts", text: "diff for src/b.ts" },
+    ]);
+    expect(get(activeDiffPath)).toBe("src/b.ts");
+
+    // Re-clicking an open file activates its tab without spawning a duplicate.
+    await viewDiff("src/a.ts");
+    expect(get(diffTabs).map((tab) => tab.path)).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(get(activeDiffPath)).toBe("src/a.ts");
+  });
+
+  it("closes one diff tab and activates the left neighbor, falling back to none", () => {
+    diffTabs.set([
+      { path: "src/a.ts", text: "a" },
+      { path: "src/b.ts", text: "b" },
+      { path: "src/c.ts", text: "c" },
+    ]);
+    activeDiffPath.set("src/b.ts");
+    diffActive.set(true);
+
+    // Closing the active middle tab activates the tab to its left.
+    closeDiff("src/b.ts");
+    expect(get(diffTabs).map((tab) => tab.path)).toEqual(["src/a.ts", "src/c.ts"]);
+    expect(get(activeDiffPath)).toBe("src/a.ts");
+    expect(get(diffActive)).toBe(true);
+
+    // Closing an inactive tab leaves the active selection untouched.
+    closeDiff("src/c.ts");
+    expect(get(diffTabs).map((tab) => tab.path)).toEqual(["src/a.ts"]);
+    expect(get(activeDiffPath)).toBe("src/a.ts");
+
+    // Closing the last tab clears the diff view entirely.
+    closeDiff("src/a.ts");
+    expect(get(diffTabs)).toEqual([]);
+    expect(get(activeDiffPath)).toBeNull();
+    expect(get(diffActive)).toBe(false);
   });
 
   it("creates a Windows managed worktree through a job and reflects the daemon worktree event", async () => {
@@ -1320,8 +1386,8 @@ describe("Windows project paths", () => {
       deletions: 4,
       files: [{ path: filePath, status: "modified", staged: false }],
     });
-    diffPath.set(filePath);
-    diffText.set("diff --git a/file b/file");
+    diffTabs.set([{ path: filePath, text: "diff --git a/file b/file" }]);
+    activeDiffPath.set(filePath);
     diffActive.set(true);
     prByWorktree.set({
       [removed.id]: { number: 7, url: "https://example.test/pr/7", state: "OPEN", draft: false },
@@ -1336,7 +1402,8 @@ describe("Windows project paths", () => {
     expect(get(selectedWorktreeId)).toBeNull();
     expect(get(activeSessionId)).toBeNull();
     expect(get(gitStatus)).toBeNull();
-    expect(get(diffPath)).toBeNull();
+    expect(get(diffTabs)).toEqual([]);
+    expect(get(activeDiffPath)).toBeNull();
     expect(get(diffText)).toBeNull();
     expect(get(diffActive)).toBe(false);
     expect(get(dirtyWorktrees)).toEqual({ [worktree.id]: false });
@@ -1352,6 +1419,110 @@ describe("Windows project paths", () => {
   });
 });
 
+
+describe("all-changes diff tab", () => {
+  const project = { id: "proj-all", name: "repo", kind: "git-backed", root: "/repo" } as const;
+  const worktree = {
+    id: "wt-all",
+    project_id: project.id,
+    path: "/repo/wt",
+    branch: "feature",
+    is_main: false,
+    is_hitch_managed: true,
+  } as const;
+
+  function setStatus(files: ChangedFile[]) {
+    gitStatus.set({
+      worktree_id: worktree.id,
+      branch: "feature",
+      dirty: files.length > 0,
+      ahead: 0,
+      behind: 0,
+      additions: 0,
+      deletions: 0,
+      files,
+    });
+  }
+
+  function mockDiffs() {
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          return { type: "git-diff", diff: { diff: `diff for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+  }
+
+  it("opens the sentinel tab and fans out per-file diffs (staged first)", async () => {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([
+      { path: "src/b.ts", status: "modified", staged: false },
+      { path: "src/a.ts", status: "modified", staged: true },
+    ]);
+    mockDiffs();
+
+    await viewAllChanges();
+
+    // One special tab, activated, diff view up.
+    expect(get(diffTabs)).toEqual([{ path: ALL_CHANGES_TAB, text: null }]);
+    expect(get(activeDiffPath)).toBe(ALL_CHANGES_TAB);
+    expect(get(diffActive)).toBe(true);
+    // Back-compat single-diff text store ignores the sentinel (its text is null).
+    expect(get(diffText)).toBeNull();
+    // Rows ordered staged-then-unstaged, each with its fetched diff.
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: true, text: "diff for src/a.ts" },
+      { path: "src/b.ts", staged: false, text: "diff for src/b.ts" },
+    ]);
+  });
+
+  it("re-activates the existing sentinel tab without duplicating it", async () => {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false }]);
+    mockDiffs();
+
+    await viewAllChanges();
+    await viewAllChanges();
+
+    expect(get(diffTabs).filter((tab) => tab.path === ALL_CHANGES_TAB)).toHaveLength(1);
+  });
+
+  it("closing the sentinel tab clears its per-file rows and falls back to a neighbor", async () => {
+    diffTabs.set([
+      { path: "src/x.ts", text: "x" },
+      { path: ALL_CHANGES_TAB, text: null },
+    ]);
+    activeDiffPath.set(ALL_CHANGES_TAB);
+    diffActive.set(true);
+    allChangesFiles.set([{ path: "src/a.ts", staged: false, text: "a" }]);
+
+    closeDiff(ALL_CHANGES_TAB);
+
+    expect(get(diffTabs).map((tab) => tab.path)).toEqual(["src/x.ts"]);
+    expect(get(activeDiffPath)).toBe("src/x.ts");
+    expect(get(allChangesFiles)).toEqual([]);
+  });
+
+  it("close-all and worktree switch both drop the sentinel tab and its rows", () => {
+    diffTabs.set([{ path: ALL_CHANGES_TAB, text: null }]);
+    activeDiffPath.set(ALL_CHANGES_TAB);
+    diffActive.set(true);
+    allChangesFiles.set([{ path: "src/a.ts", staged: false, text: "a" }]);
+
+    closeDiff();
+
+    expect(get(diffTabs)).toEqual([]);
+    expect(get(activeDiffPath)).toBeNull();
+    expect(get(diffActive)).toBe(false);
+    expect(get(allChangesFiles)).toEqual([]);
+  });
+});
 
 describe("worktree-scoped git actions", () => {
   it("keeps a commit-then-push sequence on the triggering worktree after selection changes", async () => {

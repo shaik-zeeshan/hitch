@@ -38,6 +38,7 @@
     push,
     setFileStaged,
     setFilesStaged,
+    viewAllChanges,
     viewDiff,
   } from "../daemon";
   import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
@@ -450,7 +451,11 @@
       {#if staged.length > 0}
         <div class="fgroup">
           <h3>
-            <span>Staged</span><span class="ct">{staged.length}</span><span class="hr"></span>
+            <button
+              class="group-label"
+              title="View all changes as one diff"
+              onclick={() => void viewAllChanges()}
+            >Staged</button><span class="ct">{staged.length}</span><span class="hr"></span>
             <button
               class="all"
               onclick={() => void setFilesStaged(staged.map((f) => f.path), false).catch(() => {})}
@@ -499,7 +504,11 @@
       {#if unstaged.length > 0}
         <div class="fgroup">
           <h3>
-            <span>Changes</span><span class="ct">{unstaged.length}</span><span class="hr"></span>
+            <button
+              class="group-label"
+              title="View all changes as one diff"
+              onclick={() => void viewAllChanges()}
+            >Changes</button><span class="ct">{unstaged.length}</span><span class="hr"></span>
             <button
               class="all"
               onclick={() => void setFilesStaged(unstaged.map((f) => f.path), true).catch(() => {})}
@@ -919,6 +928,26 @@
     font-weight: 700;
     padding: 6px 8px 5px;
     margin: 0;
+  }
+  /* The group label IS the entry point to the unified all-changes diff.
+     A button only for semantics + keyboard focus; copies the h3's text
+     rendering exactly (mono caps, same size/spacing/ink/weight) so it reads
+     identical to the former <span> label, with a quiet hover to stronger ink. */
+  .fgroup h3 .group-label {
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-2);
+    font-weight: 700;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    transition: color 0.2s ease-out;
+  }
+  .fgroup h3 .group-label:hover {
+    color: var(--ink-1);
   }
   .fgroup h3 .ct {
     color: var(--ink-3);

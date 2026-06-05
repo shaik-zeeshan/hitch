@@ -16,6 +16,7 @@
   // so live GPU contexts stay well under the browser cap.
   import {
     activeSessionId,
+    ALL_CHANGES_TAB,
     connection,
     diffActive,
     diffPath,
@@ -37,6 +38,7 @@
   import SessionTabs from "./SessionTabs.svelte";
   import Terminal from "./Terminal.svelte";
   import DiffTab from "./DiffTab.svelte";
+  import DiffAllTab from "./DiffAllTab.svelte";
 
   // Re-theme every --term-* consumer in the center column at one bind point: the
   // tab strip's active tab, the terminal panels' insets/overlays, and the diff
@@ -115,6 +117,10 @@
           shell or launch an agent.
         </p>
       </div>
+    {:else if $diffActive && $diffPath === ALL_CHANGES_TAB}
+      <!-- The all-changes view: every changed file in one scroll, as collapsible
+           sections. Same overlay behavior as a single-file diff. -->
+      <DiffAllTab />
     {:else if $diffActive && $diffPath}
       <!-- The diff OVERLAYS the (now hidden) terminals rather than replacing
            them; closing it reveals the active terminal with scroll + buffer

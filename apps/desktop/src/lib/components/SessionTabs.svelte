@@ -10,31 +10,44 @@
   import { ContextMenu, DropdownMenu } from "bits-ui";
   import Plus from "~icons/lucide/plus";
   import X from "~icons/lucide/x";
+  import Files from "~icons/lucide/files";
   import Claude from "~icons/hitch/claude";
   import Codex from "~icons/hitch/codex";
   import Shell from "~icons/hitch/shell";
   import {
     activeSession,
     activeSessionId,
+    activeDiffPath,
+    ALL_CHANGES_TAB,
     displaySessionStates,
     closeDiff,
     closeSession,
     diffActive,
-    diffPath,
+    diffTabs,
     openSession,
     sessionAgents,
     sessionCommands,
     visibleSessions,
   } from "../daemon";
+  import { fileIconUrl } from "../file-icons";
   import { needsAction, type Session, type SessionParent } from "../types";
   import { sessionTabKind, sessionTabTitle } from "../sessionDisplay";
   let { parent }: { parent: SessionParent } = $props();
 
-  const diffName = $derived($diffPath?.split("/").pop() ?? "diff");
+  function diffName(path: string): string {
+    return path.split("/").pop() ?? "diff";
+  }
 
   function select(session: Session) {
     diffActive.set(false);
     activeSessionId.set(session.id);
+  }
+
+  // Activate an already-open diff tab (no fetch — its text is already loaded /
+  // loading from when it was opened).
+  function selectDiff(path: string) {
+    activeDiffPath.set(path);
+    diffActive.set(true);
   }
 </script>
 
@@ -102,17 +115,30 @@
     </ContextMenu.Root>
   {/each}
 
-  {#if $diffPath}
+  <!-- One peer tab per open diff. Each leads with the file-type Material icon
+       (full-color <img>, matching the Changes panel rows), then the basename and
+       its own close affordance. Active iff the diff view is up AND it's the
+       active path. -->
+  {#each $diffTabs as tab (tab.path)}
+    {@const active = $diffActive && tab.path === $activeDiffPath}
     <button
       class="tab"
-      class:active={$diffActive}
+      class:active
       role="tab"
-      aria-selected={$diffActive}
-      title={$diffPath}
-      onclick={() => diffActive.set(true)}
+      aria-selected={active}
+      title={tab.path === ALL_CHANGES_TAB ? "All changes" : tab.path}
+      onclick={() => selectDiff(tab.path)}
     >
-      <span class="tabmark glyph" aria-hidden="true">±</span>
-      <span class="name">{diffName}</span>
+      {#if tab.path === ALL_CHANGES_TAB}
+        <!-- The all-changes tab: a lucide glyph instead of a file-type icon. -->
+        <Files class="icon tabmark allmark" />
+        <span class="name">All changes</span>
+      {:else}
+        <span class="tabmark ftype" aria-hidden="true">
+          <img src={fileIconUrl(tab.path)} alt="" />
+        </span>
+        <span class="name">{diffName(tab.path)}</span>
+      {/if}
       <span
         class="closer"
         role="button"
@@ -121,14 +147,14 @@
         title="Close diff"
         onclick={(e) => {
           e.stopPropagation();
-          closeDiff();
+          closeDiff(tab.path);
         }}
         onkeydown={() => {}}
       >
         <X class="icon" />
       </span>
     </button>
-  {/if}
+  {/each}
 
   <DropdownMenu.Root>
     <DropdownMenu.Trigger>
@@ -242,13 +268,21 @@
   .tab.active :global(.tabmark.codex) {
     color: var(--term-dim);
   }
-  /* Diff tab uses a ± glyph instead of a harness mark. */
-  .tabmark.glyph {
+  /* Diff tab uses the file-type Material icon instead of a harness mark: a
+     full-color <img> boxed to the 14px tabmark grid (matching the Changes-panel
+     rows), so it reads identically on the paper strip and the active dark ink. */
+  .tabmark.ftype {
     display: inline-grid;
     place-items: center;
-    font-weight: 600;
-    font-size: 0.875rem;
-    line-height: 1;
+  }
+  .tabmark.ftype img {
+    width: 14px;
+    height: 14px;
+    display: block;
+  }
+  /* All-changes tab glyph: dims on the active dark ink like the harness marks. */
+  .tab.active :global(.tabmark.allmark) {
+    color: var(--term-dim);
   }
 
   /* Act-state dot: 6px oxide circle, ringed in the terminal ink so it reads on
