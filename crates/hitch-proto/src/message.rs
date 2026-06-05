@@ -715,6 +715,13 @@ pub struct ChangedFile {
     pub path: PathBuf,
     pub status: FileStatus,
     pub staged: bool,
+    /// Added/deleted line counts for this path (the side shown: staged counts
+    /// when staged, worktree counts otherwise). `#[serde(default)]` keeps older
+    /// daemons/clients decodable during rolling upgrades, matching GitStatus.
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
 }
 
 /// Coarse file status values needed by the UI.
@@ -876,6 +883,20 @@ mod tests {
         };
         assert_eq!(status.additions, 0);
         assert_eq!(status.deletions, 0);
+    }
+
+    #[test]
+    fn changed_file_deserializes_without_line_counts_for_rolling_upgrades() {
+        let json = r#"{"path":"src/lib.rs","status":"modified","staged":true}"#;
+        let file: ChangedFile = serde_json::from_str(json).unwrap();
+        assert_eq!(file.additions, 0);
+        assert_eq!(file.deletions, 0);
+
+        let with_counts =
+            r#"{"path":"src/lib.rs","status":"modified","staged":true,"additions":7,"deletions":2}"#;
+        let file: ChangedFile = serde_json::from_str(with_counts).unwrap();
+        assert_eq!(file.additions, 7);
+        assert_eq!(file.deletions, 2);
     }
 
     #[test]
@@ -1342,6 +1363,8 @@ mod tests {
                 path: "src/lib.rs".into(),
                 status: FileStatus::Modified,
                 staged: false,
+                additions: 12,
+                deletions: 3,
             }],
         }
     }

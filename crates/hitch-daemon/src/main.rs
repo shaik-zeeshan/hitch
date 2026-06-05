@@ -2815,6 +2815,15 @@ fn status_entry_to_proto(entry: &StatusEntry) -> ChangedFile {
     } else {
         entry.working_tree
     };
+    // Show the line counts for the side this row represents: a staged row's
+    // counts come from HEAD↔index, an unstaged/untracked row's from
+    // index↔worktree. This keeps the +N −N badge in step with the diff the row
+    // opens, and avoids double-counting a partially-staged file.
+    let (additions, deletions) = if staged {
+        (entry.staged_additions, entry.staged_deletions)
+    } else {
+        (entry.worktree_additions, entry.worktree_deletions)
+    };
     ChangedFile {
         path: entry.path.clone(),
         status: match state {
@@ -2827,6 +2836,8 @@ fn status_entry_to_proto(entry: &StatusEntry) -> ChangedFile {
             FileState::Unmodified => FileStatus::Modified,
         },
         staged,
+        additions: additions.min(u32::MAX as usize) as u32,
+        deletions: deletions.min(u32::MAX as usize) as u32,
     }
 }
 

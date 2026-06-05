@@ -480,9 +480,8 @@
               <span class="ftype" aria-hidden="true"><img src={fileIconUrl(file.path)} alt="" /></span>
               <span class="path">{#if parts.dir}<span class="dir">{parts.dir}</span>{/if}<b>{parts.name}</b></span>
               <span class="fdiff">
-                {#if file.status === "added" || file.status === "untracked"}
-                  <span class="a">new</span>
-                {/if}
+                <span class="a">+{file.additions ?? 0}</span>
+                <span class="d">−{file.deletions ?? 0}</span>
               </span>
               <span
                 class="discard"
@@ -534,9 +533,8 @@
               <span class="ftype" aria-hidden="true"><img src={fileIconUrl(file.path)} alt="" /></span>
               <span class="path">{#if parts.dir}<span class="dir">{parts.dir}</span>{/if}<b>{parts.name}</b></span>
               <span class="fdiff">
-                {#if file.status === "added" || file.status === "untracked"}
-                  <span class="a">new</span>
-                {/if}
+                <span class="a">+{file.additions ?? 0}</span>
+                <span class="d">−{file.deletions ?? 0}</span>
               </span>
               <span
                 class="discard"
@@ -1073,14 +1071,26 @@
     color: var(--ink-0);
     font-weight: 500;
   }
+  /* Per-file LOC change counts, right-aligned. Mirrors the header net diffstat
+     (.changes-head .net) — same mono/tabular treatment and add/del tokens — so
+     a row reads as that file's slice of the panel total. */
   .frow .fdiff {
     flex: 0 0 auto;
     margin-left: auto;
-    font-size: 0.625rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: var(--r0);
     font-variant-numeric: tabular-nums;
   }
   .frow .fdiff .a {
     color: var(--diff-add);
+    font-weight: 600;
+  }
+  .frow .fdiff .d {
+    color: var(--diff-del);
+    font-weight: 600;
   }
   /* Inline discard affordance — quiet, revealed on hover/active. */
   .frow .discard {

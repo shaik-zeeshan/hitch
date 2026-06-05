@@ -62,6 +62,11 @@ export type ChangedFile = {
   path: string;
   status: FileStatus;
   staged: boolean;
+  // Added/deleted line counts for the side this row represents (staged counts
+  // when staged, worktree counts otherwise). Optional for rolling upgrades —
+  // an older daemon omits them; the UI treats absent as 0.
+  additions?: number;
+  deletions?: number;
 };
 
 export type GitStatus = {

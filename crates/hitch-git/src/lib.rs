@@ -13,6 +13,7 @@ use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusO
 use hitch_core::{ProjectId, Worktree};
 use hitch_process::{DrainOutcome, PipeReader, ProcessTree, ProcessTreeRegistration};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
@@ -763,6 +764,12 @@ pub struct StatusEntry {
     pub old_path: Option<PathBuf>,
     pub index: FileState,
     pub working_tree: FileState,
+    /// Added/deleted line counts on the staged side (HEAD↔index) for this path.
+    pub staged_additions: usize,
+    pub staged_deletions: usize,
+    /// Added/deleted line counts on the worktree side (index↔worktree).
+    pub worktree_additions: usize,
+    pub worktree_deletions: usize,
 }
 
 /// Complete status snapshot for a repository.
@@ -996,10 +1003,26 @@ pub fn status(repo_path: impl AsRef<Path>) -> Result<StatusSummary> {
             old_path,
             index: index_state(status),
             working_tree: worktree_state(status),
+            staged_additions: 0,
+            staged_deletions: 0,
+            worktree_additions: 0,
+            worktree_deletions: 0,
         });
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
-    let (additions, deletions) = diff_line_stats(&repo)?;
+    let line_stats = diff_line_stats(&repo)?;
+    for entry in &mut entries {
+        if let Some((additions, deletions)) = line_stats.staged.get(entry.path.as_path()) {
+            entry.staged_additions = *additions;
+            entry.staged_deletions = *deletions;
+        }
+        if let Some((additions, deletions)) = line_stats.worktree.get(entry.path.as_path()) {
+            entry.worktree_additions = *additions;
+            entry.worktree_deletions = *deletions;
+        }
+    }
+    let additions = line_stats.additions;
+    let deletions = line_stats.deletions;
     Ok(StatusSummary {
         dirty: !entries.is_empty(),
         entries,
@@ -1008,16 +1031,34 @@ pub fn status(repo_path: impl AsRef<Path>) -> Result<StatusSummary> {
     })
 }
 
-fn diff_line_stats(repo: &Repository) -> Result<(usize, usize)> {
-    let mut additions = 0;
-    let mut deletions = 0;
+/// Aggregate and per-path add/delete line counts from one status pass. The
+/// per-path maps are keyed by the new-side path (the path libgit2 status
+/// reports), so a rename's counts land on the entry the Changes panel shows.
+/// Staged and worktree sides are kept apart so a partially-staged file's row
+/// can show the counts for the side it represents.
+struct DiffLineStats {
+    additions: usize,
+    deletions: usize,
+    staged: HashMap<PathBuf, (usize, usize)>,
+    worktree: HashMap<PathBuf, (usize, usize)>,
+}
+
+fn diff_line_stats(repo: &Repository) -> Result<DiffLineStats> {
+    let mut stats = DiffLineStats {
+        additions: 0,
+        deletions: 0,
+        staged: HashMap::new(),
+        worktree: HashMap::new(),
+    };
 
     let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
     let index = repo.index()?;
     let staged = repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), None)?;
-    let staged_stats = staged.stats()?;
-    additions += staged_stats.insertions();
-    deletions += staged_stats.deletions();
+    let mut staged_per_path = HashMap::new();
+    let (sa, sd) = accumulate_diff_line_stats(&staged, &mut staged_per_path)?;
+    stats.additions += sa;
+    stats.deletions += sd;
+    stats.staged = staged_per_path;
 
     let mut options = DiffOptions::new();
     options
@@ -1026,11 +1067,47 @@ fn diff_line_stats(repo: &Repository) -> Result<(usize, usize)> {
         .show_untracked_content(true);
     let index = repo.index()?;
     let worktree = repo.diff_index_to_workdir(Some(&index), Some(&mut options))?;
-    let worktree_stats = worktree.stats()?;
-    additions += worktree_stats.insertions();
-    deletions += worktree_stats.deletions();
+    let mut worktree_per_path = HashMap::new();
+    let (wa, wd) = accumulate_diff_line_stats(&worktree, &mut worktree_per_path)?;
+    stats.additions += wa;
+    stats.deletions += wd;
+    stats.worktree = worktree_per_path;
 
-    Ok((additions, deletions))
+    Ok(stats)
+}
+
+/// Fold one libgit2 [`Diff`] into a per-path stats map and return its aggregate
+/// (additions, deletions). Per-delta counts come from each [`git2::Patch`]'s
+/// `line_stats` so the same diff the aggregate would sum also yields the
+/// per-file numbers — no extra git work. Binary deltas have no patch and
+/// contribute nothing (matching the frontend `parseDiff`, which shows binary
+/// files with no +/− counts).
+fn accumulate_diff_line_stats(
+    diff: &git2::Diff<'_>,
+    per_path: &mut HashMap<PathBuf, (usize, usize)>,
+) -> Result<(usize, usize)> {
+    let mut total_additions = 0;
+    let mut total_deletions = 0;
+    for (idx, delta) in diff.deltas().enumerate() {
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(Path::to_path_buf);
+        let Some(patch) = git2::Patch::from_diff(diff, idx)? else {
+            continue;
+        };
+        // `line_stats` is (context, additions, deletions).
+        let (_context, additions, deletions) = patch.line_stats()?;
+        total_additions += additions;
+        total_deletions += deletions;
+        if let Some(path) = path {
+            let entry = per_path.entry(path).or_insert((0, 0));
+            entry.0 += additions;
+            entry.1 += deletions;
+        }
+    }
+    Ok((total_additions, total_deletions))
 }
 
 /// Fast dirty check for badge/event refreshes that only need a boolean.
@@ -2198,6 +2275,31 @@ mod tests {
         );
         let staged = diff_file(fixture.path(), "tracked.txt", DiffTarget::Staged).unwrap();
         assert!(staged.contains("changed"), "staged diff was {staged:?}");
+    }
+
+    #[test]
+    fn status_reports_per_file_line_counts_on_the_relevant_side() {
+        let fixture = RepoFixture::new();
+        // tracked.txt: "initial\n" -> "changed\n" is 1 add + 1 del on the
+        // worktree side. new.txt is a fresh file: 1 add, 0 del.
+        fixture.write("tracked.txt", "changed\n");
+        fixture.write("new.txt", "hello\n");
+
+        let summary = status(fixture.path()).unwrap();
+        let tracked = summary.entry_for("tracked.txt").unwrap();
+        assert_eq!((tracked.worktree_additions, tracked.worktree_deletions), (1, 1));
+        assert_eq!((tracked.staged_additions, tracked.staged_deletions), (0, 0));
+        let new = summary.entry_for("new.txt").unwrap();
+        assert_eq!((new.worktree_additions, new.worktree_deletions), (1, 0));
+
+        // Staging tracked.txt moves its counts to the staged (HEAD↔index) side.
+        GitClient::default()
+            .stage_files(fixture.path(), &[PathBuf::from("tracked.txt")])
+            .unwrap();
+        let summary = status(fixture.path()).unwrap();
+        let tracked = summary.entry_for("tracked.txt").unwrap();
+        assert_eq!((tracked.staged_additions, tracked.staged_deletions), (1, 1));
+        assert_eq!((tracked.worktree_additions, tracked.worktree_deletions), (0, 0));
     }
 
     #[test]
