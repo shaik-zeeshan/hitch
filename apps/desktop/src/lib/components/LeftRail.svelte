@@ -18,6 +18,10 @@
 
   let { collapsed = false }: { collapsed?: boolean } = $props();
 
+  // The tree owns roving-row focus; the rail forwards root focus (from the
+  // Cmd+Shift+E command, which focuses [data-pane="tree"]) onto the active row.
+  let tree = $state<ProjectTree>();
+
   // Footer counts: plain totals only ("4 sessions · 3 worktrees"). An earlier
   // "2 of 4 worktrees active" form read as a puzzle, not a count.
   const sessionCount = $derived($sessions.length);
@@ -25,7 +29,21 @@
   const plural = (n: number, word: string) => `${word}${n === 1 ? "" : "s"}`;
 </script>
 
-<aside class="rail-left" class:collapsed>
+<!-- data-pane + tabindex let the keymap's focus.tree command move DOM focus into
+     this rail (the dispatcher queries [data-pane="tree"] and focuses it). The
+     roving-row focus lands here in slice 3; for now focusing the root is enough
+     to set the pane and route bare-key bindings (when === focusedPane). -->
+<aside
+  class="rail-left"
+  class:collapsed
+  data-pane="tree"
+  tabindex="-1"
+  onfocus={(e) => {
+    // Only when focus landed on the inert root itself (the focus.tree command),
+    // not bubbling up from a row/button inside — forward onto the active row.
+    if (e.target === e.currentTarget) tree?.focusActiveRow();
+  }}
+>
   <header class="rail-head">
     <span class="rail-title">Projects</span>
     <div class="add-split">
@@ -66,7 +84,7 @@
   </header>
 
   <div class="rail-scroll">
-    <ProjectTree />
+    <ProjectTree bind:this={tree} />
   </div>
 
   <footer class="rail-foot">

@@ -29,6 +29,7 @@
     sessionCommands,
     visibleSessions,
   } from "../daemon";
+  import { focusedPane, focusTerminal } from "../keymap";
   import { fileIconUrl } from "../file-icons";
   import { needsAction, type Session, type SessionParent } from "../types";
   import { sessionTabKind, sessionTabTitle } from "../sessionDisplay";
@@ -59,6 +60,11 @@
   function select(session: Session) {
     diffActive.set(false);
     activeSessionId.set(session.id);
+    // Selecting a session tab also lands the cursor in its terminal (the
+    // keyboard tab commands do the same), closing the prior focus gap where a
+    // click left focus on the tab button rather than the terminal surface.
+    focusedPane.set("terminal");
+    focusTerminal(session.id);
   }
 
   // Activate an already-open diff tab (no fetch — its text is already loaded /

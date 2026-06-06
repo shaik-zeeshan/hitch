@@ -37,6 +37,7 @@
     worktrees,
   } from "../daemon";
   import { createWorktreeFor, removeProjectTarget, removeWorktreeTarget } from "../overlays";
+  import { focusedPane } from "../keymap";
   import {
     currentDesktopPlatform,
     revealItemLabel,
@@ -188,16 +189,158 @@
     selectedWorktreeId.set(w.id);
   }
 
-  function onProjectKey(event: KeyboardEvent, p: Project) {
-    if (event.target !== event.currentTarget) return;
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      selectProject(p);
+  // ---- roving tabindex (keyboard navigation, plan slice 3) ----
+  // The tree is a flat sequence of VISIBLE rows for keyboard purposes: every
+  // project row, plus the worktree rows of each EXPANDED project (collapsed
+  // projects contribute none — ↑/↓ skip their hidden children). One row is the
+  // roving target (tabindex 0); all others are tabindex -1, so Tab lands on the
+  // current row and arrows move between rows without leaving the pane. Rows are
+  // keyed `proj:<id>` / `wt:<id>` so the active key survives reorders/refreshes
+  // (the element refs are re-collected each render via the `bind:this` actions).
+  type Row =
+    | { key: string; kind: "project"; project: Project }
+    | { key: string; kind: "worktree"; worktree: Worktree };
+
+  const visibleRows = $derived.by<Row[]>(() => {
+    const rows: Row[] = [];
+    for (const project of $projects) {
+      rows.push({ key: `proj:${project.id}`, kind: "project", project });
+      if (isExpanded(project)) {
+        for (const worktree of worktreesFor(project.id)) {
+          rows.push({ key: `wt:${worktree.id}`, kind: "worktree", worktree });
+        }
+      }
+    }
+    return rows;
+  });
+
+  // The roving target's key. Null until the first row mounts / focus arrives;
+  // resolved to a concrete key (first visible row, or the selected row) lazily
+  // by `activeKey()` so it tracks the live selection without extra effects.
+  let activeRowKey = $state<string | null>(null);
+  // Live element refs, keyed like the rows, for programmatic focus + scroll.
+  const rowEls = new Map<string, HTMLElement>();
+
+  // Svelte action: register a row's element under its stable key for
+  // programmatic focus/scroll. Rows are keyed in the {#each}, so a given node's
+  // key never changes for its lifetime; cleaned up on destroy.
+  function registerRow(el: HTMLElement, key: string) {
+    rowEls.set(key, el);
+    return {
+      destroy() {
+        if (rowEls.get(key) === el) rowEls.delete(key);
+      },
+    };
+  }
+
+  // The effective roving key: prefer an explicit roving target if it's still
+  // visible; else the selected worktree/project row; else the first row. Keeps
+  // exactly one row at tabindex 0 even as selection changes elsewhere (clicks,
+  // palette) without the roving state going stale.
+  function activeKey(): string | null {
+    const rows = visibleRows;
+    if (rows.length === 0) return null;
+    if (activeRowKey && rows.some((r) => r.key === activeRowKey)) return activeRowKey;
+    if ($selectedWorktreeId) {
+      const wt = rows.find((r) => r.key === `wt:${$selectedWorktreeId}`);
+      if (wt) return wt.key;
+    }
+    if ($selectedProjectId) {
+      const pr = rows.find((r) => r.key === `proj:${$selectedProjectId}`);
+      if (pr) return pr.key;
+    }
+    return rows[0].key;
+  }
+
+  // Move the roving target to `key` and put DOM focus on its row, scrolling it
+  // just into view (no new visual language — the row's own :focus-visible / .sel
+  // styles carry the cue).
+  function focusRow(key: string | null) {
+    if (!key) return;
+    activeRowKey = key;
+    const el = rowEls.get(key);
+    el?.focus();
+    el?.scrollIntoView({ block: "nearest" });
+  }
+
+  // Forward focus from the pane root (LeftRail's [data-pane="tree"], focused by
+  // the Cmd+Shift+E command) onto the roving row, so the shortcut lands the user
+  // on a navigable row rather than the inert container.
+  export function focusActiveRow() {
+    focusRow(activeKey());
+  }
+
+  function moveRoving(delta: 1 | -1) {
+    const rows = visibleRows;
+    const cur = activeKey();
+    const i = rows.findIndex((r) => r.key === cur);
+    const next = i < 0 ? 0 : Math.min(rows.length - 1, Math.max(0, i + delta));
+    focusRow(rows[next]?.key ?? null);
+  }
+
+  // ←/→ on a project expand/collapse; on a worktree, ← jumps to its parent
+  // project (→ is a no-op, worktrees have no children). Mirrors a file-tree's
+  // arrow semantics.
+  function rowRight(row: Row) {
+    if (row.kind !== "project") return;
+    if (row.project.kind === "git-backed" && collapsed[row.project.id]) {
+      toggleExpand(row.project);
+    } else {
+      moveRoving(1); // already expanded → descend to first child
+    }
+  }
+
+  function rowLeft(row: Row) {
+    if (row.kind === "worktree") {
+      focusRow(`proj:${row.worktree.project_id}`);
+      return;
+    }
+    if (row.project.kind === "git-backed" && !collapsed[row.project.id]) {
+      toggleExpand(row.project);
+    }
+  }
+
+  function selectRow(row: Row) {
+    if (row.kind === "project") selectProject(row.project);
+    else selectWorktree(row.worktree);
+  }
+
+  // Component-local keydown for the bare tree keys. The global dispatcher matches
+  // these same combos but registers NO handler for them, so it never
+  // preventDefaults — handling here is the sole route (see keymap.ts / +layout).
+  // Modifier combos (e.g. Cmd+N) are left to the global dispatcher.
+  function onRowKey(event: KeyboardEvent, row: Row) {
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    switch (event.key) {
+      case "ArrowDown":
+        event.preventDefault();
+        moveRoving(1);
+        break;
+      case "ArrowUp":
+        event.preventDefault();
+        moveRoving(-1);
+        break;
+      case "ArrowRight":
+        event.preventDefault();
+        rowRight(row);
+        break;
+      case "ArrowLeft":
+        event.preventDefault();
+        rowLeft(row);
+        break;
+      case "Enter":
+      case " ":
+        event.preventDefault();
+        selectRow(row);
+        break;
     }
   }
 </script>
 
-<div class="tree">
+<!-- focusin sets the pane so clicking into the tree (not just the Cmd+Shift+E
+     command) routes bare-key bindings here. Forwards to a real row when the
+     focus landed on the inert container/root rather than a row. -->
+<div class="tree" onfocusin={() => focusedPane.set("tree")}>
   {#if $projects.length === 0}
     <p class="empty-copy">No projects yet. Add a local repo or folder to begin.</p>
   {/if}
@@ -212,12 +355,17 @@
           {#snippet child({ props })}
             <div
               {...props}
+              use:registerRow={`proj:${project.id}`}
               class="row"
               class:sel={project.id === $selectedProjectId && $selectedWorktreeId === null}
               role="button"
-              tabindex="0"
-              onclick={() => selectProject(project)}
-              onkeydown={(e) => onProjectKey(e, project)}
+              tabindex={activeKey() === `proj:${project.id}` ? 0 : -1}
+              onclick={() => {
+                activeRowKey = `proj:${project.id}`;
+                selectProject(project);
+              }}
+              onfocus={() => (activeRowKey = `proj:${project.id}`)}
+              onkeydown={(e) => onRowKey(e, { key: `proj:${project.id}`, kind: "project", project })}
             >
               {#if isGit}
                 <button
@@ -315,18 +463,18 @@
                   {#snippet child({ props })}
                     <div
                       {...props}
+                      use:registerRow={`wt:${worktree.id}`}
                       class="wrow"
                       class:sel={isActive}
                       role="button"
-                      tabindex="0"
+                      tabindex={activeKey() === `wt:${worktree.id}` ? 0 : -1}
                       title={KIND_TITLE[kind]}
-                      onclick={() => selectWorktree(worktree)}
-                      onkeydown={(e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                          e.preventDefault();
-                          selectWorktree(worktree);
-                        }
+                      onclick={() => {
+                        activeRowKey = `wt:${worktree.id}`;
+                        selectWorktree(worktree);
                       }}
+                      onfocus={() => (activeRowKey = `wt:${worktree.id}`)}
+                      onkeydown={(e) => onRowKey(e, { key: `wt:${worktree.id}`, kind: "worktree", worktree })}
                     >
                       <div class="l1">
                         <GitBranch class="branchic icon" />
@@ -448,7 +596,13 @@
   .row:hover {
     background: var(--paper-3);
   }
-  .row:focus-visible {
+  /* `:focus`, not `:focus-visible`: roving moves focus PROGRAMMATICALLY
+     (focusRow's el.focus()), and WKWebView does not reliably match
+     :focus-visible for script focus on tabindex=-1 rows — the ring silently
+     never rendered while arrowing. Rows only receive focus via keyboard
+     roving, and a clicked row becomes .sel with the identical ring, so
+     plain :focus adds no click noise. */
+  .row:focus {
     outline: 1px solid var(--iris-line);
     outline-offset: -1px;
   }
@@ -610,7 +764,8 @@
   .wrow:hover {
     background: var(--paper-3);
   }
-  .wrow:focus-visible {
+  /* `:focus` for the same WKWebView script-focus reason as `.row:focus`. */
+  .wrow:focus {
     outline: 1px solid var(--iris-line);
     outline-offset: -1px;
   }

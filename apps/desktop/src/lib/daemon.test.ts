@@ -73,6 +73,10 @@ import {
   sessionCommands,
   sessionOutputActive,
   sessions,
+  orderedTabs,
+  activeTabIndex,
+  activateTabIndex,
+  closeActiveTab,
   viewDiff,
   worktreeLineStats,
   worktrees,
@@ -2050,5 +2054,82 @@ describe("PR status freshness across batched and per-worktree lookups", () => {
 
     expect(get(prByWorktree)["wt-1"]).toEqual(freshPr);
     expect(get(prInfo)).toEqual(freshPr);
+  });
+});
+
+describe("ordered tabs (keyboard tab navigation)", () => {
+  // Put two visible sessions under the selected worktree, then open two diff
+  // tabs — the same shape SessionTabs renders: sessions first, diffs after.
+  function seedTwoSessionsTwoDiffs(): void {
+    projects.set([{ id: "p1", name: "Repo", root: "/repo", kind: "git-backed" }]);
+    worktrees.set([
+      { id: "w1", project_id: "p1", path: "/repo", branch: "main", is_main: true, is_hitch_managed: false },
+    ]);
+    selectedProjectId.set("p1");
+    selectedWorktreeId.set("w1");
+    sessions.set([
+      { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+      { id: "s2", name: "codex", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+    ]);
+    diffTabs.set([
+      { path: "src/a.ts", text: null },
+      { path: "src/b.ts", text: null },
+    ]);
+  }
+
+  it("orders sessions before diff tabs, mirroring the tab strip", () => {
+    seedTwoSessionsTwoDiffs();
+    expect(get(orderedTabs)).toEqual([
+      { kind: "session", id: "s1" },
+      { kind: "session", id: "s2" },
+      { kind: "diff", id: "src/a.ts" },
+      { kind: "diff", id: "src/b.ts" },
+    ]);
+  });
+
+  it("reports the active tab index for the active session or active diff", () => {
+    seedTwoSessionsTwoDiffs();
+    activeSessionId.set("s2");
+    diffActive.set(false);
+    expect(activeTabIndex()).toBe(1);
+
+    activeDiffPath.set("src/b.ts");
+    diffActive.set(true);
+    expect(activeTabIndex()).toBe(3);
+  });
+
+  it("returns -1 when nothing maps to a tab", () => {
+    expect(get(orderedTabs)).toEqual([]);
+    expect(activeTabIndex()).toBe(-1);
+  });
+
+  it("activates the Nth tab — session clears the diff view, diff sets the path", () => {
+    seedTwoSessionsTwoDiffs();
+    activateTabIndex(0);
+    expect(get(activeSessionId)).toBe("s1");
+    expect(get(diffActive)).toBe(false);
+
+    activateTabIndex(2);
+    expect(get(diffActive)).toBe(true);
+    expect(get(activeDiffPath)).toBe("src/a.ts");
+  });
+
+  it("ignores an out-of-range index (Cmd+N with fewer than N tabs)", () => {
+    seedTwoSessionsTwoDiffs();
+    activeSessionId.set("s1");
+    diffActive.set(false);
+    activateTabIndex(9);
+    expect(get(activeSessionId)).toBe("s1");
+    expect(get(diffActive)).toBe(false);
+  });
+
+  it("closeActiveTab closes the active diff tab by path", () => {
+    seedTwoSessionsTwoDiffs();
+    activeDiffPath.set("src/a.ts");
+    diffActive.set(true);
+    closeActiveTab();
+    expect(get(diffTabs).map((t) => t.path)).toEqual(["src/b.ts"]);
+    // Closing the active diff re-activates the neighbor (closeDiff's rule).
+    expect(get(activeDiffPath)).toBe("src/b.ts");
   });
 });

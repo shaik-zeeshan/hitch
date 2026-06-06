@@ -415,6 +415,56 @@ export const activeSession = derived(
   ([$sessions, $id]) => $sessions.find((s) => s.id === $id) ?? null,
 );
 
+// The visual tab order, exactly as SessionTabs.svelte renders the strip: every
+// visible session first (in `visibleSessions` order), then every open diff tab
+// (in `diffTabs` order, the all-changes sentinel included as a normal entry).
+// A descriptor's `id` is the session id for sessions and the (worktree-relative
+// or sentinel) path for diffs — the same key each command needs to re-activate
+// or close that tab. Keyboard tab commands (Cmd+1–9, next/prev) index into this
+// so their N matches what the user sees, and `activeTabIndex` reports where the
+// current center view sits in it.
+export type TabDescriptor = { kind: "session"; id: Id } | { kind: "diff"; id: string };
+export const orderedTabs = derived(
+  [visibleSessions, diffTabs],
+  ([$sessions, $diffTabs]): TabDescriptor[] => [
+    ...$sessions.map((s): TabDescriptor => ({ kind: "session", id: s.id })),
+    ...$diffTabs.map((t): TabDescriptor => ({ kind: "diff", id: t.path })),
+  ],
+);
+
+// Index of the currently-active tab in `orderedTabs`, or -1 when nothing maps
+// (no sessions and no diffs). Mirrors SessionTabs' active rule: a diff tab is
+// active iff `diffActive` (then it's `activeDiffPath`); otherwise the active
+// session is `activeSessionId`. Pure read off the stores so next/prev can pivot
+// from the current selection.
+export function activeTabIndex(): number {
+  const tabs = get(orderedTabs);
+  if (get(diffActive)) {
+    const path = get(activeDiffPath);
+    return tabs.findIndex((t) => t.kind === "diff" && t.id === path);
+  }
+  const id = get(activeSessionId);
+  return tabs.findIndex((t) => t.kind === "session" && t.id === id);
+}
+
+// Activate the tab at `index` in `orderedTabs` (the visual order). Out-of-range
+// is a no-op (Cmd+N with fewer than N tabs). A session tab clears the diff view
+// and selects the session; a diff tab activates that path — the same state moves
+// SessionTabs.select()/selectDiff() make. Terminal DOM focus is the caller's job
+// (the layout owns the focuser registry); this only moves daemon state.
+export function activateTabIndex(index: number): void {
+  const tabs = get(orderedTabs);
+  const tab = tabs[index];
+  if (!tab) return;
+  if (tab.kind === "session") {
+    diffActive.set(false);
+    activeSessionId.set(tab.id);
+  } else {
+    activeDiffPath.set(tab.id);
+    diffActive.set(true);
+  }
+}
+
 // Per-worktree rollup of the DISPLAY state (act states always; `running` only
 // while its output gate is open; `waiting` is unlabeled and never rolls up).
 export const agentStateByWorktree = derived(
@@ -1736,6 +1786,21 @@ export async function closeSession(session: Session): Promise<void> {
   } catch (err) {
     error.set(toMessage(err));
   }
+}
+
+// Close whichever tab is active (Cmd+W), matching how SessionTabs' per-tab ×
+// closes each kind: an active diff tab is dropped by path via `closeDiff`
+// (which re-activates a neighbor); an active session is closed via
+// `closeSession` (kill + drop, no confirm — the same flow the × button and the
+// context menu use). No-op when nothing is active.
+export function closeActiveTab(): void {
+  if (get(diffActive)) {
+    const path = get(activeDiffPath);
+    if (path !== null) closeDiff(path);
+    return;
+  }
+  const session = get(activeSession);
+  if (session) void closeSession(session);
 }
 
 export async function resizeSession(

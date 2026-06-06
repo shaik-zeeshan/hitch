@@ -21,13 +21,40 @@
   // sized host and its ResizeObserver/fit no-ops — preserving the grid for
   // the moment the user returns.
   import "../app.css";
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
-  import { disposeDaemon, initDaemon } from "$lib/daemon";
+  import { get } from "svelte/store";
+  import {
+    activeSessionId,
+    activateTabIndex,
+    activeTabIndex,
+    closeActiveTab,
+    disposeDaemon,
+    initDaemon,
+    openSession,
+    orderedTabs,
+    selectedParent,
+    selectedProject,
+  } from "$lib/daemon";
   import { initFileDrop } from "$lib/fileDrop";
-  import { commandOpen } from "$lib/overlays";
-  import { currentDesktopPlatform, isShortcutModifier } from "$lib/desktopPlatform";
+  import {
+    commandOpen,
+    addProjectOpen,
+    cloneProjectOpen,
+    createWorktreeFor,
+    removeProjectTarget,
+    removeWorktreeTarget,
+    commitOpen,
+    createPrOpen,
+  } from "$lib/overlays";
+  import { currentDesktopPlatform } from "$lib/desktopPlatform";
+  import {
+    focusedPane,
+    focusTerminal,
+    matchBinding,
+    type FocusedPane,
+  } from "$lib/keymap";
   import { initTheme } from "$lib/theme";
   import WindowControls from "$lib/components/WindowControls.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
@@ -64,19 +91,209 @@
   const desktopPlatform = currentDesktopPlatform();
 
 
-  function onKeydown(event: KeyboardEvent) {
-    if (!isShortcutModifier(event, desktopPlatform)) return;
-    if (event.key.toLowerCase() === "k") {
-      event.preventDefault();
-      commandOpen.update((open) => !open);
-    } else if (event.key === ",") {
-      // Cmd+, (Ctrl+, elsewhere) — the platform-conventional preferences
-      // shortcut. Toggles: from the shell it opens /settings, from /settings
-      // it returns to the shell (Escape on the page does the same).
-      event.preventDefault();
-      commandOpen.set(false);
-      void goto(page.url.pathname === "/settings" ? "/" : "/settings");
+  // Is any overlay/dialog open? Shortcuts are suppressed while one is — the
+  // dialog owns the keyboard (typing, Esc-to-close). bits-ui dialogs handle Esc
+  // themselves, so the dispatcher simply never intercepts while any of these are
+  // open. Object-scoped dialogs (createWorktreeFor, removeProjectTarget,
+  // removeWorktreeTarget) are "open" when non-null.
+  function anyOverlayOpen(): boolean {
+    return (
+      get(commandOpen) ||
+      get(addProjectOpen) ||
+      get(cloneProjectOpen) ||
+      get(commitOpen) ||
+      get(createPrOpen) ||
+      get(createWorktreeFor) !== null ||
+      get(removeProjectTarget) !== null ||
+      get(removeWorktreeTarget) !== null
+    );
+  }
+
+  // True when the event target is an editable element (input/textarea/select or
+  // a contenteditable). Bare-key bindings (R, Space, arrows) must never fire
+  // while the user is typing. NOTE xterm's hidden textarea is also editable —
+  // but bare-key bindings are pane-gated (when === focusedPane) and the terminal
+  // pane has no bare-key bindings, so a focused terminal naturally never matches
+  // one; this guard covers app inputs (commit message, palette, dialogs).
+  function isEditableTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) return false;
+    const tag = target.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+    return target.isContentEditable;
+  }
+
+  // Open the command palette (Cmd/Ctrl+K).
+  function openPalette() {
+    commandOpen.update((open) => !open);
+  }
+
+  // Cmd+, (Ctrl+, elsewhere) — the platform-conventional preferences shortcut.
+  // Toggles: from the shell it opens /settings, from /settings it returns to the
+  // shell (Escape on the page does the same). Identical to the pre-keymap behavior.
+  function toggleSettings() {
+    commandOpen.set(false);
+    void goto(page.url.pathname === "/settings" ? "/" : "/settings");
+  }
+
+  // Move focus into a pane: set the focusedPane store, ensure the pane is
+  // visible (un-collapse a hidden rail), then move DOM focus to its root (the
+  // roving-row focus lands in slices 3/4). Terminal focus goes through the
+  // keymap's per-session focuser registry.
+  function focusPane(pane: FocusedPane) {
+    focusedPane.set(pane);
+    if (pane === "terminal") {
+      focusTerminal(get(activeSessionId));
+      return;
     }
+    if (pane === "tree" && !showLeft) showLeft = true;
+    if (pane === "git" && !showRight) showRight = true;
+    // Focus after the (possible) un-collapse has applied so the element is
+    // focusable (a collapsed rail is pointer-events:none but still focusable;
+    // tick keeps this robust if visibility gating ever changes).
+    void tick().then(() => {
+      const sel = pane === "tree" ? '[data-pane="tree"]' : '[data-pane="git"]';
+      document.querySelector<HTMLElement>(sel)?.focus();
+    });
+  }
+
+  // Activate the tab at `index` in the visual order (sessions then diff tabs).
+  // Out-of-range is a no-op (Cmd+N with fewer than N tabs). When the tab is a
+  // session, also move DOM focus into its terminal and mark the terminal pane
+  // focused — keyboard tab-switching should land the cursor in the terminal,
+  // closing the same focus gap fixed in SessionTabs.select(). Diff tabs leave
+  // focus where it is (their surface has no text entry to grab).
+  function activateTab(index: number) {
+    const tab = get(orderedTabs)[index];
+    if (!tab) return;
+    activateTabIndex(index);
+    if (tab.kind === "session") {
+      focusedPane.set("terminal");
+      focusTerminal(get(activeSessionId));
+    }
+  }
+
+  // Cycle to the next/previous tab in the visual order with wraparound. Pivots
+  // off the currently active tab; with no active tab (empty strip) it's a no-op.
+  function cycleTab(delta: number) {
+    const tabs = get(orderedTabs);
+    if (tabs.length === 0) return;
+    const current = activeTabIndex();
+    if (current === -1) return;
+    activateTab((current + delta + tabs.length) % tabs.length);
+  }
+
+  // Cmd+T — open a new shell tab in the active parent (terminal-app convention:
+  // Cmd+T gives you a plain shell; agents are an explicit pick from the
+  // new-session menu/palette). No-op when no parent is selected (nothing to
+  // host it).
+  function newTab() {
+    const parent = get(selectedParent);
+    if (parent) void openSession(parent, "shell", null);
+  }
+
+  // The command dispatch table. The dispatcher ignores (does NOT preventDefault)
+  // a matched binding with no handler, so unwired ids fall through to the
+  // terminal/pane. A handler returns `false` to signal it DECLINED to act (its
+  // own gate failed — e.g. git.commit outside the git pane, tree.newWorktree
+  // with no git-backed project); the dispatcher then leaves the key alone rather
+  // than consuming it for nothing. Handlers that always act return void.
+  const handlers: Record<string, () => boolean | void> = {
+    "focus.tree": () => focusPane("tree"),
+    "focus.terminal": () => focusPane("terminal"),
+    "focus.git": () => focusPane("git"),
+    "toggle.left": () => (showLeft = !showLeft),
+    "toggle.right": () => (showRight = !showRight),
+    "palette.open": openPalette,
+    "settings.toggle": toggleSettings,
+    "focus.terminal.escape": () => {
+      // Esc returns focus to the terminal only from a non-terminal pane (Esc in
+      // the terminal must reach the PTY for vim/TUIs). Suppression while an
+      // overlay is open is handled by the dispatcher's early return.
+      if (get(focusedPane) !== "terminal") focusPane("terminal");
+    },
+    // ---- tabs (slice 2) ---------------------------------------------------
+    // Cmd+1…9 jump to the Nth tab in the visual order (1-based → 0-based).
+    "tab.jump.1": () => activateTab(0),
+    "tab.jump.2": () => activateTab(1),
+    "tab.jump.3": () => activateTab(2),
+    "tab.jump.4": () => activateTab(3),
+    "tab.jump.5": () => activateTab(4),
+    "tab.jump.6": () => activateTab(5),
+    "tab.jump.7": () => activateTab(6),
+    "tab.jump.8": () => activateTab(7),
+    "tab.jump.9": () => activateTab(8),
+    // Both next/prev pairs (Cmd+Shift+]/[ and Ctrl+Tab/Ctrl+Shift+Tab) cycle.
+    "tab.next": () => cycleTab(1),
+    "tab.prev": () => cycleTab(-1),
+    "tab.next.ctrl": () => cycleTab(1),
+    "tab.prev.ctrl": () => cycleTab(-1),
+    "tab.new": newTab,
+    "tab.close": closeActiveTab,
+    // ---- tree (slice 3) ---------------------------------------------------
+    // Cmd+N opens the create-worktree dialog for the selected project. It's a
+    // modifier combo (not pane-gated by matchBinding), but worktrees only exist
+    // for git-backed projects, so we gate HERE on a selected git-backed project —
+    // a no-op otherwise rather than opening an empty dialog. The bare tree keys
+    // (↑/↓/←/→/Enter/Space) are handled component-locally in ProjectTree (DOM
+    // focus is inside the pane); their ids stay unwired so the dispatcher lets
+    // them fall through to the tree.
+    "tree.newWorktree": () => {
+      const project = get(selectedProject);
+      if (project?.kind !== "git-backed") return false; // declined — no key consumed
+      createWorktreeFor.set(project);
+    },
+    // ---- git (slice 4) ----------------------------------------------------
+    // Cmd+Enter opens the commit dialog — the key the right-rail footer
+    // advertises. `git.commit` is a modifier combo, so `matchBinding` does NOT
+    // pane-gate it (only bare keys are gated); we gate it HERE to the git pane so
+    // it stays scoped to the Changes context the footer legend implies, rather
+    // than hijacking Cmd+Enter globally. While the commit dialog is open the
+    // dispatcher returns early (commitOpen is an overlay), so the dialog's own
+    // Cmd+Enter submit handler is the sole route there — no conflict. The bare
+    // git keys (↑/↓/Space/Enter/Backspace/R) are handled component-locally in
+    // RightRail (DOM focus is inside the pane); their keymap ids stay unwired
+    // here so the dispatcher lets them fall through to the rail.
+    "git.commit": () => {
+      if (get(focusedPane) !== "git") return false; // declined — no key consumed
+      commitOpen.set(true);
+    },
+  };
+
+  function onKeydown(event: KeyboardEvent) {
+    const pane = get(focusedPane);
+    const binding = matchBinding(event, desktopPlatform, pane);
+    if (!binding) return;
+
+    // On a shell-hidden route (/settings) the 3-pane shell is display:none, so
+    // tab/pane/git shortcuts would act on a hidden shell and Esc would
+    // double-handle with the settings page's own Esc-to-back. Only the palette
+    // and settings toggle make sense there; everything else falls through.
+    if (shellHidden && binding.id !== "palette.open" && binding.id !== "settings.toggle") {
+      return;
+    }
+
+    // While an overlay is open, intercept nothing: the dialog owns the keyboard
+    // (typing, and Esc-to-close, which bits-ui handles itself). Returning here —
+    // rather than special-casing Esc — keeps typing in the commit dialog /
+    // palette from triggering single-key shortcuts and leaves Esc to the dialog.
+    if (anyOverlayOpen()) return;
+
+    // Bare-key bindings (no modifier) must not fire while typing in an editable
+    // element. Modifier combos are always eligible.
+    const hasModifier =
+      binding.combo.primary ||
+      binding.combo.ctrl ||
+      binding.combo.shift ||
+      binding.combo.alt;
+    if (!hasModifier && isEditableTarget(event.target)) return;
+
+    const handler = handlers[binding.id];
+    if (!handler) return; // Unwired (tab/tree/git) — let the key fall through.
+
+    // Run the handler; only consume the key if it actually acted. A handler that
+    // returns false declined (its pane/state gate failed — e.g. git.commit
+    // outside the git pane), so we leave the key alone rather than swallowing it.
+    if (handler() !== false) event.preventDefault();
   }
 
   // Apply the persisted (or default light "paper") theme to <html> and keep it
@@ -88,7 +305,6 @@
 
   onMount(() => {
     void initDaemon();
-    window.addEventListener("keydown", onKeydown);
     // App-wide OS-file-drop listener: drops onto a terminal insert the dropped
     // paths at its prompt (see fileDrop.ts for why this is window-global rather
     // than a per-terminal DOM handler). Registration is async; stash the
@@ -109,12 +325,19 @@
     }, 500);
     return () => {
       clearInterval(heartbeat);
-      window.removeEventListener("keydown", onKeydown);
       unlistenDrop?.();
       disposeDaemon();
     };
   });
 </script>
+
+<!-- One capture-phase keydown listener drives the whole keymap. Capture (the
+     Svelte 5 `onkeydowncapture`) fires BEFORE xterm's textarea listener, so app
+     combos win even when the terminal is focused; the matched command runs and
+     preventDefault stops the key from also reaching the terminal. The xterm
+     classifier's "app" pass-through (terminalKeys.ts) is the belt to this
+     suspenders — together they guarantee app combos never reach the PTY. -->
+<svelte:window onkeydowncapture={onKeydown} />
 
 <!-- The shell is mounted exactly once for the app's lifetime. When a route
      opts into replacing it (currently only /settings), we hide it via the

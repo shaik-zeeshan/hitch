@@ -5,6 +5,7 @@
   // Changes file groups with inline stage toggles. Clicking a file row opens its
   // diff. This is the restyle of the long-standing smart-action state machine —
   // the ladder below mirrors that logic exactly, it is not a rewrite.
+  import { tick } from "svelte";
   import { DropdownMenu } from "bits-ui";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import GitBranch from "~icons/lucide/git-branch";
@@ -44,6 +45,7 @@
   } from "../daemon";
   import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
   import { fileIconUrl } from "../file-icons";
+  import { focusedPane } from "../keymap";
   import { autoCommitPush } from "../settings";
   import { commitOpen, createPrOpen } from "../overlays";
   import { STATUS_GLYPH, statusGlyphClass } from "../types";
@@ -81,6 +83,145 @@
   const cancellableJob = $derived($cancellableJobForSelectedWorktree);
 
   let autoRunning = $state(false);
+
+  // ---- roving keyboard focus (slice 4) ------------------------------------
+  // The staged + unstaged groups are navigated as ONE list in visual order
+  // (staged first, then changes) — what the user sees top-to-bottom. The active
+  // row is tracked by file PATH (not index) so it survives a status refresh that
+  // reorders/regroups rows (e.g. staging moves a file between groups); after the
+  // lists update we re-anchor to the same path, clamping to the nearest index if
+  // that path is gone. The row keeps the EXISTING `.active` selection visual —
+  // no new focus language; we just reuse the same treatment the diff selection
+  // already paints. Bare keys are handled here (component-local) rather than in
+  // the layout dispatcher: DOM focus is inside this pane, the dispatcher does not
+  // preventDefault unwired git ids, and the keymap entries (git.up/down/stage/…)
+  // exist purely as the documentation/Settings source for these same keys.
+  const rovingFiles = $derived([...staged, ...unstaged]);
+  let activePath = $state<string | null>(null);
+  let railEl = $state<HTMLElement | null>(null);
+
+  // Re-anchor the active row after the list changes. If the tracked path is gone
+  // (committed, discarded, or staged-away), clamp to the nearest surviving index
+  // so focus lands on an adjacent row instead of vanishing.
+  let lastFiles: typeof rovingFiles = [];
+  $effect(() => {
+    const list = rovingFiles;
+    if (list.length === 0) {
+      activePath = null;
+    } else if (activePath === null || !list.some((f) => f.path === activePath)) {
+      const prevIdx = lastFiles.findIndex((f) => f.path === activePath);
+      const clamped = prevIdx < 0 ? 0 : Math.min(prevIdx, list.length - 1);
+      activePath = list[clamped].path;
+    }
+    lastFiles = list;
+  });
+
+  // Move the active row by `delta` rows within the flattened list and scroll it
+  // into view. No wrap-around — clamps at the ends.
+  function moveActive(delta: number) {
+    const list = rovingFiles;
+    if (list.length === 0) return;
+    const cur = list.findIndex((f) => f.path === activePath);
+    const next = cur < 0 ? 0 : Math.min(Math.max(cur + delta, 0), list.length - 1);
+    activePath = list[next].path;
+    void tick().then(() => {
+      // Move DOM focus to the new row (not just scroll it into view) so
+      // :focus-visible follows .roving — matching ProjectTree's focusRow().
+      const row = railEl?.querySelector<HTMLElement>(
+        `.frow[data-path="${cssEscape(activePath ?? "")}"]`,
+      );
+      row?.focus();
+      row?.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  // Stage/unstage the active file — the same action the row's checkbox runs.
+  function toggleActiveStaged() {
+    const file = rovingFiles.find((f) => f.path === activePath);
+    if (!file) return;
+    void setFileStaged(file.path, !file.staged).catch(() => {});
+  }
+
+  // Open the active file's diff — the same action a row click runs (the staged
+  // copy diffs staged, the unstaged copy diffs the working tree).
+  function openActiveDiff() {
+    const file = rovingFiles.find((f) => f.path === activePath);
+    if (!file) return;
+    void viewDiff(file.path, true, file.staged);
+  }
+
+  // Discard the active file through the existing confirm flow.
+  function discardActive() {
+    const file = rovingFiles.find((f) => f.path === activePath);
+    if (file) confirmDiscardFile(file.path);
+  }
+
+  // Pane-local key handling for the bare git keys advertised in the footer. The
+  // layout dispatcher leaves these unwired (no preventDefault), so handling them
+  // here is the sole route — no double-fire. Cmd+Enter (commit) is NOT handled
+  // here: it is a modifier combo wired in the layout dispatcher, which gates it
+  // on the git pane and suppresses it while the commit dialog is open.
+  function onRailKeydown(event: KeyboardEvent) {
+    // Never hijack keys typed into an editable element (none today, but the
+    // checkbox/discard spans are role="button" — keep the guard for safety).
+    if (event.target instanceof HTMLElement) {
+      const tag = event.target.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || event.target.isContentEditable) {
+        return;
+      }
+    }
+    switch (event.key) {
+      case "ArrowDown":
+        event.preventDefault();
+        moveActive(1);
+        break;
+      case "ArrowUp":
+        event.preventDefault();
+        moveActive(-1);
+        break;
+      case " ":
+        // preventDefault stops the space from scrolling the file list / page.
+        event.preventDefault();
+        toggleActiveStaged();
+        break;
+      case "Enter":
+        // Plain Enter only — Cmd+Enter (commit) is the layout dispatcher's.
+        if (event.metaKey || event.ctrlKey) return;
+        event.preventDefault();
+        openActiveDiff();
+        break;
+      case "Backspace":
+        event.preventDefault();
+        discardActive();
+        break;
+      case "r":
+      case "R":
+        if (event.metaKey || event.ctrlKey || event.altKey) return;
+        event.preventDefault();
+        void handleRefresh();
+        break;
+    }
+  }
+
+  // When the rail root itself receives focus (e.g. via the Cmd+Shift+G focus.git
+  // command, which focuses [data-pane="git"]), forward focus to the active/first
+  // file row so the arrow keys work immediately without a second keystroke.
+  function onRailFocus(event: FocusEvent) {
+    if (event.target !== railEl) return;
+    void tick().then(() => {
+      const row =
+        railEl?.querySelector<HTMLElement>(`.frow[data-path="${cssEscape(activePath ?? "")}"]`) ??
+        railEl?.querySelector<HTMLElement>(".frow");
+      row?.focus();
+    });
+  }
+
+  // Minimal CSS.escape fallback — file paths can contain characters that break a
+  // raw attribute selector (quotes, brackets). CSS.escape exists in the webview;
+  // guard for the test/SSR environment just in case.
+  function cssEscape(value: string): string {
+    return typeof CSS !== "undefined" && CSS.escape ? CSS.escape(value) : value;
+  }
 
   // ---- smart actions ------------------------------------------------------
   // One state machine drives both the split button's primary action and the
@@ -255,7 +396,23 @@
   }
 </script>
 
-<aside class="rail-right" class:collapsed>
+<!-- data-pane + tabindex let the keymap's focus.git command move DOM focus into
+     this rail (the dispatcher queries [data-pane="git"] and focuses it). focusin
+     marks the git pane as focused so the layout dispatcher gates its modifier
+     combos (Cmd+Enter commit) correctly; onfocus on the root forwards focus to a
+     file row so arrows work immediately. Bare git keys are handled locally
+     (onRailKeydown) — see the roving-focus note in the script. -->
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+<aside
+  bind:this={railEl}
+  class="rail-right"
+  class:collapsed
+  data-pane="git"
+  tabindex="-1"
+  onfocusin={() => focusedPane.set("git")}
+  onfocus={onRailFocus}
+  onkeydown={onRailKeydown}
+>
   <!-- Header: 38px baseline grid. CHANGES label + net diffstat. A quiet refresh
        icon sits next to the net stat (the old header refresh/hide buttons are
        gone; hide is dropped, refresh lives here + in the action menu's reach). -->
@@ -468,7 +625,7 @@
           </h3>
           {#each staged as file (file.path)}
             {@const parts = splitPath(file.path)}
-            <button class="frow" class:active={$diffPath === file.path && $diffStaged !== false} onclick={() => void viewDiff(file.path, true, true)}>
+            <button class="frow" data-path={file.path} class:active={$diffPath === file.path && $diffStaged !== false} class:roving={activePath === file.path} onclick={() => { activePath = file.path; void viewDiff(file.path, true, true); }}>
               <span
                 class="chk on"
                 role="button"
@@ -522,7 +679,7 @@
           </h3>
           {#each unstaged as file (file.path)}
             {@const parts = splitPath(file.path)}
-            <button class="frow" class:active={$diffPath === file.path && $diffStaged !== true} onclick={() => void viewDiff(file.path, true, false)}>
+            <button class="frow" data-path={file.path} class:active={$diffPath === file.path && $diffStaged !== true} class:roving={activePath === file.path} onclick={() => { activePath = file.path; void viewDiff(file.path, true, false); }}>
               <span
                 class="chk"
                 role="button"
@@ -1005,9 +1162,24 @@
   .frow:hover {
     background: var(--paper-3);
   }
-  .frow.active {
+  /* `.roving` is the keyboard-focused row. It reuses the EXISTING `.active`
+     (diff-selected) treatment verbatim — no new focus language — so a row is
+     visibly selected while arrowing even before its diff opens. .frow is a
+     <button>, so its native :focus is also styled below to match. */
+  .frow.active,
+  .frow.roving {
     background: var(--paper-3);
     box-shadow: inset 0 0 0 1px var(--line);
+  }
+  .frow:focus-visible {
+    outline: none;
+    background: var(--paper-3);
+    box-shadow: inset 0 0 0 1px var(--line);
+  }
+  /* The discard affordance is revealed for the roving row too (it is hidden by
+     default and shown on hover/active). */
+  .frow.roving .discard {
+    opacity: 1;
   }
   .frow .chk {
     width: 14px;

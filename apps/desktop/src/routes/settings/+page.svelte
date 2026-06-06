@@ -7,6 +7,8 @@
   import { goto } from "$app/navigation";
   import { listDraftModels } from "$lib/daemon";
   import { currentDesktopPlatform } from "$lib/desktopPlatform";
+  import { bindings, comboKeys, type Binding, type BindingGroup } from "$lib/keymap";
+  import { terminalKeyReference } from "$lib/terminalKeys";
   import { onMount } from "svelte";
   import { Select, Toggle } from "bits-ui";
   import {
@@ -29,7 +31,7 @@
     terminalThemeLight,
   } from "$lib/terminal-themes";
 
-  type Section = "editor" | "themes" | "drafts" | "git" | "about";
+  type Section = "editor" | "themes" | "drafts" | "git" | "keybindings" | "about";
 
   // Split the curated palettes by app mode. Each group is the 10 themes for that
   // mode plus the built-in "Hitch (default)" sentinel, which renders from the
@@ -70,6 +72,59 @@
     { value: "Zed", label: "Zed" },
     ...(platform === "windows" ? [{ value: "Notepad++", label: "Notepad++" }] : []),
     { value: CUSTOM_EDITOR_VALUE, label: "Custom…" },
+  ];
+
+  // ---- Keybindings reference (read-only) --------------------------------
+  // Built entirely from keymap.ts `bindings` + terminalKeys.ts so the panel can
+  // never drift from behavior. Each visible row carries a description plus one
+  // or more combos rendered as keycap chips on the CURRENT platform; bindings
+  // that share a description (e.g. Next tab = Cmd+Shift+] OR Ctrl+Tab) collapse
+  // into a single row with "or"-joined chip groups.
+  type KeyRow = { description: string; combos: string[][] };
+  type KeyGroup = { title: string; rows: KeyRow[] };
+
+  // Human header per binding group; the keymap group order is fixed here.
+  const groupTitles: Record<BindingGroup, string> = {
+    global: "Global",
+    tabs: "Terminal tabs",
+    tree: "Project tree",
+    git: "Git changes",
+  };
+  const groupOrder: BindingGroup[] = ["global", "tabs", "tree", "git"];
+
+  // Collapse bindings with the same description into one row, accumulating their
+  // combos as alternates (preserving definition order).
+  function collectRows(items: Binding[]): KeyRow[] {
+    const rows: KeyRow[] = [];
+    const byDescription = new Map<string, KeyRow>();
+    for (const b of items) {
+      const existing = byDescription.get(b.description);
+      if (existing) {
+        existing.combos.push(comboKeys(b.combo, platform));
+      } else {
+        const row: KeyRow = { description: b.description, combos: [comboKeys(b.combo, platform)] };
+        byDescription.set(b.description, row);
+        rows.push(row);
+      }
+    }
+    return rows;
+  }
+
+  const keyGroups: KeyGroup[] = [
+    ...groupOrder.map((group) => ({
+      title: groupTitles[group],
+      rows: collectRows(bindings.filter((b) => b.group === group)),
+    })),
+    // Terminal-internal keys live next to classifyTerminalKey, not in the
+    // keymap; render them as a final group so the panel is the one place that
+    // lists every key the app reacts to.
+    {
+      title: "Terminal",
+      rows: terminalKeyReference(platform).map((ref) => ({
+        description: ref.description,
+        combos: [comboKeys(ref.combo, platform)],
+      })),
+    },
   ];
 
   let section = $state<Section>("editor");
@@ -267,6 +322,13 @@
       </button>
       <button class="nav-row" class:active={section === "git"} onclick={() => (section = "git")}>
         Git
+      </button>
+      <button
+        class="nav-row"
+        class:active={section === "keybindings"}
+        onclick={() => (section = "keybindings")}
+      >
+        Keybindings
       </button>
       <button class="nav-row" class:active={section === "about"} onclick={() => (section = "about")}>
         About
@@ -536,6 +598,36 @@
             </Toggle.Root>
           </div>
         </section>
+      {:else if section === "keybindings"}
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Keybindings</h2>
+            <p class="help">
+              Keyboard shortcuts on this platform. Read-only for now. Some actions accept more
+              than one combo — alternates are shown with <b>or</b>.
+            </p>
+          </div>
+          {#each keyGroups as group (group.title)}
+            <div class="kb-group">
+              <span class="kb-group-label">{group.title}</span>
+              <ul class="kb-list">
+                {#each group.rows as row (row.description)}
+                  <li class="kb-row">
+                    <span class="kb-desc">{row.description}</span>
+                    <span class="kb-combos">
+                      {#each row.combos as combo, i (i)}
+                        {#if i > 0}<span class="kb-or">or</span>{/if}
+                        <span class="keys">
+                          {#each combo as cap (cap)}<kbd>{cap}</kbd>{/each}
+                        </span>
+                      {/each}
+                    </span>
+                  </li>
+                {/each}
+              </ul>
+            </div>
+          {/each}
+        </section>
       {:else if section === "about"}
         <section class="panel">
           <div class="panel-head">
@@ -725,6 +817,52 @@
   .saved {
     font-size: var(--r0);
     color: var(--ink-2);
+  }
+
+  /* Keybindings — grouped rows, label left / keycap chips right. Same uppercase
+     group-label voice as the themes section; chips reuse the shared kbd recipe
+     (app.css) so light + dark are token-driven. */
+  .kb-group {
+    display: grid;
+    gap: 8px;
+  }
+  .kb-group-label {
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: var(--ink-2);
+  }
+  .kb-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+  }
+  .kb-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 12px;
+    background: var(--paper-1);
+  }
+  .kb-desc {
+    font-size: var(--r0);
+    color: var(--ink-2);
+  }
+  .kb-combos {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: none;
+  }
+  .kb-or {
+    font-size: var(--r0);
+    color: var(--ink-3);
   }
 
   /* Themes — the card grid needs more width than the default 520px column. */

@@ -48,6 +48,7 @@
   import { WebglAddon } from "@xterm/addon-webgl";
   import type { Session } from "../types";
   import { classifyTerminalKey } from "../terminalKeys";
+  import { focusedPane, registerTerminalFocus } from "../keymap";
   import { createOutputBatcher } from "../outputBatch";
   import { releaseWebgl, retainWebgl, touchWebgl } from "../webglBudget";
   import { dropTargetSession } from "../fileDrop";
@@ -93,6 +94,9 @@
   let written = 0;
   let resizeObserver: ResizeObserver | null = null;
   let unsubOutput: (() => void) | null = null;
+  // Unregister thunk for the keymap's terminal-focus registry (focus.terminal
+  // command). Registered in onMount, dropped in onDestroy.
+  let unregisterFocus: (() => void) | null = null;
   // Pending rAF handle for the coalesced local fit (see `scheduleFit`).
   let fitFrame: number | null = null;
 
@@ -149,6 +153,17 @@
     e.preventDefault();
     if (!term) return;
     void navigator.clipboard.readText().then((t) => term?.paste(t));
+  }
+
+  // Clicking (or otherwise moving DOM focus) into the live xterm marks the
+  // terminal pane focused. Tab selection already does this, but a direct click
+  // into the terminal body did not — so after Cmd+Shift+G the pane stayed "git"
+  // while typing here, and Cmd+Enter would wrongly open the commit dialog. xterm
+  // has no focus event; its hidden textarea is the focusable target, so a
+  // bubbling `focusin` on the host (which already owns the contextmenu listener)
+  // catches it idiomatically.
+  function onHostFocusIn() {
+    focusedPane.set("terminal");
   }
 
   function onSearchKeydown(e: KeyboardEvent) {
@@ -524,6 +539,12 @@
     // route) — is verifiable without a live DOM.
     term.attachCustomKeyEventHandler((e) => {
       switch (classifyTerminalKey(e)) {
+        case "app":
+          // App-level combo (pane focus, tab switching, rail toggles, palette,
+          // settings — see keymap.ts). The window-capture dispatcher in
+          // +layout.svelte already handled it; xterm must NOT also process it,
+          // so consume the event here.
+          return false;
         case "newline":
           // Send Shift+Enter as a line feed (\n) rather than carriage return
           // (\r) so apps (e.g. Claude Code) can tell Enter (execute) apart from
@@ -555,6 +576,11 @@
 
     term.onData((data) => sendInput(sessionId, data));
 
+    // Expose focusing this terminal to the keymap's focus.terminal command. The
+    // dispatcher focuses the ACTIVE session's terminal, so registering every
+    // mounted terminal is safe (only the active id is ever called).
+    unregisterFocus = registerTerminalFocus(sessionId, () => term?.focus());
+
     // Output subscription is deferred to the first open + fit (see
     // ensureSubscribed): the visible-mount path below for a tab that mounts
     // active, or activate()/scheduleFit() for one that mounts hidden — so the
@@ -570,6 +596,9 @@
     // Own the right-click menu (paste). On `host` so it covers the whole
     // terminal area; removed in onDestroy.
     host.addEventListener("contextmenu", onContextMenu);
+    // Mark the terminal pane focused on any focus into the host (xterm's hidden
+    // textarea) — see onHostFocusIn. focusin bubbles, so the host catches it.
+    host.addEventListener("focusin", onHostFocusIn);
 
     // Open + fit + focus only if we mounted visible. A non-active tab in the
     // same parent mounts hidden (`display:none`) alongside the active one; even
@@ -589,9 +618,12 @@
   });
 
   onDestroy(() => {
+    unregisterFocus?.();
+    unregisterFocus = null;
     unsubOutput?.();
     resizeObserver?.disconnect();
     host?.removeEventListener("contextmenu", onContextMenu);
+    host?.removeEventListener("focusin", onHostFocusIn);
     // Cancel any frame queued by scheduleFit so it can't run against a disposed
     // term. The per-session daemon debounce timer is cleared centrally in
     // daemon.ts on session close (closeSessionOutput); a parent-switch unmount
