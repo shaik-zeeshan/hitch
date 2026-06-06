@@ -50,7 +50,10 @@ use tauri::tray::TrayIconBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 #[cfg(feature = "packaged-smoke")]
 use tauri::RunEvent;
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
+use tauri::window::Color;
+use tauri::{
+    AppHandle, Emitter, Manager, State, Theme, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry,
+};
 
 /// Per-session bound on the bytes we stage before the webview registers that
 /// session's output channel. Mirrors the daemon's `DEFAULT_SCROLLBACK_CAPACITY`
@@ -2007,6 +2010,83 @@ fn daemon_log_path() -> PathBuf {
     hitch_proto::transport::default_data_dir().join("daemon.log")
 }
 
+/// The two canonical Paper Terminal `--paper-0` window-base colors (doc-design/
+/// colors.md), as sRGB hex: light `oklch(97.4% 0.008 80)`, dusk
+/// `oklch(16.5% 0.012 72)`. These are the ONLY two background colors the native
+/// window is ever painted; they match the pre-paint values in `app.html` so the
+/// native frame, the document, and the app CSS all agree before first paint.
+const PAPER_0_LIGHT: Color = Color(0xf9, 0xf6, 0xf1, 0xff);
+const PAPER_0_DARK: Color = Color(0x12, 0x0e, 0x09, 0xff);
+
+/// File the frontend mirrors the persisted theme into so the Rust side can read
+/// it synchronously at startup — Rust cannot reliably read WKWebView localStorage
+/// (where `theme.ts` keeps the canonical value). `set_window_theme` writes either
+/// `"dark"` or `"light"`; startup reads it to pick the native window background.
+fn window_theme_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|dir| dir.join("theme"))
+}
+
+/// Read the persisted window theme, falling back to the OS appearance when the
+/// mirror file is absent (first run / installs predating the mirror), and to
+/// light if even that is unavailable. Only ever returns one of the two themes.
+fn persisted_window_theme(app: &AppHandle) -> Theme {
+    if let Some(path) = window_theme_path(app) {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            match contents.trim() {
+                "dark" => return Theme::Dark,
+                "light" => return Theme::Light,
+                _ => {}
+            }
+        }
+    }
+    // No mirror yet: match the OS appearance so the native frame still reads
+    // right on first launch. Default to light if the platform can't report one.
+    app.get_webview_window("main")
+        .and_then(|w| w.theme().ok())
+        .unwrap_or(Theme::Light)
+}
+
+fn window_background_color(theme: Theme) -> Color {
+    match theme {
+        Theme::Dark => PAPER_0_DARK,
+        _ => PAPER_0_LIGHT,
+    }
+}
+
+/// Create the main window programmatically so its native background is painted
+/// from the persisted theme BEFORE the webview loads — otherwise dark-theme users
+/// see a light native frame for the pre-paint frames (the static
+/// `backgroundColor` in the config could only ever be one theme). All other
+/// window config that used to live in `tauri.conf.json` / `tauri.windows.conf.json`
+/// is reproduced here, cfg-gated per platform.
+fn build_main_window(app: &AppHandle) -> tauri::Result<()> {
+    let theme = persisted_window_theme(app);
+    let mut builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+        .title("Hitch")
+        .inner_size(1100.0, 720.0)
+        .min_inner_size(720.0, 480.0)
+        .background_color(window_background_color(theme))
+        .theme(Some(theme));
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .title_bar_style(tauri::TitleBarStyle::Overlay)
+            .traffic_light_position(tauri::LogicalPosition::new(16.0, 23.0))
+            .hidden_title(true);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Frameless on Windows: the app draws its own caption controls and the
+        // Snap-Layouts bridge re-adds max-button hit-testing (window_chrome).
+        builder = builder.decorations(false).zoom_hotkeys_enabled(false);
+    }
+
+    builder.build()?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EditorLaunchSpec {
     program: OsString,
@@ -2862,6 +2942,25 @@ fn unregister_session_output(
 #[tauri::command]
 fn set_max_button_rect(left: i32, top: i32, right: i32, bottom: i32) {
     window_chrome::set_max_button_rect(left, top, right, bottom);
+}
+
+/// Mirror the persisted theme into a file the Rust side can read synchronously at
+/// the next launch, so the native window background is painted from the user's
+/// theme before the webview loads (no light flash for dark-theme users). The
+/// frontend's `theme.ts` is the source of truth (localStorage `hitch-theme`),
+/// which Rust cannot read from WKWebView; this command is its small write-through
+/// mirror. Best-effort and called fire-and-forget: any value other than `"dark"`
+/// is normalised to `"light"`.
+#[tauri::command]
+fn set_window_theme(app: AppHandle, theme: String) -> Result<(), String> {
+    let value = if theme == "dark" { "dark" } else { "light" };
+    let path = window_theme_path(&app)
+        .ok_or_else(|| "could not resolve app config dir for theme mirror".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create config dir: {err}"))?;
+    }
+    std::fs::write(&path, value).map_err(|err| format!("failed to write theme mirror: {err}"))
 }
 
 /// Menu-bar status line mirroring the four-state Daemon Status (ADR 0009). The
@@ -4262,6 +4361,11 @@ pub fn run() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             disable_press_and_hold();
+            // Create the main window in Rust (not statically in the config) so its
+            // native background can be painted from the persisted theme before the
+            // webview loads — otherwise dark-theme users get a light native frame
+            // for the pre-paint frames.
+            build_main_window(&app.handle())?;
             // Debug builds run their own isolated daemon (`.hitch-dev`); label the
             // window so it's obvious which build you're looking at when a dev build
             // and an installed release build are open side by side.
@@ -4300,7 +4404,8 @@ pub fn run() {
             get_daemon_status,
             get_daemon_log_tail,
             restart_daemon_command,
-            set_max_button_rect
+            set_max_button_rect,
+            set_window_theme
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

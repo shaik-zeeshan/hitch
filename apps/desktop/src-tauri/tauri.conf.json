@@ -10,18 +10,6 @@
     "frontendDist": "../build"
   },
   "app": {
-    "windows": [
-      {
-        "title": "Hitch",
-        "width": 1100,
-        "height": 720,
-        "minWidth": 720,
-        "minHeight": 480,
-        "titleBarStyle": "Overlay",
-        "trafficLightPosition": { "x": 16, "y": 23 },
-        "hiddenTitle": true
-      }
-    ],
     "security": {
       "csp": null
     }

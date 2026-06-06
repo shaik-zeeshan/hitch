@@ -336,8 +336,8 @@
   // HISTORY is only an available view for a git worktree (the toggle is hidden
   // otherwise). Gating the rendered view on $gitWorktreeId too keeps the header
   // and body consistent: with no git worktree the header shows the plain CHANGES
-  // label and the body shows the Changes empty-state, even if railView persisted
-  // as "history" from a previous git selection.
+  // label and the body shows the Changes empty-state, even if railView still
+  // reads "history" from a previous git selection this session.
   const historyView = $derived($railView === "history" && Boolean($gitWorktreeId));
   const commits = $derived($commitLog.commits);
   // The roving (keyboard-focused) commit is tracked by SHA, not array index, so it
@@ -599,7 +599,7 @@
         <!-- CHANGES | HISTORY view toggle. Shown only for a git worktree; for a
              non-git / no-worktree rail the header keeps the plain CHANGES label
              (the toggle is absent, matching how git ops are gated). Mono-uppercase
-             text buttons bound to the persisted railView, with an iris-ink active
+             text buttons bound to the railView selection, with an iris-ink active
              state — the rail's own header language (no segmented widget exists in
              the chrome to reuse). -->
         <div class="view-toggle" role="tablist" aria-label="Right rail view">

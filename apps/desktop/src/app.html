@@ -4,6 +4,36 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Hitch</title>
+    <!-- Pre-paint theme + background. The app bundle (and its CSS, which sets
+         the real --paper-0 body background and the data-theme="dark" token
+         overrides) loads asynchronously, so without this the native window
+         and document paint browser-white for a frame — a white flash, and for
+         dusk users the WRONG theme. This blocking inline script reads the SAME
+         persisted theme (localStorage "hitch-theme") that theme.ts uses, sets
+         data-theme="dark" on <html> before first paint, and paints the matching
+         --paper-0 letterpress background (doc-design/colors.md: light
+         oklch(97.4% 0.008 80) = #f9f6f1, dusk oklch(16.5% 0.012 72) = #120e09)
+         so launch reads as the user's theme with no flash. Kept tiny and
+         dependency-free so it runs before anything else; theme.ts re-applies
+         and keeps it in sync once the bundle mounts. -->
+    <script>
+      (function () {
+        try {
+          var dark = localStorage.getItem("hitch-theme") === "dark";
+          var root = document.documentElement;
+          if (dark) root.setAttribute("data-theme", "dark");
+          root.style.backgroundColor = dark ? "#120e09" : "#f9f6f1";
+        } catch (e) {}
+      })();
+    </script>
+    <style>
+      /* Fallback for the brief window before the inline script runs (and if
+         localStorage is unavailable): paint the light "paper" base, never
+         browser-white. The dusk override above wins via the inline style. */
+      html {
+        background-color: #f9f6f1;
+      }
+    </style>
     %sveltekit.head%
   </head>
 
