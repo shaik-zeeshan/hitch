@@ -45,9 +45,9 @@ use hitch_proto::{
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tauri::tray::TrayIconBuilder;
 #[cfg(windows)]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-use tauri::tray::TrayIconBuilder;
 #[cfg(feature = "packaged-smoke")]
 use tauri::RunEvent;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
@@ -2425,8 +2425,7 @@ fn env_editor_command_spec(command: &str, path: &Path) -> EditorLaunchSpec {
         let program = parts.next().expect("non-empty after trim");
         let mut args: Vec<OsString> = parts.collect();
         args.push(path.as_os_str().to_os_string());
-        let command_processor_shim =
-            windows_editor_program_needs_command_shim(Path::new(&program));
+        let command_processor_shim = windows_editor_program_needs_command_shim(Path::new(&program));
         EditorLaunchSpec {
             program: OsString::from(program),
             args,
@@ -3115,7 +3114,10 @@ mod tests {
         let spec = env_editor_command_spec(r#""C:\Tools\editor.bat" --wait"#, path);
 
         assert!(spec.command_processor_shim);
-        assert_eq!(spec.program, std::ffi::OsString::from(r"C:\Tools\editor.bat"));
+        assert_eq!(
+            spec.program,
+            std::ffi::OsString::from(r"C:\Tools\editor.bat")
+        );
         assert_eq!(
             spec.args,
             vec![

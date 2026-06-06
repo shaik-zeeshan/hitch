@@ -263,16 +263,6 @@ function writeFreshDiffCache(cacheKey: string, writeSeq: number, text: string): 
   return true;
 }
 
-let gitStatusSnapshotSeq = 0;
-const gitStatusSnapshotIds = new WeakMap<GitStatus, number>();
-
-function gitStatusSnapshotIdentity(status: GitStatus): number {
-  const existing = gitStatusSnapshotIds.get(status);
-  if (existing !== undefined) return existing;
-  const next = ++gitStatusSnapshotSeq;
-  gitStatusSnapshotIds.set(status, next);
-  return next;
-}
 let statusRequestSeq = 0;
 let statusPollTimer: ReturnType<typeof setInterval> | null = null;
 let statusPollInFlight = false;
@@ -1518,14 +1508,15 @@ export function recordTerminalSize(cols: number, rows: number): void {
   if (cols > 0 && rows > 0) lastTerminalSize = { cols, rows };
 }
 
-// The xterm config in Terminal.svelte. Kept here so the offscreen measuring
-// span below uses the exact same font as the real terminal.
-const TERM_FONT_FAMILY =
-  '"Berkeley Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace';
-const TERM_FONT_SIZE_PX = 12.5;
-// `.term` padding from Terminal.svelte's stylesheet (`padding: 12px 14px`).
-const TERM_PADDING_X = 14;
-const TERM_PADDING_Y = 12;
+// The xterm config and panel inset in Terminal.svelte. Kept here so the
+// offscreen measuring span uses the same font as the real terminal and subtracts
+// the wrapper padding before dividing the grid.
+const TERM_FONT_FAMILY = '"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace';
+const TERM_FONT_SIZE_PX = 13;
+// `.terminal` padding from Terminal.svelte (`padding: 14px 16px 4px`).
+const TERM_PADDING_X_PX = 16;
+const TERM_PADDING_TOP_PX = 14;
+const TERM_PADDING_BOTTOM_PX = 4;
 // Last-resort grid when nothing on the page is measurable (e.g. opening a
 // session before any view has laid out). A sane terminal-ish default.
 const FALLBACK_COLS = 120;
@@ -1569,9 +1560,9 @@ function estimateInitialSize(): { cols: number; rows: number } {
   if (cellWidth <= 0 || cellHeight <= 0) {
     return { cols: FALLBACK_COLS, rows: FALLBACK_ROWS };
   }
-  // Subtract the `.term` padding the content area loses on both sides.
-  const usableWidth = rect.width - TERM_PADDING_X * 2;
-  const usableHeight = rect.height - TERM_PADDING_Y * 2;
+  // Subtract the `.terminal` wrapper padding before dividing by the cell size.
+  const usableWidth = rect.width - TERM_PADDING_X_PX * 2;
+  const usableHeight = rect.height - TERM_PADDING_TOP_PX - TERM_PADDING_BOTTOM_PX;
   const cols = Math.max(1, Math.floor(usableWidth / cellWidth));
   const rows = Math.max(1, Math.floor(usableHeight / cellHeight));
   return { cols, rows };
@@ -1832,6 +1823,7 @@ export async function viewAllChanges(activate = true): Promise<void> {
     ...files.filter((file) => file.staged),
     ...files.filter((file) => !file.staged),
   ];
+  lastAllChangesSig = allChangesStatusSignature(worktreeId, files);
 
   const seq = ++allChangesSeq;
   // Seed the rows (text `null` = loading) so the view paints immediately, reusing
@@ -2275,12 +2267,20 @@ sessions.subscribe(($sessions) => {
   sessionCommands.update(pruneToLive);
 });
 
-// Keep the all-changes tab fresh: whenever git status changes (a poll catching
-// an agent's edits, or our own stage/commit) while that tab is open, re-fan its
-// per-file diffs without stealing focus. The daemon status contract does not
-// expose blob ids, so the snapshot object identity is the available content
-// freshness token: a new status snapshot can carry same path/status/counts after
-// text-only edits and must still invalidate cached hunks.
+// Keep the all-changes tab fresh when status metadata changes (file set, side,
+// status, or line counts) without stealing focus. Polls can return a new object
+// for identical content every second, so this signature is deliberately stable:
+// unchanged metadata must not clear the cache and refetch every row while idle.
+function allChangesStatusSignature(worktreeId: Id | null | undefined, files: ChangedFile[]): string {
+  return [
+    worktreeId ?? "",
+    ...files.map(
+      (file) =>
+        `${file.staged ? "1" : "0"}\0${file.path}\0${file.status}\0${file.additions ?? 0}\0${file.deletions ?? 0}`,
+    ),
+  ].join("\n");
+}
+
 let lastAllChangesSig: string | null = null;
 gitStatus.subscribe(($status) => {
   if (!get(diffTabs).some((tab) => tab.path === ALL_CHANGES_TAB)) {
@@ -2288,14 +2288,7 @@ gitStatus.subscribe(($status) => {
     return;
   }
   const files = $status?.files ?? [];
-  const snapshot = $status ? gitStatusSnapshotIdentity($status) : 0;
-  const sig = [
-    snapshot,
-    ...files.map(
-      (file) =>
-        `${file.staged ? "1" : "0"}\0${file.path}\0${file.status}\0${file.additions ?? 0}\0${file.deletions ?? 0}`,
-    ),
-  ].join("\n");
+  const sig = allChangesStatusSignature($status?.worktree_id, files);
   if (sig === lastAllChangesSig) return;
   const worktreeId = $status?.worktree_id;
   if (worktreeId) {

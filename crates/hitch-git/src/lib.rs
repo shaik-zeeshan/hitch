@@ -1017,24 +1017,10 @@ pub fn status(repo_path: impl AsRef<Path>) -> Result<StatusSummary> {
         if let Some((additions, deletions)) = line_stats.staged.get(entry.path.as_path()) {
             entry.staged_additions = *additions;
             entry.staged_deletions = *deletions;
-        } else if is_collapsed_untracked_dir(&repo, entry) {
-            let (additions, deletions) = aggregate_descendant_line_stats(
-                &line_stats.staged,
-                entry.path.as_path(),
-            );
-            entry.staged_additions = additions;
-            entry.staged_deletions = deletions;
         }
         if let Some((additions, deletions)) = line_stats.worktree.get(entry.path.as_path()) {
             entry.worktree_additions = *additions;
             entry.worktree_deletions = *deletions;
-        } else if is_collapsed_untracked_dir(&repo, entry) {
-            let (additions, deletions) = aggregate_descendant_line_stats(
-                &line_stats.worktree,
-                entry.path.as_path(),
-            );
-            entry.worktree_additions = additions;
-            entry.worktree_deletions = deletions;
         }
     }
     let additions = line_stats.additions;
@@ -1080,7 +1066,7 @@ fn diff_line_stats(repo: &Repository) -> Result<DiffLineStats> {
     let mut options = DiffOptions::new();
     options
         .include_untracked(true)
-        .recurse_untracked_dirs(true)
+        .recurse_untracked_dirs(false)
         .show_untracked_content(true);
     let index = repo.index()?;
     let mut worktree = repo.diff_index_to_workdir(Some(&index), Some(&mut options))?;
@@ -1092,29 +1078,6 @@ fn diff_line_stats(repo: &Repository) -> Result<DiffLineStats> {
     stats.worktree = worktree_per_path;
 
     Ok(stats)
-}
-
-fn is_collapsed_untracked_dir(repo: &Repository, entry: &StatusEntry) -> bool {
-    entry.index == FileState::Unmodified
-        && entry.working_tree == FileState::New
-        && repo
-            .workdir()
-            .is_some_and(|workdir| workdir.join(entry.path.as_path()).is_dir())
-}
-
-fn aggregate_descendant_line_stats(
-    per_path: &HashMap<PathBuf, (usize, usize)>,
-    dir: &Path,
-) -> (usize, usize) {
-    let mut additions = 0;
-    let mut deletions = 0;
-    for (path, (path_additions, path_deletions)) in per_path {
-        if path != dir && path.starts_with(dir) {
-            additions += path_additions;
-            deletions += path_deletions;
-        }
-    }
-    (additions, deletions)
 }
 
 fn detect_diff_renames(diff: &mut git2::Diff<'_>) -> Result<()> {
@@ -1183,8 +1146,11 @@ pub fn diff_file(
         .include_untracked(true)
         .recurse_untracked_dirs(true)
         .show_untracked_content(true);
+    if let Some(old_path) = diff_rename_old_path(&repo, pathspec.as_ref(), target)? {
+        options.pathspec(old_path);
+    }
 
-    let diff = match target {
+    let mut diff = match target {
         DiffTarget::Staged => {
             let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
             let index = repo.index()?;
@@ -1195,8 +1161,40 @@ pub fn diff_file(
             repo.diff_index_to_workdir(Some(&index), Some(&mut options))?
         }
     };
+    detect_diff_renames(&mut diff)?;
 
     diff_to_string(&diff)
+}
+
+fn diff_rename_old_path(
+    repo: &Repository,
+    path: &Path,
+    target: DiffTarget,
+) -> Result<Option<PathBuf>> {
+    let mut options = StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .renames_head_to_index(true)
+        .renames_index_to_workdir(true);
+    let statuses = repo.statuses(Some(&mut options))?;
+    for entry in statuses.iter() {
+        let status = entry.status();
+        let renamed = match target {
+            DiffTarget::Staged => status.contains(Status::INDEX_RENAMED),
+            DiffTarget::Worktree => status.contains(Status::WT_RENAMED),
+        };
+        if !renamed {
+            continue;
+        }
+        let Some((new_path, old_path)) = status_paths(entry) else {
+            continue;
+        };
+        if new_path == path {
+            return Ok(old_path);
+        }
+    }
+    Ok(None)
 }
 
 fn diff_pathspec<'a>(repo: &Repository, path: &'a Path) -> Cow<'a, Path> {
@@ -2394,6 +2392,16 @@ mod tests {
         assert_eq!((moved.staged_additions, moved.staged_deletions), (1, 1));
         assert_eq!((moved.worktree_additions, moved.worktree_deletions), (0, 0));
         assert_eq!((summary.additions, summary.deletions), (1, 1));
+
+        let diff = diff_file(fixture.path(), "moved.txt", DiffTarget::Staged).unwrap();
+        assert!(
+            diff.contains("rename from tracked.txt"),
+            "diff was {diff:?}"
+        );
+        assert!(diff.contains("rename to moved.txt"), "diff was {diff:?}");
+        assert!(diff.contains("-two"), "diff was {diff:?}");
+        assert!(diff.contains("+TWO"), "diff was {diff:?}");
+        assert!(!diff.contains("+one\n"), "diff was {diff:?}");
     }
 
     #[test]
@@ -2419,6 +2427,16 @@ mod tests {
         assert_eq!((moved.worktree_additions, moved.worktree_deletions), (1, 1));
         assert_eq!((moved.staged_additions, moved.staged_deletions), (0, 0));
         assert_eq!((summary.additions, summary.deletions), (1, 1));
+
+        let diff = diff_file(fixture.path(), "moved.txt", DiffTarget::Worktree).unwrap();
+        assert!(
+            diff.contains("rename from tracked.txt"),
+            "diff was {diff:?}"
+        );
+        assert!(diff.contains("rename to moved.txt"), "diff was {diff:?}");
+        assert!(diff.contains("-two"), "diff was {diff:?}");
+        assert!(diff.contains("+TWO"), "diff was {diff:?}");
+        assert!(!diff.contains("+one\n"), "diff was {diff:?}");
     }
 
     #[test]
@@ -2489,7 +2507,7 @@ mod tests {
     }
 
     #[test]
-    fn status_collapses_untracked_directories_for_fast_app_reads() {
+    fn status_collapses_untracked_directories_without_recursing_for_stats() {
         let fixture = RepoFixture::new();
         fs::create_dir(fixture.path().join("generated")).unwrap();
         fs::write(fixture.path().join("generated/one.txt"), "one\n").unwrap();
@@ -2505,9 +2523,9 @@ mod tests {
         );
         let entry = &summary.entries[0];
         assert_eq!(entry.working_tree, FileState::New);
-        assert_eq!((entry.worktree_additions, entry.worktree_deletions), (2, 0));
+        assert_eq!((entry.worktree_additions, entry.worktree_deletions), (0, 0));
         assert_eq!((entry.staged_additions, entry.staged_deletions), (0, 0));
-        assert_eq!((summary.additions, summary.deletions), (2, 0));
+        assert_eq!((summary.additions, summary.deletions), (0, 0));
     }
 
     #[test]

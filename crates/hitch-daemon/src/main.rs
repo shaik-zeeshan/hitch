@@ -2530,7 +2530,7 @@ fn git_status(
         behind,
         additions: summary.additions.min(u32::MAX as usize) as u32,
         deletions: summary.deletions.min(u32::MAX as usize) as u32,
-        files: summary.entries.iter().map(status_entry_to_proto).collect(),
+        files: status_entries_to_proto(&summary.entries),
     })
 }
 
@@ -2824,22 +2824,39 @@ fn index_is_staged(state: FileState) -> bool {
     !matches!(state, FileState::Unmodified | FileState::Conflicted)
 }
 
-fn status_entry_to_proto(entry: &StatusEntry) -> ChangedFile {
-    let staged = index_is_staged(entry.index);
-    let state = if staged {
-        entry.index
-    } else {
-        entry.working_tree
-    };
-    // Show the line counts for the side this row represents: a staged row's
-    // counts come from HEAD↔index, an unstaged/untracked row's from
-    // index↔worktree. This keeps the +N −N badge in step with the diff the row
-    // opens, and avoids double-counting a partially-staged file.
-    let (additions, deletions) = if staged {
-        (entry.staged_additions, entry.staged_deletions)
-    } else {
-        (entry.worktree_additions, entry.worktree_deletions)
-    };
+fn status_entries_to_proto(entries: &[StatusEntry]) -> Vec<ChangedFile> {
+    let mut files = Vec::with_capacity(entries.len() * 2);
+    for entry in entries {
+        let staged = index_is_staged(entry.index);
+        if staged {
+            files.push(status_entry_to_proto(
+                entry,
+                true,
+                entry.index,
+                entry.staged_additions,
+                entry.staged_deletions,
+            ));
+        }
+        if !staged || entry.working_tree != FileState::Unmodified {
+            files.push(status_entry_to_proto(
+                entry,
+                false,
+                entry.working_tree,
+                entry.worktree_additions,
+                entry.worktree_deletions,
+            ));
+        }
+    }
+    files
+}
+
+fn status_entry_to_proto(
+    entry: &StatusEntry,
+    staged: bool,
+    state: FileState,
+    additions: usize,
+    deletions: usize,
+) -> ChangedFile {
     ChangedFile {
         path: entry.path.clone(),
         status: match state {
@@ -4404,8 +4421,9 @@ fn poisoned(name: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{best_pr_for_branch, OutputBroadcaster};
+    use super::{best_pr_for_branch, status_entries_to_proto, OutputBroadcaster};
     use hitch_core::SessionId;
+    use hitch_git::{FileState, StatusEntry};
 
     fn git_pr(number: u64, state: &str) -> hitch_git::PrInfo {
         hitch_git::PrInfo {
@@ -4414,6 +4432,26 @@ mod tests {
             state: state.to_string(),
             draft: false,
         }
+    }
+
+    #[test]
+    fn status_entries_emit_both_sides_for_partially_staged_files() {
+        let files = status_entries_to_proto(&[StatusEntry {
+            path: "src/lib.rs".into(),
+            old_path: None,
+            index: FileState::Modified,
+            working_tree: FileState::Modified,
+            staged_additions: 2,
+            staged_deletions: 1,
+            worktree_additions: 3,
+            worktree_deletions: 4,
+        }]);
+
+        assert_eq!(files.len(), 2);
+        assert!(files[0].staged);
+        assert_eq!((files[0].additions, files[0].deletions), (2, 1));
+        assert!(!files[1].staged);
+        assert_eq!((files[1].additions, files[1].deletions), (3, 4));
     }
 
     #[test]

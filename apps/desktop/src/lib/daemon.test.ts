@@ -1655,7 +1655,7 @@ describe("all-changes diff tab", () => {
     ]);
   });
 
-  it("auto-refreshes all-changes for a new status snapshot with unchanged counts", async () => {
+  it("does not auto-refresh all-changes for identical status metadata", async () => {
     let diffVersion = 0;
     projects.set([project]);
     worktrees.set([worktree]);
@@ -1680,8 +1680,9 @@ describe("all-changes diff tab", () => {
     await flush();
 
     expect(get(allChangesFiles)).toEqual([
-      { path: "src/a.ts", staged: false, text: "diff v2 for src/a.ts" },
+      { path: "src/a.ts", staged: false, text: "diff v1 for src/a.ts" },
     ]);
+    expect(diffVersion).toBe(1);
   });
 
   it("closing the sentinel tab invalidates in-flight all-changes fan-out rows", async () => {
