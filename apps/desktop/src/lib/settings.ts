@@ -13,6 +13,7 @@ const DIFF_STYLE_KEY = "hitch.diffStyle";
 const DIFF_WRAP_KEY = "hitch.diffWrap";
 const DIFF_IGNORE_WHITESPACE_KEY = "hitch.diffIgnoreWhitespace";
 const DIFF_CONTEXT_LINES_KEY = "hitch.diffContextLines";
+const TERM_FONT_FAMILY_KEY = "hitch.termFontFamily";
 
 // Editor preference passed to the desktop backend. Empty string is the
 // default and means "System default": the backend resolves $VISUAL/$EDITOR at
@@ -162,3 +163,31 @@ export const diffContextLines = persistedNumber(
   DIFF_CONTEXT_LINES_MIN,
   DIFF_CONTEXT_LINES_MAX,
 );
+
+// Terminal font family. Empty string = the built-in stack below; a concrete
+// value is an installed family the user picked in Settings (typically a Nerd
+// Font, so dev icons render — see terminalFontStack).
+export const DEFAULT_TERM_FONT_FAMILY = "";
+export const terminalFontFamily = persisted(TERM_FONT_FAMILY_KEY, DEFAULT_TERM_FONT_FAMILY);
+
+// Base terminal stack: the shell's --mono stack (JetBrains Mono, app.css),
+// with the symbols-only Nerd Fonts appended as icon fallbacks. The bundled
+// JetBrains Mono is NOT Nerd-patched, and most Nerd Font icons live in
+// supplementary-plane PUA codepoints (U+F0001–U+F1AF0) that exist ONLY in
+// Nerd Fonts — WebKit renders tofu for them otherwise. Text glyphs still come
+// from the first font; only the icon codepoints fall through to the symbols
+// font when the user has it installed.
+const TERM_FONT_BASE =
+  '"JetBrains Mono", ui-monospace, "SF Mono", Menlo, "Symbols Nerd Font Mono", "Symbols Nerd Font", monospace';
+
+// The font-family string terminal panes actually render with (xterm options +
+// the daemon's cell-measurement probe — both MUST use the same stack so the
+// estimated grid matches the real one). A picked family goes FIRST so both its
+// text and its icon glyphs win; the base stack stays behind it as fallback.
+export function terminalFontStack(family: string): string {
+  // Strip quotes rather than escaping them: a family name with embedded
+  // quotes is never legitimate, and a broken value here would silently
+  // invalidate the whole font-family declaration.
+  const custom = family.trim().replace(/["']/g, "");
+  return custom ? `"${custom}", ${TERM_FONT_BASE}` : TERM_FONT_BASE;
+}

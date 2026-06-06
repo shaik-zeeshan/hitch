@@ -2539,6 +2539,207 @@ async fn open_in_editor(path: String, editor: String) -> Result<(), String> {
     .map_err(|err| format!("editor launch task failed: {err}"))?
 }
 
+/// Installed monospace font families for the Settings terminal-font picker.
+/// Enumeration loads one face per family to read its fixed-pitch flag, so it
+/// runs off the UI thread like the other blocking commands.
+#[tauri::command]
+async fn list_monospace_fonts() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(list_monospace_font_families)
+        .await
+        .map_err(|err| format!("font listing task failed: {err}"))?
+}
+
+/// One installed font face the frontend should register as a web font.
+/// `index` addresses the face within `select_family_by_name`'s handle list and
+/// is only meaningful for the matching `read_font_face` call.
+#[derive(Clone, Copy, serde::Serialize)]
+struct TerminalFontFace {
+    index: usize,
+    /// CSS font-weight (100–900).
+    weight: u16,
+    italic: bool,
+}
+
+/// The faces of an installed family the terminal needs: best match per
+/// regular / bold / italic / bold-italic slot (deduped — a single-weight
+/// family yields one face and the webview synthesizes the rest).
+///
+/// This exists because WKWebView's sandboxed web processes CANNOT see
+/// user-installed fonts (only system fonts), so naming an installed family in
+/// font-family silently falls through to fallback — Nerd Font icons render as
+/// tofu. Verified on macOS 26 that even WKPreferences'
+/// `_shouldAllowUserInstalledFonts` no longer lifts this. Instead the frontend
+/// fetches the picked family's raw face bytes through these two commands and
+/// registers them as WEB fonts (FontFace), which the sandbox never blocks.
+#[tauri::command]
+async fn list_terminal_font_faces(family: String) -> Result<Vec<TerminalFontFace>, String> {
+    tauri::async_runtime::spawn_blocking(move || terminal_font_faces(&family))
+        .await
+        .map_err(|err| format!("font face listing task failed: {err}"))?
+}
+
+/// Raw bytes of one face from `list_terminal_font_faces`, as a binary IPC
+/// response (an ArrayBuffer on the JS side) — a Nerd Font face is megabytes,
+/// so it skips JSON.
+#[tauri::command]
+async fn read_font_face(family: String, index: usize) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || font_face_bytes(&family, index))
+        .await
+        .map_err(|err| format!("font face read task failed: {err}"))??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn family_face_handles(family: &str) -> Result<Vec<font_kit::handle::Handle>, String> {
+    font_kit::source::SystemSource::new()
+        .select_family_by_name(family)
+        .map(|handle| handle.fonts().to_vec())
+        .map_err(|err| format!("font family {family:?} not found: {err}"))
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn terminal_font_faces(family: &str) -> Result<Vec<TerminalFontFace>, String> {
+    use font_kit::properties::Style;
+
+    struct Face {
+        index: usize,
+        weight: f32,
+        italic: bool,
+        stretch: f32,
+    }
+
+    let faces: Vec<Face> = family_face_handles(family)?
+        .iter()
+        .enumerate()
+        .filter(|(_, handle)| {
+            match handle {
+                // FontFace can't address a face inside a collection (.ttc), so
+                // only faces that are a whole file (or collection-first) are
+                // loadable. SYSTEM-located fonts are skipped entirely: the
+                // webview sandbox already sees those natively (the lockdown
+                // only hides user/admin-installed fonts), and registering a
+                // whole .ttc as a web font would shadow the native family with
+                // its first face regardless of which face was meant.
+                font_kit::handle::Handle::Path { font_index, path } => {
+                    *font_index == 0 && !path.starts_with("/System/")
+                }
+                font_kit::handle::Handle::Memory { font_index, .. } => *font_index == 0,
+            }
+        })
+        .filter_map(|(index, handle)| {
+            let font = handle.load().ok()?;
+            let properties = font.properties();
+            Some(Face {
+                index,
+                weight: properties.weight.0,
+                italic: !matches!(properties.style, Style::Normal),
+                stretch: properties.stretch.0,
+            })
+        })
+        .collect();
+    // Empty is a valid answer (a system family, or nothing loadable): the
+    // frontend registers nothing and native/fallback resolution applies.
+    if faces.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Best face per terminal slot: match the slot's slant, then the closest
+    // weight, then the most normal width (Nerd Font families ship Extended/
+    // Condensed cuts; the terminal wants the regular-width ones).
+    let pick = |target_weight: f32, italic: bool| -> Option<&Face> {
+        let candidates: Vec<&Face> = faces.iter().filter(|f| f.italic == italic).collect();
+        candidates.into_iter().min_by(|a, b| {
+            let cost =
+                |f: &Face| ((f.weight - target_weight).abs(), (f.stretch - 1.0).abs());
+            cost(a).partial_cmp(&cost(b)).unwrap_or(std::cmp::Ordering::Equal)
+        })
+    };
+    let slots = [
+        pick(400.0, false),
+        pick(700.0, false),
+        pick(400.0, true),
+        pick(700.0, true),
+    ];
+
+    let mut picked: Vec<TerminalFontFace> = Vec::new();
+    for face in slots.into_iter().flatten() {
+        if picked.iter().any(|p| p.index == face.index) {
+            continue;
+        }
+        picked.push(TerminalFontFace {
+            index: face.index,
+            weight: (face.weight.clamp(1.0, 1000.0)) as u16,
+            italic: face.italic,
+        });
+    }
+    Ok(picked)
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn font_face_bytes(family: &str, index: usize) -> Result<Vec<u8>, String> {
+    let handles = family_face_handles(family)?;
+    let handle = handles
+        .get(index)
+        .ok_or_else(|| format!("face {index} out of range for family {family:?}"))?;
+    match handle {
+        font_kit::handle::Handle::Path { path, .. } => std::fs::read(path)
+            .map_err(|err| format!("failed to read font file {}: {err}", path.display())),
+        font_kit::handle::Handle::Memory { bytes, .. } => Ok(bytes.as_ref().clone()),
+    }
+}
+
+/// Linux: see list_monospace_font_families.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn terminal_font_faces(_family: &str) -> Result<Vec<TerminalFontFace>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn font_face_bytes(family: &str, _index: usize) -> Result<Vec<u8>, String> {
+    Err(format!("font access not supported on this platform ({family:?})"))
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn list_monospace_font_families() -> Result<Vec<String>, String> {
+    use font_kit::source::SystemSource;
+
+    let source = SystemSource::new();
+    let mut families = source
+        .all_families()
+        .map_err(|err| format!("failed to enumerate font families: {err}"))?;
+    families.sort();
+    families.dedup();
+    let monospace = families
+        .into_iter()
+        // Leading-dot families are hidden system fonts on macOS (".SF NS Mono"
+        // and friends) that CSS font-family cannot select.
+        .filter(|family| !family.starts_with('.'))
+        .filter(|family| {
+            // Patched Nerd Font families are the reason the picker exists, but
+            // their non-"Mono" variants use double-width icon glyphs and are
+            // often NOT flagged fixed-pitch — keep them by name.
+            if family.to_ascii_lowercase().contains("nerd font") {
+                return true;
+            }
+            let Ok(handle) = source.select_family_by_name(family) else {
+                return false;
+            };
+            let Some(font) = handle.fonts().first() else {
+                return false;
+            };
+            font.load().map(|f| f.is_monospace()).unwrap_or(false)
+        })
+        .collect();
+    Ok(monospace)
+}
+
+/// Linux: font-kit would pull freetype + fontconfig into the build, so the
+/// command degrades to "no fonts found" and the Settings picker hides itself.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn list_monospace_font_families() -> Result<Vec<String>, String> {
+    Ok(Vec::new())
+}
+
 #[tauri::command]
 async fn connect_daemon(app: AppHandle, state: State<'_, HitchClient>) -> Result<(), String> {
     let client = state.inner().clone();
@@ -4088,6 +4289,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             open_in_editor,
+            list_monospace_fonts,
+            list_terminal_font_faces,
+            read_font_face,
             connect_daemon,
             hitch_request,
             send_session_input,

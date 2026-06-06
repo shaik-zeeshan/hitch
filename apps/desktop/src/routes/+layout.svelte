@@ -55,6 +55,8 @@
     matchBinding,
     type FocusedPane,
   } from "$lib/keymap";
+  import { terminalFontFamily } from "$lib/settings";
+  import { ensureTerminalFontLoaded } from "$lib/terminalFont";
   import { initTheme } from "$lib/theme";
   import WindowControls from "$lib/components/WindowControls.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
@@ -305,6 +307,10 @@
 
   onMount(() => {
     void initDaemon();
+    // Preload the picked terminal font's web-font faces (multi-MB reads off
+    // disk) so the first terminal usually mounts with them already usable —
+    // Terminal.svelte's applyTerminalFont() awaits the same cached promise.
+    void ensureTerminalFontLoaded(get(terminalFontFamily));
     // App-wide OS-file-drop listener: drops onto a terminal insert the dropped
     // paths at its prompt (see fileDrop.ts for why this is window-global rather
     // than a per-terminal DOM handler). Registration is async; stash the

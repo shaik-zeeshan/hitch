@@ -5,6 +5,7 @@
   // root layout) is never torn down. The left sub-nav is built to grow; today the
   // sections include Editor, Drafts, and static About — no dead UI.
   import { goto } from "$app/navigation";
+  import { invoke } from "@tauri-apps/api/core";
   import { listDraftModels } from "$lib/daemon";
   import { currentDesktopPlatform } from "$lib/desktopPlatform";
   import { bindings, comboKeys, type Binding, type BindingGroup } from "$lib/keymap";
@@ -15,6 +16,7 @@
     autoCommitPush,
     DEFAULT_DRAFT_MODEL,
     DEFAULT_DRAFT_PROVIDER,
+    DEFAULT_TERM_FONT_FAMILY,
     DRAFT_MODEL_OPTIONS,
     draftClaudePath,
     draftCodexPath,
@@ -22,6 +24,7 @@
     draftProvider,
     editorApp,
     SYSTEM_DEFAULT_EDITOR,
+    terminalFontFamily,
     type DraftProvider,
   } from "$lib/settings";
   import {
@@ -51,6 +54,9 @@
   // placeholder values that commitEditor maps back to the stored string.
   const SYSTEM_EDITOR_VALUE = "__hitch_system_editor__";
   const CUSTOM_EDITOR_VALUE = "__hitch_custom_editor__";
+  // Same bits-ui empty-value constraint as the editor select: the stored ""
+  // (built-in stack) rides behind a local placeholder value.
+  const DEFAULT_TERM_FONT_VALUE = "__hitch_default_term_font__";
   const providerOptions: Array<{ value: DraftProvider; label: string }> = [
     { value: "stub", label: "Stub (deterministic)" },
     { value: "claude", label: "Claude" },
@@ -152,6 +158,25 @@
       : modelOptions,
   );
 
+  // Terminal font picker (Themes section). The installed monospace families
+  // come from the desktop backend (`list_monospace_fonts`); a stored family
+  // that's no longer installed (or while the list is loading) is prepended so
+  // the select always shows what's actually saved — same shape as
+  // selectableModels above.
+  let selectedTermFont = $state(DEFAULT_TERM_FONT_VALUE);
+  let fontOptions = $state<string[]>([]);
+  let fontsLoading = $state(true);
+  let selectableFonts = $derived(
+    selectedTermFont !== DEFAULT_TERM_FONT_VALUE && !fontOptions.includes(selectedTermFont)
+      ? [selectedTermFont, ...fontOptions]
+      : fontOptions,
+  );
+
+  function onTermFontSelect(value: string) {
+    selectedTermFont = value;
+    terminalFontFamily.set(value === DEFAULT_TERM_FONT_VALUE ? DEFAULT_TERM_FONT_FAMILY : value);
+  }
+
   onMount(() => {
     // Empty stored value = System default; a value matching a known option
     // selects it; anything else (a custom app name or executable path)
@@ -174,6 +199,16 @@
     codexPath = $draftCodexPath;
     lastDraftProvider = draftProviderValue;
     draftsHydrated = true;
+    // Hydrate the terminal-font picker and fetch the installed families.
+    // Best-effort: on failure (or on Linux, where the backend returns an empty
+    // list) the picker still offers Default + the stored value.
+    const storedFont = $terminalFontFamily.trim();
+    selectedTermFont =
+      storedFont === DEFAULT_TERM_FONT_FAMILY ? DEFAULT_TERM_FONT_VALUE : storedFont;
+    void invoke<string[]>("list_monospace_fonts")
+      .then((fonts) => (fontOptions = fonts))
+      .catch(() => (fontOptions = []))
+      .finally(() => (fontsLoading = false));
   });
 
   $effect(() => {
@@ -476,6 +511,41 @@
                 </button>
               {/each}
             </div>
+          </div>
+
+          <div class="theme-group">
+            <span class="theme-group-label">Terminal font</span>
+            <div class="field">
+              <Select.Root type="single" bind:value={selectedTermFont} onValueChange={onTermFontSelect}>
+                <Select.Trigger class="select-trigger base" aria-label="Terminal font">
+                  <Select.Value placeholder={fontsLoading ? "Loading fonts…" : "Choose font"} />
+                  <span class="select-chev" aria-hidden="true">⌄</span>
+                </Select.Trigger>
+                <Select.Portal>
+                  <Select.Content class="select-content" sideOffset={6}>
+                    <Select.Viewport>
+                      <Select.Item
+                        class="select-item"
+                        value={DEFAULT_TERM_FONT_VALUE}
+                        label="Default (JetBrains Mono)"
+                      >
+                        Default (JetBrains Mono)
+                      </Select.Item>
+                      {#each selectableFonts as font (font)}
+                        <Select.Item class="select-item" value={font} label={font}>
+                          {font}
+                        </Select.Item>
+                      {/each}
+                    </Select.Viewport>
+                  </Select.Content>
+                </Select.Portal>
+              </Select.Root>
+            </div>
+            <p class="help">
+              Monospace families installed on this machine, applied to all terminal panes. Pick a
+              <b>Nerd Font</b> to render dev icons (nvim, eza, powerline prompts) — the default
+              JetBrains Mono isn't Nerd-patched, so those icons show as empty boxes with it.
+            </p>
           </div>
         </section>
       {:else if section === "drafts"}

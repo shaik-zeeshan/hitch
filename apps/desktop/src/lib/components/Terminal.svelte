@@ -48,6 +48,8 @@
   import { WebglAddon } from "@xterm/addon-webgl";
   import type { Session } from "../types";
   import { classifyTerminalKey } from "../terminalKeys";
+  import { terminalFontFamily, terminalFontStack } from "../settings";
+  import { ensureTerminalFontLoaded } from "../terminalFont";
   import { focusedPane, registerTerminalFocus } from "../keymap";
   import { createOutputBatcher } from "../outputBatch";
   import { releaseWebgl, retainWebgl, touchWebgl } from "../webglBudget";
@@ -491,11 +493,45 @@
     term.options.theme = currentTheme();
   });
 
+  // Apply the user's terminal font. The picked family must first be
+  // registered as a WEB font (see terminalFont.ts — the WKWebView sandbox
+  // hides user-installed fonts), and xterm must only be pointed at it AFTER
+  // the faces are usable: xterm measures cell metrics and rasterizes its glyph
+  // atlas at the moment the option changes, so flipping the option before the
+  // font loads would freeze fallback metrics. Hence: xterm is constructed on
+  // the BASE stack (always available), and this routine swaps the full stack
+  // in post-load — the option change re-measures cells and rebuilds the WebGL
+  // atlas, so refit and tell the daemon, exactly like a resize. Stale-guarded
+  // for a font change racing a slower earlier load; the same-value check makes
+  // reapplying a no-op (xterm would ignore it anyway).
+  function applyTerminalFont() {
+    const family = get(terminalFontFamily);
+    const stack = terminalFontStack(family);
+    void ensureTerminalFontLoaded(family).then(() => {
+      if (!term) return;
+      if (get(terminalFontFamily) !== family) return; // superseded by a newer pick
+      if (term.options.fontFamily === stack) return;
+      term.options.fontFamily = stack;
+      scheduleFit();
+    });
+  }
+
+  // Re-trigger on a Settings change. Same shape as the theme effect above:
+  // the first run happens before onMount creates `term` (bails), so onMount
+  // calls applyTerminalFont() itself for the initial application.
+  $effect(() => {
+    void $terminalFontFamily;
+    if (!term) return;
+    applyTerminalFont();
+  });
+
   onMount(() => {
     term = new Xterm({
-      // Match the shell's --mono stack (JetBrains Mono) and the panel's
-      // 0.8125rem / 13px body type from doc-design/components.md.
-      fontFamily: '"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace',
+      // Construct on the BASE stack (the shell's --mono stack; panel type is
+      // 0.8125rem / 13px from doc-design/components.md). The user's picked
+      // family is swapped in by applyTerminalFont() below once its web-font
+      // faces are loaded — see the comment on that function.
+      fontFamily: terminalFontStack(""),
       fontSize: 13,
       theme: currentTheme(),
       cursorBlink: true,
@@ -615,6 +651,11 @@
       term.focus();
       resizeSessionDebounced(sessionId, term.cols, term.rows);
     }
+
+    // Swap in the user's terminal font once its web-font faces are loaded.
+    // After the visible-mount fit above so the fallback-metrics grid is never
+    // what the daemon hears last: the apply path refits + re-notifies.
+    applyTerminalFont();
   });
 
   onDestroy(() => {

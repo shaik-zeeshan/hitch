@@ -53,6 +53,8 @@ import {
   draftCodexPath,
   draftModel,
   draftProvider,
+  terminalFontFamily,
+  terminalFontStack,
   type DraftProvider,
 } from "./settings";
 
@@ -1666,8 +1668,9 @@ export function recordTerminalSize(cols: number, rows: number): void {
 
 // The xterm config and panel inset in Terminal.svelte. Kept here so the
 // offscreen measuring span uses the same font as the real terminal and subtracts
-// the wrapper padding before dividing the grid.
-const TERM_FONT_FAMILY = '"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace';
+// the wrapper padding before dividing the grid. The font stack comes from the
+// shared settings helper (user-picked family + built-in fallback), the same
+// source Terminal.svelte renders with.
 const TERM_FONT_SIZE_PX = 13;
 // `.terminal` padding from Terminal.svelte (`padding: 14px 16px 4px`).
 const TERM_PADDING_X_PX = 16;
@@ -1704,7 +1707,7 @@ function estimateInitialSize(): { cols: number; rows: number } {
   probe.style.position = "absolute";
   probe.style.visibility = "hidden";
   probe.style.whiteSpace = "pre";
-  probe.style.fontFamily = TERM_FONT_FAMILY;
+  probe.style.fontFamily = terminalFontStack(get(terminalFontFamily));
   probe.style.fontSize = `${TERM_FONT_SIZE_PX}px`;
   probe.style.lineHeight = "normal";
   probe.textContent = "0".repeat(100);
