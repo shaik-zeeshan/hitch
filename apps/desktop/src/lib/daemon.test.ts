@@ -144,7 +144,7 @@ beforeEach(() => {
   draftCodexPath.set("");
   diffIgnoreWhitespace.set(false);
   railView.set("changes");
-  commitLog.set({ worktreeId: null, commits: [], hasMore: false, loading: false });
+  commitLog.set({ worktreeId: null, commits: [], hasMore: false, loading: false, prependedCount: 0, tick: 0 });
 });
 
 describe("daemon status mapping", () => {
@@ -2467,7 +2467,7 @@ describe("History commit log + Commit Tabs", () => {
     );
     // HISTORY is the visible view; seed the log as already pointed at this worktree
     // so flipping the view doesn't race a lazy load with the status-driven refetch.
-    commitLog.set({ worktreeId: worktree.id, commits: [], hasMore: false, loading: false });
+    commitLog.set({ worktreeId: worktree.id, commits: [], hasMore: false, loading: false, prependedCount: 0, tick: 0 });
     railView.set("history");
 
     // First status seeds HEAD (null -> head-a) and refetches the log.
@@ -2485,6 +2485,152 @@ describe("History commit log + Commit Tabs", () => {
     await loadGitStatus(worktree.id);
     await flush();
     expect(get(commitLog).commits.map((c) => c.id)).toEqual(["v2"]);
+  });
+
+  it("PREPENDS new commits on a HEAD change, preserving the loaded depth and row identity", async () => {
+    // Regression for "clicking a late-loaded commit row does nothing / snaps back
+    // to the start" under a churning HEAD (an agent committing in the selected
+    // PTY). The old refresh re-fetched and SWAPPED the whole fixed-size window
+    // every ~1s: new top commits pushed the oldest rows out of the window AND
+    // slid every visible row down with no scroll compensation, so a real pointer's
+    // mousedown and mouseup landed on different rows (no synthesized `click`). The
+    // refresh must instead (a) keep the rows in place — never go empty mid-flight,
+    // (b) PREPEND only the genuinely-new commits above the existing top, reusing
+    // the existing row objects (stable identity → no DOM churn → the keyed each
+    // keeps each node), (c) GROW the array rather than drop the oldest loaded rows,
+    // and (d) signal `prependedCount` so the list can anchor scroll.
+    selectWorktree();
+    let head = "head-a";
+    const requestedLimits: number[] = [];
+    // The commits the daemon currently reports, in HEAD order (newest first).
+    // `topId` is HEAD's number; row i back from HEAD is `c{topId - i}`.
+    let topId = 40;
+    const rowsFor = (limit: number) =>
+      Array.from({ length: limit }, (_v, i) => commitInfo(`c${topId - i}`));
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; limit?: number } }) => {
+        if (request.type === "git-status") {
+          return {
+            type: "git-status",
+            status: {
+              worktree_id: worktree.id,
+              branch: "feature",
+              dirty: false,
+              ahead: 0,
+              behind: 0,
+              additions: 0,
+              deletions: 0,
+              head_commit_id: head,
+              files: [],
+            },
+          };
+        }
+        if (request.type === "git-log") {
+          requestedLimits.push(request.limit!);
+          return { type: "commit-log", commits: rowsFor(request.limit!), has_more: true };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Seed 40 already-paginated rows (c40 … c1) for this worktree, HISTORY visible.
+    const seeded = rowsFor(40);
+    commitLog.set({
+      worktreeId: worktree.id,
+      commits: seeded,
+      hasMore: true,
+      loading: false,
+      prependedCount: 0,
+      tick: 0,
+    });
+    railView.set("history");
+
+    // Observe the store across the refresh: it must never go empty mid-flight.
+    let sawEmpty = false;
+    const unsub = commitLog.subscribe((s) => {
+      if (s.worktreeId === worktree.id && s.commits.length === 0) sawEmpty = true;
+    });
+
+    // Three new commits land on top → HEAD moves.
+    topId = 43;
+    head = "head-b";
+    await loadGitStatus(worktree.id);
+    await flush();
+    unsub();
+
+    const after = get(commitLog);
+    // Re-requested with a limit covering the 40 loaded rows (not the 20 page size).
+    expect(requestedLimits).toEqual([40]);
+    expect(sawEmpty).toBe(false);
+    // The three new commits are PREPENDED; the loaded depth GROWS 40 → 43 (the
+    // oldest rows c1 … are NOT dropped to a fixed window).
+    expect(after.commits.map((c) => c.id).slice(0, 5)).toEqual(["c43", "c42", "c41", "c40", "c39"]);
+    expect(after.commits).toHaveLength(43);
+    expect(after.commits[after.commits.length - 1].id).toBe("c1");
+    // The prepend is signaled so the list can anchor scroll, and the original row
+    // objects are reused (stable identity keeps each DOM node / avoids drift).
+    expect(after.prependedCount).toBe(3);
+    expect(after.commits[3]).toBe(seeded[0]);
+    expect(after.commits[42]).toBe(seeded[39]);
+  });
+
+  it("replaces the window when a HEAD change has no overlap with the loaded rows", async () => {
+    // A big jump, rebase, or force-update where none of the loaded shas are in the
+    // fresh top window: there is nothing to prepend onto, so the refresh must
+    // replace the window (correctness over node reuse) rather than prepend a
+    // disjoint history. prependedCount stays 0 (no scroll anchoring).
+    selectWorktree();
+    let head = "head-a";
+    let generation = 0;
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; limit?: number } }) => {
+        if (request.type === "git-status") {
+          return {
+            type: "git-status",
+            status: {
+              worktree_id: worktree.id,
+              branch: "feature",
+              dirty: false,
+              ahead: 0,
+              behind: 0,
+              additions: 0,
+              deletions: 0,
+              head_commit_id: head,
+              files: [],
+            },
+          };
+        }
+        if (request.type === "git-log") {
+          const rows = Array.from({ length: request.limit! }, (_v, i) =>
+            commitInfo(`g${generation}-${i}`),
+          );
+          return { type: "commit-log", commits: rows, has_more: true };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    generation = 1;
+    commitLog.set({
+      worktreeId: worktree.id,
+      commits: Array.from({ length: 40 }, (_v, i) => commitInfo(`g1-${i}`)),
+      hasMore: true,
+      loading: false,
+      prependedCount: 0,
+      tick: 0,
+    });
+    railView.set("history");
+
+    // A force-update rewrites history: the fresh window shares no sha with ours.
+    generation = 2;
+    head = "head-b";
+    await loadGitStatus(worktree.id);
+    await flush();
+
+    const after = get(commitLog);
+    expect(after.commits[0].id).toBe("g2-0");
+    expect(after.commits.every((c) => c.id.startsWith("g2-"))).toBe(true);
+    expect(after.prependedCount).toBe(0);
   });
 
   it("opens a commit tab keyed by sha and re-activates it without duplicating", () => {

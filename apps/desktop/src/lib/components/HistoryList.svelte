@@ -19,17 +19,24 @@
     commitTabPath,
   } from "../daemon";
   import type { CommitInfo } from "../types";
+  import { focusWithoutScroll } from "../focusWithoutScroll";
 
-  // The roving (keyboard-focused) commit index is owned by RightRail — git pane
-  // focus is shared with Changes, so the parent keeps the one active-row cursor
-  // and the bare arrow handler. We expose the scroll container + a focus helper
-  // so the parent can move/scroll the active row exactly like the file list.
+  // The roving (keyboard-focused) commit is owned by RightRail — git pane focus
+  // is shared with Changes, so the parent keeps the one active-row cursor and the
+  // bare arrow handler. The cursor is tracked by commit SHA (not array index) so
+  // it survives a pagination append (which keeps earlier rows but is index-fragile
+  // when a row's batch matters) and a reset/refetch that reorders the array. We
+  // expose the scroll container + a focus helper so the parent can move/scroll the
+  // active row exactly like the file list. `openCommit` is exported so the parent's
+  // keyboard Enter and this component's click go through ONE code path: both open
+  // the tab AND set the same id-based selection, so the roving/active visuals land
+  // on the clicked/Entered row regardless of which page it loaded in.
   let {
-    activeIndex = $bindable(-1),
+    activeSha = $bindable(null),
   }: {
-    // Index of the roving row in `commits`, or -1 when none. Two-way so the
-    // parent's arrow handler and this component's click stay in sync.
-    activeIndex?: number;
+    // SHA of the roving row, or null when none. Two-way so the parent's arrow
+    // handler and this component's click stay in sync.
+    activeSha?: string | null;
   } = $props();
 
   const log = $derived($commitLog);
@@ -37,6 +44,39 @@
 
   let listEl = $state<HTMLElement | null>(null);
   let sentinelEl = $state<HTMLElement | null>(null);
+
+  // Keep the viewport anchored when a HEAD-move refresh PREPENDS new commits at
+  // the top. Without this, inserting rows above the scroll position slides every
+  // visible row down by the inserted height while scrollTop stays put — so under
+  // a churning HEAD (an agent committing in the selected PTY) the list appears to
+  // drift/"snap", and a row the user is reaching for moves out from under the
+  // pointer between mousedown and mouseup (the browser then synthesizes no click).
+  // `$effect.pre` records scrollHeight BEFORE the prepended rows lay out; the post
+  // effect adds the height delta to scrollTop so the same commit stays under the
+  // cursor. Both key off `log.tick` (bumped once per prepend) so a normal append
+  // or reset — which must NOT shift scroll — never triggers compensation. We skip
+  // when scrolled to the very top (scrollTop ~0): there the user wants to see the
+  // new commits arrive, matching how a log viewer behaves at HEAD.
+  let anchorTick = -1;
+  let anchorScrollHeight = 0;
+  let anchorAtTop = true;
+  $effect.pre(() => {
+    const tick = log.tick;
+    if (tick === anchorTick || log.prependedCount === 0 || !listEl) return;
+    anchorTick = tick;
+    anchorScrollHeight = listEl.scrollHeight;
+    anchorAtTop = listEl.scrollTop <= 1;
+  });
+  let appliedTick = -1;
+  $effect(() => {
+    const tick = log.tick;
+    // Touch commits so this re-runs after the prepended rows are in the DOM.
+    void commits.length;
+    if (tick === appliedTick || tick !== anchorTick || !listEl || anchorAtTop) return;
+    appliedTick = tick;
+    const delta = listEl.scrollHeight - anchorScrollHeight;
+    if (delta > 0) listEl.scrollTop += delta;
+  });
 
   // The 7-char short sha shown in the meta line (libgit2 full id → display).
   function shortSha(id: string): string {
@@ -46,7 +86,17 @@
   // Coarse relative time from a unix-seconds timestamp: now / Nm / Nh / Nd, then
   // a calendar date once a week old. No external dep — the History plan asks for
   // simple coarse buckets, and no relative-time helper exists in the codebase.
-  function relativeTime(unixSeconds: number): string {
+  //
+  // Memoized by timestamp: a paginated log re-renders the whole row set on every
+  // append, and the buckets are coarse (minute-grained at the finest), so a cached
+  // string is fine within a render cycle — staleness only ever lags one bucket and
+  // the next status-driven render recomputes anyway. The cache is module-level so
+  // it survives component remounts (the rail toggles in/out) and shared across the
+  // few logs a session views; it's capped so a long-running window can't grow it
+  // without bound.
+  const RELATIVE_TIME_CACHE_CAP = 4096;
+  const relativeTimeCache = new Map<number, string>();
+  function computeRelativeTime(unixSeconds: number): string {
     const deltaMs = Date.now() - unixSeconds * 1000;
     const sec = Math.floor(deltaMs / 1000);
     if (sec < 60) return "now";
@@ -61,29 +111,51 @@
       day: "numeric",
     });
   }
+  function relativeTime(unixSeconds: number): string {
+    const cached = relativeTimeCache.get(unixSeconds);
+    if (cached !== undefined) return cached;
+    const value = computeRelativeTime(unixSeconds);
+    if (relativeTimeCache.size >= RELATIVE_TIME_CACHE_CAP) relativeTimeCache.clear();
+    relativeTimeCache.set(unixSeconds, value);
+    return value;
+  }
 
   function commitTitle(commit: CommitInfo): string {
     return commit.summary ?? "(no commit message)";
   }
 
-  function openCommit(commit: CommitInfo, index: number) {
-    activeIndex = index;
+  // The single open path for both a row click and the parent's keyboard Enter:
+  // set the id-based roving cursor AND open the commit tab. Exported so RightRail's
+  // openActiveCommit() reuses it verbatim — neither path can open a tab without
+  // also syncing the selection, so the roving visual always follows the opened row
+  // (the blue `.active` stick is id-derived from $activeDiffPath separately and is
+  // already correct for any row regardless of which page loaded it).
+  export function openCommit(commit: CommitInfo) {
+    activeSha = commit.id;
     openCommitTab(commit.id);
   }
 
   // Lazy "load more": an IntersectionObserver on a sentinel row at the list
-  // bottom appends the next page when it scrolls into view. The data layer's
-  // loadMoreCommits is a no-op while loading or when !hasMore, so re-fires while
-  // a page is in flight are harmless. (No prior scroll-pagination pattern exists
-  // in the codebase; an IO sentinel is the lightest option that doesn't poll.)
+  // bottom appends the next page when it scrolls into view. The observer depends
+  // ONLY on the sentinel + scroll-root elements — NOT on `hasMore`/`loading`, so a
+  // page landing (which flips both) does not tear down and rebuild the observer on
+  // every append. Freshness is read live inside the callback instead: we bail if no
+  // more pages or a page is already in flight, so the sentinel firing repeatedly
+  // while a load is pending is a cheap no-op rather than a duplicate request.
+  // (No prior scroll-pagination pattern exists in the codebase; an IO sentinel is
+  // the lightest option that doesn't poll.)
   $effect(() => {
     const sentinel = sentinelEl;
     const root = listEl;
     if (!sentinel || !root) return;
-    if (!log.hasMore) return;
     const io = new IntersectionObserver(
       (entries) => {
-        if (entries.some((e) => e.isIntersecting)) void loadMoreCommits();
+        if (!entries.some((e) => e.isIntersecting)) return;
+        // Read freshness live so a stale closure can't request past the end or
+        // double-fire while a page is in flight. loadMoreCommits is itself a
+        // no-op while loading, but gating here avoids the wasted call entirely.
+        if (!log.hasMore || log.loading) return;
+        void loadMoreCommits();
       },
       { root, rootMargin: "120px" },
     );
@@ -95,11 +167,19 @@
   // focus move itself is the parent's job (it owns the cursor); this only
   // mirrors the file list's scrollIntoView so a long log stays usable.
   export function scrollActiveIntoView() {
+    if (activeSha === null) return;
+    const sha = activeSha;
     void tick().then(() => {
-      const row = listEl?.querySelector<HTMLElement>(`.crow[data-index="${activeIndex}"]`);
+      const row = listEl?.querySelector<HTMLElement>(`.crow[data-sha="${cssEscape(sha)}"]`);
       row?.focus();
       row?.scrollIntoView({ block: "nearest" });
     });
+  }
+
+  // Minimal CSS.escape fallback for the sha attribute selector (a full git id is
+  // hex + safe, but guard the same way RightRail does for the test/SSR env).
+  function cssEscape(value: string): string {
+    return typeof CSS !== "undefined" && CSS.escape ? CSS.escape(value) : value;
   }
 </script>
 
@@ -114,16 +194,16 @@
     {/if}
   {:else}
     <ul class="clist">
-      {#each commits as commit, i (commit.id)}
+      {#each commits as commit (commit.id)}
         <li>
           <button
             class="crow"
-            data-index={i}
             data-sha={commit.id}
             class:active={$diffActive && $activeDiffPath === commitTabPath(commit.id)}
-            class:roving={activeIndex === i}
+            class:roving={activeSha === commit.id}
             title={commitTitle(commit)}
-            onclick={() => openCommit(commit, i)}
+            onpointerdown={focusWithoutScroll}
+            onclick={() => openCommit(commit)}
           >
             <span class="summary">{commitTitle(commit)}</span>
             <span class="meta">

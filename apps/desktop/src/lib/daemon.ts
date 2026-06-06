@@ -407,12 +407,22 @@ export type CommitLogState = {
   commits: CommitInfo[];
   hasMore: boolean;
   loading: boolean;
+  // How many commits a HEAD-move refresh just PREPENDED above the existing rows.
+  // The History list reads this to compensate scrollTop by the inserted rows'
+  // height so the viewport stays anchored to the same commit (rather than the new
+  // top commits sliding every visible row down under a churning HEAD). `tick` is a
+  // monotonic stamp so the component re-anchors once per prepend even when two
+  // refreshes prepend the same count back-to-back.
+  prependedCount: number;
+  tick: number;
 };
 const EMPTY_COMMIT_LOG: CommitLogState = {
   worktreeId: null,
   commits: [],
   hasMore: false,
   loading: false,
+  prependedCount: 0,
+  tick: 0,
 };
 export const commitLog = writable<CommitLogState>(EMPTY_COMMIT_LOG);
 // Page size for each `git-log` fetch (lazy "load more" pulls the next page).
@@ -425,22 +435,61 @@ let commitLogSeq = 0;
 // detect a HEAD change and refetch only when it actually moved.
 let commitLogHeadId: string | null = null;
 
-// Fetch one page of the worktree's commit log. `reset` true replaces the rows
-// (page one, used on worktree switch / HEAD change); false appends the next
-// offset page (loadMore). A no-op if no git worktree is selected.
-async function loadCommitLogPage(reset: boolean): Promise<void> {
+// How a `loadCommitLogPage` call treats the rows it already holds:
+//   - "reset":   replace from page one, clearing the rows first (worktree switch
+//                / first open) — the array genuinely belongs to a new context.
+//   - "append":  add the next offset page at the bottom (loadMore).
+//   - "refresh": a HEAD moved under the SAME worktree (e.g. an agent committed in
+//                the selected PTY). Fetch the fresh top window, then PREPEND only
+//                the genuinely-new commits above the rows we already hold —
+//                keeping every existing row's object identity (so the sha-keyed
+//                `{#each … (commit.id)}` does zero DOM work for them) and the full
+//                paginated depth (new commits GROW the list rather than pushing
+//                the oldest rows out of a fixed window). The component compensates
+//                scrollTop for the prepended height so the viewport stays anchored
+//                to the same commit instead of drifting down under a churning
+//                HEAD. This is the fix for the "late row click does nothing /
+//                snaps back" bug: the old refresh swapped the WHOLE window every
+//                ~1s while an agent committed, so visible rows slid down by a row
+//                each tick (scrollTop never compensated) — a real pointer's
+//                mousedown and mouseup then landed on DIFFERENT rows and the
+//                browser synthesized NO `click`, and the oldest rows silently fell
+//                out of the window. A prepend-only, scroll-anchored refresh fixes
+//                both. When the new commits don't overlap our top sha within the
+//                fetched window (a big jump, a rebase, or a force-update), we fall
+//                back to replacing the window — correctness over node reuse.
+type CommitLogLoad = "reset" | "append" | "refresh";
+
+// Fetch commit-log rows for the selected worktree under one of the modes above.
+// A no-op if no git worktree is selected.
+async function loadCommitLogPage(mode: CommitLogLoad): Promise<void> {
   const worktreeId = get(gitWorktreeId);
   if (!worktreeId) return;
   const current = get(commitLog);
-  // Appending only makes sense for the worktree whose rows we already hold.
-  const offset = reset || current.worktreeId !== worktreeId ? 0 : current.commits.length;
-  if (!reset && current.worktreeId === worktreeId && !current.hasMore) return;
+  const sameWorktree = current.worktreeId === worktreeId;
+  // A refresh of a worktree we don't actually hold yet is just a first load.
+  const effective: CommitLogLoad = mode === "refresh" && !sameWorktree ? "reset" : mode;
+
+  // Append starts past the rows we hold; reset/refresh start at the top. Refresh
+  // pulls enough to cover everything already paginated in (clamped to one page
+  // minimum) so the fresh top window definitely overlaps the row we already hold
+  // at the top — the new commits are the prefix above that overlap.
+  const offset = effective === "append" && sameWorktree ? current.commits.length : 0;
+  const limit =
+    effective === "refresh" ? Math.max(COMMIT_LOG_PAGE, current.commits.length) : COMMIT_LOG_PAGE;
+  if (effective === "append" && sameWorktree && !current.hasMore) return;
+  // A refresh whose HEAD didn't actually change nothing-to-do early-out is the
+  // caller's job (it only refreshes on a HEAD move); but if we somehow hold no
+  // rows yet, treat it as a first load so the window is established.
+  const refreshHasRows = effective === "refresh" && current.commits.length > 0;
 
   const seq = ++commitLogSeq;
   commitLog.update((state) =>
-    reset || state.worktreeId !== worktreeId
-      ? { worktreeId, commits: [], hasMore: false, loading: true }
-      : { ...state, loading: true },
+    effective === "reset" || state.worktreeId !== worktreeId
+      ? { ...state, worktreeId, commits: [], hasMore: false, loading: true, prependedCount: 0 }
+      : // append + refresh keep the rows in place (the merge below swaps/prepends
+        // only once the fresh page lands, so no node churn while it's in flight).
+        { ...state, loading: true, prependedCount: 0 },
   );
 
   // The fetch is still the freshest and its worktree is still selected.
@@ -450,35 +499,100 @@ async function loadCommitLogPage(reset: boolean): Promise<void> {
     const request: GitLogRequest = {
       type: "git-log",
       worktree_id: worktreeId,
-      limit: COMMIT_LOG_PAGE,
+      limit,
       offset,
     };
     const response = await daemonRequest<
       Response & { commits: CommitInfo[]; has_more: boolean }
     >(request);
     if (!isLatest()) return;
-    commitLog.update((state) => ({
-      worktreeId,
-      commits: offset === 0 ? response.commits : [...state.commits, ...response.commits],
-      hasMore: response.has_more,
-      loading: false,
-    }));
+    commitLog.update((state) => {
+      if (effective === "append") {
+        return {
+          ...state,
+          worktreeId,
+          commits: [...state.commits, ...response.commits],
+          hasMore: response.has_more,
+          loading: false,
+          prependedCount: 0,
+        };
+      }
+      if (refreshHasRows) {
+        // Prepend only the genuinely-new commits above the rows we already hold.
+        // The fresh window is newest-first and overlaps our current top sha; the
+        // commits before that overlap are new. Reuse the EXISTING objects for the
+        // overlapping tail so the sha-keyed each does zero DOM work for unchanged
+        // rows, and GROW the list (don't drop the oldest loaded rows to a fixed
+        // window). If the overlap isn't in the fetched window (a big jump / rebase
+        // / force-update), replace the window — correctness over node reuse.
+        const topSha = state.commits[0]?.id;
+        const overlap = topSha ? response.commits.findIndex((c) => c.id === topSha) : -1;
+        if (overlap >= 0) {
+          const prepended = response.commits.slice(0, overlap);
+          // overlap === 0 means our top commit is still HEAD's first row — nothing
+          // new to prepend; leave the rows (and scroll) exactly as they are.
+          if (prepended.length === 0) {
+            return { ...state, loading: false, prependedCount: 0 };
+          }
+          return {
+            ...state,
+            worktreeId,
+            commits: [...prepended, ...state.commits],
+            hasMore: state.hasMore,
+            loading: false,
+            prependedCount: prepended.length,
+            tick: state.tick + 1,
+          };
+        }
+        // No overlap: replace the window (rows the user had may genuinely be gone).
+        return {
+          ...state,
+          worktreeId,
+          commits: response.commits,
+          hasMore: response.has_more,
+          loading: false,
+          prependedCount: 0,
+        };
+      }
+      // reset (or a refresh with no prior rows): take the fresh window as-is.
+      return {
+        ...state,
+        worktreeId,
+        commits: response.commits,
+        hasMore: response.has_more,
+        loading: false,
+        prependedCount: 0,
+      };
+    });
   } catch (err) {
     error.set(toMessage(err));
     if (isLatest()) commitLog.update((state) => ({ ...state, loading: false }));
   }
 }
 
-// Load (reset to) the first page of the selected worktree's commit log.
+// Load (reset to) the first page of the selected worktree's commit log. Used on
+// worktree switch / first open, where clearing the rows is correct.
 export function loadCommitLog(): Promise<void> {
-  return loadCommitLogPage(true);
+  return loadCommitLogPage("reset");
+}
+
+// Re-fetch the selected worktree's log in place after its HEAD moved, PREPENDING
+// only the genuinely-new top commits above the rows already loaded. Existing rows
+// keep their object identity (the sha-keyed each does no DOM work for them) and
+// the full paginated depth is preserved; the History list compensates scrollTop
+// for the prepended height so the viewport stays anchored. This keeps a late-row
+// click stable under a churning HEAD (a row never slides out from under the
+// pointer between mousedown and mouseup) — the reported "click does nothing /
+// snaps to start" failure.
+export function refreshCommitLog(): Promise<void> {
+  return loadCommitLogPage("refresh");
 }
 
 // Append the next page of commits (lazy "load more" at the scroll bottom). A
 // no-op while a page is already in flight or when there are no more commits.
 export function loadMoreCommits(): Promise<void> {
   if (get(commitLog).loading) return Promise.resolve();
-  return loadCommitLogPage(false);
+  return loadCommitLogPage("append");
 }
 
 // ---- Commit diff cache (Commit Tab) ---------------------------------------
@@ -1471,7 +1585,7 @@ export function disposeDaemon(): void {
   diffCacheWriteSeq.clear();
   commitDiffCache.clear();
   commitDiffInFlight.clear();
-  commitLog.set({ worktreeId: null, commits: [], hasMore: false, loading: false });
+  commitLog.set(EMPTY_COMMIT_LOG);
   commitLogHeadId = null;
   booted = false;
 }
@@ -1539,16 +1653,21 @@ export async function loadGitStatus(worktreeId: Id): Promise<GitStatus> {
     gitStatus.set(response.status);
     // History freshness rides the 1s status backbone (no new poller). When the
     // selected worktree's HEAD sha moves (e.g. an Agent committed in a PTY),
-    // refetch the log from page one — but only when it's worth it: HISTORY is the
+    // refresh the log IN PLACE — but only when it's worth it: HISTORY is the
     // visible rail view, or the log store is already showing this worktree (stale
     // rows the user may switch back to). A non-visible, never-loaded log waits for
     // its first open. The shape `head_commit_id` is optional for rolling upgrades.
+    //
+    // refreshCommitLog (not loadCommitLog) preserves the paginated row count and,
+    // via the sha-keyed each, every surviving row's DOM node — so a commit landing
+    // mid-click never tears down the row the user is pressing (which would drop the
+    // synthesized `click` and leave late rows un-openable; see refreshCommitLog).
     const headId = response.status.head_commit_id ?? null;
     if (headId !== commitLogHeadId) {
       commitLogHeadId = headId;
       const logShowsThisWorktree = get(commitLog).worktreeId === worktreeId;
       if (get(railView) === "history" || logShowsThisWorktree) {
-        void loadCommitLog();
+        void refreshCommitLog();
       }
     }
   }
@@ -2773,7 +2892,7 @@ gitWorktreeId.subscribe(($id) => {
   // Swap the History log to the new worktree (per-worktree, refetched on
   // selection). Reset the HEAD tracker so the next status doesn't mistake the new
   // worktree's HEAD for an in-place commit on the old one and skip the load.
-  commitLog.set({ worktreeId: null, commits: [], hasMore: false, loading: false });
+  commitLog.set(EMPTY_COMMIT_LOG);
   commitLogHeadId = null;
   commitLogSeq += 1;
   stopGitStatusPolling();

@@ -23,6 +23,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tempfile::NamedTempFile;
 
@@ -1887,17 +1888,68 @@ fn ahead_of_base_set(repo: &Repository, head: Oid, base: Option<&str>) -> Option
     Some(revwalk.filter_map(|oid| oid.ok()).collect())
 }
 
+/// Process-wide cache of per-commit add/delete totals, keyed by commit [`Oid`].
+///
+/// A commit's diff vs its first parent is immutable for a given sha, so an entry
+/// never goes stale and the cache needs no invalidation. Oids are globally
+/// unique, so a single process-wide map is safe across repos. The History rail
+/// pages the log repeatedly (page size 20) and re-walks overlapping commits, so
+/// caching turns repeated `diff_tree_to_tree` work into a hash lookup. Bounded
+/// to keep memory flat under long scrolling: when full it is cleared wholesale
+/// (cheap, and the hot recent pages refill immediately) rather than pulling in
+/// an LRU dependency the workspace does not already have.
+const LINE_TOTALS_CACHE_CAP: usize = 4096;
+
+fn line_totals_cache() -> &'static Mutex<HashMap<Oid, (usize, usize)>> {
+    static CACHE: OnceLock<Mutex<HashMap<Oid, (usize, usize)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_line_totals(oid: Oid) -> Option<(usize, usize)> {
+    line_totals_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&oid).copied())
+}
+
+fn store_line_totals(oid: Oid, totals: (usize, usize)) {
+    if let Ok(mut cache) = line_totals_cache().lock() {
+        // Wholesale clear when full keeps memory bounded without an LRU dep; the
+        // few hot pages the user is scrolling refill on their next fetch.
+        if cache.len() >= LINE_TOTALS_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(oid, totals);
+    }
+}
+
 /// Add/delete line totals for a commit vs its first parent (vs the empty tree
 /// for a root commit). Mirrors `commit_diff`'s first-parent rule so log totals
-/// and the Commit Tab header agree.
+/// and the Commit Tab header agree. Results are memoised by commit sha; see
+/// [`line_totals_cache`].
 fn commit_line_totals(repo: &Repository, commit: &git2::Commit<'_>) -> Result<(usize, usize)> {
+    let oid = commit.id();
+    if let Some(totals) = cached_line_totals(oid) {
+        return Ok(totals);
+    }
+
     let new_tree = commit.tree()?;
     let parent_tree = match commit.parent(0) {
         Ok(parent) => Some(parent.tree()?),
         Err(_) => None,
     };
-    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), None)?;
-    diff_totals(&diff)
+    // The log only needs add/delete sums, not per-file patches or context, so
+    // skip context lines and ask libgit2 for the aggregate via `Diff::stats()`
+    // (a single pass) instead of building a `Patch` per delta as `diff_totals`
+    // does for the Commit Tab.
+    let mut opts = DiffOptions::new();
+    opts.context_lines(0).interhunk_lines(0);
+    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), Some(&mut opts))?;
+    let stats = diff.stats()?;
+    let totals = (stats.insertions(), stats.deletions());
+
+    store_line_totals(oid, totals);
+    Ok(totals)
 }
 
 /// Sum a diff's added/deleted lines from its per-patch `line_stats`. Binary

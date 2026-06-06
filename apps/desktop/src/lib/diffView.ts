@@ -70,6 +70,50 @@ export type ViewParams = {
   opts: FileDiffOptions<undefined>;
 };
 
+// Deferred, batched teardown for FileDiff instances. cleanUp() only touches the
+// instance's own stored references — it disconnects its ResizeObserver, removes
+// the listeners it added to its own <pre>, cancels its own timers/rAFs, and nulls
+// its caches; its only DOM mutation is `fileContainer.remove()`, which is a
+// harmless no-op once Svelte has already detached the <diffs-container>. So none
+// of it needs the node to still be connected, and it can run after the unmount
+// has painted. A commit tab with dozens of expanded sections fires dozens of
+// destroy()s in one synchronous unmount call stack; running every cleanUp() there
+// blocks the close/tab-switch until they all finish. Instead we queue the
+// instances and flush them once, after the next paint, so the tab visibly closes
+// first. queueMicrotask would still run before paint (no perceived win); we want
+// the paint in between, so we rAF then setTimeout(0): the rAF lands before paint,
+// the timeout after it. The queue is drained whole on every flush, so closing
+// many tabs quickly can never leak an instance.
+const pendingCleanUp: FileDiff<undefined>[] = [];
+let cleanUpScheduled = false;
+
+function flushCleanUp() {
+  cleanUpScheduled = false;
+  // Drain the whole queue (swap to a local list so any destroy() that fires
+  // mid-flush re-schedules a fresh flush rather than mutating the list we walk).
+  const batch = pendingCleanUp.splice(0, pendingCleanUp.length);
+  for (const instance of batch) instance.cleanUp();
+}
+
+function scheduleCleanUp(instance: FileDiff<undefined>) {
+  pendingCleanUp.push(instance);
+  if (cleanUpScheduled) return;
+  cleanUpScheduled = true;
+  // rAF lands just before the next paint; chaining a setTimeout(0) inside it runs
+  // the flush just after the paint, so the closed/switched tab is visible before
+  // the heavy teardown runs. rAF can be starved in a hidden/background document,
+  // so a standalone setTimeout fallback guarantees the flush still happens; both
+  // funnel through `run`, whose guard ensures the batch is flushed exactly once.
+  let flushed = false;
+  const run = () => {
+    if (flushed) return;
+    flushed = true;
+    flushCleanUp();
+  };
+  requestAnimationFrame(() => setTimeout(run, 0));
+  setTimeout(run, 32); // fallback if rAF is starved (hidden document).
+}
+
 // Svelte action: owns one FileDiff instance for the section it's attached to. It
 // renders on mount + on metadata/theme/option change and cleans up when the
 // section unmounts (cleanUp() detaching the Svelte-owned <diffs-container> is fine
@@ -111,8 +155,15 @@ export function fileDiffView(node: HTMLElement, params: ViewParams) {
       }
     },
     destroy() {
-      instance?.cleanUp();
-      instance = undefined;
+      // Hand the instance to the batched, post-paint queue instead of running its
+      // (heavy, dozens-at-once) cleanUp() synchronously in the unmount call stack.
+      // Nulling the local ref first means this action can never re-render or
+      // re-queue the same instance — it's now owned solely by the flush.
+      if (instance) {
+        const dying = instance;
+        instance = undefined;
+        scheduleCleanUp(dying);
+      }
     },
   };
 }

@@ -35,7 +35,6 @@
     gitWorktreeId,
     loadGitStatus,
     loadPrStatus,
-    openCommitTab,
     openPrInfo,
     prInfo,
     pull,
@@ -46,6 +45,7 @@
     viewDiff,
   } from "../daemon";
   import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
+  import { focusWithoutScroll } from "../focusWithoutScroll";
   import { fileIconUrl } from "../file-icons";
   import { focusedPane } from "../keymap";
   import { autoCommitPush, railView } from "../settings";
@@ -277,14 +277,23 @@
   // focus, so we fall back to the aside itself — it has tabindex="-1" and carries
   // onRailKeydown, so ←/→ still round-trips out of an empty view. Assumes the new
   // list is already mounted; callers tick() first when they just changed views.
+  // Forward focus WITHOUT scrolling: this helper only restores DOM focus into the
+  // rail (so arrows work) — it never intends to move the viewport. A roving row is
+  // often clipped at the scroll edge, and a plain .focus() would scroll it fully
+  // into view; under a fresh mouse focus that lands here (target === railEl), the
+  // native scroll yanks the list back to the active row and strands the in-flight
+  // click. The keyboard/scroll paths that DO want to reveal a row call
+  // scrollIntoView explicitly (moveActive / moveActiveCommit → scrollActiveIntoView).
   function focusRailRows() {
     if (historyView) {
       // HISTORY: focus the roving (or first) commit row so arrows work at once.
-      const idx = activeCommit >= 0 ? activeCommit : 0;
+      // The cursor is a sha, so target [data-sha]; fall back to the first row when
+      // nothing is roving (or the roving sha isn't currently rendered).
       const row =
-        railEl?.querySelector<HTMLElement>(`.crow[data-index="${idx}"]`) ??
-        railEl?.querySelector<HTMLElement>(".crow");
-      (row ?? railEl)?.focus();
+        (activeCommitSha
+          ? railEl?.querySelector<HTMLElement>(`.crow[data-sha="${cssEscape(activeCommitSha)}"]`)
+          : null) ?? railEl?.querySelector<HTMLElement>(".crow");
+      (row ?? railEl)?.focus({ preventScroll: true });
       return;
     }
     const active = rovingFiles.find((f) => rowKey(f) === activeKey);
@@ -294,7 +303,7 @@
             `.frow[data-path="${cssEscape(active.path)}"][data-staged="${active.staged}"]`,
           )
         : null) ?? railEl?.querySelector<HTMLElement>(".frow");
-    (row ?? railEl)?.focus();
+    (row ?? railEl)?.focus({ preventScroll: true });
   }
 
   // When the rail root itself receives focus (e.g. via the Cmd+Shift+G focus.git
@@ -312,6 +321,10 @@
     return typeof CSS !== "undefined" && CSS.escape ? CSS.escape(value) : value;
   }
 
+  // Row clicks on the scrollable file list use the shared focusWithoutScroll
+  // pointerdown helper — see ../focusWithoutScroll for why a clipped row's native
+  // focus-into-view would otherwise strand the click.
+
   // ---- HISTORY view: toggle + roving over commit rows ---------------------
   // Git pane focus is SHARED with Changes; the rail-view toggle decides which
   // list is rendered. ←/→ flips the view; ↑/↓ roves commit rows (clamped, no
@@ -327,24 +340,30 @@
   // as "history" from a previous git selection.
   const historyView = $derived($railView === "history" && Boolean($gitWorktreeId));
   const commits = $derived($commitLog.commits);
-  let activeCommit = $state(-1);
+  // The roving (keyboard-focused) commit is tracked by SHA, not array index, so it
+  // survives a pagination APPEND (earlier rows keep their identity) and only drops
+  // when the selected commit genuinely leaves the rendered set. A bare index would
+  // desync after appends/resets and land the indicator on the wrong row (or -1);
+  // the sha is matched against the live array whenever an index is needed.
+  let activeCommitSha = $state<string | null>(null);
   let historyList = $state<HistoryList | null>(null);
 
-  // Reset the roving cursor whenever the rendered log identity changes: a new
-  // worktree's log, a HEAD-change refetch (page-one replaces the array), or
-  // leaving HISTORY. A loadMore APPEND keeps the same head row, so the cursor is
-  // preserved across pagination by anchoring on the worktree id + head sha, not
-  // the array length.
-  let lastLogKey = "";
+  // Reset the roving cursor only when the rendered log's WORKTREE changes (or we
+  // leave HISTORY) — not on a HEAD-change refetch or a pagination append. The
+  // selection is sha-keyed, so it self-heals across those: if the previously
+  // selected sha is still present after a refetch it stays roving, and if it's
+  // gone the cursor simply reads as unset until the user moves/clicks again, rather
+  // than being force-cleared (which previously clobbered a valid selection whenever
+  // page one replaced the array or HEAD moved).
+  let lastWorktreeKey = "";
   $effect(() => {
-    const headSha = commits[0]?.id ?? "";
-    const key = `${$commitLog.worktreeId ?? ""}\0${headSha}`;
+    const key = $commitLog.worktreeId ?? "";
     if (!historyView) {
-      activeCommit = -1;
-      lastLogKey = "";
-    } else if (key !== lastLogKey) {
-      activeCommit = -1;
-      lastLogKey = key;
+      activeCommitSha = null;
+      lastWorktreeKey = "";
+    } else if (key !== lastWorktreeKey) {
+      activeCommitSha = null;
+      lastWorktreeKey = key;
     }
   });
 
@@ -360,18 +379,25 @@
   }
 
   // Move the roving commit by `delta` (clamped, no wrap) and scroll/focus it via
-  // the HistoryList helper — mirrors the file list's moveActive.
+  // the HistoryList helper — mirrors the file list's moveActive. The cursor is a
+  // sha, so we resolve it to the current index, step, then store the neighbor's
+  // sha. An unset/stale sha starts from the top (↓) or bottom (↑) edge.
   function moveActiveCommit(delta: number) {
     if (commits.length === 0) return;
-    const cur = activeCommit < 0 ? (delta > 0 ? -1 : 0) : activeCommit;
-    activeCommit = Math.min(Math.max(cur + delta, 0), commits.length - 1);
+    const curIdx = activeCommitSha ? commits.findIndex((c) => c.id === activeCommitSha) : -1;
+    const from = curIdx < 0 ? (delta > 0 ? -1 : 0) : curIdx;
+    const next = Math.min(Math.max(from + delta, 0), commits.length - 1);
+    activeCommitSha = commits[next]?.id ?? null;
     historyList?.scrollActiveIntoView();
   }
 
-  // Open the focused commit's tab — the same action a row click runs.
+  // Open the focused commit's tab — routes through the SAME path as a row click
+  // (HistoryList.openCommit), so the keyboard Enter both opens the tab AND sets the
+  // sha-based roving selection, exactly as clicking does. Falls back to the first
+  // row when nothing is roving yet so Enter on a fresh History view still opens.
   function openActiveCommit() {
-    const commit = commits[activeCommit];
-    if (commit) openCommitTab(commit.id);
+    const commit = commits.find((c) => c.id === activeCommitSha) ?? commits[0];
+    if (commit) historyList?.openCommit(commit);
   }
 
   // ---- smart actions ------------------------------------------------------
@@ -615,7 +641,7 @@
   </div>
 
   {#if historyView}
-    <HistoryList bind:this={historyList} bind:activeIndex={activeCommit} />
+    <HistoryList bind:this={historyList} bind:activeSha={activeCommitSha} />
   {:else}
   {#if $gitStatus}
     <div class="changes-ctx">
@@ -804,7 +830,7 @@
           </h3>
           {#each staged as file (file.path)}
             {@const parts = splitPath(file.path)}
-            <button class="frow" data-path={file.path} data-staged="true" class:active={$diffPath === file.path && $diffStaged !== false} class:roving={activeKey === rowKey(file)} onclick={() => { activeKey = rowKey(file); void viewDiff(file.path, true, true); }}>
+            <button class="frow" data-path={file.path} data-staged="true" class:active={$diffPath === file.path && $diffStaged !== false} class:roving={activeKey === rowKey(file)} onpointerdown={focusWithoutScroll} onclick={() => { activeKey = rowKey(file); void viewDiff(file.path, true, true); }}>
               <span
                 class="chk on"
                 role="button"
@@ -858,7 +884,7 @@
           </h3>
           {#each unstaged as file (file.path)}
             {@const parts = splitPath(file.path)}
-            <button class="frow" data-path={file.path} data-staged="false" class:active={$diffPath === file.path && $diffStaged !== true} class:roving={activeKey === rowKey(file)} onclick={() => { activeKey = rowKey(file); void viewDiff(file.path, true, false); }}>
+            <button class="frow" data-path={file.path} data-staged="false" class:active={$diffPath === file.path && $diffStaged !== true} class:roving={activeKey === rowKey(file)} onpointerdown={focusWithoutScroll} onclick={() => { activeKey = rowKey(file); void viewDiff(file.path, true, false); }}>
               <span
                 class="chk"
                 role="button"
