@@ -23,6 +23,7 @@
     commit,
     defaultBase,
     diffPath,
+    diffStaged,
     discardAllFiles,
     discardFile,
     generateCommitDraft,
@@ -238,7 +239,10 @@
 
   function confirmDiscardAll() {
     if (files.length === 0 || $gitBusy) return;
-    if (window.confirm(`Discard all ${files.length} changed file${files.length === 1 ? "" : "s"}?`)) {
+    // A partially-staged file appears as two rows (staged + unstaged); count
+    // distinct paths so the prompt matches what discard actually touches.
+    const count = new Set(files.map((f) => f.path)).size;
+    if (window.confirm(`Discard all ${count} changed file${count === 1 ? "" : "s"}?`)) {
       void discardAllFiles();
     }
   }
@@ -464,7 +468,7 @@
           </h3>
           {#each staged as file (file.path)}
             {@const parts = splitPath(file.path)}
-            <button class="frow" class:active={$diffPath === file.path} onclick={() => void viewDiff(file.path, true, true)}>
+            <button class="frow" class:active={$diffPath === file.path && $diffStaged !== false} onclick={() => void viewDiff(file.path, true, true)}>
               <span
                 class="chk on"
                 role="button"
@@ -518,7 +522,7 @@
           </h3>
           {#each unstaged as file (file.path)}
             {@const parts = splitPath(file.path)}
-            <button class="frow" class:active={$diffPath === file.path} onclick={() => void viewDiff(file.path, true, false)}>
+            <button class="frow" class:active={$diffPath === file.path && $diffStaged !== true} onclick={() => void viewDiff(file.path, true, false)}>
               <span
                 class="chk"
                 role="button"

@@ -1615,6 +1615,8 @@ impl TestClient {
                 worktree_id,
                 path,
                 staged: None,
+                ignore_whitespace: None,
+                context_lines: None,
             },
         );
         loop {

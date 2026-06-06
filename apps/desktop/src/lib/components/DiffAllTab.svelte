@@ -62,6 +62,10 @@
     collapsed[rowKey] = !collapsed[rowKey];
   }
 
+  // A partially-staged file contributes two rows (staged + unstaged); the
+  // header counts distinct files, not sections.
+  const fileCount = $derived(new Set($allChangesFiles.map((f) => f.path)).size);
+
   // A single FileDiff per mounted (expanded, renderable) section. The Svelte
   // action owns its instance: it renders on mount + on text/theme change and
   // cleans up when the section unmounts (collapse) — cleanUp() detaching the
@@ -117,7 +121,7 @@
     <span class="glyph" aria-hidden="true">±</span>
     <span class="path">All changes</span>
     <span class="head-right">
-      <span class="meta">{$allChangesFiles.length} files</span>
+      <span class="meta">{fileCount} file{fileCount === 1 ? "" : "s"}</span>
       <DiffViewOptions />
     </span>
   </div>

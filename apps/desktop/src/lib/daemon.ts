@@ -183,6 +183,13 @@ export const diffActive = writable<boolean>(false);
 // which only ever care about the visible diff. They derive off the tab set so
 // there's a single source of truth (`diffTabs` + `activeDiffPath`).
 export const diffPath = derived(activeDiffPath, ($path) => $path);
+// Which side the visible diff tab shows. A partially-staged file appears as two
+// Changes-panel rows (staged + unstaged), so the highlight must compare both
+// axes; `undefined` (legacy/no explicit side) matches either row.
+export const diffStaged = derived(
+  [diffTabs, activeDiffPath],
+  ([$tabs, $path]) => $tabs.find((tab) => tab.path === $path)?.staged,
+);
 export const diffText = derived(
   [diffTabs, activeDiffPath],
   ([$tabs, $path]) => $tabs.find((tab) => tab.path === $path)?.text ?? null,
@@ -1434,16 +1441,30 @@ function optimisticallySetFilesStaged(
   gitStatus.update((current) => {
     if (!current || current.worktree_id !== worktreeId) return current;
     let changed = false;
-    const files: ChangedFile[] = current.files.map((file) => {
-      if (!selected.has(file.path)) return file;
-      const next = {
-        ...file,
-        staged,
-        status: staged ? statusAfterStage(file.status) : statusAfterUnstage(file.status),
-      };
-      changed ||= next.staged !== file.staged || next.status !== file.status;
-      return next;
-    });
+    // A partially-staged file has two rows (staged + unstaged). Flipping a side
+    // merges it into the other side's row, so dedupe by (path, staged) — keeping
+    // the first occurrence preserves the flipped row's post-stage/unstage status
+    // (rows arrive staged-side first, matching the daemon's emit order).
+    const seen = new Set<string>();
+    const files: ChangedFile[] = [];
+    for (const file of current.files) {
+      let next = file;
+      if (selected.has(file.path) && file.staged !== staged) {
+        next = {
+          ...file,
+          staged,
+          status: staged ? statusAfterStage(file.status) : statusAfterUnstage(file.status),
+        };
+        changed = true;
+      }
+      const key = `${next.staged}\0${next.path}`;
+      if (seen.has(key)) {
+        changed = true;
+        continue;
+      }
+      seen.add(key);
+      files.push(next);
+    }
     return changed ? { ...current, dirty: files.length > 0, files } : current;
   });
   dirtyWorktrees.update((current) =>
@@ -2083,7 +2104,8 @@ export function discardFile(path: string): Promise<void> {
 }
 
 export function discardAllFiles(): Promise<void> {
-  const paths = get(gitStatus)?.files.map((file) => file.path) ?? [];
+  // A partially-staged file appears as two rows; send each path only once.
+  const paths = [...new Set(get(gitStatus)?.files.map((file) => file.path) ?? [])];
   return discardFiles(paths);
 }
 
