@@ -1,17 +1,23 @@
 <script lang="ts">
   // Diff view (mockup .diff): a unified diff rendered with Shiki syntax
   // highlighting via @pierre/diffs. The daemon-fetched diff text (a full git
-  // unified-diff string) is parsed by @pierre/diffs' processFile and rendered
-  // into a shadow-DOM <diffs-container> by a FileDiff instance. The local
-  // classifier (lib/diff.ts) is still used for the add/del counts and the
-  // empty/binary fallback states. Theming follows the app's light/dark mode and
-  // bridges Pierre's --diffs-* chrome vars to the app's --term-* tokens. Peer of
-  // the session terminal in the center; the tab + close affordance live in
-  // SessionTabs.
+  // unified-diff string) is parsed by @pierre/diffs' processPatch — which splits
+  // the patch on `diff --git` boundaries — and each file section is rendered into
+  // its own shadow-DOM <diffs-container> by a FileDiff instance. Most rows are a
+  // single file (one section, identical to a plain FileDiff), but a collapsed
+  // untracked-directory row diffs with recurse_untracked_dirs(true) on the daemon
+  // side, so its patch carries one `diff --git` section per file in the directory;
+  // processPatch yields them all so the whole directory renders rather than only
+  // the first file (processFile would greedily fold the later files' hunks into
+  // the first, corrupting the view). The local classifier (lib/diff.ts) is still
+  // used for the add/del counts and the empty/binary fallback states. Theming
+  // follows the app's light/dark mode and bridges Pierre's --diffs-* chrome vars
+  // to the app's --term-* tokens. Peer of the session terminal in the center; the
+  // tab + close affordance live in SessionTabs.
   // Importing FileDiff also registers the <diffs-container> custom element it
   // renders into (its module pulls in @pierre/diffs' web-components side effect,
   // which owns the shadow root + adopted Pierre stylesheet).
-  import { FileDiff, processFile, type FileDiffOptions } from "@pierre/diffs";
+  import { FileDiff, processPatch, type FileDiffMetadata, type FileDiffOptions } from "@pierre/diffs";
   import { diffPath, diffText } from "../daemon";
   import { parseDiff } from "../diff";
   import { theme } from "../theme";
@@ -19,19 +25,26 @@
   import { diffStyle, diffWrap } from "../settings";
 
   // Local classifier: only used here for the add/del counts shown in the header
-  // and to detect the binary / empty (mode/rename-only) cases that processFile
-  // also returns `undefined` for — keeping the existing fallback UI.
+  // and to detect the binary / empty (mode/rename-only) cases that processPatch
+  // also returns no renderable files for — keeping the existing fallback UI.
   const parsed = $derived($diffText === null ? null : parseDiff($diffText));
 
-  // Pierre's FileDiffMetadata (undefined for empty/binary).
-  const fileDiff = $derived(
-    $diffText === null ? undefined : processFile($diffText, { isGitDiff: true }),
+  // Pierre's per-file metadata, one entry per `diff --git` section in the patch.
+  // A normal file row yields a single section; a collapsed untracked-directory
+  // row yields one section per file in the directory. Empty for binary/empty.
+  const files = $derived<FileDiffMetadata[]>(
+    $diffText === null ? [] : processPatch($diffText, undefined).files,
   );
+  // True when there's at least one renderable file section.
+  const hasDiff = $derived(files.length > 0);
+  // Show a per-section path header only when the patch spans multiple files
+  // (a directory row); a single-file diff keeps the bare top header bar.
+  const showSectionHeaders = $derived(files.length > 1);
 
   // Render-side view options driven by the persisted `diffStyle` / `diffWrap`
   // settings. They only re-lay-out the already-fetched diff (split vs unified,
   // wrap vs scroll), so changing them calls setOptions + rerender on the live
-  // instance rather than re-fetching. `$derived` so instances created mid-
+  // instances rather than re-fetching. `$derived` so sections created mid-
   // session also start with the current values.
   const options = $derived<FileDiffOptions<undefined>>({
     diffStyle: $diffStyle,
@@ -44,52 +57,52 @@
     stickyHeader: false,
     preferredHighlighter: "shiki-js", // no WASM, faster startup.
     theme: { light: "pierre-light", dark: "pierre-dark" },
+    themeType: $theme,
   });
 
-  let container = $state<HTMLElement>();
-  let instance: FileDiff<undefined> | undefined;
+  // One FileDiff per rendered file section. The Svelte action owns its instance:
+  // it renders on mount + on metadata/theme/option change and cleans up when the
+  // section unmounts (cleanUp() detaching the Svelte-owned <diffs-container> is
+  // fine here because Svelte is removing it too). Threading the params through the
+  // action lets a split/wrap/theme toggle re-apply to every live instance via
+  // setOptions + rerender. Mirrors DiffAllTab's per-section pattern.
+  type ViewParams = {
+    fileDiff: FileDiffMetadata;
+    opts: FileDiffOptions<undefined>;
+  };
 
-  // Create the instance once, (re)render whenever the parsed diff changes.
-  // Deliberately NO teardown on this effect: an $effect teardown runs before
-  // every re-run (not just on destroy), and FileDiff.cleanUp() removes the
-  // container element from the DOM (it assumes it created it, but ours is the
-  // Svelte-owned <diffs-container> below) — cleaning up between renders would
-  // leave every render after the first in a detached node, so only the first
-  // clicked diff would ever show. When there's no renderable diff (empty /
-  // binary / loading) the previous render is left in place, hidden by
-  // `class:hidden` so only the fallback markup shows.
-  $effect(() => {
-    const el = container;
-    if (!el || !fileDiff) return;
-    if (!instance) instance = new FileDiff<undefined>({ ...options, themeType: $theme });
-    instance.setThemeType($theme);
-    instance.render({ fileDiff, fileContainer: el, forceRender: true });
-  });
+  function fileDiffView(node: HTMLElement, params: ViewParams) {
+    let instance: FileDiff<undefined> | undefined;
+    let lastFileDiff: FileDiffMetadata | undefined;
 
-  // Destroy-only teardown: this effect reads no reactive state, so it runs
-  // exactly once and its cleanup fires only on unmount (where cleanUp()
-  // detaching the container is fine — Svelte is removing it anyway).
-  $effect(() => {
-    return () => {
-      instance?.cleanUp();
-      instance = undefined;
+    function render(fileDiff: FileDiffMetadata, opts: FileDiffOptions<undefined>) {
+      if (!instance) instance = new FileDiff<undefined>({ ...opts });
+      else instance.setOptions(opts);
+      instance.setThemeType(opts.themeType ?? "light");
+      instance.render({ fileDiff, fileContainer: node, forceRender: true });
+      lastFileDiff = fileDiff;
+    }
+
+    render(params.fileDiff, params.opts);
+
+    return {
+      update(next: ViewParams) {
+        if (next.fileDiff !== lastFileDiff) {
+          // New metadata: a full re-render (also picks up the latest opts).
+          render(next.fileDiff, next.opts);
+        } else if (instance) {
+          // Same metadata, changed options (split/wrap/theme): merge + re-lay-out.
+          instance.setOptions(next.opts);
+          instance.setThemeType(next.opts.themeType ?? "light");
+          instance.rerender();
+        }
+      },
+      destroy() {
+        instance?.cleanUp();
+        instance = undefined;
+      },
     };
-  });
-
-  // Follow the app's light/dark mode.
-  $effect(() => {
-    instance?.setThemeType($theme);
-  });
-
-  // Apply render-side option changes (split/unified, wrap/scroll) to the live
-  // instance. setOptions only merges the new options; rerender() re-lays-out the
-  // already-parsed diff with them. Reads `options` so it re-runs on any toggle.
-  $effect(() => {
-    const next = options;
-    if (!instance) return;
-    instance.setOptions(next);
-    instance.rerender();
-  });
+  }
 </script>
 
 <div class="diff">
@@ -111,18 +124,27 @@
     <div class="diff-empty"><p>Loading diff…</p></div>
   {:else if parsed.isBinary}
     <div class="diff-empty"><p>Binary file — no text diff.</p></div>
-  {:else if parsed.isEmpty || !fileDiff}
+  {:else if parsed.isEmpty || !hasDiff}
     <div class="diff-empty"><p>No textual changes.</p></div>
+  {:else}
+    <!-- One @pierre/diffs instance per file section in the patch. A single file
+         renders one bare section; a directory row stacks every file, each with a
+         small path header so they read as distinct files. The action keys off the
+         metadata identity so re-renders rebuild only what changed. -->
+    {#each files as fileDiff (fileDiff.name)}
+      <div class="section">
+        {#if showSectionHeaders}
+          <div class="section-head">
+            <span class="fpath">{fileDiff.name}</span>
+          </div>
+        {/if}
+        <diffs-container
+          class="diffs"
+          use:fileDiffView={{ fileDiff, opts: options }}
+        ></diffs-container>
+      </div>
+    {/each}
   {/if}
-
-  <!-- The FileDiff renders into this element via shadow DOM; it stays mounted so
-       a single instance can re-render across diff changes. Hidden when there's
-       nothing renderable so only the fallback message above shows. -->
-  <diffs-container
-    bind:this={container}
-    class="diffs"
-    class:hidden={!fileDiff}
-  ></diffs-container>
 </div>
 
 <style>
@@ -188,6 +210,32 @@
     margin-left: 4px;
   }
 
+  /* Per-file section header for multi-file (directory) rows. Matches the
+     all-changes section header (DiffAllTab .file-head) so stacked files read the
+     same across both diff views. Single-file diffs never render this. */
+  .section + .section {
+    border-top: 1px solid var(--term-line);
+  }
+  .section-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 16px;
+    background: var(--term-bg2);
+    border-bottom: 1px solid var(--term-line);
+    position: sticky;
+    top: 38px;
+    z-index: 1;
+  }
+  .section-head .fpath {
+    font-family: var(--mono);
+    font-size: var(--r1);
+    color: var(--term-fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   /* The @pierre/diffs container. The --diffs-* custom properties inherit across
      the shadow boundary, so setting them here bridges Pierre's chrome to the
      app's terminal tokens (which Center.svelte already overrides per-mode via
@@ -212,9 +260,6 @@
     /* Line-number gutter + hover → dim terminal tokens. */
     --diffs-fg-number-override: var(--term-dim);
     --diffs-bg-hover-override: oklch(from var(--term-fg) l c h / 0.06);
-  }
-  .diffs.hidden {
-    display: none;
   }
 
   .diff-empty {

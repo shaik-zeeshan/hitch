@@ -303,8 +303,26 @@ function writeFreshDiffCache(cacheKey: string, writeSeq: number, text: string): 
 
 const forcedAllChangesRefreshWorktrees = new Set<Id>();
 
+// Drop every cached diff variant for one worktree/path/side, across ALL re-diff
+// option keys — not just the one active now. The option key sits between the side
+// token and the path in the cache key (`worktree\0side\0optionKey\0path`), so a
+// fixed-key delete would only evict the current-option variant and leave a stale
+// entry under another option key (e.g. ignore-whitespace toggled) that a later
+// toggle-back would serve without re-asking the daemon. The `\0` delimiter bounds
+// every segment, so matching the worktree+side prefix and the `\0path` suffix is
+// unambiguous (no false positives between paths that share a suffix, or between
+// sides whose names share a prefix). `staged === undefined` invalidates all sides.
+function invalidateDiffCacheVariants(worktreeId: Id, path: string, staged?: boolean): void {
+  const pathSuffix = `\0${path}`;
+  const prefix =
+    staged === undefined ? `${worktreeId}\0` : `${worktreeId}\0${diffSideKey(staged)}\0`;
+  for (const key of diffCache.keys()) {
+    if (key.startsWith(prefix) && key.endsWith(pathSuffix)) diffCache.delete(key);
+  }
+}
+
 function deleteDiffCacheForChangedFiles(worktreeId: Id, files: ChangedFile[]): void {
-  for (const file of files) diffCache.delete(diffCacheKey(worktreeId, file.path, file.staged));
+  for (const file of files) invalidateDiffCacheVariants(worktreeId, file.path, file.staged);
 }
 
 function requestAllChangesRefreshOnNextStatus(worktreeId: Id): void {
@@ -2035,9 +2053,7 @@ export async function setFilesStaged(
     const openTabs = get(diffTabs);
     const openPaths = new Set(openTabs.map((tab) => tab.path));
     for (const path of paths) {
-      diffCache.delete(diffCacheKey(worktreeId, path, true));
-      diffCache.delete(diffCacheKey(worktreeId, path, false));
-      diffCache.delete(diffCacheKey(worktreeId, path));
+      invalidateDiffCacheVariants(worktreeId, path);
       if (!openPaths.has(path)) continue;
       void viewDiff(path, false, staged);
     }
@@ -2079,9 +2095,7 @@ export async function discardFiles(paths: string[]): Promise<void> {
     });
     // A discarded file has no diff left to show, so drop its tab.
     for (const path of paths) {
-      diffCache.delete(diffCacheKey(worktreeId, path, true));
-      diffCache.delete(diffCacheKey(worktreeId, path, false));
-      diffCache.delete(diffCacheKey(worktreeId, path));
+      invalidateDiffCacheVariants(worktreeId, path);
       closeDiff(path);
     }
     await loadGitStatus(worktreeId);

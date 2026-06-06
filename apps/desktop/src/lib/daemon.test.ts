@@ -77,7 +77,13 @@ import {
   worktreeLineStats,
   worktrees,
 } from "./daemon";
-import { draftClaudePath, draftCodexPath, draftModel, draftProvider } from "./settings";
+import {
+  diffIgnoreWhitespace,
+  draftClaudePath,
+  draftCodexPath,
+  draftModel,
+  draftProvider,
+} from "./settings";
 import type { ChangedFile } from "./types";
 
 // Flush the StartJob promise chain (runJob -> daemonRequest -> invoke) so the
@@ -115,6 +121,7 @@ beforeEach(() => {
   draftModel.set("");
   draftClaudePath.set("");
   draftCodexPath.set("");
+  diffIgnoreWhitespace.set(false);
 });
 
 describe("daemon status mapping", () => {
@@ -1730,6 +1737,83 @@ describe("all-changes diff tab", () => {
 
     expect(get(allChangesFiles)).toEqual([
       { path: "src/a.ts", staged: false, text: "diff v2 for src/a.ts" },
+    ]);
+  });
+
+  it("invalidates every option-key variant on worktree-dirty so a toggled-back option re-fetches", async () => {
+    // Each git-diff response encodes the diff version and the current
+    // ignore-whitespace option, so a stale (un-invalidated) cache entry is
+    // detectable by its version/option text.
+    let diffVersion = 0;
+    const files: ChangedFile[] = [
+      { path: "src/a.ts", status: "modified", staged: false, additions: 1, deletions: 1 },
+    ];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus(files);
+    invokeMock.mockImplementation(
+      async (
+        _command: string,
+        { request }: { request: { type: string; path?: string; ignore_whitespace?: boolean } },
+      ) => {
+        if (request.type === "git-diff") {
+          diffVersion += 1;
+          const iw = request.ignore_whitespace ? "iw" : "no-iw";
+          return { type: "git-diff", diff: { diff: `diff v${diffVersion} ${iw} for ${request.path}` } };
+        }
+        if (request.type === "git-status") {
+          return {
+            type: "git-status",
+            status: {
+              worktree_id: worktree.id,
+              branch: "feature",
+              dirty: true,
+              ahead: 0,
+              behind: 0,
+              additions: 1,
+              deletions: 1,
+              files,
+            },
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // (a) Cache the all-changes diff under option-key A (ignore-whitespace ON).
+    diffIgnoreWhitespace.set(true);
+    await viewAllChanges();
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v1 iw for src/a.ts" },
+    ]);
+
+    // (b) Toggle to option-key B (ignore-whitespace OFF); the subscribe-driven
+    // refreshOpenDiffs re-fans and caches the file under key B too.
+    diffIgnoreWhitespace.set(false);
+    await flush();
+    await flush();
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v2 no-iw for src/a.ts" },
+    ]);
+
+    // (c) The file changes on disk while option B is the current setting. The
+    // dirty-status handler must invalidate BOTH option variants, not just B.
+    applyHitchEvent({ type: "worktree-dirty", worktree_id: worktree.id, dirty: true });
+    await flush();
+    await flush();
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v3 no-iw for src/a.ts" },
+    ]);
+
+    // (d) Toggle back to option-key A. If only the current (B) variant was
+    // invalidated, the stale v1 key-A entry survives and is served without
+    // re-asking the daemon — permanently showing the pre-change diff.
+    diffIgnoreWhitespace.set(true);
+    await flush();
+    await flush();
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v4 iw for src/a.ts" },
     ]);
   });
 

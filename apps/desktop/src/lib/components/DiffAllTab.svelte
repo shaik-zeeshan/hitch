@@ -1,13 +1,25 @@
 <script lang="ts">
   // All-changes view (the special ALL_CHANGES_TAB diff tab): every changed file
   // in one scroll, each as a collapsible section. Mirrors DiffTab's @pierre/diffs
-  // rendering, but one FileDiff instance per *expanded* file (the library
+  // rendering, but one FileDiff instance per *expanded* file section (the library
   // supports many instances). Sections are expanded by default; collapsing a
   // section unmounts its <diffs-container> so we only process diffs the user is
-  // looking at. Per-file diff text comes from `allChangesFiles` (fanned out by
+  // looking at. Per-row diff text comes from `allChangesFiles` (fanned out by
   // viewAllChanges in daemon.ts), not a single diff string — so this reuses the
   // --diffs-* token bridge from DiffTab but its own data path.
-  import { FileDiff, processFile, type FileDiffOptions } from "@pierre/diffs";
+  //
+  // A row's patch usually carries one `diff --git` section, but a collapsed
+  // untracked-directory row diffs with recurse_untracked_dirs(true) on the daemon
+  // side, so its patch carries one section per file in the directory. We parse
+  // each row's text with processPatch and render one FileDiff per section (one
+  // path sub-header each, mirroring DiffTab) — processFile is single-file-only and
+  // would greedily fold the later files' hunks into the first, corrupting the view.
+  import {
+    FileDiff,
+    processPatch,
+    type FileDiffMetadata,
+    type FileDiffOptions,
+  } from "@pierre/diffs";
   import ChevronDown from "~icons/lucide/chevron-down";
   import ChevronRight from "~icons/lucide/chevron-right";
   import { allChangesFiles } from "../daemon";
@@ -33,6 +45,24 @@
     const parsed = parseDiff(text);
     parsedByRow.set(rowKey, { text, parsed });
     return parsed;
+  }
+
+  // Pierre's per-file metadata for an expanded row, one entry per `diff --git`
+  // section: a single entry for a normal file row, one per file for a collapsed
+  // untracked-directory row. Cached by row identity so a re-render reuses the
+  // parsed sections rather than re-splitting the patch. Only computed for
+  // expanded rows (collapsed rows are never processed). processPatch returns no
+  // files for binary/empty patches, which the parseDiff classifier already flags
+  // and renders a fallback for, so this is only read on the renderable branch.
+  const filesByRow = new Map<string, { text: string; files: FileDiffMetadata[] }>();
+
+  function filesFor(rowKey: string, text: string | null, expanded: boolean): FileDiffMetadata[] {
+    if (text === null || !expanded) return [];
+    const cached = filesByRow.get(rowKey);
+    if (cached?.text === text) return cached.files;
+    const files = processPatch(text, undefined).files;
+    filesByRow.set(rowKey, { text, files });
+    return files;
   }
 
   function allChangesRowKey(path: string, staged: boolean): string {
@@ -67,7 +97,7 @@
   const fileCount = $derived(new Set($allChangesFiles.map((f) => f.path)).size);
 
   // A single FileDiff per mounted (expanded, renderable) section. The Svelte
-  // action owns its instance: it renders on mount + on text/theme change and
+  // action owns its instance: it renders on mount + on metadata/theme change and
   // cleans up when the section unmounts (collapse) — cleanUp() detaching the
   // <diffs-container> is fine here because Svelte is removing it too. Mirrors the
   // teardown reasoning in DiffTab, but per section. The render-side `opts` are
@@ -75,34 +105,31 @@
   // every active instance via setOptions + rerender (the {@const} below passes
   // the current `options` to each section, so Svelte re-runs `update` on change).
   type ViewParams = {
-    text: string;
-    themeType: "light" | "dark";
+    fileDiff: FileDiffMetadata;
     opts: FileDiffOptions<undefined>;
   };
 
   function fileDiffView(node: HTMLElement, params: ViewParams) {
     let instance: FileDiff<undefined> | undefined;
-    let lastText: string | null = null;
+    let lastFileDiff: FileDiffMetadata | undefined;
 
-    function render(text: string, opts: FileDiffOptions<undefined>) {
-      const fileDiff = processFile(text, { isGitDiff: true });
-      if (!fileDiff) return;
+    function render(fileDiff: FileDiffMetadata, opts: FileDiffOptions<undefined>) {
       if (!instance) instance = new FileDiff<undefined>({ ...opts });
       else instance.setOptions(opts);
       instance.setThemeType(opts.themeType ?? "light");
       instance.render({ fileDiff, fileContainer: node, forceRender: true });
-      lastText = text;
+      lastFileDiff = fileDiff;
     }
 
-    render(params.text, params.opts);
+    render(params.fileDiff, params.opts);
 
     return {
       update(next: ViewParams) {
-        if (next.text !== lastText) {
-          // New text: a full re-render (which also picks up the latest opts).
-          render(next.text, next.opts);
+        if (next.fileDiff !== lastFileDiff) {
+          // New metadata: a full re-render (which also picks up the latest opts).
+          render(next.fileDiff, next.opts);
         } else if (instance) {
-          // Same text, changed options (split/wrap/theme): merge + re-lay-out.
+          // Same metadata, changed options (split/wrap/theme): merge + re-lay-out.
           instance.setOptions(next.opts);
           instance.setThemeType(next.opts.themeType ?? "light");
           instance.rerender();
@@ -134,6 +161,8 @@
     {@const rowKey = allChangesRowKey(file.path, file.staged)}
     {@const isCollapsed = collapsed[rowKey] === true}
     {@const parsed = parsedFor(rowKey, file.text, !isCollapsed)}
+    {@const files = filesFor(rowKey, file.text, !isCollapsed)}
+    {@const showSectionHeaders = files.length > 1}
     <section class="file">
       <button
         class="file-head"
@@ -169,12 +198,25 @@
         {:else if parsed.isEmpty}
           <div class="diff-empty small"><p>No textual changes.</p></div>
         {:else}
-          <!-- One @pierre/diffs instance per expanded section, mounted only while
-               expanded so collapsed files are never processed. -->
-          <diffs-container
-            class="diffs"
-            use:fileDiffView={{ text: file.text!, themeType: $theme, opts: options }}
-          ></diffs-container>
+          <!-- One @pierre/diffs instance per file section in the row's patch,
+               mounted only while expanded so collapsed rows are never processed.
+               A normal row is a single section (no sub-header — identical to
+               before); a collapsed untracked-directory row stacks every file,
+               each with a small path sub-header (mirroring DiffTab) so they read
+               as distinct files rather than repeating the directory path. -->
+          {#each files as fileDiff (fileDiff.name)}
+            <div class="section">
+              {#if showSectionHeaders}
+                <div class="section-head">
+                  <span class="fpath">{fileDiff.name}</span>
+                </div>
+              {/if}
+              <diffs-container
+                class="diffs"
+                use:fileDiffView={{ fileDiff, opts: options }}
+              ></diffs-container>
+            </div>
+          {/each}
         {/if}
       {/if}
     </section>
@@ -316,6 +358,31 @@
     color: var(--diff-del);
     font-weight: 600;
     margin-left: 4px;
+  }
+
+  /* Per-file section sub-header for multi-file (collapsed-directory) rows. Only
+     rendered when a row's patch spans more than one `diff --git` section; a
+     normal single-file row renders the bare diff body with no sub-header, exactly
+     as before. Matches DiffTab's .section-head so stacked files read the same
+     across both diff views. */
+  .section + .section {
+    border-top: 1px solid var(--term-line);
+  }
+  .section-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 16px 7px 38px;
+    background: var(--term-bg2);
+    border-bottom: 1px solid var(--term-line);
+  }
+  .section-head .fpath {
+    font-family: var(--mono);
+    font-size: var(--r1);
+    color: var(--term-fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   /* The @pierre/diffs container — same chrome→terminal token bridge as DiffTab. */
