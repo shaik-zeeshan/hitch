@@ -14,6 +14,7 @@ const DIFF_WRAP_KEY = "hitch.diffWrap";
 const DIFF_IGNORE_WHITESPACE_KEY = "hitch.diffIgnoreWhitespace";
 const DIFF_CONTEXT_LINES_KEY = "hitch.diffContextLines";
 const TERM_FONT_FAMILY_KEY = "hitch.termFontFamily";
+const RAIL_VIEW_KEY = "hitch.railView";
 
 // Editor preference passed to the desktop backend. Empty string is the
 // default and means "System default": the backend resolves $VISUAL/$EDITOR at
@@ -173,6 +174,20 @@ export const diffContextLines = persistedNumber(
 // Font, so dev icons render — see terminalFontStack).
 export const DEFAULT_TERM_FONT_FAMILY = "";
 export const terminalFontFamily = persisted(TERM_FONT_FAMILY_KEY, DEFAULT_TERM_FONT_FAMILY);
+
+// Which right-rail view is active: CHANGES (working tree) or HISTORY (commit
+// log). A global UI preference — it survives worktree switches and restarts;
+// the log itself is per-worktree and refetches on selection.
+export type RailView = "changes" | "history";
+export const DEFAULT_RAIL_VIEW: RailView = "changes";
+
+function isRailView(value: string): value is RailView {
+  return value === "changes" || value === "history";
+}
+
+export const railView = persisted(RAIL_VIEW_KEY, DEFAULT_RAIL_VIEW, (value) =>
+  isRailView(value) ? value : DEFAULT_RAIL_VIEW,
+) as Writable<RailView>;
 
 // Base terminal stack: the shell's --mono stack (JetBrains Mono, app.css),
 // with the symbols-only Nerd Fonts appended as icon fallbacks. The bundled

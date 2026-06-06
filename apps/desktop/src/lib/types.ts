@@ -77,12 +77,52 @@ export type GitStatus = {
   behind: number;
   additions: number;
   deletions: number;
+  // Full SHA of the current HEAD commit, or `null` on an unborn HEAD. The
+  // History view refetches its log when this changes. Optional for rolling
+  // upgrades — an older daemon omits it (serde `default`).
+  head_commit_id?: string | null;
   files: ChangedFile[];
 };
 
 export type FileDiff = {
   worktree_id: Id;
   path: string;
+  diff: string;
+};
+
+// One commit row in a History `CommitLog` page. Mirrors hitch-proto's
+// `CommitInfo` (struct fields are snake_case in the wire JSON). `time` is unix
+// seconds; `summary`/`body`/`author` are null when absent.
+export type CommitInfo = {
+  id: string;
+  summary: string | null;
+  body: string | null;
+  author: string | null;
+  time: number;
+  is_merge: boolean;
+  ahead_of_base: boolean;
+  additions: number;
+  deletions: number;
+};
+
+// The metadata header of a Commit Tab. Mirrors hitch-proto's `CommitMeta`
+// (CommitInfo minus `ahead_of_base`).
+export type CommitMeta = {
+  id: string;
+  summary: string | null;
+  body: string | null;
+  author: string | null;
+  time: number;
+  is_merge: boolean;
+  additions: number;
+  deletions: number;
+};
+
+// One file's diff within a Commit Tab. Mirrors the working-tree per-file diff
+// shape (path + status + patch text) so the frontend reuses its diff renderer.
+export type CommitFileDiff = {
+  path: string;
+  status: FileStatus;
   diff: string;
 };
 
@@ -136,6 +176,23 @@ export type GitDiffRequest = {
   // `context_lines` overrides git's default of 3 lines of surrounding context.
   ignore_whitespace?: boolean;
   context_lines?: number;
+};
+
+// Read a page of the worktree's enriched HEAD commit log (History view). A fast
+// synchronous git read, not a Job. Replies with a `commit-log` response.
+export type GitLogRequest = {
+  type: "git-log";
+  worktree_id: Id;
+  limit: number;
+  offset: number;
+};
+
+// Read one commit's metadata plus per-file first-parent diff in one round-trip
+// (Commit Tab). A fast synchronous git read; replies with `commit-diff`.
+export type CommitDiffRequest = {
+  type: "commit-diff";
+  worktree_id: Id;
+  commit_id: string;
 };
 
 

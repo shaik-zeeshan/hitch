@@ -60,6 +60,14 @@ _Avoid_: Task (a Job is not a tracked tree work-item — see Session's avoided t
 A non-interactive generation run that drafts commit messages, commit bodies, or PR descriptions from git context. It is one kind of **Job** — dispatched off the request loop rather than blocking a synchronous request as it does today. Its provider binaries (claude/codex) are user-configurable paths, needed where they aren't on the service PATH (ADR 0007 amendment 2026-06-04).
 _Avoid_: Agent harness, Agent.
 
+**History**:
+The right rail's second view (decided 2026-06-06): the selected **Worktree**'s full commit log from HEAD, switched via a CHANGES | HISTORY header toggle (one view at a time, `←`/`→` when the git pane is focused). Commits ahead of the base branch carry an iris branch-work marker; rows are two lines (summary, then sha · relative time · author). Freshness rides the existing status backbone: the HEAD commit id travels in `GitStatus`, and a changed id refetches the log (~1s, covers Agent commits made in a PTY). Selecting a commit opens its **Commit Tab**. Merge commits diff against their first parent and carry a *merge* badge.
+_Avoid_: Log view (UI label is HISTORY), Timeline.
+
+**Commit Tab**:
+A center-pane diff tab showing one commit, opened from **History** — one tab **per commit**, keyed by sha (peer of file diff tabs and all-changes). Label is a commit glyph + 7-char short sha; body is a metadata header (full sha, message, author, date, ±totals) above collapsible per-file sections in the all-changes style. Its content is immutable: cached per sha with no invalidation, and the tab survives history rewrites (an amended/rebased-away sha keeps its open tab; the object is still readable).
+_Avoid_: Commit view (it is a tab, not a rail view), Revision tab.
+
 ## Relationships
 
 - A **Project** is either git-backed or a plain folder (its *kind*).
@@ -72,6 +80,7 @@ _Avoid_: Agent harness, Agent.
 - A **Draft Generator** runs outside Sessions and does not produce **Agent State**.
 - A **Job** is owned by the **Daemon**, runs off the request loop, and reports its lifecycle via events; the GUI observes Jobs but never owns them. Fast git reads are not Jobs.
 - **Daemon Status** describes the Daemon process's own liveness; it is broader than, and contains, any single GUI's connection state.
+- **History** belongs to the right rail and shows exactly one **Worktree**'s log; a **Commit Tab** belongs to the center tab strip. Commit reads (log, commit diff) follow the fast synchronous git-read path, not **Jobs**.
 
 ## Flagged ambiguities
 

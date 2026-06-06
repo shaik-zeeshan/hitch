@@ -45,8 +45,13 @@ use serde::{Deserialize, Serialize};
 /// `Request::GitDiff` gains `staged`/`ignore_whitespace`/`context_lines` so the
 /// client can request the correct diff side and rendering, and `ChangedFile`
 /// gains `additions`/`deletions` line counts — an old daemon at v21 would
-/// otherwise serve wrong-side diffs and zeroed counts.
-pub const PROTOCOL_VERSION: u16 = 22;
+/// otherwise serve wrong-side diffs and zeroed counts. v23 adds the History
+/// reads: `Request::GitLog`/`Response::CommitLog` (paginated enriched commit
+/// log) and `Request::CommitDiff`/`Response::CommitDiff` (one commit's
+/// first-parent per-file diff), and adds `head_commit_id` to `GitStatus` so the
+/// log can refetch off the existing status backbone — an old daemon at v22 has
+/// neither request nor the head id.
+pub const PROTOCOL_VERSION: u16 = 23;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -239,6 +244,22 @@ pub enum Request {
         ignore_whitespace: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_lines: Option<u32>,
+    },
+    /// Read a page of the worktree's enriched `HEAD` commit log for the History
+    /// view, newest first. `offset` skips that many commits; `limit` caps the
+    /// page. Replies with [`Response::CommitLog`] (`has_more` flags more past
+    /// the page). A fast synchronous git read, not a Job.
+    GitLog {
+        worktree_id: WorktreeId,
+        limit: u32,
+        offset: u32,
+    },
+    /// Read one commit's full diff — metadata plus per-file unified patches vs
+    /// its first parent (the empty tree for a root commit) — in one round-trip.
+    /// Replies with [`Response::CommitDiff`]. A fast synchronous git read.
+    CommitDiff {
+        worktree_id: WorktreeId,
+        commit_id: String,
     },
     /// Stage whole files.
     StageFiles {
@@ -546,6 +567,17 @@ pub enum Response {
     FileDiff {
         diff: FileDiff,
     },
+    /// A page of the History commit log (reply to [`Request::GitLog`]).
+    /// `has_more` is `true` when commits remain past this page.
+    CommitLog {
+        commits: Vec<CommitInfo>,
+        has_more: bool,
+    },
+    /// One commit's metadata and per-file diff (reply to [`Request::CommitDiff`]).
+    CommitDiff {
+        meta: CommitMeta,
+        files: Vec<CommitFileDiff>,
+    },
     PullRequestCreated {
         url: String,
     },
@@ -703,6 +735,12 @@ pub struct GitStatus {
     pub additions: u32,
     #[serde(default)]
     pub deletions: u32,
+    /// Full SHA of the current `HEAD` commit, or `None` on an unborn HEAD. The
+    /// History view refetches its log when this changes (~1s status backbone).
+    /// `#[serde(default)]` keeps older daemons/clients decodable during rolling
+    /// upgrades, matching the other added GitStatus fields.
+    #[serde(default)]
+    pub head_commit_id: Option<String>,
     pub files: Vec<ChangedFile>,
 }
 
@@ -757,6 +795,53 @@ pub enum FileStatus {
 pub struct FileDiff {
     pub worktree_id: WorktreeId,
     pub path: PathBuf,
+    pub diff: String,
+}
+
+/// One commit in a [`Response::CommitLog`] page (the History view's row data).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitInfo {
+    /// Full commit SHA.
+    pub id: String,
+    /// Commit summary (first line), `None` when absent.
+    pub summary: Option<String>,
+    /// Commit message body (after the summary), `None` when absent.
+    pub body: Option<String>,
+    pub author: Option<String>,
+    /// Author time in unix seconds.
+    pub time: i64,
+    /// Whether this commit has more than one parent (carries a merge badge).
+    pub is_merge: bool,
+    /// Whether this commit is ahead of the base branch (branch-work marker).
+    /// Always `false` when no base is resolvable (e.g. the main worktree).
+    pub ahead_of_base: bool,
+    /// Added/deleted line totals vs the first parent (empty tree for a root).
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+/// Metadata header for a [`Response::CommitDiff`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitMeta {
+    /// Full commit SHA.
+    pub id: String,
+    pub summary: Option<String>,
+    pub body: Option<String>,
+    pub author: Option<String>,
+    /// Author time in unix seconds.
+    pub time: i64,
+    pub is_merge: bool,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+/// One file's unified diff within a [`Response::CommitDiff`]. Mirrors the
+/// working-tree per-file diff shape (path + status + patch text) so the frontend
+/// can reuse its diff renderer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitFileDiff {
+    pub path: PathBuf,
+    pub status: FileStatus,
     pub diff: String,
 }
 
@@ -898,6 +983,90 @@ mod tests {
         };
         assert_eq!(status.additions, 0);
         assert_eq!(status.deletions, 0);
+        // An old daemon's status without the head id decodes to None.
+        assert_eq!(status.head_commit_id, None);
+    }
+
+    #[test]
+    fn git_log_request_and_commit_log_response_round_trip_as_contract() {
+        let (_, worktree_id, _) = ids();
+
+        let request = Request::GitLog {
+            worktree_id,
+            limit: 100,
+            offset: 200,
+        };
+        let value: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["type"], "git-log");
+        assert_eq!(value["worktree_id"], worktree_id.to_string());
+        assert_eq!(value["limit"], 100);
+        assert_eq!(value["offset"], 200);
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(request, back);
+
+        let response = Response::CommitLog {
+            commits: vec![CommitInfo {
+                id: "a".repeat(40),
+                summary: Some("feat: add proto".into()),
+                body: None,
+                author: Some("Hitch Test".into()),
+                time: 1_700_000_000,
+                is_merge: true,
+                ahead_of_base: true,
+                additions: 5,
+                deletions: 1,
+            }],
+            has_more: false,
+        };
+        let value: serde_json::Value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "commit-log");
+        assert_eq!(value["has_more"], false);
+        assert_eq!(value["commits"][0]["is_merge"], true);
+        assert_eq!(value["commits"][0]["ahead_of_base"], true);
+        assert!(value["commits"][0]["body"].is_null());
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(response, back);
+    }
+
+    #[test]
+    fn commit_diff_request_and_response_round_trip_as_contract() {
+        let (_, worktree_id, _) = ids();
+
+        let request = Request::CommitDiff {
+            worktree_id,
+            commit_id: "a".repeat(40),
+        };
+        let value: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["type"], "commit-diff");
+        assert_eq!(value["commit_id"], "a".repeat(40));
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(request, back);
+
+        let response = Response::CommitDiff {
+            meta: CommitMeta {
+                id: "a".repeat(40),
+                summary: Some("feat: add proto".into()),
+                body: Some("Body".into()),
+                author: Some("Hitch Test".into()),
+                time: 1_700_000_000,
+                is_merge: false,
+                additions: 5,
+                deletions: 1,
+            },
+            files: vec![CommitFileDiff {
+                path: "src/lib.rs".into(),
+                status: FileStatus::Added,
+                diff: "diff --git a/src/lib.rs b/src/lib.rs".into(),
+            }],
+        };
+        let value: serde_json::Value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "commit-diff");
+        assert_eq!(value["meta"]["id"], "a".repeat(40));
+        // The per-file diff reuses the FileStatus enum so the frontend renderer
+        // can be shared with working-tree diffs.
+        assert_eq!(value["files"][0]["status"], "added");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(response, back);
     }
 
     #[test]
@@ -1208,7 +1377,7 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(PROTOCOL_VERSION, 23);
     }
 
     #[test]
@@ -1418,6 +1587,7 @@ mod tests {
             behind: 0,
             additions: 12,
             deletions: 3,
+            head_commit_id: Some("a".repeat(40)),
             files: vec![ChangedFile {
                 path: "src/lib.rs".into(),
                 status: FileStatus::Modified,
@@ -1505,6 +1675,15 @@ mod tests {
                 staged: Some(false),
                 ignore_whitespace: Some(true),
                 context_lines: Some(10),
+            },
+            Request::GitLog {
+                worktree_id,
+                limit: 100,
+                offset: 0,
+            },
+            Request::CommitDiff {
+                worktree_id,
+                commit_id: "a".repeat(40),
             },
             Request::StageFiles {
                 worktree_id,
@@ -1626,6 +1805,37 @@ mod tests {
             },
             Response::FileDiff {
                 diff: sample_diff(worktree_id),
+            },
+            Response::CommitLog {
+                commits: vec![CommitInfo {
+                    id: "a".repeat(40),
+                    summary: Some("feat: add proto".into()),
+                    body: Some("Body line".into()),
+                    author: Some("Hitch Test".into()),
+                    time: 1_700_000_000,
+                    is_merge: false,
+                    ahead_of_base: true,
+                    additions: 12,
+                    deletions: 3,
+                }],
+                has_more: true,
+            },
+            Response::CommitDiff {
+                meta: CommitMeta {
+                    id: "a".repeat(40),
+                    summary: Some("feat: add proto".into()),
+                    body: Some("Body line".into()),
+                    author: Some("Hitch Test".into()),
+                    time: 1_700_000_000,
+                    is_merge: false,
+                    additions: 12,
+                    deletions: 3,
+                },
+                files: vec![CommitFileDiff {
+                    path: "src/lib.rs".into(),
+                    status: FileStatus::Modified,
+                    diff: "diff --git a/src/lib.rs b/src/lib.rs".into(),
+                }],
             },
             Response::PullRequestCreated {
                 url: "https://github.com/example/hitch/pull/1".into(),

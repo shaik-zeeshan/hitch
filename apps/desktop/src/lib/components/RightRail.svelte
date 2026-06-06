@@ -22,6 +22,7 @@
     cancelJob,
     cancellableJobForSelectedWorktree,
     commit,
+    commitLog,
     defaultBase,
     diffPath,
     diffStaged,
@@ -34,6 +35,7 @@
     gitWorktreeId,
     loadGitStatus,
     loadPrStatus,
+    openCommitTab,
     openPrInfo,
     prInfo,
     pull,
@@ -46,11 +48,12 @@
   import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
   import { fileIconUrl } from "../file-icons";
   import { focusedPane } from "../keymap";
-  import { autoCommitPush } from "../settings";
+  import { autoCommitPush, railView } from "../settings";
   import { commitOpen, createPrOpen } from "../overlays";
   import { STATUS_GLYPH, statusGlyphClass } from "../types";
   import CommitDialog from "./CommitDialog.svelte";
   import CreatePrDialog from "./CreatePrDialog.svelte";
+  import HistoryList from "./HistoryList.svelte";
   import toast from "svelte-french-toast";
 
   // `onToggleRight` is kept in the prop contract so the layout wiring stays
@@ -182,6 +185,58 @@
         return;
       }
     }
+    // ←/→ switch the rail view in BOTH views (git pane focus is shared). Handled
+    // before the per-view branch so it works identically from Changes or History.
+    // Switching the view UNMOUNTS the focused row (the other list renders), so
+    // DOM focus would fall back to <body> and the next ←/→ would dead-end. We
+    // restore focus into the rail after the flip (tick() lets the new list mount)
+    // so arrows keep round-tripping; on an empty target list focusRailRows falls
+    // back to the aside itself, which still carries this handler.
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (!$gitWorktreeId) return;
+      event.preventDefault();
+      toggleRailView();
+      void tick().then(() => focusRailRows());
+      return;
+    }
+
+    if (historyView) {
+      // HISTORY: ↑/↓ rove commits, Enter opens the commit tab. Space/Backspace
+      // carry Changes-only meanings (stage / discard) — they are INERT here, not
+      // errors. R still refreshes (handled in the shared branch below) — but for
+      // History the log rides the status backbone, so it's a no-op-friendly
+      // refetch of status; we leave the existing handleRefresh as-is.
+      switch (event.key) {
+        case "ArrowDown":
+          event.preventDefault();
+          moveActiveCommit(1);
+          return;
+        case "ArrowUp":
+          event.preventDefault();
+          moveActiveCommit(-1);
+          return;
+        case "Enter":
+          if (event.metaKey || event.ctrlKey) return;
+          event.preventDefault();
+          openActiveCommit();
+          return;
+        case " ":
+        case "Backspace":
+          // Inert in HISTORY (no stage/discard target). Swallow so the page
+          // doesn't scroll / navigate, but do nothing else.
+          event.preventDefault();
+          return;
+        case "r":
+        case "R":
+          if (event.metaKey || event.ctrlKey || event.altKey) return;
+          event.preventDefault();
+          void handleRefresh();
+          return;
+      }
+      return;
+    }
+
     switch (event.key) {
       case "ArrowDown":
         event.preventDefault();
@@ -215,21 +270,39 @@
     }
   }
 
+  // Forward focus to the active/first row of whichever view is rendered so the
+  // arrow keys work immediately. Shared by onRailFocus (rail gains focus, e.g.
+  // via Cmd+Shift+G) and the ←/→ view switch (which unmounts the focused row).
+  // When the target list is EMPTY (clean tree / empty log) there is no row to
+  // focus, so we fall back to the aside itself — it has tabindex="-1" and carries
+  // onRailKeydown, so ←/→ still round-trips out of an empty view. Assumes the new
+  // list is already mounted; callers tick() first when they just changed views.
+  function focusRailRows() {
+    if (historyView) {
+      // HISTORY: focus the roving (or first) commit row so arrows work at once.
+      const idx = activeCommit >= 0 ? activeCommit : 0;
+      const row =
+        railEl?.querySelector<HTMLElement>(`.crow[data-index="${idx}"]`) ??
+        railEl?.querySelector<HTMLElement>(".crow");
+      (row ?? railEl)?.focus();
+      return;
+    }
+    const active = rovingFiles.find((f) => rowKey(f) === activeKey);
+    const row =
+      (active
+        ? railEl?.querySelector<HTMLElement>(
+            `.frow[data-path="${cssEscape(active.path)}"][data-staged="${active.staged}"]`,
+          )
+        : null) ?? railEl?.querySelector<HTMLElement>(".frow");
+    (row ?? railEl)?.focus();
+  }
+
   // When the rail root itself receives focus (e.g. via the Cmd+Shift+G focus.git
   // command, which focuses [data-pane="git"]), forward focus to the active/first
   // file row so the arrow keys work immediately without a second keystroke.
   function onRailFocus(event: FocusEvent) {
     if (event.target !== railEl) return;
-    void tick().then(() => {
-      const active = rovingFiles.find((f) => rowKey(f) === activeKey);
-      const row =
-        (active
-          ? railEl?.querySelector<HTMLElement>(
-              `.frow[data-path="${cssEscape(active.path)}"][data-staged="${active.staged}"]`,
-            )
-          : null) ?? railEl?.querySelector<HTMLElement>(".frow");
-      row?.focus();
-    });
+    void tick().then(() => focusRailRows());
   }
 
   // Minimal CSS.escape fallback — file paths can contain characters that break a
@@ -237,6 +310,68 @@
   // guard for the test/SSR environment just in case.
   function cssEscape(value: string): string {
     return typeof CSS !== "undefined" && CSS.escape ? CSS.escape(value) : value;
+  }
+
+  // ---- HISTORY view: toggle + roving over commit rows ---------------------
+  // Git pane focus is SHARED with Changes; the rail-view toggle decides which
+  // list is rendered. ←/→ flips the view; ↑/↓ roves commit rows (clamped, no
+  // wrap — same as file rows); Enter opens the focused commit's tab. The roving
+  // cursor is a plain index into the (immutable, append-only) commit list — a
+  // simpler shape than the file list's composite key because commit rows never
+  // regroup or split. It resets to -1 on view switch / worktree change / log
+  // refetch so a stale index never points past the rows.
+  // HISTORY is only an available view for a git worktree (the toggle is hidden
+  // otherwise). Gating the rendered view on $gitWorktreeId too keeps the header
+  // and body consistent: with no git worktree the header shows the plain CHANGES
+  // label and the body shows the Changes empty-state, even if railView persisted
+  // as "history" from a previous git selection.
+  const historyView = $derived($railView === "history" && Boolean($gitWorktreeId));
+  const commits = $derived($commitLog.commits);
+  let activeCommit = $state(-1);
+  let historyList = $state<HistoryList | null>(null);
+
+  // Reset the roving cursor whenever the rendered log identity changes: a new
+  // worktree's log, a HEAD-change refetch (page-one replaces the array), or
+  // leaving HISTORY. A loadMore APPEND keeps the same head row, so the cursor is
+  // preserved across pagination by anchoring on the worktree id + head sha, not
+  // the array length.
+  let lastLogKey = "";
+  $effect(() => {
+    const headSha = commits[0]?.id ?? "";
+    const key = `${$commitLog.worktreeId ?? ""}\0${headSha}`;
+    if (!historyView) {
+      activeCommit = -1;
+      lastLogKey = "";
+    } else if (key !== lastLogKey) {
+      activeCommit = -1;
+      lastLogKey = key;
+    }
+  });
+
+  // Switch CHANGES ⇄ HISTORY. Only meaningful when the toggle is present (a git
+  // worktree is selected); a no-op otherwise so a stray ←/→ in a non-git rail
+  // does nothing.
+  function setRailView(view: "changes" | "history") {
+    if (!$gitWorktreeId) return;
+    railView.set(view);
+  }
+  function toggleRailView() {
+    setRailView(historyView ? "changes" : "history");
+  }
+
+  // Move the roving commit by `delta` (clamped, no wrap) and scroll/focus it via
+  // the HistoryList helper — mirrors the file list's moveActive.
+  function moveActiveCommit(delta: number) {
+    if (commits.length === 0) return;
+    const cur = activeCommit < 0 ? (delta > 0 ? -1 : 0) : activeCommit;
+    activeCommit = Math.min(Math.max(cur + delta, 0), commits.length - 1);
+    historyList?.scrollActiveIntoView();
+  }
+
+  // Open the focused commit's tab — the same action a row click runs.
+  function openActiveCommit() {
+    const commit = commits[activeCommit];
+    if (commit) openCommitTab(commit.id);
   }
 
   // ---- smart actions ------------------------------------------------------
@@ -434,9 +569,34 @@
        gone; hide is dropped, refresh lives here + in the action menu's reach). -->
   <div class="changes-head">
     <div class="title">
-      <h2>Changes</h2>
+      {#if $gitWorktreeId}
+        <!-- CHANGES | HISTORY view toggle. Shown only for a git worktree; for a
+             non-git / no-worktree rail the header keeps the plain CHANGES label
+             (the toggle is absent, matching how git ops are gated). Mono-uppercase
+             text buttons bound to the persisted railView, with an iris-ink active
+             state — the rail's own header language (no segmented widget exists in
+             the chrome to reuse). -->
+        <div class="view-toggle" role="tablist" aria-label="Right rail view">
+          <button
+            class="vtab"
+            role="tab"
+            aria-selected={!historyView}
+            class:on={!historyView}
+            onclick={() => setRailView("changes")}
+          >Changes</button>
+          <button
+            class="vtab"
+            role="tab"
+            aria-selected={historyView}
+            class:on={historyView}
+            onclick={() => setRailView("history")}
+          >History</button>
+        </div>
+      {:else}
+        <h2>Changes</h2>
+      {/if}
       <span class="head-right">
-        {#if $gitStatus}
+        {#if !historyView && $gitStatus}
           <span class="net">
             <span class="a">+{additions}</span> <span class="d">−{deletions}</span>
           </span>
@@ -454,6 +614,9 @@
     </div>
   </div>
 
+  {#if historyView}
+    <HistoryList bind:this={historyList} bind:activeIndex={activeCommit} />
+  {:else}
   {#if $gitStatus}
     <div class="changes-ctx">
       <div class="branchline">
@@ -733,12 +896,23 @@
       {/if}
     {/if}
   </div>
+  {/if}
 
-  <div class="rail-r-foot">
-    <span><kbd>␣</kbd> stage</span>
-    <span><kbd>↵</kbd> open diff</span>
-    <span><span class="keys">{#each commitKeys as k (k)}<kbd>{k}</kbd>{/each}</span> commit</span>
-  </div>
+  <!-- Footer kbd legend swaps per view: Changes advertises stage/diff/commit,
+       History advertises rove/open/view-switch. -->
+  {#if historyView}
+    <div class="rail-r-foot">
+      <span><kbd>↑</kbd><kbd>↓</kbd> rove</span>
+      <span><kbd>↵</kbd> open</span>
+      <span><kbd>←</kbd><kbd>→</kbd> view</span>
+    </div>
+  {:else}
+    <div class="rail-r-foot">
+      <span><kbd>␣</kbd> stage</span>
+      <span><kbd>↵</kbd> open diff</span>
+      <span><span class="keys">{#each commitKeys as k (k)}<kbd>{k}</kbd>{/each}</span> commit</span>
+    </div>
+  {/if}
 
   <!-- Mounted once, triggerless: opened from the action menu (and the command
        palette) via the commitOpen / createPrOpen stores. -->
@@ -781,6 +955,39 @@
     text-transform: uppercase;
     color: var(--ink-2);
     font-weight: 700;
+  }
+  /* CHANGES | HISTORY toggle: two mono-uppercase text buttons in the rail's own
+     header language. The inactive view reads like the dimmed PROJECTS/CHANGES
+     label; the active view lifts to iris-ink (the selection accent) so one view
+     is unambiguously current. Square, no widget chrome. */
+  .changes-head .view-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .changes-head .vtab {
+    font-family: var(--ui);
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: var(--ink-3);
+    background: transparent;
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+    cursor: pointer;
+    transition: color 0.15s ease-out;
+  }
+  .changes-head .vtab:hover {
+    color: var(--ink-1);
+  }
+  .changes-head .vtab.on {
+    color: var(--iris-ink);
+  }
+  .changes-head .vtab:focus-visible {
+    outline: 1px solid var(--iris-ink);
+    outline-offset: 2px;
   }
   .changes-head .head-right {
     display: inline-flex;

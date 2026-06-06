@@ -20,6 +20,7 @@
     connection,
     diffActive,
     diffPath,
+    commitShaFromTab,
     error,
     reconnect,
     selectedParent,
@@ -39,6 +40,7 @@
   import Terminal from "./Terminal.svelte";
   import DiffTab from "./DiffTab.svelte";
   import DiffAllTab from "./DiffAllTab.svelte";
+  import CommitTab from "./CommitTab.svelte";
 
   // Re-theme every --term-* consumer in the center column at one bind point: the
   // tab strip's active tab, the terminal panels' insets/overlays, and the diff
@@ -121,6 +123,14 @@
       <!-- The all-changes view: every changed file in one scroll, as collapsible
            sections. Same overlay behavior as a single-file diff. -->
       <DiffAllTab />
+    {:else if $diffActive && $diffPath && commitShaFromTab($diffPath) !== null}
+      <!-- A Commit Tab: one immutable commit's metadata header + collapsible
+           per-file sections, keyed by sha. Keyed on the sha so switching between
+           open commit tabs remounts with the right commit (the per-sha diff
+           cache means a remount never refetches an already-loaded commit). -->
+      {#key $diffPath}
+        <CommitTab sha={commitShaFromTab($diffPath)!} />
+      {/key}
     {:else if $diffActive && $diffPath}
       <!-- The diff OVERLAYS the (now hidden) terminals rather than replacing
            them; closing it reveals the active terminal with scroll + buffer

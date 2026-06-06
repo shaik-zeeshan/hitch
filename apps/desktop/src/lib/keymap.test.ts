@@ -105,9 +105,11 @@ describe("matchBinding — bare-key pane gating", () => {
     expect(id("macos", { key: "ArrowDown" }, "git")).toBe("git.down");
     // No bare-key arrow binding is gated to the terminal pane.
     expect(id("macos", { key: "ArrowDown" }, "terminal")).toBeNull();
-    // The tree's expand/collapse arrows have no git counterpart → null in git.
+    // The tree's expand/collapse arrows map to expand/collapse there; in the git
+    // pane the same arrows switch the rail view (Changes ⇄ History).
     expect(id("macos", { key: "ArrowRight" }, "tree")).toBe("tree.expand");
-    expect(id("macos", { key: "ArrowRight" }, "git")).toBeNull();
+    expect(id("macos", { key: "ArrowRight" }, "git")).toBe("git.viewNext");
+    expect(id("macos", { key: "ArrowLeft" }, "git")).toBe("git.viewPrev");
   });
 
   it("git Space/Enter/R/Backspace only match when the git pane is focused", () => {

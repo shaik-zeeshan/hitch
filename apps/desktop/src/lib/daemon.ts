@@ -21,12 +21,17 @@ import {
   type AgentState,
   type BranchSummary,
   type ChangedFile,
+  type CommitDiffRequest,
   type CommitDraft,
+  type CommitFileDiff,
+  type CommitInfo,
+  type CommitMeta,
   type DaemonStatus,
   type DraftGenerationSettings,
   type FileStatus,
   type GitStatus,
   type GitDiffRequest,
+  type GitLogRequest,
   type HitchEvent,
   type Id,
   type JobStatus,
@@ -53,6 +58,7 @@ import {
   draftCodexPath,
   draftModel,
   draftProvider,
+  railView,
   terminalFontFamily,
   terminalFontStack,
   type DraftProvider,
@@ -162,6 +168,26 @@ export const diffTabs = writable<DiffTabEntry[]>([]);
 // a file. Its tab carries no `text` (its content is `allChangesFiles`, not a
 // single diff string); the back-compat `diffText`/`parseDiff` path skips it.
 export const ALL_CHANGES_TAB = "\0all";
+
+// Sentinel "path" prefix for a Commit Tab — one diff tab per commit, keyed by
+// sha (`\0commit:<sha>`). Like `ALL_CHANGES_TAB`, the leading NUL byte can never
+// appear in a real worktree-relative path, so a commit tab never collides with a
+// file or with the all-changes sentinel. Its `text` is unused (its content is the
+// per-sha commit diff cache, not a single diff string); the single-file
+// `diffText`/`parseDiff` path skips it like the all-changes tab.
+export const COMMIT_TAB_PREFIX = "\0commit:";
+// The sentinel tab path for a commit sha.
+export function commitTabPath(sha: string): string {
+  return `${COMMIT_TAB_PREFIX}${sha}`;
+}
+// Whether a diff-tab path is a Commit Tab sentinel.
+export function isCommitTab(path: string): boolean {
+  return path.startsWith(COMMIT_TAB_PREFIX);
+}
+// The full sha carried by a Commit Tab sentinel path, or `null` if it isn't one.
+export function commitShaFromTab(path: string): string | null {
+  return isCommitTab(path) ? path.slice(COMMIT_TAB_PREFIX.length) : null;
+}
 
 // Per-file diffs for the all-changes view, in the order RightRail lists them
 // (staged first, then unstaged). `text` is `null` while that file's `git-diff`
@@ -365,6 +391,158 @@ function requestAllChangesRefreshOnNextStatus(worktreeId: Id): void {
   ) {
     forcedAllChangesRefreshWorktrees.add(worktreeId);
   }
+}
+
+// ---- History commit log ---------------------------------------------------
+//
+// The HISTORY rail view's commit log for the selected worktree: paginated, fetched
+// lazily a page at a time. `commits` is the accumulated pages in order (newest
+// first); `hasMore` flags more past the last fetched page; `loading` is true while
+// any page request is in flight. `worktreeId` records which worktree the rows
+// belong to so a stale fetch from a previous worktree can't land into the new one,
+// mirroring the seq guards on `loadGitStatus`/diffs. The store swaps wholesale on
+// worktree switch (the gitWorktreeId subscription resets it and refetches page one).
+export type CommitLogState = {
+  worktreeId: Id | null;
+  commits: CommitInfo[];
+  hasMore: boolean;
+  loading: boolean;
+};
+const EMPTY_COMMIT_LOG: CommitLogState = {
+  worktreeId: null,
+  commits: [],
+  hasMore: false,
+  loading: false,
+};
+export const commitLog = writable<CommitLogState>(EMPTY_COMMIT_LOG);
+// Page size for each `git-log` fetch (lazy "load more" pulls the next page).
+const COMMIT_LOG_PAGE = 20;
+// Monotonic freshness clock: a slow page response from a previous worktree (or a
+// superseded reset) must not land. Each load stamps a seq; only the freshest
+// applies, mirroring `statusRequestSeq`.
+let commitLogSeq = 0;
+// The HEAD sha the current log was last fetched for, so the status backbone can
+// detect a HEAD change and refetch only when it actually moved.
+let commitLogHeadId: string | null = null;
+
+// Fetch one page of the worktree's commit log. `reset` true replaces the rows
+// (page one, used on worktree switch / HEAD change); false appends the next
+// offset page (loadMore). A no-op if no git worktree is selected.
+async function loadCommitLogPage(reset: boolean): Promise<void> {
+  const worktreeId = get(gitWorktreeId);
+  if (!worktreeId) return;
+  const current = get(commitLog);
+  // Appending only makes sense for the worktree whose rows we already hold.
+  const offset = reset || current.worktreeId !== worktreeId ? 0 : current.commits.length;
+  if (!reset && current.worktreeId === worktreeId && !current.hasMore) return;
+
+  const seq = ++commitLogSeq;
+  commitLog.update((state) =>
+    reset || state.worktreeId !== worktreeId
+      ? { worktreeId, commits: [], hasMore: false, loading: true }
+      : { ...state, loading: true },
+  );
+
+  // The fetch is still the freshest and its worktree is still selected.
+  const isLatest = () => commitLogSeq === seq && get(gitWorktreeId) === worktreeId;
+
+  try {
+    const request: GitLogRequest = {
+      type: "git-log",
+      worktree_id: worktreeId,
+      limit: COMMIT_LOG_PAGE,
+      offset,
+    };
+    const response = await daemonRequest<
+      Response & { commits: CommitInfo[]; has_more: boolean }
+    >(request);
+    if (!isLatest()) return;
+    commitLog.update((state) => ({
+      worktreeId,
+      commits: offset === 0 ? response.commits : [...state.commits, ...response.commits],
+      hasMore: response.has_more,
+      loading: false,
+    }));
+  } catch (err) {
+    error.set(toMessage(err));
+    if (isLatest()) commitLog.update((state) => ({ ...state, loading: false }));
+  }
+}
+
+// Load (reset to) the first page of the selected worktree's commit log.
+export function loadCommitLog(): Promise<void> {
+  return loadCommitLogPage(true);
+}
+
+// Append the next page of commits (lazy "load more" at the scroll bottom). A
+// no-op while a page is already in flight or when there are no more commits.
+export function loadMoreCommits(): Promise<void> {
+  if (get(commitLog).loading) return Promise.resolve();
+  return loadCommitLogPage(false);
+}
+
+// ---- Commit diff cache (Commit Tab) ---------------------------------------
+//
+// Commit objects are immutable, so a commit's diff is cached per `worktree+sha`
+// FOREVER — there is no invalidation path (unlike the working-tree diff cache
+// variants). A Commit Tab opened twice fetches once; every later open serves the
+// cache. Entries are only ever dropped on `disposeDaemon`.
+export type CommitDiffData = { meta: CommitMeta; files: CommitFileDiff[] };
+const commitDiffCache = new Map<string, CommitDiffData>();
+// Coalesce concurrent fetches of the same commit (e.g. a re-click while the first
+// request is still in flight) onto one daemon round-trip.
+const commitDiffInFlight = new Map<string, Promise<CommitDiffData | null>>();
+const commitDiffCacheKey = (worktreeId: Id, sha: string) => `${worktreeId}\0${sha}`;
+
+// Fetch one commit's metadata + per-file diff, serving the immutable per-sha
+// cache after the first fetch. Returns `null` on error (the caller renders an
+// error/empty state). Concurrent calls for the same commit share one request.
+export async function fetchCommitDiff(
+  worktreeId: Id,
+  sha: string,
+): Promise<CommitDiffData | null> {
+  const cacheKey = commitDiffCacheKey(worktreeId, sha);
+  const cached = commitDiffCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const inFlight = commitDiffInFlight.get(cacheKey);
+  if (inFlight) return inFlight;
+
+  const promise = (async (): Promise<CommitDiffData | null> => {
+    try {
+      const request: CommitDiffRequest = {
+        type: "commit-diff",
+        worktree_id: worktreeId,
+        commit_id: sha,
+      };
+      const response = await daemonRequest<
+        Response & { meta: CommitMeta; files: CommitFileDiff[] }
+      >(request);
+      const data: CommitDiffData = { meta: response.meta, files: response.files };
+      commitDiffCache.set(cacheKey, data);
+      return data;
+    } catch (err) {
+      error.set(toMessage(err));
+      return null;
+    } finally {
+      commitDiffInFlight.delete(cacheKey);
+    }
+  })();
+  commitDiffInFlight.set(cacheKey, promise);
+  return promise;
+}
+
+// Open (or re-activate) the Commit Tab for `sha`: a peer of file diff tabs and
+// the all-changes sentinel in `diffTabs`, keyed by the `\0commit:<sha>` path.
+// Clicking a commit that's already open re-activates its tab rather than spawning
+// a duplicate, mirroring `viewDiff`/`viewAllChanges`. The diff body is fetched
+// (and cached) through `fetchCommitDiff` by the tab component, not here.
+export function openCommitTab(sha: string): void {
+  const path = commitTabPath(sha);
+  diffTabs.update((tabs) =>
+    tabs.some((tab) => tab.path === path) ? tabs : [...tabs, { path, text: null }],
+  );
+  activeDiffPath.set(path);
+  diffActive.set(true);
 }
 
 async function forEachBounded<T>(
@@ -1291,6 +1469,10 @@ export function disposeDaemon(): void {
   diffCache.clear();
   diffRequestSeq.clear();
   diffCacheWriteSeq.clear();
+  commitDiffCache.clear();
+  commitDiffInFlight.clear();
+  commitLog.set({ worktreeId: null, commits: [], hasMore: false, loading: false });
+  commitLogHeadId = null;
   booted = false;
 }
 
@@ -1355,6 +1537,20 @@ export async function loadGitStatus(worktreeId: Id): Promise<GitStatus> {
   // UI state. This matters when agents edit files while the user stages changes.
   if (requestSeq === statusRequestSeq && get(gitWorktreeId) === worktreeId) {
     gitStatus.set(response.status);
+    // History freshness rides the 1s status backbone (no new poller). When the
+    // selected worktree's HEAD sha moves (e.g. an Agent committed in a PTY),
+    // refetch the log from page one — but only when it's worth it: HISTORY is the
+    // visible rail view, or the log store is already showing this worktree (stale
+    // rows the user may switch back to). A non-visible, never-loaded log waits for
+    // its first open. The shape `head_commit_id` is optional for rolling upgrades.
+    const headId = response.status.head_commit_id ?? null;
+    if (headId !== commitLogHeadId) {
+      commitLogHeadId = headId;
+      const logShowsThisWorktree = get(commitLog).worktreeId === worktreeId;
+      if (get(railView) === "history" || logShowsThisWorktree) {
+        void loadCommitLog();
+      }
+    }
   }
   dirtyWorktrees.update((current) =>
     current[worktreeId] === response.status.dirty
@@ -2574,11 +2770,18 @@ gitWorktreeId.subscribe(($id) => {
   closeDiff();
   prUrl.set(null);
   prInfo.set(null);
+  // Swap the History log to the new worktree (per-worktree, refetched on
+  // selection). Reset the HEAD tracker so the next status doesn't mistake the new
+  // worktree's HEAD for an in-place commit on the old one and skip the load.
+  commitLog.set({ worktreeId: null, commits: [], hasMore: false, loading: false });
+  commitLogHeadId = null;
+  commitLogSeq += 1;
   stopGitStatusPolling();
   if ($id) {
     void loadGitStatus($id).catch((err) => error.set(toMessage(err)));
     void loadPrStatus($id);
     startGitStatusPolling($id);
+    if (get(railView) === "history") void loadCommitLog();
   }
 });
 
@@ -2596,3 +2799,19 @@ const onReDiffOptionChange = () => {
 };
 diffIgnoreWhitespace.subscribe(onReDiffOptionChange);
 diffContextLines.subscribe(onReDiffOptionChange);
+
+// Load the History log lazily the first time it becomes the visible rail view
+// for the selected worktree (so a user who never opens HISTORY pays no `git-log`
+// cost). Switching back to a worktree whose log is already loaded is a no-op.
+// Skip the synchronous initial emission — startup selection drives the first load
+// via the gitWorktreeId subscription above.
+let railViewInit = true;
+railView.subscribe(($view) => {
+  if (railViewInit) {
+    railViewInit = false;
+    return;
+  }
+  if ($view !== "history") return;
+  const worktreeId = get(gitWorktreeId);
+  if (worktreeId && get(commitLog).worktreeId !== worktreeId) void loadCommitLog();
+});

@@ -11,6 +11,7 @@
   import Plus from "~icons/lucide/plus";
   import X from "~icons/lucide/x";
   import Files from "~icons/lucide/files";
+  import GitCommitHorizontal from "~icons/lucide/git-commit-horizontal";
   import Claude from "~icons/hitch/claude";
   import Codex from "~icons/hitch/codex";
   import Shell from "~icons/hitch/shell";
@@ -19,6 +20,7 @@
     activeSessionId,
     activeDiffPath,
     ALL_CHANGES_TAB,
+    commitShaFromTab,
     displaySessionStates,
     closeDiff,
     closeSession,
@@ -145,18 +147,28 @@
        active path. -->
   {#each $diffTabs as tab (tab.path)}
     {@const active = $diffActive && tab.path === $activeDiffPath}
+    {@const commitSha = commitShaFromTab(tab.path)}
     <button
       class="tab"
       class:active
       role="tab"
       aria-selected={active}
-      title={tab.path === ALL_CHANGES_TAB ? "All changes" : tab.path}
+      title={tab.path === ALL_CHANGES_TAB
+        ? "All changes"
+        : commitSha !== null
+          ? `Commit ${commitSha}`
+          : tab.path}
       onclick={() => selectDiff(tab.path)}
     >
       {#if tab.path === ALL_CHANGES_TAB}
         <!-- The all-changes tab: a lucide glyph instead of a file-type icon. -->
         <Files class="icon tabmark allmark" />
         <span class="name">All changes</span>
+      {:else if commitSha !== null}
+        <!-- A Commit Tab: commit glyph + 7-char short sha (mono), keyed by the
+             `\0commit:<sha>` sentinel path. Same mark + name + ✕ anatomy. -->
+        <GitCommitHorizontal class="icon tabmark allmark" />
+        <span class="name">{commitSha.slice(0, 7)}</span>
       {:else}
         <span class="tabmark ftype" aria-hidden="true">
           <img src={fileIconUrl(tab.path)} alt="" />

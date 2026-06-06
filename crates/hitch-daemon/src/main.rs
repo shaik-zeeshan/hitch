@@ -49,10 +49,10 @@ use hitch_process::{DrainOutcome, PipeReader, ProcessTree};
 use hitch_proto::{
     encode_control_message, encode_pty_frame,
     transport::{connect_daemon, DaemonListener, DaemonStream},
-    ChangedFile, CommitDraft, ControlMessage, DraftGenerationSettings, DraftProvider, ErrorCode,
-    Event, FileDiff, FileStatus, GitStatus, JobRequest, JobStatus, KnownAgent, PrInfo,
-    ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode, WorktreePr,
-    MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
+    ChangedFile, CommitDraft, CommitFileDiff, CommitInfo, CommitMeta, ControlMessage,
+    DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
+    JobRequest, JobStatus, KnownAgent, PrInfo, ProtocolError, PullRequestDraft, Request, Response,
+    WorktreeCreateMode, WorktreePr, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
 use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY};
 use hitch_store::Store;
@@ -1310,6 +1310,31 @@ fn handle_request<R: Read>(
             )?;
             send_response(state, client_id, request_id, Response::FileDiff { diff })?;
         }
+        Request::GitLog {
+            worktree_id,
+            limit,
+            offset,
+        } => {
+            let (commits, has_more) = git_log(state, worktree_id, limit, offset)?;
+            send_response(
+                state,
+                client_id,
+                request_id,
+                Response::CommitLog { commits, has_more },
+            )?;
+        }
+        Request::CommitDiff {
+            worktree_id,
+            commit_id,
+        } => {
+            let (meta, files) = commit_diff(state, worktree_id, &commit_id)?;
+            send_response(
+                state,
+                client_id,
+                request_id,
+                Response::CommitDiff { meta, files },
+            )?;
+        }
         Request::StageFiles { worktree_id, paths } => {
             let (git, worktree_path) = git_context(state, worktree_id)?;
             git.stage_files(&worktree_path, &paths).map_err(git_error)?;
@@ -2539,6 +2564,7 @@ fn git_status(
         behind,
         additions: summary.additions.min(u32::MAX as usize) as u32,
         deletions: summary.deletions.min(u32::MAX as usize) as u32,
+        head_commit_id: summary.head_commit_id,
         files: status_entries_to_proto(&summary.entries),
     })
 }
@@ -2658,6 +2684,125 @@ fn git_diff(
         path,
         diff,
     })
+}
+
+fn git_log(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+    limit: u32,
+    offset: u32,
+) -> Result<(Vec<CommitInfo>, bool), ProtocolError> {
+    let (worktree, main_branch) = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        let worktree = state
+            .worktrees
+            .get(&worktree_id)
+            .cloned()
+            .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?;
+        // The base convention (matching the frontend's `defaultBase`) is the
+        // branch checked out in the project's main worktree, not the repo's
+        // default branch: a remote-less linked worktree has no
+        // `refs/remotes/origin/HEAD`, so `default_branch()` falls back to the
+        // worktree's OWN branch and nothing would ever be marked ahead.
+        let main_branch = state
+            .worktrees
+            .values()
+            .find(|w| w.project_id == worktree.project_id && w.is_main)
+            .map(|w| w.branch.clone());
+        (worktree, main_branch)
+    };
+    let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
+    // Mark commits ahead of the project's main-worktree branch, except on the
+    // main worktree itself (its own branch is the base, so there is no branch
+    // work to mark). Fall back to the repo's default branch when no main
+    // worktree is known; an unresolvable base degrades to no markers in the
+    // git layer.
+    let resolved_base = match main_branch {
+        Some(branch) => Some(branch),
+        None => repo.default_branch().ok(),
+    };
+    let base = resolved_base
+        .as_deref()
+        .filter(|base| *base != worktree.branch);
+    let (commits, has_more) = repo
+        .log_enriched(base, offset as usize, limit as usize)
+        .map_err(git_error)?;
+    Ok((
+        commits.into_iter().map(log_commit_to_proto).collect(),
+        has_more,
+    ))
+}
+
+fn commit_diff(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+    commit_id: &str,
+) -> Result<(CommitMeta, Vec<CommitFileDiff>), ProtocolError> {
+    let worktree = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        state
+            .worktrees
+            .get(&worktree_id)
+            .cloned()
+            .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?
+    };
+    let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
+    let diff = repo.commit_diff(commit_id).map_err(git_error)?;
+    let meta = CommitMeta {
+        id: diff.meta.id,
+        summary: diff.meta.summary,
+        body: diff.meta.body,
+        author: diff.meta.author_name,
+        time: diff.meta.time_seconds,
+        is_merge: diff.meta.is_merge,
+        additions: clamp_u32(diff.meta.additions),
+        deletions: clamp_u32(diff.meta.deletions),
+    };
+    let files = diff
+        .files
+        .into_iter()
+        .map(|file| CommitFileDiff {
+            path: file.path,
+            status: delta_status_to_proto(file.status),
+            diff: file.diff,
+        })
+        .collect();
+    Ok((meta, files))
+}
+
+fn log_commit_to_proto(commit: hitch_git::LogCommit) -> CommitInfo {
+    CommitInfo {
+        id: commit.id,
+        summary: commit.summary,
+        body: commit.body,
+        author: commit.author_name,
+        time: commit.time_seconds,
+        is_merge: commit.is_merge,
+        ahead_of_base: commit.ahead_of_base,
+        additions: clamp_u32(commit.additions),
+        deletions: clamp_u32(commit.deletions),
+    }
+}
+
+/// Map a git-layer per-file delta status to the proto `FileStatus` the frontend
+/// already renders. `Typechange`/`Unmodified` have no proto peer and fold into
+/// `Modified`, matching how status entries already coalesce them.
+fn delta_status_to_proto(status: hitch_git::DeltaStatus) -> FileStatus {
+    match status {
+        hitch_git::DeltaStatus::Added => FileStatus::Added,
+        hitch_git::DeltaStatus::Deleted => FileStatus::Deleted,
+        hitch_git::DeltaStatus::Modified => FileStatus::Modified,
+        hitch_git::DeltaStatus::Renamed => FileStatus::Renamed,
+        hitch_git::DeltaStatus::Copied => FileStatus::Copied,
+        hitch_git::DeltaStatus::Conflicted => FileStatus::Conflicted,
+        hitch_git::DeltaStatus::Typechange | hitch_git::DeltaStatus::Unmodified => {
+            FileStatus::Modified
+        }
+    }
+}
+
+fn clamp_u32(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
 }
 
 fn diff_path_for_worktree<'a>(worktree_path: &Path, path: &'a Path) -> std::borrow::Cow<'a, Path> {

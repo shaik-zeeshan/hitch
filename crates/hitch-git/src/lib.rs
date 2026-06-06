@@ -15,7 +15,7 @@ use git2::{
 use hitch_core::{ProjectId, Worktree};
 use hitch_process::{DrainOutcome, PipeReader, ProcessTree, ProcessTreeRegistration};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
@@ -79,6 +79,21 @@ impl GitRepository {
     /// Return recent commits from `HEAD`, newest first.
     pub fn log(&self, limit: usize) -> Result<Vec<CommitInfo>> {
         log(&self.root, limit)
+    }
+
+    /// Read a page of the enriched `HEAD` log for the History view, newest first.
+    pub fn log_enriched(
+        &self,
+        base: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<LogCommit>, bool)> {
+        log_enriched(&self.root, base, offset, limit)
+    }
+
+    /// Read one commit's full diff vs its first parent (empty tree for a root).
+    pub fn commit_diff(&self, commit_id: &str) -> Result<CommitDiff> {
+        commit_diff(&self.root, commit_id)
     }
 
     /// Return commits reachable from `HEAD` but not from `base`, newest first.
@@ -786,6 +801,9 @@ pub struct StatusSummary {
     pub dirty: bool,
     pub additions: usize,
     pub deletions: usize,
+    /// Full SHA of the current `HEAD` commit, or `None` on an unborn HEAD. Lets
+    /// the History view ride the status backbone: a changed id refetches the log.
+    pub head_commit_id: Option<String>,
 }
 
 impl StatusSummary {
@@ -835,6 +853,73 @@ pub struct CommitInfo {
     pub author_name: Option<String>,
     pub author_email: Option<String>,
     pub time_seconds: i64,
+}
+
+/// An enriched commit for the History log: [`CommitInfo`] plus the separate
+/// body, the merge flag, per-commit add/delete totals (vs the first parent, or
+/// the empty tree for a root commit), and whether it is ahead of the base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogCommit {
+    pub id: String,
+    pub summary: Option<String>,
+    /// Commit message body (everything after the summary), `None` when absent.
+    pub body: Option<String>,
+    pub author_name: Option<String>,
+    pub author_email: Option<String>,
+    pub time_seconds: i64,
+    /// Whether this commit has more than one parent.
+    pub is_merge: bool,
+    /// Whether this commit is reachable from `HEAD` but not from the base — the
+    /// branch-work marker. Always `false` when no base is resolvable.
+    pub ahead_of_base: bool,
+    /// Added/deleted line totals for this commit vs its first parent (vs the
+    /// empty tree for a root commit).
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+/// A single commit's full diff: metadata plus per-file patches vs the first
+/// parent (vs the empty tree for a root commit), for the Commit Tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDiff {
+    pub meta: CommitDiffMeta,
+    pub files: Vec<CommitFileDiff>,
+}
+
+/// Metadata header for a [`CommitDiff`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDiffMeta {
+    pub id: String,
+    pub summary: Option<String>,
+    pub body: Option<String>,
+    pub author_name: Option<String>,
+    pub author_email: Option<String>,
+    pub time_seconds: i64,
+    pub is_merge: bool,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+/// One file's unified diff within a [`CommitDiff`], mirroring the shape of the
+/// working-tree per-file diff so the frontend can reuse its renderer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitFileDiff {
+    pub path: PathBuf,
+    pub status: DeltaStatus,
+    pub diff: String,
+}
+
+/// Coarse per-file change kind within a commit diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    Typechange,
+    Conflicted,
+    Unmodified,
 }
 
 /// `HEAD`-vs-`base` comparison computed in a single pass: commits, changed
@@ -1040,11 +1125,13 @@ pub fn status(repo_path: impl AsRef<Path>) -> Result<StatusSummary> {
     }
     let additions = line_stats.additions;
     let deletions = line_stats.deletions;
+    let head_commit_id = head_commit_oid(&repo).map(|oid| oid.to_string());
     Ok(StatusSummary {
         dirty: !entries.is_empty(),
         entries,
         additions,
         deletions,
+        head_commit_id,
     })
 }
 
@@ -1210,11 +1297,12 @@ fn diff_rename_old_path(
         // whose matching delete may live outside the parent directory (a
         // cross-directory rename). Redo the walk over the whole repo, exactly
         // as before this optimisation, to settle it.
-        RenameLookup::AddedOrAbsent => match diff_rename_old_path_scoped(repo, path, target, false)?
-        {
-            RenameLookup::Found(old) => Ok(old),
-            _ => Ok(None),
-        },
+        RenameLookup::AddedOrAbsent => {
+            match diff_rename_old_path_scoped(repo, path, target, false)? {
+                RenameLookup::Found(old) => Ok(old),
+                _ => Ok(None),
+            }
+        }
     }
 }
 
@@ -1361,6 +1449,102 @@ pub fn log(repo_path: impl AsRef<Path>, limit: usize) -> Result<Vec<CommitInfo>>
     revwalk.push_head()?;
 
     commits_from_revwalk(&repo, revwalk, limit)
+}
+
+/// Read a page of the `HEAD` log, enriched for the History view, newest first.
+///
+/// `offset` skips that many commits before collecting `limit`; `has_more` is
+/// `true` when the walk still had commits past the page (so the frontend can
+/// lazily load more). Each commit carries its body, merge flag, per-commit
+/// add/delete totals (vs its first parent, or the empty tree for a root
+/// commit), and `ahead_of_base`. When `base` is `Some` and resolvable, the set
+/// of commits reachable from `HEAD` but not the base is precomputed once and
+/// each returned commit is marked; an unresolvable or absent base degrades to
+/// no markers (e.g. the main worktree), matching how `commits_since` tolerates
+/// a missing HEAD.
+pub fn log_enriched(
+    repo_path: impl AsRef<Path>,
+    base: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<LogCommit>, bool)> {
+    let repo = Repository::discover(repo_path.as_ref())?;
+    let Some(head) = head_commit_oid(&repo) else {
+        // An unborn HEAD has no commits to log.
+        return Ok((Vec::new(), false));
+    };
+
+    // Precompute the ahead-of-base set in one walk; absent/unresolvable base
+    // means no markers.
+    let ahead = ahead_of_base_set(&repo, head, base);
+
+    let mut revwalk = repo.revwalk()?;
+    revwalk.push(head)?;
+
+    // Skip the offset, take one extra to detect whether more remain past the
+    // page, then enrich exactly the page.
+    let mut commits = Vec::with_capacity(limit);
+    let mut has_more = false;
+    for oid in revwalk.skip(offset) {
+        let oid = oid?;
+        if commits.len() == limit {
+            has_more = true;
+            break;
+        }
+        let commit = repo.find_commit(oid)?;
+        let author = commit.author();
+        let (additions, deletions) = commit_line_totals(&repo, &commit)?;
+        commits.push(LogCommit {
+            id: commit.id().to_string(),
+            summary: commit.summary().map(str::to_owned),
+            body: commit.body().map(str::to_owned),
+            author_name: author.name().map(str::to_owned),
+            author_email: author.email().map(str::to_owned),
+            time_seconds: commit.time().seconds(),
+            is_merge: commit.parent_count() > 1,
+            ahead_of_base: ahead.as_ref().is_some_and(|set| set.contains(&oid)),
+            additions,
+            deletions,
+        });
+    }
+    Ok((commits, has_more))
+}
+
+/// Read one commit's full diff vs its first parent (vs the empty tree for a
+/// root commit), with per-file patches, for the Commit Tab. Merge commits diff
+/// against their first parent only.
+pub fn commit_diff(repo_path: impl AsRef<Path>, commit_id: &str) -> Result<CommitDiff> {
+    let repo = Repository::discover(repo_path.as_ref())?;
+    let oid = Oid::from_str(commit_id)?;
+    let commit = repo.find_commit(oid)?;
+    let author = commit.author();
+
+    let new_tree = commit.tree()?;
+    // First parent only; a root commit has no parent and diffs vs the empty
+    // tree (passing `None` as the old tree to libgit2).
+    let parent_tree = match commit.parent(0) {
+        Ok(parent) => Some(parent.tree()?),
+        Err(_) => None,
+    };
+    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), None)?;
+
+    let (additions, deletions) = diff_totals(&diff)?;
+    let files = commit_file_diffs(&diff)?;
+
+    Ok(CommitDiff {
+        meta: CommitDiffMeta {
+            id: commit.id().to_string(),
+            summary: commit.summary().map(str::to_owned),
+            body: commit.body().map(str::to_owned),
+            author_name: author.name().map(str::to_owned),
+            author_email: author.email().map(str::to_owned),
+            time_seconds: commit.time().seconds(),
+            is_merge: commit.parent_count() > 1,
+            additions,
+            deletions,
+        },
+        files,
+    })
 }
 
 /// Return commits reachable from `HEAD` but not from `base`, newest first.
@@ -1688,6 +1872,92 @@ fn diff_since_base<'repo>(repo: &'repo Repository, base: &str) -> Result<git2::D
 /// Resolve the OID of the current `HEAD` commit, or `None` on an unborn HEAD.
 fn head_commit_oid(repo: &Repository) -> Option<Oid> {
     repo.head().ok().and_then(|head| head.target())
+}
+
+/// The set of commit OIDs reachable from `head` but not from `base`, computed in
+/// one revwalk. `None` when `base` is absent or cannot be resolved — the caller
+/// then renders no branch-work markers (e.g. the main worktree).
+fn ahead_of_base_set(repo: &Repository, head: Oid, base: Option<&str>) -> Option<HashSet<Oid>> {
+    let base = base?;
+    let base_oid = resolve_base_oid(repo, base).ok()?;
+    let merge_base = repo.merge_base(head, base_oid).unwrap_or(base_oid);
+    let mut revwalk = repo.revwalk().ok()?;
+    revwalk.push(head).ok()?;
+    revwalk.hide(merge_base).ok()?;
+    Some(revwalk.filter_map(|oid| oid.ok()).collect())
+}
+
+/// Add/delete line totals for a commit vs its first parent (vs the empty tree
+/// for a root commit). Mirrors `commit_diff`'s first-parent rule so log totals
+/// and the Commit Tab header agree.
+fn commit_line_totals(repo: &Repository, commit: &git2::Commit<'_>) -> Result<(usize, usize)> {
+    let new_tree = commit.tree()?;
+    let parent_tree = match commit.parent(0) {
+        Ok(parent) => Some(parent.tree()?),
+        Err(_) => None,
+    };
+    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), None)?;
+    diff_totals(&diff)
+}
+
+/// Sum a diff's added/deleted lines from its per-patch `line_stats`. Binary
+/// deltas have no patch and contribute nothing, matching `accumulate_diff_line_stats`.
+fn diff_totals(diff: &git2::Diff<'_>) -> Result<(usize, usize)> {
+    let mut additions = 0;
+    let mut deletions = 0;
+    for idx in 0..diff.deltas().len() {
+        let Some(patch) = git2::Patch::from_diff(diff, idx)? else {
+            continue;
+        };
+        let (_context, added, deleted) = patch.line_stats()?;
+        additions += added;
+        deletions += deleted;
+    }
+    Ok((additions, deletions))
+}
+
+/// Split a tree-to-tree diff into per-file patches, mirroring the working-tree
+/// per-file diff shape (path, status, patch text) so the frontend can reuse its
+/// renderer. Each delta's patch text carries its own file/hunk headers.
+fn commit_file_diffs(diff: &git2::Diff<'_>) -> Result<Vec<CommitFileDiff>> {
+    let mut files = Vec::with_capacity(diff.deltas().len());
+    for (idx, delta) in diff.deltas().enumerate() {
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let diff_text = match git2::Patch::from_diff(diff, idx)? {
+            Some(mut patch) => {
+                let buf = patch.to_buf()?;
+                String::from_utf8_lossy(&buf).into_owned()
+            }
+            // Binary deltas have no textual patch; surface the path/status with
+            // an empty body, matching the working-tree diff's binary handling.
+            None => String::new(),
+        };
+        files.push(CommitFileDiff {
+            path,
+            status: delta_status(delta.status()),
+            diff: diff_text,
+        });
+    }
+    Ok(files)
+}
+
+/// Map a libgit2 [`git2::Delta`] to our coarse [`DeltaStatus`].
+fn delta_status(delta: git2::Delta) -> DeltaStatus {
+    match delta {
+        git2::Delta::Added => DeltaStatus::Added,
+        git2::Delta::Deleted => DeltaStatus::Deleted,
+        git2::Delta::Modified => DeltaStatus::Modified,
+        git2::Delta::Renamed => DeltaStatus::Renamed,
+        git2::Delta::Copied => DeltaStatus::Copied,
+        git2::Delta::Typechange => DeltaStatus::Typechange,
+        git2::Delta::Conflicted => DeltaStatus::Conflicted,
+        _ => DeltaStatus::Unmodified,
+    }
 }
 
 /// Collect the changed file paths from a diff, sorted and deduped.
@@ -2409,7 +2679,13 @@ mod tests {
         assert_eq!(summary.additions, 2);
         assert_eq!(summary.deletions, 1);
 
-        let diff = diff_file(fixture.path(), "tracked.txt", DiffTarget::Worktree, DiffFileOptions::default()).unwrap();
+        let diff = diff_file(
+            fixture.path(),
+            "tracked.txt",
+            DiffTarget::Worktree,
+            DiffFileOptions::default(),
+        )
+        .unwrap();
         assert!(diff.contains("changed"), "diff was {diff:?}");
 
         GitClient::default()
@@ -2424,7 +2700,13 @@ mod tests {
             summary.entry_for("tracked.txt").unwrap().working_tree,
             FileState::Unmodified
         );
-        let staged = diff_file(fixture.path(), "tracked.txt", DiffTarget::Staged, DiffFileOptions::default()).unwrap();
+        let staged = diff_file(
+            fixture.path(),
+            "tracked.txt",
+            DiffTarget::Staged,
+            DiffFileOptions::default(),
+        )
+        .unwrap();
         assert!(staged.contains("changed"), "staged diff was {staged:?}");
     }
 
@@ -2554,7 +2836,13 @@ mod tests {
         assert_eq!((moved.worktree_additions, moved.worktree_deletions), (0, 0));
         assert_eq!((summary.additions, summary.deletions), (1, 1));
 
-        let diff = diff_file(fixture.path(), "moved.txt", DiffTarget::Staged, DiffFileOptions::default()).unwrap();
+        let diff = diff_file(
+            fixture.path(),
+            "moved.txt",
+            DiffTarget::Staged,
+            DiffFileOptions::default(),
+        )
+        .unwrap();
         assert!(
             diff.contains("rename from tracked.txt"),
             "diff was {diff:?}"
@@ -2589,7 +2877,13 @@ mod tests {
         assert_eq!((moved.staged_additions, moved.staged_deletions), (0, 0));
         assert_eq!((summary.additions, summary.deletions), (1, 1));
 
-        let diff = diff_file(fixture.path(), "moved.txt", DiffTarget::Worktree, DiffFileOptions::default()).unwrap();
+        let diff = diff_file(
+            fixture.path(),
+            "moved.txt",
+            DiffTarget::Worktree,
+            DiffFileOptions::default(),
+        )
+        .unwrap();
         assert!(
             diff.contains("rename from tracked.txt"),
             "diff was {diff:?}"
@@ -2628,9 +2922,13 @@ mod tests {
                 fixture.git(["add", "-A"]);
             }
 
-            let diff =
-                diff_file(fixture.path(), "dst/moved.txt", target, DiffFileOptions::default())
-                    .unwrap();
+            let diff = diff_file(
+                fixture.path(),
+                "dst/moved.txt",
+                target,
+                DiffFileOptions::default(),
+            )
+            .unwrap();
             assert!(
                 diff.contains("rename from src/tracked.txt"),
                 "{target:?} diff was {diff:?}"
@@ -2663,7 +2961,13 @@ mod tests {
         let entry = summary.entry_for(&file).unwrap();
         assert_eq!(entry.working_tree, FileState::Modified);
 
-        let relative = diff_file(fixture.path(), &file, DiffTarget::Worktree, DiffFileOptions::default()).unwrap();
+        let relative = diff_file(
+            fixture.path(),
+            &file,
+            DiffTarget::Worktree,
+            DiffFileOptions::default(),
+        )
+        .unwrap();
         assert!(
             relative.contains("changed"),
             "relative diff was {relative:?}"
@@ -3002,6 +3306,220 @@ mod tests {
     }
 
     #[test]
+    fn log_enriched_paginates_and_flags_has_more_at_the_boundary() {
+        // RepoFixture seeds one commit; add two more for three total.
+        let fixture = RepoFixture::new();
+        fixture.write("a.txt", "a\n");
+        fixture.git(["add", "a.txt"]);
+        fixture.git(["commit", "-m", "second"]);
+        fixture.write("b.txt", "b\n");
+        fixture.git(["add", "b.txt"]);
+        fixture.git(["commit", "-m", "third"]);
+
+        // First page of two: more remains.
+        let (page, has_more) = log_enriched(fixture.path(), None, 0, 2).unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|c| c.summary.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["third", "second"],
+        );
+        assert!(has_more);
+
+        // Offset past the first page returns the tail with no more.
+        let (page, has_more) = log_enriched(fixture.path(), None, 2, 2).unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|c| c.summary.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["initial commit"],
+        );
+        assert!(!has_more);
+
+        // A page exactly covering the remaining commits reports no more.
+        let (page, has_more) = log_enriched(fixture.path(), None, 0, 3).unwrap();
+        assert_eq!(page.len(), 3);
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn log_enriched_marks_commits_ahead_of_base() {
+        let fixture = RepoFixture::new();
+        fixture.git(["checkout", "-b", "feature/ahead"]);
+        fixture.write("feature.txt", "feature\n");
+        fixture.git(["add", "feature.txt"]);
+        fixture.git(["commit", "-m", "branch work"]);
+
+        // With a resolvable base, only the branch commit is ahead; the inherited
+        // base commit is not.
+        let (page, _) = log_enriched(fixture.path(), Some("main"), 0, 10).unwrap();
+        let branch = page
+            .iter()
+            .find(|c| c.summary.as_deref() == Some("branch work"));
+        let base = page
+            .iter()
+            .find(|c| c.summary.as_deref() == Some("initial commit"));
+        assert!(branch.unwrap().ahead_of_base);
+        assert!(!base.unwrap().ahead_of_base);
+
+        // No base (the main-worktree fallback): no markers at all.
+        let (page, _) = log_enriched(fixture.path(), None, 0, 10).unwrap();
+        assert!(page.iter().all(|c| !c.ahead_of_base));
+
+        // An unresolvable base also degrades to no markers rather than erroring.
+        let (page, _) = log_enriched(fixture.path(), Some("does-not-exist"), 0, 10).unwrap();
+        assert!(page.iter().all(|c| !c.ahead_of_base));
+    }
+
+    #[test]
+    fn log_enriched_reports_merge_flag_body_and_line_totals() {
+        let fixture = RepoFixture::new();
+        // A commit with a body and a known +/− shape vs its parent.
+        fixture.write("tracked.txt", "initial\nadded line\n");
+        fixture.git(["add", "tracked.txt"]);
+        fixture.git(["commit", "-m", "edit subject", "-m", "body paragraph"]);
+
+        // A real merge commit: branch off, commit, merge back with --no-ff.
+        fixture.git(["checkout", "-b", "side"]);
+        fixture.write("side.txt", "side\n");
+        fixture.git(["add", "side.txt"]);
+        fixture.git(["commit", "-m", "side commit"]);
+        fixture.git(["checkout", "main"]);
+        fixture.git(["merge", "--no-ff", "side", "-m", "merge side"]);
+
+        let (page, _) = log_enriched(fixture.path(), None, 0, 10).unwrap();
+
+        let merge = page
+            .iter()
+            .find(|c| c.summary.as_deref() == Some("merge side"))
+            .unwrap();
+        assert!(merge.is_merge);
+
+        let edit = page
+            .iter()
+            .find(|c| c.summary.as_deref() == Some("edit subject"))
+            .unwrap();
+        assert!(!edit.is_merge);
+        assert_eq!(edit.body.as_deref(), Some("body paragraph"));
+        // One line added, none deleted vs the parent ("initial\n" → +"added line").
+        assert_eq!(edit.additions, 1);
+        assert_eq!(edit.deletions, 0);
+    }
+
+    #[test]
+    fn commit_diff_diffs_a_normal_commit_against_its_parent() {
+        let fixture = RepoFixture::new();
+        fixture.write("tracked.txt", "initial\nsecond line\n");
+        fixture.git(["add", "tracked.txt"]);
+        fixture.git(["commit", "-m", "add second line", "-m", "the body"]);
+
+        let id = head_sha(&fixture);
+        let diff = commit_diff(fixture.path(), &id).unwrap();
+
+        assert_eq!(diff.meta.id, id);
+        assert_eq!(diff.meta.summary.as_deref(), Some("add second line"));
+        assert_eq!(diff.meta.body.as_deref(), Some("the body"));
+        assert!(!diff.meta.is_merge);
+        assert_eq!(diff.meta.additions, 1);
+        assert_eq!(diff.meta.deletions, 0);
+
+        assert_eq!(diff.files.len(), 1);
+        let file = &diff.files[0];
+        assert_eq!(file.path, PathBuf::from("tracked.txt"));
+        assert_eq!(file.status, DeltaStatus::Modified);
+        assert!(file.diff.contains("+second line"));
+    }
+
+    #[test]
+    fn commit_diff_of_root_commit_diffs_against_the_empty_tree() {
+        let fixture = RepoFixture::new();
+        // The seed commit is the root: it has no parent, so the whole file is an
+        // addition vs the empty tree.
+        let root = first_commit_sha(&fixture);
+        let diff = commit_diff(fixture.path(), &root).unwrap();
+
+        assert_eq!(diff.meta.summary.as_deref(), Some("initial commit"));
+        assert_eq!(diff.files.len(), 1);
+        let file = &diff.files[0];
+        assert_eq!(file.path, PathBuf::from("tracked.txt"));
+        assert_eq!(file.status, DeltaStatus::Added);
+        assert!(file.diff.contains("+initial"));
+        assert_eq!(diff.meta.additions, 1);
+        assert_eq!(diff.meta.deletions, 0);
+    }
+
+    #[test]
+    fn commit_diff_of_merge_uses_first_parent_only() {
+        let fixture = RepoFixture::new();
+        // First parent (main) adds main.txt; the merged branch adds side.txt.
+        fixture.write("main.txt", "main\n");
+        fixture.git(["add", "main.txt"]);
+        fixture.git(["commit", "-m", "main work"]);
+        fixture.git(["checkout", "-b", "side"]);
+        fixture.write("side.txt", "side\n");
+        fixture.git(["add", "side.txt"]);
+        fixture.git(["commit", "-m", "side work"]);
+        fixture.git(["checkout", "main"]);
+        fixture.git(["merge", "--no-ff", "side", "-m", "merge side"]);
+
+        let merge = head_sha(&fixture);
+        let diff = commit_diff(fixture.path(), &merge).unwrap();
+        assert!(diff.meta.is_merge);
+
+        // Diffing the merge against its FIRST parent (main, before the merge)
+        // shows only what the side branch brought in: side.txt. main.txt was
+        // already on the first parent, so it must not appear.
+        let paths: Vec<_> = diff.files.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from("side.txt")]);
+    }
+
+    fn head_sha(fixture: &RepoFixture) -> String {
+        sha_of(fixture, "HEAD")
+    }
+
+    fn first_commit_sha(fixture: &RepoFixture) -> String {
+        // Oldest commit (the root) via a reverse-ordered rev-list.
+        let output = Command::new("git")
+            .current_dir(fixture.path())
+            .args(["rev-list", "--max-parents=0", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn sha_of(fixture: &RepoFixture, rev: &str) -> String {
+        let output = Command::new("git")
+            .current_dir(fixture.path())
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn status_carries_the_head_commit_id() {
+        let fixture = RepoFixture::new();
+        let summary = status(fixture.path()).unwrap();
+        assert_eq!(
+            summary.head_commit_id.as_deref(),
+            Some(head_sha(&fixture).as_str())
+        );
+    }
+
+    #[test]
+    fn log_enriched_is_empty_on_unborn_head() {
+        let fixture = RepoFixture::new();
+        fixture.git(["checkout", "--orphan", "feature/unborn"]);
+        fixture.git(["rm", "-rf", "--cached", "."]);
+
+        let (page, has_more) = log_enriched(fixture.path(), None, 0, 10).unwrap();
+        assert!(page.is_empty());
+        assert!(!has_more);
+    }
+
+    #[test]
     fn branch_queries_degrade_gracefully_on_unborn_head() {
         // A repo with a committed `main` but a fresh unborn branch checked out:
         // commits/diff "since main" must not error on the missing HEAD.
@@ -3127,6 +3645,72 @@ mod tests {
 
     fn canonical_or_self(path: &Path) -> PathBuf {
         path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// Regression for the `git_log` base-pick bug: in a remote-less repo a
+    /// linked worktree has no `refs/remotes/origin/HEAD`, so `default_branch()`
+    /// falls back to the worktree's OWN branch. The daemon must NOT use that as
+    /// the base (it would filter the base out and mark nothing); it must use the
+    /// project's main-worktree branch instead. This test pins both halves: the
+    /// trap (default_branch returns the linked branch) and the correct base
+    /// (the main worktree's branch marks the ahead commits).
+    #[test]
+    fn linked_worktree_in_remoteless_repo_marks_commits_ahead_of_main_branch() {
+        let fixture = RepoFixture::new();
+        let managed = TempDir::new().unwrap();
+        let client = GitClient::default();
+
+        // A linked worktree on a feature branch, branched from `main`.
+        let request = CreateWorktreeRequest {
+            project_id: ProjectId::new(),
+            project_name: "hitch".into(),
+            managed_root: managed.path().into(),
+            branch: "feature/ahead".into(),
+            checkout: WorktreeCheckout::NewBranch,
+            base: Some("main".into()),
+        };
+        let created = client.create_worktree(fixture.path(), &request).unwrap();
+
+        // Commit branch work past the merge-base inside the linked worktree.
+        run_real_git(&created.path, ["config", "user.name", "Hitch Test"]);
+        run_real_git(
+            &created.path,
+            ["config", "user.email", "hitch@example.test"],
+        );
+        fs::write(created.path.join("feature.txt"), "feature\n").unwrap();
+        run_real_git(&created.path, ["add", "feature.txt"]);
+        run_real_git(&created.path, ["commit", "-m", "branch work"]);
+
+        // The trap: with no remote HEAD, `default_branch()` on the linked
+        // worktree resolves to the worktree's OWN branch, which the daemon used
+        // to filter out (base == worktree branch) => nothing marked.
+        assert_eq!(
+            default_branch(&created.path).unwrap(),
+            "feature/ahead",
+            "default_branch must fall back to the worktree's own branch here, \
+             which is exactly why git_log can't use it as the base"
+        );
+
+        // The fix: using the project's main-worktree branch (`main`) as the base
+        // correctly marks the branch commit ahead and leaves the inherited base
+        // commit unmarked.
+        let (page, _) = log_enriched(&created.path, Some("main"), 0, 10).unwrap();
+        let branch = page
+            .iter()
+            .find(|c| c.summary.as_deref() == Some("branch work"))
+            .expect("branch commit present");
+        let base = page
+            .iter()
+            .find(|c| c.summary.as_deref() == Some("initial commit"))
+            .expect("inherited base commit present");
+        assert!(
+            branch.ahead_of_base,
+            "branch commit must be marked ahead of the main-worktree branch"
+        );
+        assert!(
+            !base.ahead_of_base,
+            "inherited base commit must not be marked ahead"
+        );
     }
 
     #[test]

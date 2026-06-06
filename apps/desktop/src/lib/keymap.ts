@@ -256,6 +256,26 @@ export const bindings: readonly Binding[] = [
     combo: { key: "r" },
     when: "git",
   },
+  // ←/→ switch the right-rail view (CHANGES ⇄ HISTORY) while the git pane is
+  // focused. The git pane focus is SHARED by both views; the toggle decides what
+  // is rendered. Like the other bare git keys these stay UNWIRED in the layout
+  // dispatcher and are handled component-locally in RightRail (DOM focus is in
+  // the pane), so the dispatcher lets them fall through. They exist here as the
+  // documentation / Settings source and so matchBinding pane-gates them to git.
+  {
+    id: "git.viewPrev",
+    group: "git",
+    description: "Switch rail view (Changes ⇄ History)",
+    combo: { key: "ArrowLeft" },
+    when: "git",
+  },
+  {
+    id: "git.viewNext",
+    group: "git",
+    description: "Switch rail view (Changes ⇄ History)",
+    combo: { key: "ArrowRight" },
+    when: "git",
+  },
   {
     id: "git.commit",
     group: "git",
