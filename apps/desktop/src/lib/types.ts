@@ -129,6 +129,13 @@ export type GitDiffRequest = {
   // Optional for protocol compatibility. Omitted requests keep daemon legacy
   // worktree-first, staged-fallback selection.
   staged?: boolean;
+  // Diff-shaping options, serialized snake_case like the rest of the request.
+  // Both are serde skip-if-none on the daemon, so the frontend omits them at
+  // their defaults (no whitespace flag, 3 context lines) to keep older daemons
+  // happy. `ignore_whitespace` true asks git to ignore whitespace-only changes;
+  // `context_lines` overrides git's default of 3 lines of surrounding context.
+  ignore_whitespace?: boolean;
+  context_lines?: number;
 };
 
 

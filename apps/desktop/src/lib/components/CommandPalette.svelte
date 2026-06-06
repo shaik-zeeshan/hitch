@@ -25,6 +25,7 @@
     worktrees,
   } from "../daemon";
   import { addProjectOpen, cloneProjectOpen, commandOpen, createPrOpen, createWorktreeFor } from "../overlays";
+  import { diffIgnoreWhitespace, diffStyle, diffWrap } from "../settings";
   import { AGENT_LABEL, type Session, type Worktree } from "../types";
   import Search from "~icons/lucide/search";
   import Claude from "~icons/hitch/claude";
@@ -215,6 +216,36 @@
                     /></svg
                   >
                   <span class="pi-label">Open settings…</span>
+                </Command.Item>
+                <Command.Item
+                  class="p-item"
+                  value="diff toggle split unified view side by side"
+                  onSelect={() => run(() => diffStyle.set($diffStyle === "split" ? "unified" : "split"))}
+                >
+                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                    ><rect x="2.5" y="3" width="11" height="10" /><line x1="8" y1="3" x2="8" y2="13" /></svg
+                  >
+                  <span class="pi-label">Diff: toggle split view</span>
+                </Command.Item>
+                <Command.Item
+                  class="p-item"
+                  value="diff toggle line wrap soft overflow"
+                  onSelect={() => run(() => diffWrap.update((v) => !v))}
+                >
+                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
+                    ><path d="M2.5 4h11M2.5 8h9a2 2 0 0 1 0 4h-2.5M11 10.5 9 12l2 1.5" /><path d="M2.5 12h3" /></svg
+                  >
+                  <span class="pi-label">Diff: toggle line wrap</span>
+                </Command.Item>
+                <Command.Item
+                  class="p-item"
+                  value="diff toggle ignore whitespace blank changes"
+                  onSelect={() => run(() => diffIgnoreWhitespace.update((v) => !v))}
+                >
+                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
+                    ><path d="M3 6.5v3M6 6.5v3M10 6.5v3M13 6.5v3" /></svg
+                  >
+                  <span class="pi-label">Diff: toggle ignore whitespace</span>
                 </Command.Item>
               </Command.GroupItems>
             </Command.Group>

@@ -1577,13 +1577,13 @@ describe("all-changes diff tab", () => {
 
     pending[1]!.resolve({ type: "git-diff", diff: { diff: "staged diff" } });
     await stagedPromise;
-    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "staged diff" }]);
+    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "staged diff", staged: true }]);
     expect(get(diffText)).toBe("staged diff");
 
     pending[0]!.resolve({ type: "git-diff", diff: { diff: "worktree diff" } });
     await worktreePromise;
 
-    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "staged diff" }]);
+    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "staged diff", staged: true }]);
     expect(get(diffText)).toBe("staged diff");
   });
 

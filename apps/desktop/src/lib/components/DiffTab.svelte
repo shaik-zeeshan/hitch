@@ -15,6 +15,8 @@
   import { diffPath, diffText } from "../daemon";
   import { parseDiff } from "../diff";
   import { theme } from "../theme";
+  import DiffViewOptions from "./DiffViewOptions.svelte";
+  import { diffStyle, diffWrap } from "../settings";
 
   // Local classifier: only used here for the add/del counts shown in the header
   // and to detect the binary / empty (mode/rename-only) cases that processFile
@@ -26,18 +28,23 @@
     $diffText === null ? undefined : processFile($diffText, { isGitDiff: true }),
   );
 
-  const options: FileDiffOptions<undefined> = {
-    diffStyle: "unified",
+  // Render-side view options driven by the persisted `diffStyle` / `diffWrap`
+  // settings. They only re-lay-out the already-fetched diff (split vs unified,
+  // wrap vs scroll), so changing them calls setOptions + rerender on the live
+  // instance rather than re-fetching. `$derived` so instances created mid-
+  // session also start with the current values.
+  const options = $derived<FileDiffOptions<undefined>>({
+    diffStyle: $diffStyle,
     disableFileHeader: true, // DiffTab renders its own header bar.
     disableLineNumbers: false,
     diffIndicators: "classic",
     hunkSeparators: "line-info",
     lineDiffType: "word",
-    overflow: "scroll",
+    overflow: $diffWrap ? "wrap" : "scroll",
     stickyHeader: false,
     preferredHighlighter: "shiki-js", // no WASM, faster startup.
     theme: { light: "pierre-light", dark: "pierre-dark" },
-  };
+  });
 
   let container = $state<HTMLElement>();
   let instance: FileDiff<undefined> | undefined;
@@ -73,18 +80,31 @@
   $effect(() => {
     instance?.setThemeType($theme);
   });
+
+  // Apply render-side option changes (split/unified, wrap/scroll) to the live
+  // instance. setOptions only merges the new options; rerender() re-lays-out the
+  // already-parsed diff with them. Reads `options` so it re-runs on any toggle.
+  $effect(() => {
+    const next = options;
+    if (!instance) return;
+    instance.setOptions(next);
+    instance.rerender();
+  });
 </script>
 
 <div class="diff">
   <div class="diff-head">
     <span class="glyph" aria-hidden="true">±</span>
     <span class="path">{$diffPath}</span>
-    {#if parsed && !parsed.isEmpty}
-      <span class="meta">
-        <span class="add">+{parsed.additions}</span>
-        <span class="del">−{parsed.deletions}</span>
-      </span>
-    {/if}
+    <span class="head-right">
+      {#if parsed && !parsed.isEmpty}
+        <span class="meta">
+          <span class="add">+{parsed.additions}</span>
+          <span class="del">−{parsed.deletions}</span>
+        </span>
+      {/if}
+      <DiffViewOptions />
+    </span>
   </div>
 
   {#if parsed === null}
@@ -144,10 +164,16 @@
     direction: rtl;
     text-align: left;
   }
+  .diff-head .head-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-left: auto;
+    flex: none;
+  }
   .diff-head .meta {
     font-size: 0.6875rem;
     color: var(--term-dim);
-    margin-left: auto;
     font-family: var(--mono);
     font-variant-numeric: tabular-nums;
     flex: none;

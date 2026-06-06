@@ -46,6 +46,9 @@ import {
   type Worktree,
 } from "./types";
 import {
+  DEFAULT_DIFF_CONTEXT_LINES,
+  diffContextLines,
+  diffIgnoreWhitespace,
   draftClaudePath,
   draftCodexPath,
   draftModel,
@@ -145,7 +148,11 @@ export const gitStatus = writable<GitStatus | null>(null);
 // as peers of the session tabs in the strip; clicking a file that's already open
 // re-activates its tab rather than spawning a duplicate. Paths are worktree-
 // relative, so the set is cleared wholesale on worktree switch.
-export type DiffTabEntry = { path: string; text: string | null };
+// `staged` records which side a single-file tab was opened with, so a re-diff
+// (e.g. after toggling ignore-whitespace) can re-fetch the same git target it
+// originally showed. The all-changes sentinel tab carries no staged side (its
+// per-file rows track their own); undefined keeps the daemon's legacy selection.
+export type DiffTabEntry = { path: string; text: string | null; staged?: boolean };
 export const diffTabs = writable<DiffTabEntry[]>([]);
 // Sentinel "path" for the single all-changes tab — the unified view that shows
 // every changed file at once, each as its own collapsible section. The NUL byte
@@ -236,8 +243,28 @@ const diffRequestSeq = new Map<string, number>();
 const diffCacheWriteSeq = new Map<string, number>();
 const diffSideKey = (staged: boolean | undefined) =>
   staged === undefined ? "legacy" : staged ? "staged" : "worktree";
+
+// The two re-diff options change the diff *text* the daemon returns, so they're
+// part of the cache identity: toggling either must not serve a diff fetched
+// under the old options. Read live from the settings stores so every cache key
+// (and every request) reflects the user's current choice. Defaults serialize as
+// the omitted shape, matching what the request builder sends.
+function diffOptionFields(): { ignore_whitespace?: boolean; context_lines?: number } {
+  const fields: { ignore_whitespace?: boolean; context_lines?: number } = {};
+  if (get(diffIgnoreWhitespace)) fields.ignore_whitespace = true;
+  const context = get(diffContextLines);
+  if (context !== DEFAULT_DIFF_CONTEXT_LINES) fields.context_lines = context;
+  return fields;
+}
+// Stable string for the cache key: default options collapse to "" so warm
+// caches from before any toggle still hit at default settings.
+function diffOptionKey(): string {
+  const fields = diffOptionFields();
+  if (fields.ignore_whitespace === undefined && fields.context_lines === undefined) return "";
+  return `iw${fields.ignore_whitespace ? 1 : 0}\0cx${fields.context_lines ?? DEFAULT_DIFF_CONTEXT_LINES}`;
+}
 const diffCacheKey = (worktreeId: Id, path: string, staged?: boolean) =>
-  `${worktreeId}\0${diffSideKey(staged)}\0${path}`;
+  `${worktreeId}\0${diffSideKey(staged)}\0${diffOptionKey()}\0${path}`;
 const diffFreshnessKey = (worktreeId: Id, consumer: string, path: string, staged?: boolean) =>
   `${worktreeId}\0${consumer}\0${diffSideKey(staged)}\0${path}`;
 const diffTabFreshnessKey = (worktreeId: Id, path: string) =>
@@ -1779,8 +1806,8 @@ export async function viewDiff(path: string, activate = true, staged?: boolean):
   const cached = diffCache.get(cacheKey) ?? null;
   diffTabs.update((tabs) =>
     tabs.some((tab) => tab.path === path)
-      ? tabs.map((tab) => (tab.path === path ? { ...tab, text: cached } : tab))
-      : [...tabs, { path, text: cached }],
+      ? tabs.map((tab) => (tab.path === path ? { ...tab, text: cached, staged } : tab))
+      : [...tabs, { path, text: cached, staged }],
   );
   if (activate) {
     activeDiffPath.set(path);
@@ -1803,6 +1830,7 @@ export async function viewDiff(path: string, activate = true, staged?: boolean):
       worktree_id: worktreeId,
       path,
       ...(staged === undefined ? {} : { staged }),
+      ...diffOptionFields(),
     };
     const response = await daemonRequest<Response & { diff: { diff: string } }>(request);
     writeFreshDiffCache(cacheKey, writeSeq, response.diff.diff);
@@ -1834,6 +1862,7 @@ async function fetchFileDiff(
       worktree_id: worktreeId,
       path,
       staged,
+      ...diffOptionFields(),
     };
     const response = await daemonRequest<Response & { diff: { diff: string } }>(request);
     const wrote = writeFreshDiffCache(cacheKey, writeSeq, response.diff.diff);
@@ -1905,6 +1934,24 @@ export async function viewAllChanges(activate = true): Promise<void> {
       ),
     );
   });
+}
+
+// Re-fetch every open diff under the current re-diff options. Called when
+// `diffIgnoreWhitespace` / `diffContextLines` change: those options are part of
+// the cache key, so a fresh fetch under the new key is what surfaces the
+// re-shaped diff (old-option text stays cached but unreferenced). Single-file
+// tabs re-run `viewDiff` with the `staged` side they were opened with, never
+// stealing focus (`activate: false`); the all-changes tab re-fans via
+// `viewAllChanges`. Both reuse the existing freshness guards, so this races
+// safely with concurrent stage/unstage refreshes.
+export function refreshOpenDiffs(): void {
+  if (!get(gitWorktreeId)) return;
+  const tabs = get(diffTabs);
+  for (const tab of tabs) {
+    if (tab.path === ALL_CHANGES_TAB) continue;
+    void viewDiff(tab.path, false, tab.staged);
+  }
+  if (tabs.some((tab) => tab.path === ALL_CHANGES_TAB)) void viewAllChanges(false);
 }
 
 // Close one diff tab (or, with no argument, all of them) and fall back to the
@@ -2360,3 +2407,18 @@ gitWorktreeId.subscribe(($id) => {
     startGitStatusPolling($id);
   }
 });
+
+// The re-diff options change the daemon request, so a change must re-fetch any
+// open diff (the cache key already folds these in, so the refetch hits a fresh
+// key). Skip each store's synchronous initial emission — only user toggles
+// should trigger a refresh, not module load.
+let diffReDiffInit = 2;
+const onReDiffOptionChange = () => {
+  if (diffReDiffInit > 0) {
+    diffReDiffInit -= 1;
+    return;
+  }
+  refreshOpenDiffs();
+};
+diffIgnoreWhitespace.subscribe(onReDiffOptionChange);
+diffContextLines.subscribe(onReDiffOptionChange);

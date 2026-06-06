@@ -42,8 +42,8 @@ use hitch_core::{
     Worktree, WorktreeId,
 };
 use hitch_git::{
-    staged_diff, CommandControl, CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState,
-    GitClient, GitRepository, StatusEntry, WorktreeCheckout,
+    staged_diff, CommandControl, CreatePrRequest, CreateWorktreeRequest, DiffFileOptions,
+    DiffTarget, FileState, GitClient, GitRepository, StatusEntry, WorktreeCheckout,
 };
 use hitch_process::{DrainOutcome, PipeReader, ProcessTree};
 use hitch_proto::{
@@ -1297,8 +1297,17 @@ fn handle_request<R: Read>(
             worktree_id,
             path,
             staged,
+            ignore_whitespace,
+            context_lines,
         } => {
-            let diff = git_diff(state, worktree_id, path, staged)?;
+            let diff = git_diff(
+                state,
+                worktree_id,
+                path,
+                staged,
+                ignore_whitespace,
+                context_lines,
+            )?;
             send_response(state, client_id, request_id, Response::FileDiff { diff })?;
         }
         Request::StageFiles { worktree_id, paths } => {
@@ -2608,6 +2617,8 @@ fn git_diff(
     worktree_id: WorktreeId,
     path: PathBuf,
     staged: Option<bool>,
+    ignore_whitespace: Option<bool>,
+    context_lines: Option<u32>,
 ) -> Result<FileDiff, ProtocolError> {
     let worktree = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
@@ -2619,20 +2630,24 @@ fn git_diff(
     };
     let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
     let diff_path = diff_path_for_worktree(&worktree.path, &path);
+    let view = DiffFileOptions {
+        ignore_whitespace: ignore_whitespace.unwrap_or(false),
+        context_lines,
+    };
     let diff = match staged {
         Some(true) => repo
-            .diff_file(&diff_path, DiffTarget::Staged)
+            .diff_file(&diff_path, DiffTarget::Staged, view)
             .map_err(git_error)?,
         Some(false) => repo
-            .diff_file(&diff_path, DiffTarget::Worktree)
+            .diff_file(&diff_path, DiffTarget::Worktree, view)
             .map_err(git_error)?,
         None => {
             let mut diff = repo
-                .diff_file(&diff_path, DiffTarget::Worktree)
+                .diff_file(&diff_path, DiffTarget::Worktree, view)
                 .map_err(git_error)?;
             if diff.is_empty() {
                 diff = repo
-                    .diff_file(&diff_path, DiffTarget::Staged)
+                    .diff_file(&diff_path, DiffTarget::Staged, view)
                     .map_err(git_error)?;
             }
             diff

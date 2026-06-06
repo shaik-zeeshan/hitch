@@ -223,11 +223,18 @@ pub enum Request {
     /// Read a file-level diff for a path in a worktree. `staged == Some(true)`
     /// selects HEAD↔index; `Some(false)` selects index↔worktree. `None` keeps
     /// the legacy worktree-first, staged-fallback behavior for older clients.
+    /// `ignore_whitespace == Some(true)` drops whitespace-only changes;
+    /// `context_lines` overrides the surrounding context size (git default 3).
+    /// Both are omitted by older clients and keep today's behavior when absent.
     GitDiff {
         worktree_id: WorktreeId,
         path: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         staged: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ignore_whitespace: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_lines: Option<u32>,
     },
     /// Stage whole files.
     StageFiles {
@@ -915,8 +922,36 @@ mod tests {
                 worktree_id,
                 path: "src/lib.rs".into(),
                 staged: None,
+                ignore_whitespace: None,
+                context_lines: None,
             }
         );
+    }
+
+    #[test]
+    fn git_diff_carries_whitespace_and_context_view_options() {
+        let (_, worktree_id, _) = ids();
+        let json = format!(
+            r#"{{"type":"git-diff","worktree_id":"{worktree_id}","path":"src/lib.rs","ignore_whitespace":true,"context_lines":10}}"#
+        );
+        let request: Request = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            request,
+            Request::GitDiff {
+                worktree_id,
+                path: "src/lib.rs".into(),
+                staged: None,
+                ignore_whitespace: Some(true),
+                context_lines: Some(10),
+            }
+        );
+
+        // The same field names round-trip back out (snake_case, like the rest of
+        // the request payload).
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["ignore_whitespace"], true);
+        assert_eq!(value["context_lines"], 10);
     }
 
     #[test]
@@ -1464,6 +1499,8 @@ mod tests {
                 worktree_id,
                 path: "src/lib.rs".into(),
                 staged: Some(false),
+                ignore_whitespace: Some(true),
+                context_lines: Some(10),
             },
             Request::StageFiles {
                 worktree_id,

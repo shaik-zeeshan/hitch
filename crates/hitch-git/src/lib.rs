@@ -62,8 +62,13 @@ impl GitRepository {
     }
 
     /// Read a file-level patch for either the staged or unstaged/worktree side.
-    pub fn diff_file(&self, path: impl AsRef<Path>, target: DiffTarget) -> Result<String> {
-        diff_file(&self.root, path, target)
+    pub fn diff_file(
+        &self,
+        path: impl AsRef<Path>,
+        target: DiffTarget,
+        options: DiffFileOptions,
+    ) -> Result<String> {
+        diff_file(&self.root, path, target, options)
     }
 
     /// List local and remote branches.
@@ -803,6 +808,16 @@ pub enum DiffTarget {
     Worktree,
 }
 
+/// View knobs for a file-level diff. The [`Default`] keeps libgit2's defaults
+/// (whitespace-sensitive, three context lines), matching the legacy behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiffFileOptions {
+    /// Collapse whitespace-only changes (`DiffOptions::ignore_whitespace`).
+    pub ignore_whitespace: bool,
+    /// Override the surrounding context size. `None` keeps git's default (3).
+    pub context_lines: Option<u32>,
+}
+
 /// Branch metadata for local and remote refs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchInfo {
@@ -1132,11 +1147,13 @@ pub fn is_dirty(repo_path: impl AsRef<Path>) -> Result<bool> {
     Ok(!statuses.is_empty())
 }
 
-/// Read a file-level diff using libgit2.
+/// Read a file-level diff using libgit2. `view` carries the optional
+/// whitespace/context knobs; its [`Default`] reproduces the legacy behavior.
 pub fn diff_file(
     repo_path: impl AsRef<Path>,
     path: impl AsRef<Path>,
     target: DiffTarget,
+    view: DiffFileOptions,
 ) -> Result<String> {
     let repo = Repository::discover(repo_path.as_ref())?;
     let pathspec = diff_pathspec(&repo, path.as_ref());
@@ -1146,6 +1163,12 @@ pub fn diff_file(
         .include_untracked(true)
         .recurse_untracked_dirs(true)
         .show_untracked_content(true);
+    if view.ignore_whitespace {
+        options.ignore_whitespace(true);
+    }
+    if let Some(context_lines) = view.context_lines {
+        options.context_lines(context_lines);
+    }
     if let Some(old_path) = diff_rename_old_path(&repo, pathspec.as_ref(), target)? {
         options.pathspec(old_path);
     }
@@ -2318,7 +2341,7 @@ mod tests {
         assert_eq!(summary.additions, 2);
         assert_eq!(summary.deletions, 1);
 
-        let diff = diff_file(fixture.path(), "tracked.txt", DiffTarget::Worktree).unwrap();
+        let diff = diff_file(fixture.path(), "tracked.txt", DiffTarget::Worktree, DiffFileOptions::default()).unwrap();
         assert!(diff.contains("changed"), "diff was {diff:?}");
 
         GitClient::default()
@@ -2333,8 +2356,78 @@ mod tests {
             summary.entry_for("tracked.txt").unwrap().working_tree,
             FileState::Unmodified
         );
-        let staged = diff_file(fixture.path(), "tracked.txt", DiffTarget::Staged).unwrap();
+        let staged = diff_file(fixture.path(), "tracked.txt", DiffTarget::Staged, DiffFileOptions::default()).unwrap();
         assert!(staged.contains("changed"), "staged diff was {staged:?}");
+    }
+
+    #[test]
+    fn diff_file_ignore_whitespace_drops_whitespace_only_changes() {
+        let fixture = RepoFixture::new();
+        // Commit a known baseline, then re-indent the same line — a pure
+        // whitespace change.
+        fixture.write("tracked.txt", "value\n");
+        fixture.git(["add", "tracked.txt"]);
+        fixture.git(["commit", "-m", "set tracked value"]);
+        fixture.write("tracked.txt", "    value\n");
+
+        let default = diff_file(
+            fixture.path(),
+            "tracked.txt",
+            DiffTarget::Worktree,
+            DiffFileOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            default.contains("+    value"),
+            "whitespace-sensitive diff was {default:?}"
+        );
+
+        let ignored = diff_file(
+            fixture.path(),
+            "tracked.txt",
+            DiffTarget::Worktree,
+            DiffFileOptions {
+                ignore_whitespace: true,
+                ..DiffFileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            ignored.is_empty(),
+            "ignore_whitespace diff should be empty, was {ignored:?}"
+        );
+    }
+
+    #[test]
+    fn diff_file_context_lines_controls_hunk_context_size() {
+        let fixture = RepoFixture::new();
+        // Ten committed lines; flip the middle one so the hunk has equal context
+        // available on both sides.
+        let base: String = (1..=10).map(|n| format!("line{n}\n")).collect();
+        fixture.write("tracked.txt", &base);
+        fixture.git(["add", "tracked.txt"]);
+        fixture.git(["commit", "-m", "ten lines"]);
+        let changed = base.replace("line5\n", "line5-changed\n");
+        fixture.write("tracked.txt", &changed);
+
+        let count_context = |context: u32| -> usize {
+            let diff = diff_file(
+                fixture.path(),
+                "tracked.txt",
+                DiffTarget::Worktree,
+                DiffFileOptions {
+                    context_lines: Some(context),
+                    ..DiffFileOptions::default()
+                },
+            )
+            .unwrap();
+            // Context lines render with a leading space (not +/-/@/diff headers).
+            diff.lines().filter(|line| line.starts_with(' ')).count()
+        };
+
+        // Zero context shows only the changed line; ten shows every other line.
+        assert_eq!(count_context(0), 0);
+        assert_eq!(count_context(10), 9);
     }
 
     #[test]
@@ -2393,7 +2486,7 @@ mod tests {
         assert_eq!((moved.worktree_additions, moved.worktree_deletions), (0, 0));
         assert_eq!((summary.additions, summary.deletions), (1, 1));
 
-        let diff = diff_file(fixture.path(), "moved.txt", DiffTarget::Staged).unwrap();
+        let diff = diff_file(fixture.path(), "moved.txt", DiffTarget::Staged, DiffFileOptions::default()).unwrap();
         assert!(
             diff.contains("rename from tracked.txt"),
             "diff was {diff:?}"
@@ -2428,7 +2521,7 @@ mod tests {
         assert_eq!((moved.staged_additions, moved.staged_deletions), (0, 0));
         assert_eq!((summary.additions, summary.deletions), (1, 1));
 
-        let diff = diff_file(fixture.path(), "moved.txt", DiffTarget::Worktree).unwrap();
+        let diff = diff_file(fixture.path(), "moved.txt", DiffTarget::Worktree, DiffFileOptions::default()).unwrap();
         assert!(
             diff.contains("rename from tracked.txt"),
             "diff was {diff:?}"
@@ -2457,7 +2550,7 @@ mod tests {
         let entry = summary.entry_for(&file).unwrap();
         assert_eq!(entry.working_tree, FileState::Modified);
 
-        let relative = diff_file(fixture.path(), &file, DiffTarget::Worktree).unwrap();
+        let relative = diff_file(fixture.path(), &file, DiffTarget::Worktree, DiffFileOptions::default()).unwrap();
         assert!(
             relative.contains("changed"),
             "relative diff was {relative:?}"
@@ -2467,6 +2560,7 @@ mod tests {
             fixture.path(),
             fixture.path().join(&file),
             DiffTarget::Worktree,
+            DiffFileOptions::default(),
         )
         .unwrap();
         assert!(
@@ -2492,6 +2586,7 @@ mod tests {
             fixture.path(),
             fixture.path().join(&file),
             DiffTarget::Staged,
+            DiffFileOptions::default(),
         )
         .unwrap();
         assert!(diff.contains("staged"), "staged diff was {diff:?}");

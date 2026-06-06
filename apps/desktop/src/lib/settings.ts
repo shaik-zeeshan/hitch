@@ -9,6 +9,10 @@ const DRAFT_MODEL_KEY = "hitch.draftModel";
 const DRAFT_CLAUDE_PATH_KEY = "hitch.draftClaudePath";
 const DRAFT_CODEX_PATH_KEY = "hitch.draftCodexPath";
 const AUTO_COMMIT_PUSH_KEY = "hitch.autoCommitPush";
+const DIFF_STYLE_KEY = "hitch.diffStyle";
+const DIFF_WRAP_KEY = "hitch.diffWrap";
+const DIFF_IGNORE_WHITESPACE_KEY = "hitch.diffIgnoreWhitespace";
+const DIFF_CONTEXT_LINES_KEY = "hitch.diffContextLines";
 
 // Editor preference passed to the desktop backend. Empty string is the
 // default and means "System default": the backend resolves $VISUAL/$EDITOR at
@@ -96,9 +100,65 @@ function persistedBool(key: string, initial: boolean): Writable<boolean> {
   return store;
 }
 
+// Numeric preference, persisted as a string. Reads that don't parse (or fall
+// outside [min, max]) fall back to the default, mirroring `persisted`'s
+// best-effort localStorage handling. Writes clamp into range so a stored value
+// can never drift out of bounds.
+function persistedNumber(
+  key: string,
+  initial: number,
+  min: number,
+  max: number,
+): Writable<number> {
+  const clamp = (value: number) => Math.min(max, Math.max(min, Math.round(value)));
+  let start = initial;
+  try {
+    const stored = localStorage.getItem(key);
+    if (stored !== null) {
+      const parsed = Number(stored);
+      if (Number.isFinite(parsed)) start = clamp(parsed);
+    }
+  } catch {
+    // localStorage unavailable; keep an in-memory store with the default.
+  }
+  const store = writable(start);
+  store.subscribe((value) => {
+    try {
+      localStorage.setItem(key, String(clamp(value)));
+    } catch {}
+  });
+  return store;
+}
+
+export type DiffStyle = "unified" | "split";
+export const DEFAULT_DIFF_STYLE: DiffStyle = "unified";
+export const DEFAULT_DIFF_CONTEXT_LINES = 3;
+export const DIFF_CONTEXT_LINES_MIN = 0;
+export const DIFF_CONTEXT_LINES_MAX = 999;
+
+function isDiffStyle(value: string): value is DiffStyle {
+  return value === "unified" || value === "split";
+}
+
 export const editorApp = persisted(EDITOR_KEY, SYSTEM_DEFAULT_EDITOR);
 export const draftProvider = persistedDraftProvider();
 export const draftModel = persisted(DRAFT_MODEL_KEY, DEFAULT_DRAFT_MODEL);
 export const draftClaudePath = persisted(DRAFT_CLAUDE_PATH_KEY, "");
 export const draftCodexPath = persisted(DRAFT_CODEX_PATH_KEY, "");
 export const autoCommitPush = persistedBool(AUTO_COMMIT_PUSH_KEY, false);
+
+// Diff view preferences. The render-side pair (`diffStyle`, `diffWrap`) only
+// affects how an already-fetched diff is laid out by @pierre/diffs. The
+// re-diff pair (`diffIgnoreWhitespace`, `diffContextLines`) changes the
+// daemon's `git diff` invocation, so toggling them re-fetches the diff text.
+export const diffStyle = persisted(DIFF_STYLE_KEY, DEFAULT_DIFF_STYLE, (value) =>
+  isDiffStyle(value) ? value : DEFAULT_DIFF_STYLE,
+) as Writable<DiffStyle>;
+export const diffWrap = persistedBool(DIFF_WRAP_KEY, false);
+export const diffIgnoreWhitespace = persistedBool(DIFF_IGNORE_WHITESPACE_KEY, false);
+export const diffContextLines = persistedNumber(
+  DIFF_CONTEXT_LINES_KEY,
+  DEFAULT_DIFF_CONTEXT_LINES,
+  DIFF_CONTEXT_LINES_MIN,
+  DIFF_CONTEXT_LINES_MAX,
+);
