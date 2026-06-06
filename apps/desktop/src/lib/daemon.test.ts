@@ -39,6 +39,7 @@ import {
   allChangesFiles,
   allChangesRowKey,
   fetchAllChangesRow,
+  invalidateDiffCacheVariants,
   viewAllChanges,
   createWorktree,
   daemonReason,
@@ -1679,6 +1680,60 @@ describe("all-changes diff tab", () => {
       { path: "src/a.ts", staged: false, text: "new all diff" },
     ]);
     expect(pending).toHaveLength(2);
+  });
+
+  it("does not let an in-flight diff repopulate the cache after invalidation when no newer fetch follows", async () => {
+    // The stale-write race: a row's diff fetch is in flight (it captured the
+    // current write-seq) when the file changes and the cache is invalidated. If
+    // the user then collapses the row, no newer fetch bumps the write-seq, so the
+    // in-flight (stale) response must not be allowed to write back into the cache
+    // — otherwise expanding the row later serves the pre-change diff.
+    const pending: {
+      path: string;
+      resolve: (value: { type: "git-diff"; diff: { diff: string } }) => void;
+    }[] = [];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false, additions: 1 }]);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type !== "git-diff" || !request.path) throw new Error(`unexpected request ${request.type}`);
+        const deferredResponse = deferred<{ type: "git-diff"; diff: { diff: string } }>();
+        pending.push({ path: request.path, resolve: deferredResponse.resolve });
+        return deferredResponse.promise;
+      },
+    );
+
+    // Open all-changes: src/a.ts is expanded, so its diff fetch starts (held).
+    const openPromise = viewAllChanges();
+    await flush();
+    expect(pending.map((request) => request.path)).toEqual(["src/a.ts"]);
+
+    // The file changes on disk: the cache entry for src/a.ts is invalidated. This
+    // is exactly what the gitStatus subscriber does on a worktree-dirty refresh
+    // (deleteDiffCacheForChangedFiles -> invalidateDiffCacheVariants).
+    invalidateDiffCacheVariants(worktree.id, "src/a.ts");
+
+    // The user collapses the row, so the in-flight fetch's seq is the LATEST —
+    // no follow-up fetch bumps the write-seq to neutralize it.
+    allChangesCollapsed.set(new Set([allChangesRowKey("src/a.ts", false)]));
+
+    // The held (now stale) response resolves.
+    pending[0]!.resolve({ type: "git-diff", diff: { diff: "stale a diff" } });
+    await openPromise;
+    await flush();
+
+    // Expanding the row must NOT serve the stale cached diff: it has to re-fetch.
+    pending.length = 0;
+    const expandPromise = fetchAllChangesRow("src/a.ts", false);
+    await flush();
+    expect(pending.map((request) => request.path)).toEqual(["src/a.ts"]);
+    pending[0]!.resolve({ type: "git-diff", diff: { diff: "fresh a diff" } });
+    await expandPromise;
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "fresh a diff" },
+    ]);
   });
 
   it("auto-refreshes all-changes when file metadata changes without a path or staged change", async () => {

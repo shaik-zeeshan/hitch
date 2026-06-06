@@ -233,13 +233,17 @@
     "tab.close": closeActiveTab,
     // ---- tree (slice 3) ---------------------------------------------------
     // Cmd+N opens the create-worktree dialog for the selected project. It's a
-    // modifier combo (not pane-gated by matchBinding), but worktrees only exist
-    // for git-backed projects, so we gate HERE on a selected git-backed project —
+    // modifier combo, so `matchBinding` does NOT pane-gate it (only bare keys are
+    // gated); we gate it HERE to the tree pane — mirroring git.commit — so it
+    // stays scoped to the tree context (its keymap `when: "tree"`) rather than
+    // hijacking Cmd+N from the terminal or git pane. It additionally requires a
+    // selected git-backed project (worktrees only exist for those), declining to
     // a no-op otherwise rather than opening an empty dialog. The bare tree keys
     // (↑/↓/←/→/Enter/Space) are handled component-locally in ProjectTree (DOM
     // focus is inside the pane); their ids stay unwired so the dispatcher lets
     // them fall through to the tree.
     "tree.newWorktree": () => {
+      if (get(focusedPane) !== "tree") return false; // declined — no key consumed
       const project = get(selectedProject);
       if (project?.kind !== "git-backed") return false; // declined — no key consumed
       createWorktreeFor.set(project);

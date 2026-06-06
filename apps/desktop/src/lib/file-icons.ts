@@ -38,7 +38,7 @@ import { getIconForFilePath } from "vscode-material-icons";
 const iconUrlModules = import.meta.glob<string>(
   [
     "../../node_modules/vscode-material-icons/generated/icons/*.svg",
-    "../../../node_modules/vscode-material-icons/generated/icons/*.svg",
+    "../../../../node_modules/vscode-material-icons/generated/icons/*.svg",
   ],
   { query: "?url", eager: true, import: "default", exhaustive: true },
 );

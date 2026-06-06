@@ -331,12 +331,26 @@ const forcedAllChangesRefreshWorktrees = new Set<Id>();
 // every segment, so matching the worktree+side prefix and the `\0path` suffix is
 // unambiguous (no false positives between paths that share a suffix, or between
 // sides whose names share a prefix). `staged === undefined` invalidates all sides.
-function invalidateDiffCacheVariants(worktreeId: Id, path: string, staged?: boolean): void {
+//
+// Bumping the per-key write-seq is as load-bearing as the delete: an in-flight
+// `git-diff` captured the current write-seq before this invalidation and would
+// otherwise pass `writeFreshDiffCache`'s seq check and repopulate the just-cleared
+// entry with its now-stale text. That refill is invisible until the cache is read
+// again — and the "All changes" collapse-during-refresh path issues no follow-up
+// fetch to bump the seq, so expanding the row later serves the pre-change diff.
+// Bumping here invalidates any request older than this point. The write-seq map is
+// the superset (every cache write goes through `nextDiffCacheWriteSeq`, plus
+// in-flight keys not yet written), so iterating it covers both the delete and the
+// bump, including requests whose entry was never cached.
+export function invalidateDiffCacheVariants(worktreeId: Id, path: string, staged?: boolean): void {
   const pathSuffix = `\0${path}`;
   const prefix =
     staged === undefined ? `${worktreeId}\0` : `${worktreeId}\0${diffSideKey(staged)}\0`;
-  for (const key of diffCache.keys()) {
-    if (key.startsWith(prefix) && key.endsWith(pathSuffix)) diffCache.delete(key);
+  for (const key of diffCacheWriteSeq.keys()) {
+    if (key.startsWith(prefix) && key.endsWith(pathSuffix)) {
+      diffCache.delete(key);
+      diffCacheWriteSeq.set(key, (diffCacheWriteSeq.get(key) ?? 0) + 1);
+    }
   }
 }
 
