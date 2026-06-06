@@ -160,6 +160,10 @@ export const ALL_CHANGES_TAB = "\0all";
 // one @pierre/diffs instance per expanded entry from these.
 export type AllChangesFile = { path: string; staged: boolean; text: string | null };
 export const allChangesFiles = writable<AllChangesFile[]>([]);
+// Keep the daemon/webview responsive for large working trees: All changes may
+// contain hundreds of rows, and untracked directory rows can expand to large
+// diffs. Fetch a small pool instead of starting one git-diff per row at once.
+const ALL_CHANGES_DIFF_CONCURRENCY = 4;
 // The path of the diff tab currently shown when the diff view is active. `null`
 // when no diff tabs are open.
 export const activeDiffPath = writable<string | null>(null);
@@ -261,6 +265,41 @@ function writeFreshDiffCache(cacheKey: string, writeSeq: number, text: string): 
   if (diffCacheWriteSeq.get(cacheKey) !== writeSeq) return false;
   diffCache.set(cacheKey, text);
   return true;
+}
+
+const forcedAllChangesRefreshWorktrees = new Set<Id>();
+
+function deleteDiffCacheForChangedFiles(worktreeId: Id, files: ChangedFile[]): void {
+  for (const file of files) diffCache.delete(diffCacheKey(worktreeId, file.path, file.staged));
+}
+
+function requestAllChangesRefreshOnNextStatus(worktreeId: Id): void {
+  if (
+    get(gitWorktreeId) === worktreeId &&
+    get(diffTabs).some((tab) => tab.path === ALL_CHANGES_TAB)
+  ) {
+    forcedAllChangesRefreshWorktrees.add(worktreeId);
+  }
+}
+
+async function forEachBounded<T>(
+  items: readonly T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) return;
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      for (;;) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= items.length) return;
+        await worker(items[index]!, index);
+      }
+    }),
+  );
 }
 
 let statusRequestSeq = 0;
@@ -899,6 +938,7 @@ export function applyHitchEvent(event: HitchEvent): void {
     dirtyWorktrees.update((current) =>
       current[worktreeId] === dirty ? current : { ...current, [worktreeId]: dirty },
     );
+    requestAllChangesRefreshOnNextStatus(worktreeId);
     // Refresh the full status so the tree's line stats and, when selected,
     // the Changes panel track filesystem changes live.
     void loadGitStatus(worktreeId).catch(() => {});
@@ -1807,8 +1847,8 @@ async function fetchFileDiff(
 
 // Open (or refresh + activate) the single all-changes tab: one unified view of
 // every changed file. The file list is taken from the current git status (staged
-// first, then unstaged, matching RightRail), each file's diff fetched in parallel
-// through `fetchFileDiff` (reusing `diffCache`). A monotonic seq guards against an
+// first, then unstaged, matching RightRail), and each diff is fetched through a
+// bounded pool via `fetchFileDiff` (reusing `diffCache`). A monotonic seq guards
 // older fan-out (e.g. from before a stage/unstage) overwriting a newer one. The
 // tab is represented by the `ALL_CHANGES_TAB` sentinel in `diffTabs` so it lives
 // in the strip as a peer; its content lives in `allChangesFiles`, not its `text`.
@@ -1851,22 +1891,20 @@ export async function viewAllChanges(activate = true): Promise<void> {
   // This fan-out is still the freshest and its worktree is still selected.
   const isLatest = () => allChangesSeq === seq && get(gitWorktreeId) === worktreeId;
 
-  await Promise.all(
-    ordered.map(async (file) => {
-      const text = await fetchFileDiff(worktreeId, file.path, file.staged);
-      if (!isLatest()) return;
-      allChangesFiles.update((rows) =>
-        rows.map((row) =>
-          row.path === file.path && row.staged === file.staged
-            ? {
-                ...row,
-                text: text ?? diffCache.get(diffCacheKey(worktreeId, file.path, file.staged)) ?? row.text,
-              }
-            : row,
-        ),
-      );
-    }),
-  );
+  await forEachBounded(ordered, ALL_CHANGES_DIFF_CONCURRENCY, async (file) => {
+    const text = await fetchFileDiff(worktreeId, file.path, file.staged);
+    if (!isLatest()) return;
+    allChangesFiles.update((rows) =>
+      rows.map((row) =>
+        row.path === file.path && row.staged === file.staged
+          ? {
+              ...row,
+              text: text ?? diffCache.get(diffCacheKey(worktreeId, file.path, file.staged)) ?? row.text,
+            }
+          : row,
+      ),
+    );
+  });
 }
 
 // Close one diff tab (or, with no argument, all of them) and fall back to the
@@ -2268,9 +2306,10 @@ sessions.subscribe(($sessions) => {
 });
 
 // Keep the all-changes tab fresh when status metadata changes (file set, side,
-// status, or line counts) without stealing focus. Polls can return a new object
-// for identical content every second, so this signature is deliberately stable:
-// unchanged metadata must not clear the cache and refetch every row while idle.
+// status, or line counts) without stealing focus. Idle polls can return a new
+// object for identical content every second, so identical metadata does not
+// refetch. A worktree-dirty event sets a one-shot force flag because the diff
+// text can change while this metadata stays identical.
 function allChangesStatusSignature(worktreeId: Id | null | undefined, files: ChangedFile[]): string {
   return [
     worktreeId ?? "",
@@ -2283,16 +2322,21 @@ function allChangesStatusSignature(worktreeId: Id | null | undefined, files: Cha
 
 let lastAllChangesSig: string | null = null;
 gitStatus.subscribe(($status) => {
-  if (!get(diffTabs).some((tab) => tab.path === ALL_CHANGES_TAB)) {
+  const hasAllChangesTab = get(diffTabs).some((tab) => tab.path === ALL_CHANGES_TAB);
+  if (!hasAllChangesTab) {
     lastAllChangesSig = null;
+    forcedAllChangesRefreshWorktrees.clear();
     return;
   }
   const files = $status?.files ?? [];
-  const sig = allChangesStatusSignature($status?.worktree_id, files);
-  if (sig === lastAllChangesSig) return;
   const worktreeId = $status?.worktree_id;
+  const sig = allChangesStatusSignature(worktreeId, files);
+  const forceRefresh = worktreeId
+    ? forcedAllChangesRefreshWorktrees.delete(worktreeId)
+    : false;
+  if (sig === lastAllChangesSig && !forceRefresh) return;
   if (worktreeId) {
-    for (const file of files) diffCache.delete(diffCacheKey(worktreeId, file.path, file.staged));
+    deleteDiffCacheForChangedFiles(worktreeId, files);
   }
   lastAllChangesSig = sig;
   void viewAllChanges(false);

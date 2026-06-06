@@ -1685,6 +1685,125 @@ describe("all-changes diff tab", () => {
     expect(diffVersion).toBe(1);
   });
 
+  it("refreshes all-changes on worktree-dirty even when status metadata is identical", async () => {
+    let diffVersion = 0;
+    const files: ChangedFile[] = [
+      { path: "src/a.ts", status: "modified", staged: false, additions: 1, deletions: 1 },
+    ];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus(files);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffVersion += 1;
+          return { type: "git-diff", diff: { diff: `diff v${diffVersion} for ${request.path}` } };
+        }
+        if (request.type === "git-status") {
+          return {
+            type: "git-status",
+            status: {
+              worktree_id: worktree.id,
+              branch: "feature",
+              dirty: true,
+              ahead: 0,
+              behind: 0,
+              additions: 1,
+              deletions: 1,
+              files,
+            },
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await viewAllChanges();
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v1 for src/a.ts" },
+    ]);
+
+    applyHitchEvent({ type: "worktree-dirty", worktree_id: worktree.id, dirty: true });
+    await flush();
+    await flush();
+
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v2 for src/a.ts" },
+    ]);
+  });
+
+  it("bounds all-changes diff fan-out", async () => {
+    const files: ChangedFile[] = Array.from({ length: 20 }, (_value, index) => ({
+      path: `src/${index}.ts`,
+      status: "modified",
+      staged: false,
+    }));
+    const pending: {
+      path: string;
+      resolve: (value: { type: "git-diff"; diff: { diff: string } }) => void;
+    }[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let resolvedCount = 0;
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus(files);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type !== "git-diff" || !request.path) {
+          throw new Error(`unexpected request ${request.type}`);
+        }
+        const response = deferred<{ type: "git-diff"; diff: { diff: string } }>();
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        pending.push({
+          path: request.path,
+          resolve: (value) => {
+            inFlight -= 1;
+            response.resolve(value);
+          },
+        });
+        return response.promise;
+      },
+    );
+
+    const promise = viewAllChanges();
+    await flush();
+
+    const firstBatchSize = pending.length;
+    expect(firstBatchSize).toBeGreaterThan(0);
+    expect(firstBatchSize).toBeLessThan(files.length);
+    expect(maxInFlight).toBe(firstBatchSize);
+
+    pending[resolvedCount]!.resolve({
+      type: "git-diff",
+      diff: { diff: `diff for ${pending[resolvedCount]!.path}` },
+    });
+    resolvedCount += 1;
+    await flush();
+
+    expect(pending).toHaveLength(firstBatchSize + 1);
+    expect(maxInFlight).toBe(firstBatchSize);
+
+    while (resolvedCount < files.length) {
+      while (resolvedCount < pending.length) {
+        pending[resolvedCount]!.resolve({
+          type: "git-diff",
+          diff: { diff: `diff for ${pending[resolvedCount]!.path}` },
+        });
+        resolvedCount += 1;
+      }
+      await flush();
+    }
+    await promise;
+
+    expect(maxInFlight).toBe(firstBatchSize);
+    expect(get(allChangesFiles)).toHaveLength(files.length);
+    expect(get(allChangesFiles).every((row) => row.text === `diff for ${row.path}`)).toBe(true);
+  });
+
   it("closing the sentinel tab invalidates in-flight all-changes fan-out rows", async () => {
     const response = deferred<{ type: "git-diff"; diff: { diff: string } }>();
     projects.set([project]);

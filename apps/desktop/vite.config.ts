@@ -4,6 +4,7 @@ import tailwindcss from "@tailwindcss/vite";
 import Icons from "unplugin-icons/vite";
 import { FileSystemIconLoader } from "unplugin-icons/loaders";
 
+
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
@@ -23,6 +24,7 @@ export default defineConfig(async () => ({
       },
     }),
   ],
+
 
   build: {
     // The changes-list file-type glyphs (vscode-material-icons) are pulled in

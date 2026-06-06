@@ -31,12 +31,16 @@
 import { getIconForFilePath } from "vscode-material-icons";
 
 // name→URL map of every shipped material icon. `eager: true` + `query: '?url'`
-// resolves at build time to hashed asset URLs (one short string each), and Vite
-// only copies the SVGs that survive into the bundle. The keys are absolute-ish
-// module paths, so we re-key them by bare icon name (the file's basename).
+// resolves at build time to hashed asset URLs (one short string each). The keys
+// are module paths, so we re-key them by bare icon name (the file's basename).
+// Bun may materialize this workspace dependency under apps/desktop/node_modules
+// or hoist it to the workspace root, so include both fixed workspace layouts.
 const iconUrlModules = import.meta.glob<string>(
-  "../../node_modules/vscode-material-icons/generated/icons/*.svg",
-  { query: "?url", eager: true, import: "default" },
+  [
+    "../../node_modules/vscode-material-icons/generated/icons/*.svg",
+    "../../../node_modules/vscode-material-icons/generated/icons/*.svg",
+  ],
+  { query: "?url", eager: true, import: "default", exhaustive: true },
 );
 
 const ICON_URLS: Record<string, string> = {};
