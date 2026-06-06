@@ -17,9 +17,10 @@
   // Importing FileDiff also registers the <diffs-container> custom element it
   // renders into (its module pulls in @pierre/diffs' web-components side effect,
   // which owns the shadow root + adopted Pierre stylesheet).
-  import { FileDiff, processPatch, type FileDiffMetadata, type FileDiffOptions } from "@pierre/diffs";
+  import { processPatch, type FileDiffMetadata } from "@pierre/diffs";
   import { diffPath, diffText } from "../daemon";
   import { parseDiff } from "../diff";
+  import { diffViewOptions, fileDiffView } from "../diffView";
   import { theme } from "../theme";
   import DiffViewOptions from "./DiffViewOptions.svelte";
   import { diffStyle, diffWrap } from "../settings";
@@ -45,64 +46,9 @@
   // settings. They only re-lay-out the already-fetched diff (split vs unified,
   // wrap vs scroll), so changing them calls setOptions + rerender on the live
   // instances rather than re-fetching. `$derived` so sections created mid-
-  // session also start with the current values.
-  const options = $derived<FileDiffOptions<undefined>>({
-    diffStyle: $diffStyle,
-    disableFileHeader: true, // DiffTab renders its own header bar.
-    disableLineNumbers: false,
-    diffIndicators: "classic",
-    hunkSeparators: "line-info",
-    lineDiffType: "word",
-    overflow: $diffWrap ? "wrap" : "scroll",
-    stickyHeader: false,
-    preferredHighlighter: "shiki-js", // no WASM, faster startup.
-    theme: { light: "pierre-light", dark: "pierre-dark" },
-    themeType: $theme,
-  });
-
-  // One FileDiff per rendered file section. The Svelte action owns its instance:
-  // it renders on mount + on metadata/theme/option change and cleans up when the
-  // section unmounts (cleanUp() detaching the Svelte-owned <diffs-container> is
-  // fine here because Svelte is removing it too). Threading the params through the
-  // action lets a split/wrap/theme toggle re-apply to every live instance via
-  // setOptions + rerender. Mirrors DiffAllTab's per-section pattern.
-  type ViewParams = {
-    fileDiff: FileDiffMetadata;
-    opts: FileDiffOptions<undefined>;
-  };
-
-  function fileDiffView(node: HTMLElement, params: ViewParams) {
-    let instance: FileDiff<undefined> | undefined;
-    let lastFileDiff: FileDiffMetadata | undefined;
-
-    function render(fileDiff: FileDiffMetadata, opts: FileDiffOptions<undefined>) {
-      if (!instance) instance = new FileDiff<undefined>({ ...opts });
-      else instance.setOptions(opts);
-      instance.setThemeType(opts.themeType ?? "light");
-      instance.render({ fileDiff, fileContainer: node, forceRender: true });
-      lastFileDiff = fileDiff;
-    }
-
-    render(params.fileDiff, params.opts);
-
-    return {
-      update(next: ViewParams) {
-        if (next.fileDiff !== lastFileDiff) {
-          // New metadata: a full re-render (also picks up the latest opts).
-          render(next.fileDiff, next.opts);
-        } else if (instance) {
-          // Same metadata, changed options (split/wrap/theme): merge + re-lay-out.
-          instance.setOptions(next.opts);
-          instance.setThemeType(next.opts.themeType ?? "light");
-          instance.rerender();
-        }
-      },
-      destroy() {
-        instance?.cleanUp();
-        instance = undefined;
-      },
-    };
-  }
+  // session also start with the current values. The instance lifecycle + the
+  // chrome token bridge live in the shared diffView module (fileDiffView action).
+  const options = $derived(diffViewOptions($diffStyle, $diffWrap, $theme));
 </script>
 
 <div class="diff">
@@ -236,31 +182,9 @@
     white-space: nowrap;
   }
 
-  /* The @pierre/diffs container. The --diffs-* custom properties inherit across
-     the shadow boundary, so setting them here bridges Pierre's chrome to the
-     app's terminal tokens (which Center.svelte already overrides per-mode via
-     terminalSurfaceOverride). Token (syntax) colors come from the pierre-light/
-     pierre-dark Shiki themes; only the chrome is overridden. */
-  .diffs {
-    display: block;
-    /* Match the previous diff view's monospace styling. */
-    --diffs-font-family: var(--mono);
-    --diffs-font-size: var(--r1);
-    /* Base surface → the terminal panel fill. */
-    --diffs-light-bg: var(--term-bg2);
-    --diffs-dark-bg: var(--term-bg2);
-    --diffs-bg-context-override: var(--term-bg2);
-    /* Add/del row tints → derived from the app's diff accent tokens. */
-    --diffs-bg-addition-override: oklch(from var(--diff-add) l c h / 0.1);
-    --diffs-bg-deletion-override: oklch(from var(--diff-del) l c h / 0.1);
-    --diffs-bg-addition-emphasis-override: oklch(from var(--diff-add) l c h / 0.22);
-    --diffs-bg-deletion-emphasis-override: oklch(from var(--diff-del) l c h / 0.22);
-    --diffs-addition-color-override: var(--diff-add);
-    --diffs-deletion-color-override: var(--diff-del);
-    /* Line-number gutter + hover → dim terminal tokens. */
-    --diffs-fg-number-override: var(--term-dim);
-    --diffs-bg-hover-override: oklch(from var(--term-fg) l c h / 0.06);
-  }
+  /* The @pierre/diffs container's chrome→terminal token bridge (the --diffs-*
+     custom properties) is applied imperatively by the shared fileDiffView action
+     in lib/diffView.ts so it lives in one place; `display: block` is set there. */
 
   .diff-empty {
     display: grid;

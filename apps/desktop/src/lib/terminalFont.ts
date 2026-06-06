@@ -20,26 +20,13 @@ const pending = new Map<string, Promise<void>>();
 // Resolves once `family`'s faces are usable (or determined unusable; loading
 // is best-effort — the caller applies the font-family stack either way and
 // fallback covers failure). Empty family = the built-in stack; nothing to load.
-// TEMP DEBUG (remove): mirror progress into localStorage so it can be read
-// from outside the webview.
-function debugMark(value: string) {
-  try {
-    localStorage.setItem("hitch.debug.font", `${new Date().toISOString()} ${value}`);
-  } catch {}
-}
-
 export function ensureTerminalFontLoaded(family: string): Promise<void> {
   const name = family.trim();
   if (!name || settled.has(name)) return Promise.resolve();
   const inFlight = pending.get(name);
   if (inFlight) return inFlight;
-  debugMark(`loading ${name}`);
   const task = loadFaces(name)
-    .then(() => {
-      debugMark(`loaded ${name}; check=${document.fonts.check(`13px "${name}"`)}`);
-    })
     .catch((err) => {
-      debugMark(`FAILED ${name}: ${err instanceof Error ? err.message : String(err)}`);
       console.warn(`terminal font ${name} failed to load as a web font:`, err);
     })
     .finally(() => {

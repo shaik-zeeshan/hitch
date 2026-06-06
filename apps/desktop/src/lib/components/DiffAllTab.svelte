@@ -14,25 +14,27 @@
   // each row's text with processPatch and render one FileDiff per section (one
   // path sub-header each, mirroring DiffTab) — processFile is single-file-only and
   // would greedily fold the later files' hunks into the first, corrupting the view.
-  import {
-    FileDiff,
-    processPatch,
-    type FileDiffMetadata,
-    type FileDiffOptions,
-  } from "@pierre/diffs";
+  import { processPatch, type FileDiffMetadata } from "@pierre/diffs";
   import ChevronDown from "~icons/lucide/chevron-down";
   import ChevronRight from "~icons/lucide/chevron-right";
-  import { allChangesFiles } from "../daemon";
+  import {
+    allChangesCollapsed,
+    allChangesFiles,
+    allChangesRowKey,
+    fetchAllChangesRow,
+  } from "../daemon";
   import { parseDiff } from "../diff";
+  import { diffViewOptions, fileDiffView } from "../diffView";
   import { fileIconUrl } from "../file-icons";
   import { theme } from "../theme";
   import DiffViewOptions from "./DiffViewOptions.svelte";
   import { diffStyle, diffWrap } from "../settings";
 
-  // Collapsed sections by row identity. Absent / false = expanded (the default).
-  // All-changes can contain the same path twice (staged + unstaged), so caches
-  // must include stagedness instead of using file.path alone.
-  let collapsed = $state<Record<string, boolean>>({});
+  // Collapsed sections live in the daemon store (`allChangesCollapsed`, keyed by
+  // row identity) so a refresh can skip fetching diffs for rows the user has
+  // collapsed. Absent from the set = expanded (the default). All-changes can
+  // contain the same path twice (staged + unstaged), so the key includes
+  // stagedness instead of using file.path alone.
 
   type ParsedDiff = ReturnType<typeof parseDiff>;
   const parsedByRow = new Map<string, { text: string; parsed: ParsedDiff }>();
@@ -65,82 +67,42 @@
     return files;
   }
 
-  function allChangesRowKey(path: string, staged: boolean): string {
-    return `${staged ? "staged" : "unstaged"}\0${path}`;
-  }
-
   // Render-side view options shared by every per-file instance. Driven by the
   // persisted `diffStyle` / `diffWrap` settings (same as DiffTab) — these only
   // re-lay-out already-fetched diffs, so a change applies via setOptions +
   // rerender on each live instance rather than re-fetching. `$derived` so
   // sections mounted (expanded) after a change start with the current values.
-  const options = $derived<FileDiffOptions<undefined>>({
-    diffStyle: $diffStyle,
-    disableFileHeader: true, // each section renders its own header row.
-    disableLineNumbers: false,
-    diffIndicators: "classic",
-    hunkSeparators: "line-info",
-    lineDiffType: "word",
-    overflow: $diffWrap ? "wrap" : "scroll",
-    stickyHeader: false,
-    preferredHighlighter: "shiki-js", // no WASM, faster startup.
-    theme: { light: "pierre-light", dark: "pierre-dark" },
-    themeType: $theme,
-  });
+  // Built by the shared diffView module (same options as DiffTab).
+  const options = $derived(diffViewOptions($diffStyle, $diffWrap, $theme));
 
-  function toggle(rowKey: string) {
-    collapsed[rowKey] = !collapsed[rowKey];
+  // Collapse/expand a section. Toggling the shared store lets the daemon's
+  // refresh path know which rows to fetch; expanding a row that was collapsed
+  // (so its diff may have been evicted by a status-poll refresh, or never
+  // fetched) kicks an on-demand fetch through the diff cache — a warm row
+  // resolves instantly, a cold one fills in from `null` (the "Loading" state).
+  function toggle(file: { path: string; staged: boolean }) {
+    const rowKey = allChangesRowKey(file.path, file.staged);
+    const willExpand = $allChangesCollapsed.has(rowKey);
+    allChangesCollapsed.update((set) => {
+      const next = new Set(set);
+      if (next.has(rowKey)) next.delete(rowKey);
+      else next.add(rowKey);
+      return next;
+    });
+    if (willExpand) void fetchAllChangesRow(file.path, file.staged);
   }
 
   // A partially-staged file contributes two rows (staged + unstaged); the
   // header counts distinct files, not sections.
   const fileCount = $derived(new Set($allChangesFiles.map((f) => f.path)).size);
 
-  // A single FileDiff per mounted (expanded, renderable) section. The Svelte
-  // action owns its instance: it renders on mount + on metadata/theme change and
-  // cleans up when the section unmounts (collapse) — cleanUp() detaching the
-  // <diffs-container> is fine here because Svelte is removing it too. Mirrors the
-  // teardown reasoning in DiffTab, but per section. The render-side `opts` are
-  // threaded through the action params so a split/wrap toggle re-applies to
-  // every active instance via setOptions + rerender (the {@const} below passes
-  // the current `options` to each section, so Svelte re-runs `update` on change).
-  type ViewParams = {
-    fileDiff: FileDiffMetadata;
-    opts: FileDiffOptions<undefined>;
-  };
-
-  function fileDiffView(node: HTMLElement, params: ViewParams) {
-    let instance: FileDiff<undefined> | undefined;
-    let lastFileDiff: FileDiffMetadata | undefined;
-
-    function render(fileDiff: FileDiffMetadata, opts: FileDiffOptions<undefined>) {
-      if (!instance) instance = new FileDiff<undefined>({ ...opts });
-      else instance.setOptions(opts);
-      instance.setThemeType(opts.themeType ?? "light");
-      instance.render({ fileDiff, fileContainer: node, forceRender: true });
-      lastFileDiff = fileDiff;
-    }
-
-    render(params.fileDiff, params.opts);
-
-    return {
-      update(next: ViewParams) {
-        if (next.fileDiff !== lastFileDiff) {
-          // New metadata: a full re-render (which also picks up the latest opts).
-          render(next.fileDiff, next.opts);
-        } else if (instance) {
-          // Same metadata, changed options (split/wrap/theme): merge + re-lay-out.
-          instance.setOptions(next.opts);
-          instance.setThemeType(next.opts.themeType ?? "light");
-          instance.rerender();
-        }
-      },
-      destroy() {
-        instance?.cleanUp();
-        instance = undefined;
-      },
-    };
-  }
+  // A single FileDiff per mounted (expanded, renderable) section. The shared
+  // fileDiffView action (lib/diffView.ts) owns each instance: it renders on mount
+  // + on metadata/theme change and cleans up when the section unmounts (collapse).
+  // The render-side `opts` are threaded through the action params (the {@const}
+  // below passes the current `options` to each section, so Svelte re-runs the
+  // action's `update` on a split/wrap/theme change), re-applying via setOptions +
+  // rerender to every active instance.
 </script>
 
 <div class="diffall">
@@ -159,7 +121,7 @@
 
   {#each $allChangesFiles as file (allChangesRowKey(file.path, file.staged))}
     {@const rowKey = allChangesRowKey(file.path, file.staged)}
-    {@const isCollapsed = collapsed[rowKey] === true}
+    {@const isCollapsed = $allChangesCollapsed.has(rowKey)}
     {@const parsed = parsedFor(rowKey, file.text, !isCollapsed)}
     {@const files = filesFor(rowKey, file.text, !isCollapsed)}
     {@const showSectionHeaders = files.length > 1}
@@ -168,7 +130,7 @@
         class="file-head"
         type="button"
         aria-expanded={!isCollapsed}
-        onclick={() => toggle(rowKey)}
+        onclick={() => toggle(file)}
       >
         <span class="chev" aria-hidden="true">
           {#if isCollapsed}
@@ -385,23 +347,9 @@
     white-space: nowrap;
   }
 
-  /* The @pierre/diffs container — same chrome→terminal token bridge as DiffTab. */
-  .diffs {
-    display: block;
-    --diffs-font-family: var(--mono);
-    --diffs-font-size: var(--r1);
-    --diffs-light-bg: var(--term-bg2);
-    --diffs-dark-bg: var(--term-bg2);
-    --diffs-bg-context-override: var(--term-bg2);
-    --diffs-bg-addition-override: oklch(from var(--diff-add) l c h / 0.1);
-    --diffs-bg-deletion-override: oklch(from var(--diff-del) l c h / 0.1);
-    --diffs-bg-addition-emphasis-override: oklch(from var(--diff-add) l c h / 0.22);
-    --diffs-bg-deletion-emphasis-override: oklch(from var(--diff-del) l c h / 0.22);
-    --diffs-addition-color-override: var(--diff-add);
-    --diffs-deletion-color-override: var(--diff-del);
-    --diffs-fg-number-override: var(--term-dim);
-    --diffs-bg-hover-override: oklch(from var(--term-fg) l c h / 0.06);
-  }
+  /* The @pierre/diffs container's chrome→terminal token bridge is applied
+     imperatively by the shared fileDiffView action (lib/diffView.ts), same as
+     DiffTab; `display: block` is set there too. */
 
   .diff-empty {
     display: grid;

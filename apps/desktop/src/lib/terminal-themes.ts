@@ -2,7 +2,8 @@
 // mbadolato/iTerm2-Color-Schemes repo (ghostty/ directory), transcribed to the
 // xterm ITheme subset we apply. 10 dark + 10 light. The default ("Hitch")
 // palette is built in elsewhere and selected via HITCH_THEME_ID.
-import { writable, type Writable } from "svelte/store";
+import { type Writable } from "svelte/store";
+import { persisted } from "./settings";
 
 /** Hex colors for one terminal theme; shape mirrors xterm's ITheme subset we use. */
 export interface TerminalThemeColors {
@@ -638,27 +639,6 @@ export function terminalSurfaceOverride(id: string): string {
     `--term-dim:color-mix(in oklab, ${fg} 60%, ${bg});` +
     `--term-line:color-mix(in oklab, ${fg} 18%, ${bg});`
   );
-}
-
-// localStorage-backed writable (best-effort reads/writes). Mirrors the
-// `persisted()` helper in settings.ts; kept local so this module owns its keys.
-function persisted(key: string, initial: string): Writable<string> {
-  let start = initial;
-  try {
-    start = localStorage.getItem(key) ?? initial;
-  } catch {
-    // localStorage can be unavailable (private mode / denied); fall back to the
-    // default and keep an in-memory store for the session.
-  }
-  const store = writable(start);
-  store.subscribe((value) => {
-    try {
-      localStorage.setItem(key, value);
-    } catch {
-      // See above — writes are best-effort.
-    }
-  });
-  return store;
 }
 
 // Per-mode terminal theme selections, persisted across sessions. Default is the

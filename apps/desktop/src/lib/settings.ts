@@ -35,7 +35,11 @@ export const DRAFT_MODEL_OPTIONS: Record<DraftProvider, string[]> = {
   codex: ["gpt-5-codex", "gpt-5", "gpt-5-mini"],
 };
 
-function persisted(
+// localStorage-backed writable (best-effort reads/writes). Exported and reused
+// by terminal-themes.ts so the persistence behavior (SSR/private-mode guard,
+// best-effort writes) lives in one place. `normalize` lets callers sanitize a
+// stored value on read; it defaults to identity.
+export function persisted(
   key: string,
   initial: string,
   normalize: (value: string) => string = (value) => value,

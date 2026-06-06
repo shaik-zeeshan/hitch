@@ -97,21 +97,32 @@
   // preventDefault unwired git ids, and the keymap entries (git.up/down/stage/…)
   // exist purely as the documentation/Settings source for these same keys.
   const rovingFiles = $derived([...staged, ...unstaged]);
-  let activePath = $state<string | null>(null);
+  // A partially-staged file appears as TWO rows (staged + unstaged) sharing the
+  // same path, so the active row is keyed by a composite of staged-side + path,
+  // not path alone. Without this the lookups would always resolve the staged row
+  // and the unstaged copy could never be reached, toggled, opened, or discarded.
+  let activeKey = $state<string | null>(null);
   let railEl = $state<HTMLElement | null>(null);
 
-  // Re-anchor the active row after the list changes. If the tracked path is gone
+  // The composite key for a roving row: `s:` (staged) or `w:` (working tree)
+  // prefix + the path. Non-partially-staged files have exactly one row, so their
+  // key is unique by construction — behavior is identical to keying by path.
+  function rowKey(file: { path: string; staged: boolean }): string {
+    return `${file.staged ? "s" : "w"}:${file.path}`;
+  }
+
+  // Re-anchor the active row after the list changes. If the tracked row is gone
   // (committed, discarded, or staged-away), clamp to the nearest surviving index
   // so focus lands on an adjacent row instead of vanishing.
   let lastFiles: typeof rovingFiles = [];
   $effect(() => {
     const list = rovingFiles;
     if (list.length === 0) {
-      activePath = null;
-    } else if (activePath === null || !list.some((f) => f.path === activePath)) {
-      const prevIdx = lastFiles.findIndex((f) => f.path === activePath);
+      activeKey = null;
+    } else if (activeKey === null || !list.some((f) => rowKey(f) === activeKey)) {
+      const prevIdx = lastFiles.findIndex((f) => rowKey(f) === activeKey);
       const clamped = prevIdx < 0 ? 0 : Math.min(prevIdx, list.length - 1);
-      activePath = list[clamped].path;
+      activeKey = rowKey(list[clamped]);
     }
     lastFiles = list;
   });
@@ -121,14 +132,15 @@
   function moveActive(delta: number) {
     const list = rovingFiles;
     if (list.length === 0) return;
-    const cur = list.findIndex((f) => f.path === activePath);
+    const cur = list.findIndex((f) => rowKey(f) === activeKey);
     const next = cur < 0 ? 0 : Math.min(Math.max(cur + delta, 0), list.length - 1);
-    activePath = list[next].path;
+    const target = list[next];
+    activeKey = rowKey(target);
     void tick().then(() => {
       // Move DOM focus to the new row (not just scroll it into view) so
       // :focus-visible follows .roving — matching ProjectTree's focusRow().
       const row = railEl?.querySelector<HTMLElement>(
-        `.frow[data-path="${cssEscape(activePath ?? "")}"]`,
+        `.frow[data-path="${cssEscape(target.path)}"][data-staged="${target.staged}"]`,
       );
       row?.focus();
       row?.scrollIntoView({ block: "nearest" });
@@ -137,7 +149,7 @@
 
   // Stage/unstage the active file — the same action the row's checkbox runs.
   function toggleActiveStaged() {
-    const file = rovingFiles.find((f) => f.path === activePath);
+    const file = rovingFiles.find((f) => rowKey(f) === activeKey);
     if (!file) return;
     void setFileStaged(file.path, !file.staged).catch(() => {});
   }
@@ -145,14 +157,14 @@
   // Open the active file's diff — the same action a row click runs (the staged
   // copy diffs staged, the unstaged copy diffs the working tree).
   function openActiveDiff() {
-    const file = rovingFiles.find((f) => f.path === activePath);
+    const file = rovingFiles.find((f) => rowKey(f) === activeKey);
     if (!file) return;
     void viewDiff(file.path, true, file.staged);
   }
 
   // Discard the active file through the existing confirm flow.
   function discardActive() {
-    const file = rovingFiles.find((f) => f.path === activePath);
+    const file = rovingFiles.find((f) => rowKey(f) === activeKey);
     if (file) confirmDiscardFile(file.path);
   }
 
@@ -209,9 +221,13 @@
   function onRailFocus(event: FocusEvent) {
     if (event.target !== railEl) return;
     void tick().then(() => {
+      const active = rovingFiles.find((f) => rowKey(f) === activeKey);
       const row =
-        railEl?.querySelector<HTMLElement>(`.frow[data-path="${cssEscape(activePath ?? "")}"]`) ??
-        railEl?.querySelector<HTMLElement>(".frow");
+        (active
+          ? railEl?.querySelector<HTMLElement>(
+              `.frow[data-path="${cssEscape(active.path)}"][data-staged="${active.staged}"]`,
+            )
+          : null) ?? railEl?.querySelector<HTMLElement>(".frow");
       row?.focus();
     });
   }
@@ -625,7 +641,7 @@
           </h3>
           {#each staged as file (file.path)}
             {@const parts = splitPath(file.path)}
-            <button class="frow" data-path={file.path} class:active={$diffPath === file.path && $diffStaged !== false} class:roving={activePath === file.path} onclick={() => { activePath = file.path; void viewDiff(file.path, true, true); }}>
+            <button class="frow" data-path={file.path} data-staged="true" class:active={$diffPath === file.path && $diffStaged !== false} class:roving={activeKey === rowKey(file)} onclick={() => { activeKey = rowKey(file); void viewDiff(file.path, true, true); }}>
               <span
                 class="chk on"
                 role="button"
@@ -679,7 +695,7 @@
           </h3>
           {#each unstaged as file (file.path)}
             {@const parts = splitPath(file.path)}
-            <button class="frow" data-path={file.path} class:active={$diffPath === file.path && $diffStaged !== true} class:roving={activePath === file.path} onclick={() => { activePath = file.path; void viewDiff(file.path, true, false); }}>
+            <button class="frow" data-path={file.path} data-staged="false" class:active={$diffPath === file.path && $diffStaged !== true} class:roving={activeKey === rowKey(file)} onclick={() => { activeKey = rowKey(file); void viewDiff(file.path, true, false); }}>
               <span
                 class="chk"
                 role="button"

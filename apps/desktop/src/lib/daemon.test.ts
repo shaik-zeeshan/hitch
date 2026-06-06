@@ -35,7 +35,10 @@ import {
   completeJob,
   connection,
   ALL_CHANGES_TAB,
+  allChangesCollapsed,
   allChangesFiles,
+  allChangesRowKey,
+  fetchAllChangesRow,
   viewAllChanges,
   createWorktree,
   daemonReason,
@@ -69,6 +72,7 @@ import {
   runJob,
   selectedProjectId,
   selectedWorktreeId,
+  setFileStaged,
   sessionAgents,
   sessionCommands,
   sessionOutputActive,
@@ -116,6 +120,7 @@ beforeEach(() => {
   diffTabs.set([]);
   activeDiffPath.set(null);
   allChangesFiles.set([]);
+  allChangesCollapsed.set(new Set());
   prByWorktree.set({});
   prInfo.set(null);
   prUrl.set(null);
@@ -1532,6 +1537,45 @@ describe("all-changes diff tab", () => {
     ]);
   });
 
+  it("keeps an open diff tab on its own staged side when staging the file", async () => {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false }]);
+
+    const diffRequests: { path?: string; staged?: boolean }[] = [];
+    invokeMock.mockImplementation(
+      async (
+        _command: string,
+        { request }: { request: { type: string; path?: string; staged?: boolean } },
+      ) => {
+        if (request.type === "git-diff") {
+          diffRequests.push({ path: request.path, staged: request.staged });
+          return { type: "git-diff", diff: { diff: `${request.staged ? "staged" : "worktree"} ${request.path}` } };
+        }
+        if (request.type === "stage-files") return { type: "ack" };
+        if (request.type === "git-status") return { type: "git-status", status: get(gitStatus) };
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Open the unstaged-side single-file diff tab the user is looking at.
+    await viewDiff("src/a.ts", true, false);
+    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "worktree src/a.ts", staged: false }]);
+    diffRequests.length = 0;
+
+    // Stage the file. The keep-in-sync refresh must re-fetch the tab on ITS
+    // OWN side (unstaged), not the operation's staged side.
+    await setFileStaged("src/a.ts", true);
+    await flush();
+
+    // The tab stays on the unstaged side it was opened with (no flip to staged).
+    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "worktree src/a.ts", staged: false }]);
+    // And the refresh asked for the unstaged diff, never the staged one.
+    expect(diffRequests).toContainEqual({ path: "src/a.ts", staged: false });
+    expect(diffRequests).not.toContainEqual({ path: "src/a.ts", staged: true });
+  });
+
   it("re-activates the existing sentinel tab without duplicating it", async () => {
     projects.set([project]);
     worktrees.set([worktree]);
@@ -1663,6 +1707,87 @@ describe("all-changes diff tab", () => {
 
     expect(get(allChangesFiles)).toEqual([
       { path: "src/a.ts", staged: false, text: "diff v2 for src/a.ts" },
+    ]);
+  });
+
+  it("only re-fetches expanded rows when a status-poll signature drift refreshes", async () => {
+    const diffRequests: string[] = [];
+    let diffVersion = 0;
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([
+      { path: "src/a.ts", status: "modified", staged: false, additions: 1 },
+      { path: "src/b.ts", status: "modified", staged: false, additions: 1 },
+    ]);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffVersion += 1;
+          diffRequests.push(request.path!);
+          return { type: "git-diff", diff: { diff: `diff v${diffVersion} for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Open: both rows expanded by default, both fetched.
+    await viewAllChanges();
+    expect(diffRequests).toEqual(["src/a.ts", "src/b.ts"]);
+    diffRequests.length = 0;
+
+    // User collapses src/b.ts.
+    allChangesCollapsed.set(new Set([allChangesRowKey("src/b.ts", false)]));
+
+    // The 1s status poll picks up a line-count drift (additions 1 -> 2) on BOTH
+    // files — the signature flips and the diff cache is evicted, so the refresh
+    // re-fans. Only the expanded row (src/a.ts) is re-fetched; the collapsed
+    // src/b.ts is skipped and its row text is dropped to null (cache evicted).
+    setStatus([
+      { path: "src/a.ts", status: "modified", staged: false, additions: 2 },
+      { path: "src/b.ts", status: "modified", staged: false, additions: 2 },
+    ]);
+    await flush();
+
+    expect(diffRequests).toEqual(["src/a.ts"]);
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v3 for src/a.ts" },
+      { path: "src/b.ts", staged: false, text: null },
+    ]);
+  });
+
+  it("fetches a collapsed row on demand when it is expanded", async () => {
+    const diffRequests: string[] = [];
+    let diffVersion = 0;
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/b.ts", status: "modified", staged: false, additions: 1 }]);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffVersion += 1;
+          diffRequests.push(request.path!);
+          return { type: "git-diff", diff: { diff: `diff v${diffVersion} for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Collapse the row before opening, then open: the collapsed row isn't fetched
+    // and seeds as null (the "Loading" state the component renders).
+    allChangesCollapsed.set(new Set([allChangesRowKey("src/b.ts", false)]));
+    await viewAllChanges();
+    expect(diffRequests).toEqual([]);
+    expect(get(allChangesFiles)).toEqual([{ path: "src/b.ts", staged: false, text: null }]);
+
+    // Expanding the section drives the store and kicks an on-demand fetch.
+    allChangesCollapsed.set(new Set());
+    await fetchAllChangesRow("src/b.ts", false);
+
+    expect(diffRequests).toEqual(["src/b.ts"]);
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/b.ts", staged: false, text: "diff v1 for src/b.ts" },
     ]);
   });
 

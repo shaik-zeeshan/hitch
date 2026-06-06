@@ -41,8 +41,12 @@ use serde::{Deserialize, Serialize};
 /// replay so a newly attached client starts with the correct gate value instead
 /// of assuming. v21 adds optional `agent_run_id` to agent hook reports/announces
 /// so the daemon can drop stale lifecycle hooks from a previous agent process
-/// after a newer `SessionStart`.
-pub const PROTOCOL_VERSION: u16 = 21;
+/// after a newer `SessionStart`. v22 extends the diff wire contract:
+/// `Request::GitDiff` gains `staged`/`ignore_whitespace`/`context_lines` so the
+/// client can request the correct diff side and rendering, and `ChangedFile`
+/// gains `additions`/`deletions` line counts — an old daemon at v21 would
+/// otherwise serve wrong-side diffs and zeroed counts.
+pub const PROTOCOL_VERSION: u16 = 22;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -1204,7 +1208,7 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 21);
+        assert_eq!(PROTOCOL_VERSION, 22);
     }
 
     #[test]

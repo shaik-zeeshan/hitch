@@ -1194,30 +1194,98 @@ fn diff_rename_old_path(
     path: &Path,
     target: DiffTarget,
 ) -> Result<Option<PathBuf>> {
+    // libgit2 only pairs a rename when both the new file's add and the old
+    // file's delete survive the status walk, so a pathspec scoped to just the
+    // new path hides the delete and the rename is never detected. Most renames
+    // keep the file in the same directory, so scope the (otherwise full-repo)
+    // walk to the new path plus its parent directory — the old side rides along
+    // and the walk stays bounded. Cross-directory renames fall through to an
+    // unbounded walk below, preserving the previous behaviour exactly.
+    match diff_rename_old_path_scoped(repo, path, target, true)? {
+        RenameLookup::Found(old) => Ok(old),
+        // The file shows up modified/typechanged (its old and new side share a
+        // path), so it cannot be the new side of a rename — no fallback needed.
+        RenameLookup::PresentNonRename => Ok(None),
+        // The scoped walk either didn't see the file, or saw it as a bare add
+        // whose matching delete may live outside the parent directory (a
+        // cross-directory rename). Redo the walk over the whole repo, exactly
+        // as before this optimisation, to settle it.
+        RenameLookup::AddedOrAbsent => match diff_rename_old_path_scoped(repo, path, target, false)?
+        {
+            RenameLookup::Found(old) => Ok(old),
+            _ => Ok(None),
+        },
+    }
+}
+
+/// Outcome of a single (possibly path-scoped) status walk while resolving a
+/// file's rename source.
+enum RenameLookup {
+    /// The file is the new side of a detected rename; carries the old path.
+    Found(Option<PathBuf>),
+    /// The file appeared with a single (modified/typechange/delete) status
+    /// whose old and new paths match — it cannot be a rename target, so a
+    /// scoped walk that finds this needs no full-repo fallback.
+    PresentNonRename,
+    /// The file is absent from this walk, or present only as a bare add whose
+    /// rename partner (the old path's delete) might lie outside the scope.
+    AddedOrAbsent,
+}
+
+fn diff_rename_old_path_scoped(
+    repo: &Repository,
+    path: &Path,
+    target: DiffTarget,
+    scope_to_parent: bool,
+) -> Result<RenameLookup> {
     let mut options = StatusOptions::new();
     options
         .include_untracked(true)
         .recurse_untracked_dirs(false)
         .renames_head_to_index(true)
         .renames_index_to_workdir(true);
+    if scope_to_parent {
+        options.pathspec(path.to_string_lossy().into_owned());
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                options.pathspec(format!("{}/*", parent.to_string_lossy()));
+            }
+            // File at the repo root: a bare `*` keeps the walk to root-level
+            // entries without recursing into subdirectories.
+            _ => {
+                options.pathspec("*");
+            }
+        }
+    }
     let statuses = repo.statuses(Some(&mut options))?;
+    let mut result = RenameLookup::AddedOrAbsent;
     for entry in statuses.iter() {
         let status = entry.status();
+        let Some((new_path, old_path)) = status_paths(entry) else {
+            continue;
+        };
+        if new_path != path {
+            continue;
+        }
         let renamed = match target {
             DiffTarget::Staged => status.contains(Status::INDEX_RENAMED),
             DiffTarget::Worktree => status.contains(Status::WT_RENAMED),
         };
-        if !renamed {
-            continue;
+        if renamed {
+            return Ok(RenameLookup::Found(old_path));
         }
-        let Some((new_path, old_path)) = status_paths(entry) else {
-            continue;
+        // Present, not a rename. A bare add (new file, no old side) could still
+        // be the surviving half of a cross-dir rename whose delete the scope
+        // dropped, so only treat clearly non-add states as terminal.
+        let added = match target {
+            DiffTarget::Staged => status.contains(Status::INDEX_NEW),
+            DiffTarget::Worktree => status.contains(Status::WT_NEW),
         };
-        if new_path == path {
-            return Ok(old_path);
+        if !added {
+            result = RenameLookup::PresentNonRename;
         }
     }
-    Ok(None)
+    Ok(result)
 }
 
 fn diff_pathspec<'a>(repo: &Repository, path: &'a Path) -> Cow<'a, Path> {
@@ -2530,6 +2598,51 @@ mod tests {
         assert!(diff.contains("-two"), "diff was {diff:?}");
         assert!(diff.contains("+TWO"), "diff was {diff:?}");
         assert!(!diff.contains("+one\n"), "diff was {diff:?}");
+    }
+
+    // A rename across directories puts the old (deleted) side outside the new
+    // path's parent directory, so the scoped status walk can't see the pairing.
+    // diff_file must fall back to the full-repo walk and still report the rename
+    // and its old path, for both the staged and worktree views. `dst/` already
+    // holds a committed file so the new side never lands in a fresh untracked
+    // directory (which `recurse_untracked_dirs(false)` would collapse out of
+    // view — a limitation that predates this change and is orthogonal to it).
+    #[test]
+    fn diff_file_reports_cross_directory_rename() {
+        for target in [DiffTarget::Staged, DiffTarget::Worktree] {
+            let fixture = RepoFixture::new();
+            fs::create_dir_all(fixture.path().join("src")).unwrap();
+            fs::create_dir_all(fixture.path().join("dst")).unwrap();
+            fixture.write("src/tracked.txt", "one\ntwo\nthree\nfour\n");
+            fixture.write("dst/keep.txt", "keep\n");
+            fixture.git(["add", "-A"]);
+            fixture.git(["commit", "-m", "seed"]);
+
+            fs::rename(
+                fixture.path().join("src/tracked.txt"),
+                fixture.path().join("dst/moved.txt"),
+            )
+            .unwrap();
+            fixture.write("dst/moved.txt", "one\nTWO\nthree\nfour\n");
+            if matches!(target, DiffTarget::Staged) {
+                fixture.git(["add", "-A"]);
+            }
+
+            let diff =
+                diff_file(fixture.path(), "dst/moved.txt", target, DiffFileOptions::default())
+                    .unwrap();
+            assert!(
+                diff.contains("rename from src/tracked.txt"),
+                "{target:?} diff was {diff:?}"
+            );
+            assert!(
+                diff.contains("rename to dst/moved.txt"),
+                "{target:?} diff was {diff:?}"
+            );
+            assert!(diff.contains("-two"), "{target:?} diff was {diff:?}");
+            assert!(diff.contains("+TWO"), "{target:?} diff was {diff:?}");
+            assert!(!diff.contains("+one\n"), "{target:?} diff was {diff:?}");
+        }
     }
 
     #[test]

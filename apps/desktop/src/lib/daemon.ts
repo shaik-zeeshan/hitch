@@ -169,6 +169,23 @@ export const ALL_CHANGES_TAB = "\0all";
 // one @pierre/diffs instance per expanded entry from these.
 export type AllChangesFile = { path: string; staged: boolean; text: string | null };
 export const allChangesFiles = writable<AllChangesFile[]>([]);
+// Which all-changes rows are currently collapsed, keyed by `allChangesRowKey`
+// (side + path, since a partially-staged file appears as two rows). DiffAllTab
+// owns the toggling; the daemon reads it so a refresh only re-fetches diffs for
+// rows the user actually has expanded. A key absent from the set means expanded
+// — the default — so an initial open with nothing collapsed fans out every file
+// exactly as before, and the wasted re-fetches only disappear for sections the
+// user has explicitly collapsed.
+export const allChangesCollapsed = writable<Set<string>>(new Set());
+// Row identity for the all-changes view: side + path. A partially-staged file
+// contributes a staged and an unstaged row that diff differently, so the side
+// has to be part of the key. Shared with DiffAllTab (which keys its sections the
+// same way) through this exported helper so the two never drift.
+export function allChangesRowKey(path: string, staged: boolean): string {
+  return `${staged ? "staged" : "unstaged"}\0${path}`;
+}
+const allChangesRowExpanded = (path: string, staged: boolean): boolean =>
+  !get(allChangesCollapsed).has(allChangesRowKey(path, staged));
 // Keep the daemon/webview responsive for large working trees: All changes may
 // contain hundreds of rows, and untracked directory rows can expand to large
 // diffs. Fetch a small pool instead of starting one git-diff per row at once.
@@ -2027,7 +2044,16 @@ export async function viewAllChanges(activate = true): Promise<void> {
   // This fan-out is still the freshest and its worktree is still selected.
   const isLatest = () => allChangesSeq === seq && get(gitWorktreeId) === worktreeId;
 
-  await forEachBounded(ordered, ALL_CHANGES_DIFF_CONCURRENCY, async (file) => {
+  // Only fetch diffs for rows the user has expanded. A collapsed section isn't
+  // rendered, so fetching it is wasted work — and the 1s status poll can flip the
+  // signature on pure line-count drift (e.g. typing in an external editor) and
+  // evict the diff cache, which would otherwise re-fan every file. Collapsed rows
+  // fetch lazily when expanded (`fetchAllChangesRow`); their seeded text (cache
+  // hit or `null`) is left in place here. On the initial open nothing is
+  // collapsed, so this still fans out every file exactly as before.
+  const expanded = ordered.filter((file) => allChangesRowExpanded(file.path, file.staged));
+
+  await forEachBounded(expanded, ALL_CHANGES_DIFF_CONCURRENCY, async (file) => {
     const text = await fetchFileDiff(worktreeId, file.path, file.staged);
     if (!isLatest()) return;
     allChangesFiles.update((rows) =>
@@ -2041,6 +2067,26 @@ export async function viewAllChanges(activate = true): Promise<void> {
       ),
     );
   });
+}
+
+// Fetch one all-changes row's diff on demand — used when the user expands a
+// previously-collapsed section. Reuses the diff cache (so an already-warm row
+// renders instantly with no daemon round-trip) and the same freshness guards as
+// the fan-out, so a stage/unstage or worktree switch in flight can't repopulate a
+// stale row. A no-op for the sentinel-less / wrong-worktree state.
+export async function fetchAllChangesRow(path: string, staged: boolean): Promise<void> {
+  const worktreeId = get(gitWorktreeId);
+  if (!worktreeId) return;
+  const seq = allChangesSeq;
+  const text = await fetchFileDiff(worktreeId, path, staged);
+  if (allChangesSeq !== seq || get(gitWorktreeId) !== worktreeId) return;
+  allChangesFiles.update((rows) =>
+    rows.map((row) =>
+      row.path === path && row.staged === staged
+        ? { ...row, text: text ?? diffCache.get(diffCacheKey(worktreeId, path, staged)) ?? row.text }
+        : row,
+    ),
+  );
 }
 
 // Re-fetch every open diff under the current re-diff options. Called when
@@ -2072,6 +2118,7 @@ export function closeDiff(path?: string): void {
     activeDiffPath.set(null);
     diffActive.set(false);
     allChangesFiles.set([]);
+    allChangesCollapsed.set(new Set());
     return;
   }
   const tabs = get(diffTabs);
@@ -2082,6 +2129,7 @@ export function closeDiff(path?: string): void {
   if (path === ALL_CHANGES_TAB) {
     allChangesSeq += 1;
     allChangesFiles.set([]);
+    allChangesCollapsed.set(new Set());
   }
   const remaining = tabs.filter((tab) => tab.path !== path);
   diffTabs.set(remaining);
@@ -2117,14 +2165,22 @@ export async function setFilesStaged(
     gitBusy.set(false);
     void loadGitStatus(worktreeId).catch((err) => error.set(toMessage(err)));
     // Keep any open diff tabs in sync if their file was just (un)staged, without
-    // stealing focus from a terminal the user may be looking at.
+    // stealing focus from a terminal the user may be looking at. Each tab is
+    // re-fetched on its OWN staged side (`tab.staged`), not the operation's
+    // `staged`, so an open unstaged-side tab stays unstaged (mirroring
+    // `refreshOpenDiffs`). Staging a fully-unstaged file leaving its unstaged
+    // diff empty is correct: the tab keeps its side rather than flipping.
     const openTabs = get(diffTabs);
-    const openPaths = new Set(openTabs.map((tab) => tab.path));
+    const affected = new Set(paths);
     for (const path of paths) {
       invalidateDiffCacheVariants(worktreeId, path);
-      if (!openPaths.has(path)) continue;
-      void viewDiff(path, false, staged);
     }
+    for (const tab of openTabs) {
+      if (tab.path === ALL_CHANGES_TAB) continue;
+      if (!affected.has(tab.path)) continue;
+      void viewDiff(tab.path, false, tab.staged);
+    }
+    const openPaths = new Set(openTabs.map((tab) => tab.path));
     // The all-changes tab spans every file, so any (un)stage can change its file
     // set (a row moving group) or counts. Re-fan it without stealing focus; the
     // cache deletes above force its touched files to re-fetch.
