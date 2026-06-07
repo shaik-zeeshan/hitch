@@ -79,6 +79,8 @@ import {
   noteAgentState,
   primeNotificationPermission,
 } from "./notifications";
+import { sshHosts, sshHostScopes } from "./sshHosts";
+import type { SshHost } from "./types";
 
 export type Connection = "connecting" | "ready" | "offline";
 
@@ -180,6 +182,30 @@ const LOCAL_SCOPE: DaemonScope = {
   status: "starting",
 };
 export const daemonScopes = writable<DaemonScope[]>([LOCAL_SCOPE]);
+
+// Keep `daemonScopes` reconciled with the saved SSH Hosts (issue #26, ADR 0014):
+// Local is always present and untouched here; the SSH Host rows mirror the
+// persisted host list. A host already present keeps its current `status` (so a
+// later real Daemon Status from issue #27 isn't clobbered by a re-seed); a new
+// host enters with the neutral `unreachable` placeholder `sshHostScope` mints;
+// a removed host's scope drops out. Runs at module load (seeding saved hosts
+// before the first connect) and on every host add/remove. The local-status
+// mirror in `applyDaemonStatus` only rewrites the Local row, so it composes with
+// this cleanly.
+function reconcileSshHostScopes(hosts: SshHost[]): void {
+  daemonScopes.update((scopes) => {
+    const existingById = new Map(scopes.map((s) => [s.id, s] as const));
+    const wanted = sshHostScopes(hosts).map((scope) => {
+      const prior = existingById.get(scope.id);
+      // Preserve a live status (issue #27) if one already exists for this host.
+      return prior && prior.kind === "ssh-host" ? { ...scope, status: prior.status } : scope;
+    });
+    const local = scopes.filter((s) => s.kind === "local");
+    return [...local, ...wanted];
+  });
+}
+
+sshHosts.subscribe(reconcileSshHostScopes);
 
 // The attached scopes in tree order: Local first, then SSH Hosts alphabetically
 // by label (ADR 0014). Local always sorts ahead of any remote scope regardless
@@ -2231,10 +2257,12 @@ export function disposeDaemon(): void {
   commitLog.set(EMPTY_COMMIT_LOG);
   commitLogHeadId = null;
   compositeChains.set({});
-  // Reset scope state to just the Local scope (no projects tagged). SSH Host
-  // scopes (issue #27) are re-derived from saved hosts on the next boot.
+  // Reset scope state to the Local scope plus the saved SSH Host scopes (no
+  // projects tagged). SSH Hosts are GUI-local persisted config, independent of
+  // the daemon connection (ADR 0014), so they survive a dispose/reconnect rather
+  // than vanishing from the tree. Local's status reverts to `starting`.
   projectScopes.set({});
-  daemonScopes.set([{ ...LOCAL_SCOPE }]);
+  daemonScopes.set([{ ...LOCAL_SCOPE }, ...sshHostScopes(get(sshHosts))]);
   booted = false;
 }
 

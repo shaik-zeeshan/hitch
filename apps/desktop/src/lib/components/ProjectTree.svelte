@@ -11,6 +11,7 @@
   import { get } from "svelte/store";
   import ChevronRight from "~icons/lucide/chevron-right";
   import MonitorIcon from "~icons/lucide/monitor";
+  import Server from "~icons/lucide/server";
   import Folder from "~icons/lucide/folder";
   import GitBranch from "~icons/lucide/git-branch";
   import GitPullRequest from "~icons/lucide/git-pull-request";
@@ -39,7 +40,13 @@
     worktrees,
   } from "../daemon";
   import { LAUNCHABLE_AGENTS, TAB_MARK, sessionTabKind } from "../sessionDisplay";
-  import { createWorktreeFor, removeProjectTarget, removeWorktreeTarget } from "../overlays";
+  import {
+    createWorktreeFor,
+    removeProjectTarget,
+    removeSshHostTarget,
+    removeWorktreeTarget,
+  } from "../overlays";
+  import { sshHosts } from "../sshHosts";
   import { focusedPane, matchBinding } from "../keymap";
   import {
     currentDesktopPlatform,
@@ -389,43 +396,75 @@
     {@const scopeExpanded = isScopeExpanded(scope)}
     {@const scopeProjects = projectsForScope(scope.id)}
     <!-- Top-level daemon scope header (ADR 0014): a quiet mono group row,
-         twisty + monitor glyph + uppercase label + a liveness dot. Local is
-         first and always present; SSH Hosts join here in issue #27. -->
-    <div
-      use:registerRow={`scope:${scope.id}`}
-      class="scope-row"
-      role="button"
-      tabindex={activeKey() === `scope:${scope.id}` ? 0 : -1}
-      aria-expanded={scopeExpanded}
-      onclick={() => {
-        activeRowKey = `scope:${scope.id}`;
-        toggleScope(scope);
-      }}
-      onfocus={() => (activeRowKey = `scope:${scope.id}`)}
-      onkeydown={(e) => onRowKey(e, { key: `scope:${scope.id}`, kind: "scope", scope })}
-    >
-      <button
-        class="tw"
-        class:open={scopeExpanded}
-        aria-label={scopeExpanded ? "Collapse" : "Expand"}
-        onclick={(e) => {
-          e.stopPropagation();
-          toggleScope(scope);
-        }}
-      >
-        <ChevronRight class="icon" />
-      </button>
-      <MonitorIcon class="scope-ic icon" />
-      <span class="scope-name">{scope.label}</span>
-      <span
-        class="scope-dot {scope.status === 'running' ? 'ok' : scope.status === 'failed' || scope.status === 'unreachable' ? 'down' : 'pending'}"
-        title={`Daemon ${scope.status}`}
-      ></span>
-    </div>
+         twisty + monitor/server glyph + label + a liveness dot. Local is first
+         and always present (monitor glyph, uppercase LOCAL); saved SSH Hosts
+         follow (server glyph, target string) and carry a remove affordance. The
+         host's real Daemon Status arrives in issue #27; until then it reads as a
+         neutral `unreachable` placeholder. -->
+    {@const ScopeIcon = scope.kind === "ssh-host" ? Server : MonitorIcon}
+    {@const sshHost = scope.kind === "ssh-host" ? $sshHosts.find((h) => h.id === scope.id) : null}
+    <ContextMenu.Root>
+      <ContextMenu.Trigger>
+        {#snippet child({ props })}
+          <div
+            {...props}
+            use:registerRow={`scope:${scope.id}`}
+            class="scope-row"
+            class:ssh={scope.kind === "ssh-host"}
+            role="button"
+            tabindex={activeKey() === `scope:${scope.id}` ? 0 : -1}
+            aria-expanded={scopeExpanded}
+            onclick={() => {
+              activeRowKey = `scope:${scope.id}`;
+              toggleScope(scope);
+            }}
+            onfocus={() => (activeRowKey = `scope:${scope.id}`)}
+            onkeydown={(e) => onRowKey(e, { key: `scope:${scope.id}`, kind: "scope", scope })}
+          >
+            <button
+              class="tw"
+              class:open={scopeExpanded}
+              aria-label={scopeExpanded ? "Collapse" : "Expand"}
+              onclick={(e) => {
+                e.stopPropagation();
+                toggleScope(scope);
+              }}
+            >
+              <ChevronRight class="icon" />
+            </button>
+            <ScopeIcon class="scope-ic icon" />
+            <span class="scope-name" class:lower={scope.kind === "ssh-host"}>{scope.label}</span>
+            <span
+              class="scope-dot {scope.status === 'running' ? 'ok' : scope.status === 'failed' || scope.status === 'unreachable' ? 'down' : 'pending'}"
+              title={`Daemon ${scope.status}`}
+            ></span>
+          </div>
+        {/snippet}
+      </ContextMenu.Trigger>
+      {#if sshHost}
+        <ContextMenu.Portal>
+          <ContextMenu.Content class="menu">
+            <ContextMenu.Item class="mi" onSelect={() => void copyPath(sshHost.target)}>
+              <Copy class="mi-ico icon" />
+              Copy target
+            </ContextMenu.Item>
+            <ContextMenu.Separator class="m-sep" />
+            <ContextMenu.Item class="mi danger" onSelect={() => removeSshHostTarget.set(sshHost)}>
+              <Trash2 class="mi-ico icon" />
+              Remove host…
+            </ContextMenu.Item>
+          </ContextMenu.Content>
+        </ContextMenu.Portal>
+      {/if}
+    </ContextMenu.Root>
 
     {#if scopeExpanded}
       {#if scopeProjects.length === 0}
-        <p class="empty-copy">No projects yet. Add a local repo or folder to begin.</p>
+        {#if scope.kind === "ssh-host"}
+          <p class="empty-copy">Not connected. Remote projects appear here once the host connects.</p>
+        {:else}
+          <p class="empty-copy">No projects yet. Add a local repo or folder to begin.</p>
+        {/if}
       {/if}
 
       {#each scopeProjects as project (project.id)}
@@ -705,6 +744,12 @@
     letter-spacing: 0.1em;
     text-transform: uppercase;
     color: var(--ink-2);
+  }
+  /* An SSH Host's caption is its literal OpenSSH target (`user@example.com`),
+     shown verbatim — not the uppercased scope-label treatment Local uses. */
+  .scope-name.lower {
+    text-transform: none;
+    letter-spacing: 0.02em;
   }
   /* liveness dot, keyed off Daemon Status: running = ok (green glow), starting =
      pending (faint), failed/unreachable = down (oxide). Mirrors the top-bar

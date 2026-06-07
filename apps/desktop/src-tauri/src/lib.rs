@@ -4,6 +4,7 @@
 //! socket connection, starts the daemon when needed, and relays `hitch-proto`
 //! requests/responses/events to Tauri IPC.
 
+mod ssh;
 mod window_chrome;
 
 use hitch_proto::transport::{connect_daemon as connect_transport, is_endpoint_busy, DaemonStream};
@@ -2632,6 +2633,19 @@ fn open_path_with_default_viewer(path: &Path) -> Result<(), String> {
         .map_err(|err| format!("failed to open path with default viewer: {err}"))
 }
 
+/// Test an **SSH Host** target before saving it (issue #26, ADR 0014). Spawns
+/// `ssh -o BatchMode=yes <target> hitch daemon proxy`, attempts the Hitch Hello
+/// handshake on the subprocess stdio, then terminates it and returns a structured
+/// classified result. The blocking spawn/handshake runs off the UI thread. This
+/// is the CLIENT side of the remote attach; issue #27 reuses `ssh::run_test`'s
+/// handshake helper for the real persistent connection.
+#[tauri::command]
+async fn test_ssh_host(target: String) -> Result<ssh::SshTestResult, String> {
+    tauri::async_runtime::spawn_blocking(move || ssh::run_test(&target))
+        .await
+        .map_err(|err| format!("ssh test task failed: {err}"))
+}
+
 #[tauri::command]
 async fn open_in_editor(path: String, editor: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -4434,6 +4448,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             open_in_editor,
+            test_ssh_host,
             list_monospace_fonts,
             list_terminal_font_faces,
             read_font_face,

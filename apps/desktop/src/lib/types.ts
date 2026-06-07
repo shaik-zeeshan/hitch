@@ -75,6 +75,42 @@ export type DaemonScope = {
   status: DaemonStatus;
 };
 
+// ---- SSH Host (ADR 0014, issue #26) ---------------------------------------
+//
+// A GUI-local saved OpenSSH target string through which the GUI can reach a
+// Hitch Daemon running on that host (CONTEXT.md). It stores ONLY the target
+// string — no private keys, passphrases, ports, or usernames as separate
+// fields: OpenSSH config, ssh-agent, hardware keys, ProxyJump, and known_hosts
+// remain the source of truth (ADR 0014). `id` is the well-known scope id this
+// host mints (`ssh:<target>`), so issue #27 can interpret remote entities under
+// a stable per-host scope without a separate rename-prone identity.
+export type SshHost = {
+  id: DaemonScopeId;
+  target: string;
+};
+
+// The actionable failure categories the backend classifier returns for a failed
+// Test Connection (ADR 0014). Mirrors src-tauri's `FailureCategory` (kebab-case).
+export type SshTestCategory =
+  | "auth"
+  | "host-key"
+  | "missing-hitch"
+  | "protocol-mismatch"
+  | "proxy-startup"
+  | "network";
+
+// Structured result of `test_ssh_host`. Mirrors src-tauri's `SshTestResult`:
+// `ok` true means the Hello handshake succeeded at a compatible protocol
+// version; otherwise `category` + a user-facing `message` (which embeds the
+// exact manual `ssh … hitch daemon proxy` command) and an optional `detail`
+// (stderr tail or version numbers).
+export type SshTestResult = {
+  ok: boolean;
+  category?: SshTestCategory;
+  message: string;
+  detail?: string;
+};
+
 // Lifecycle of an async Job (CONTEXT.md, ADR 0008). Mirrors hitch-proto's
 // `JobStatus`.
 export type JobStatus =

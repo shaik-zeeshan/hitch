@@ -64,6 +64,8 @@
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import AddProjectDialog from "$lib/components/AddProjectDialog.svelte";
   import CloneProjectDialog from "$lib/components/CloneProjectDialog.svelte";
+  import AddSshHostDialog from "$lib/components/AddSshHostDialog.svelte";
+  import RemoveSshHostDialog from "$lib/components/RemoveSshHostDialog.svelte";
   import CreateWorktreeDialog from "$lib/components/CreateWorktreeDialog.svelte";
   import RemoveProjectDialog from "$lib/components/RemoveProjectDialog.svelte";
   import RemoveWorktreeDialog from "$lib/components/RemoveWorktreeDialog.svelte";
@@ -417,6 +419,8 @@
 <CommandPalette />
 <AddProjectDialog />
 <CloneProjectDialog />
+<AddSshHostDialog />
+<RemoveSshHostDialog />
 <CreateWorktreeDialog />
 <RemoveProjectDialog />
 <RemoveWorktreeDialog />

@@ -43,6 +43,7 @@ import {
   sessions,
   worktrees,
 } from "./daemon";
+import { sshHosts } from "./sshHosts";
 import { LOCAL_SCOPE_ID, type DaemonScope, type Project, type Session, type Worktree } from "./types";
 
 const project = (id: string, kind: Project["kind"] = "git-backed"): Project => ({
@@ -125,6 +126,9 @@ beforeEach(() => {
   selectedWorktreeId.set(null);
   activeSessionId.set(null);
   projectScopes.set({});
+  // Clear saved SSH Hosts first: daemon.ts reconciles `daemonScopes` from this
+  // store, so an `.set([])` here lands before we pin the Local-only baseline.
+  sshHosts.set([]);
   daemonScopes.set([{ id: LOCAL_SCOPE_ID, kind: "local", label: "LOCAL", status: "starting" }]);
 });
 
@@ -234,19 +238,69 @@ describe("rollups are unchanged under Local scoping", () => {
   });
 });
 
-describe("dispose resets scope state to just Local", () => {
-  it("clears project tags and remote scopes, keeping Local", async () => {
+describe("dispose resets scope state to Local plus saved SSH Hosts", () => {
+  it("clears project tags but keeps Local and persisted SSH Host scopes", async () => {
     mockSnapshot({ projects: [project("p1")], worktrees: [], sessions: [] });
     await refreshAll();
-    daemonScopes.update((s) => [
-      ...s,
-      { id: "ssh:x", kind: "ssh-host", label: "x", status: "running" },
-    ]);
+    sshHosts.set([{ id: "ssh:prod", target: "prod" }]);
 
     disposeDaemon();
 
     expect(get(projectScopes)).toEqual({});
-    expect(get(daemonScopes)).toHaveLength(1);
-    expect(get(daemonScopes)[0].id).toBe(LOCAL_SCOPE_ID);
+    // Local + the saved host survive (hosts are GUI-local config, not daemon
+    // state); only project tags and Local's running status reset.
+    const ids = get(daemonScopes).map((s) => s.id);
+    expect(ids).toContain(LOCAL_SCOPE_ID);
+    expect(ids).toContain("ssh:prod");
+  });
+});
+
+describe("SSH Host scopes seed the tree (issue #26)", () => {
+  it("seeds a saved host as a top-level ssh-host scope, ordered after Local", () => {
+    sshHosts.set([{ id: "ssh:user@example.com", target: "user@example.com" }]);
+    const ordered = get(daemonScopesOrdered);
+    expect(ordered.map((s) => s.id)).toEqual([LOCAL_SCOPE_ID, "ssh:user@example.com"]);
+    const host = ordered[1];
+    expect(host).toMatchObject({ kind: "ssh-host", label: "user@example.com", status: "unreachable" });
+  });
+
+  it("orders multiple SSH Hosts alphabetically by target, Local always first", () => {
+    sshHosts.set([
+      { id: "ssh:zulu", target: "zulu" },
+      { id: "ssh:alpha", target: "alpha" },
+    ]);
+    expect(get(daemonScopesOrdered).map((s) => s.label)).toEqual(["LOCAL", "alpha", "zulu"]);
+  });
+
+  it("preserves a host's live status across a re-seed (issue #27 seam)", () => {
+    sshHosts.set([{ id: "ssh:prod", target: "prod" }]);
+    // Simulate issue #27 setting a real Daemon Status on the host scope.
+    daemonScopes.update((scopes) =>
+      scopes.map((s) => (s.id === "ssh:prod" ? { ...s, status: "running" } : s)),
+    );
+    // A re-seed (e.g. another host added) must not clobber the live status.
+    sshHosts.update((hosts) => [...hosts, { id: "ssh:edge", target: "edge" }]);
+    const prod = get(daemonScopes).find((s) => s.id === "ssh:prod");
+    expect(prod?.status).toBe("running");
+  });
+
+  it("drops a removed host's scope", () => {
+    sshHosts.set([
+      { id: "ssh:a", target: "a" },
+      { id: "ssh:b", target: "b" },
+    ]);
+    sshHosts.update((hosts) => hosts.filter((h) => h.id !== "ssh:a"));
+    const ids = get(daemonScopes).map((s) => s.id);
+    expect(ids).toContain("ssh:b");
+    expect(ids).not.toContain("ssh:a");
+  });
+
+  it("mirroring the local Daemon Status does not disturb SSH Host scopes", () => {
+    sshHosts.set([{ id: "ssh:prod", target: "prod" }]);
+    applyDaemonStatus("running", null);
+    const prod = get(daemonScopes).find((s) => s.id === "ssh:prod");
+    // Local updated; the host's placeholder status is untouched.
+    expect(get(daemonScopes).find((s) => s.id === LOCAL_SCOPE_ID)?.status).toBe("running");
+    expect(prod?.status).toBe("unreachable");
   });
 });

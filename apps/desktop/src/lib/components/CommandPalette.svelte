@@ -26,6 +26,7 @@
   } from "../daemon";
   import {
     addProjectOpen,
+    addSshHostOpen,
     cloneProjectOpen,
     commandOpen,
     createPrOpen,
@@ -225,6 +226,16 @@
                     /></svg
                   >
                   <span class="pi-label">Clone remote repository…</span>
+                </Command.Item>
+                <Command.Item
+                  class="p-item"
+                  value="add ssh host remote daemon connection server"
+                  onSelect={() => run(() => addSshHostOpen.set(true))}
+                >
+                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
+                    ><rect x="2.5" y="2.5" width="11" height="4.5" /><rect x="2.5" y="9" width="11" height="4.5" /><path d="M5 4.75h0M5 11.25h0" /></svg
+                  >
+                  <span class="pi-label">Add SSH Host…</span>
                 </Command.Item>
                 <Command.Item
                   class="p-item"
