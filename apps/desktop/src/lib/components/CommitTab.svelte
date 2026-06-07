@@ -16,16 +16,14 @@
   // supplies the per-file add/del counts and the binary/empty fallback states.
   import { onMount } from "svelte";
   import { processPatch, type FileDiffMetadata } from "@pierre/diffs";
-  import ChevronDown from "~icons/lucide/chevron-down";
-  import ChevronRight from "~icons/lucide/chevron-right";
   import Copy from "~icons/lucide/copy";
   import Check from "~icons/lucide/check";
   import { fetchCommitDiff, selectedWorktreeId, type CommitDiffData } from "../daemon";
   import { parseDiff } from "../diff";
-  import { diffViewOptions, fileDiffView } from "../diffView";
-  import { fileIconUrl } from "../file-icons";
+  import { diffViewOptions } from "../diffView";
   import { theme } from "../theme";
   import { STATUS_GLYPH, statusGlyphClass } from "../types";
+  import DiffFileSection from "./DiffFileSection.svelte";
   import DiffViewOptions from "./DiffViewOptions.svelte";
   import { diffStyle, diffWrap } from "../settings";
 
@@ -172,60 +170,24 @@
   {:else}
     {#each data.files as file (file.path)}
       {@const isCollapsed = collapsed.has(file.path)}
-      {@const parsed = !isCollapsed ? parsedFor(file.path, file.diff) : null}
-      {@const files = !isCollapsed ? filesFor(file.path, file.diff) : []}
-      {@const showSectionHeaders = files.length > 1}
-      <section class="file">
-        <button
-          class="file-head"
-          type="button"
-          aria-expanded={!isCollapsed}
-          onclick={() => toggle(file.path)}
-        >
-          <span class="chev" aria-hidden="true">
-            {#if isCollapsed}
-              <ChevronRight />
-            {:else}
-              <ChevronDown />
-            {/if}
-          </span>
+      <!-- The parse + section caches stay here (keyed by path — a commit is
+           immutable, so they never invalidate), and the per-file collapsible
+           markup lives in the shared DiffFileSection. The per-file status glyph is
+           passed as the status-mark snippet; commit files have no trailing badge. -->
+      <DiffFileSection
+        path={file.path}
+        parsed={!isCollapsed ? parsedFor(file.path, file.diff) : null}
+        files={!isCollapsed ? filesFor(file.path, file.diff) : []}
+        {isCollapsed}
+        {options}
+        onToggle={() => toggle(file.path)}
+      >
+        {#snippet statusMark()}
           <span class="st {statusGlyphClass(file.status)}" title={file.status} aria-hidden="true"
             >{STATUS_GLYPH[file.status]}</span
           >
-          <span class="ftype" aria-hidden="true"><img src={fileIconUrl(file.path)} alt="" /></span>
-          <span class="fpath">{file.path}</span>
-          {#if parsed && !parsed.isEmpty}
-            <span class="counts">
-              <span class="add">+{parsed.additions}</span>
-              <span class="del">−{parsed.deletions}</span>
-            </span>
-          {/if}
-        </button>
-
-        {#if !isCollapsed}
-          {#if parsed === null}
-            <div class="diff-empty small"><p>Loading diff…</p></div>
-          {:else if parsed.isBinary}
-            <div class="diff-empty small"><p>Binary file — no text diff.</p></div>
-          {:else if parsed.isEmpty}
-            <div class="diff-empty small"><p>No textual changes.</p></div>
-          {:else}
-            <!-- One @pierre/diffs instance per file section, mounted only while
-                 expanded — identical to DiffAllTab's per-section rendering. -->
-            {#each files as fileDiff (fileDiff.name)}
-              <div class="section">
-                {#if showSectionHeaders}
-                  <div class="section-head">
-                    <span class="fpath">{fileDiff.name}</span>
-                  </div>
-                {/if}
-                <diffs-container class="diffs" use:fileDiffView={{ fileDiff, opts: options }}
-                ></diffs-container>
-              </div>
-            {/each}
-          {/if}
-        {/if}
-      </section>
+        {/snippet}
+      </DiffFileSection>
     {/each}
   {/if}
 </div>
@@ -384,50 +346,16 @@
     color: var(--term-fg);
   }
 
-  .file {
-    border-bottom: 1px solid var(--term-line);
-  }
-  /* Collapsible section header — mirrors DiffAllTab .file-head (chevron + status
-     mark + file icon + path + counts), sticking under the metadata head. */
-  .file-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    padding: 7px 16px;
-    background: var(--term-bg2);
-    border: 0;
-    border-radius: 0;
-    cursor: pointer;
-    text-align: left;
-    position: sticky;
-    top: 38px;
-    z-index: 1;
-    transition: color 0.15s ease-out;
-  }
-  .file-head:hover {
-    color: var(--term-fg);
-  }
-  .file-head:focus-visible {
-    outline: 1px solid var(--iris-ink);
-    outline-offset: -2px;
-  }
-  .file-head .chev {
-    display: inline-grid;
-    place-items: center;
-    width: 14px;
-    height: 14px;
-    flex: none;
-    color: var(--term-dim);
-  }
-  .file-head .chev :global(svg) {
-    width: 14px;
-    height: 14px;
-    stroke-width: 1.5px;
-  }
-  /* Status mark — same letters/hues as the Changes rail, retinted to the diff
-     surface where needed (U falls back to the dim terminal token). */
-  .file-head .st {
+  /* The collapsible per-file section (head button, fallback branches, per-section
+     @pierre/diffs rendering) and its CSS now live in the shared DiffFileSection.
+     The status glyph below is the only per-section chrome owned here: it's passed
+     as a snippet, so it renders in this component's style scope rather than the
+     child's — hence a standalone `.st` selector instead of `.file-head .st`.
+     Same letters/hues as the Changes rail, retinted to the diff surface where
+     needed (U falls back to the dim terminal token). Each status has an explicit
+     color, so it does not pick up the head's hover recolor (unchanged from before,
+     where these same per-status colors won over the inherited hover color). */
+  .st {
     width: 13px;
     text-align: center;
     font-weight: 700;
@@ -435,75 +363,27 @@
     font-family: var(--mono);
     flex: 0 0 13px;
   }
-  .file-head .st.M {
+  .st.M {
     color: var(--st-stall);
   }
-  .file-head .st.A {
+  .st.A {
     color: var(--st-ok);
   }
-  .file-head .st.D {
+  .st.D {
     color: var(--diff-del);
   }
-  .file-head .st.U {
+  .st.U {
     color: var(--term-dim);
   }
-  .file-head .ftype {
-    display: inline-grid;
-    place-items: center;
-    width: 16px;
-    height: 16px;
-    flex: none;
-  }
-  .file-head .ftype img {
-    width: 16px;
-    height: 16px;
-    display: block;
-  }
-  .file-head .fpath {
-    font-family: var(--mono);
-    font-size: var(--r1);
-    color: var(--term-fg);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .file-head .counts {
-    margin-left: auto;
-  }
 
-  .section + .section {
-    border-top: 1px solid var(--term-line);
-  }
-  .section-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 7px 16px 7px 38px;
-    background: var(--term-bg2);
-    border-bottom: 1px solid var(--term-line);
-  }
-  .section-head .fpath {
-    font-family: var(--mono);
-    font-size: var(--r1);
-    color: var(--term-fg);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  /* The @pierre/diffs container's chrome→terminal token bridge is applied by the
-     shared fileDiffView action (lib/diffView.ts), same as DiffTab/DiffAllTab. */
-
+  /* Tab-level state ("Loading commit…", "Couldn't load this commit.", "No file
+     changes in this commit."), centered full-height — distinct from the compact
+     in-section fallbacks owned by DiffFileSection. */
   .diff-empty {
     display: grid;
     place-content: center;
     height: calc(100% - 38px);
     padding: 24px;
-  }
-  .diff-empty.small {
-    height: auto;
-    place-content: start;
-    padding: 12px 16px 16px 38px;
   }
   .diff-empty p {
     font-family: var(--ui);
