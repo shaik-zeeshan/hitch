@@ -32,7 +32,10 @@ import {
   type CommitFileDiff,
   type CommitInfo,
   type CommitMeta,
+  type DaemonScope,
+  type DaemonScopeId,
   type DaemonStatus,
+  LOCAL_SCOPE_ID,
   type DraftGenerationSettings,
   type FileStatus,
   type GitStatus,
@@ -157,9 +160,83 @@ export const sessionCommands = writable<Record<Id, string | null>>({});
 export const dirtyWorktrees = writable<Record<Id, boolean>>({});
 export const worktreeLineStats = writable<Record<Id, { additions: number; deletions: number }>>({});
 
+// ---- Daemon scopes (ADR 0014, issue #25) ----------------------------------
+//
+// The attached Daemons presented as top-level tree scopes. A GUI window may
+// attach to several Daemons at once (CONTEXT.md); this slice ships only the
+// local Daemon, but the state is modeled per scope so issue #27 can add SSH
+// Host scopes additively. Every Project/Worktree/Session/Job id is interpreted
+// within its owning scope (see `projectScope` below), never as globally unique
+// across daemons (ADR 0014).
+//
+// The Local scope is always present, the daemon-status mirror keeps its `status`
+// live, and `daemonScopesOrdered` renders Local first (then, later, SSH Hosts
+// sorted by target). Seeded with Local at module load so the tree always has its
+// top-level scope even before the first connect.
+const LOCAL_SCOPE: DaemonScope = {
+  id: LOCAL_SCOPE_ID,
+  kind: "local",
+  label: "LOCAL",
+  status: "starting",
+};
+export const daemonScopes = writable<DaemonScope[]>([LOCAL_SCOPE]);
+
+// The attached scopes in tree order: Local first, then SSH Hosts alphabetically
+// by label (ADR 0014). Local always sorts ahead of any remote scope regardless
+// of label; remote scopes (issue #27) order among themselves by target string.
+export const daemonScopesOrdered = derived(daemonScopes, ($scopes) =>
+  [...$scopes].sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === "local" ? -1 : 1;
+    if (a.id === LOCAL_SCOPE_ID) return -1;
+    if (b.id === LOCAL_SCOPE_ID) return 1;
+    return a.label.localeCompare(b.label);
+  }),
+);
+
+// Which daemon scope owns each Project, by project id. The owning scope is
+// fixed at ingestion: a Project reached over the local socket belongs to the
+// Local scope; a Remote Project (issue #28) will be tagged with its SSH Host
+// scope when it is ingested from that daemon. Worktrees/Sessions inherit their
+// Project's scope (they are reached through the same daemon), so this one map is
+// the single source of scope membership for the whole entity tree. Absent =
+// not yet ingested; consumers fall back to Local (the only scope today).
+export const projectScopes = writable<Record<Id, DaemonScopeId>>({});
+
+// The owning daemon scope of a Project id, defaulting to Local for any project
+// not explicitly tagged (the only scope this slice ingests). The single helper
+// every scope-aware reader uses so the Local default lives in one place.
+export function scopeForProject(projectId: Id | null | undefined): DaemonScopeId {
+  if (!projectId) return LOCAL_SCOPE_ID;
+  return get(projectScopes)[projectId] ?? LOCAL_SCOPE_ID;
+}
+
+// Tag a set of Projects as owned by a scope at ingestion. Replaces the scope map
+// wholesale for a full snapshot (so a project that vanished loses its tag);
+// `mergeProjectScopes` keeps existing tags for incremental upserts.
+function setProjectScopes(projectIds: Id[], scopeId: DaemonScopeId): void {
+  projectScopes.set(Object.fromEntries(projectIds.map((id) => [id, scopeId])));
+}
+
+function tagProjectScope(projectId: Id, scopeId: DaemonScopeId): void {
+  projectScopes.update((current) =>
+    current[projectId] === scopeId ? current : { ...current, [projectId]: scopeId },
+  );
+}
+
 export const selectedProjectId = writable<Id | null>(null);
 export const selectedWorktreeId = writable<Id | null>(null);
 export const activeSessionId = writable<Id | null>(null);
+
+// The daemon scope the current selection lives in (ADR 0014 scope-aware
+// selection): a Project/Worktree/Session selection belongs to the scope that
+// owns its Project. Derived off the selected project so it can never drift from
+// the selection; defaults to Local when nothing is selected (the scope a fresh
+// add-project / palette action targets). When SSH Host scopes exist (issue #27)
+// this is how global actions resolve their target daemon.
+export const selectedScopeId = derived(
+  [selectedProjectId, projectScopes],
+  ([$projectId, $scopes]) => (($projectId && $scopes[$projectId]) || LOCAL_SCOPE_ID),
+);
 
 // Git view state (consumed by the Changes panel + diff tabs).
 export const gitStatus = writable<GitStatus | null>(null);
@@ -792,6 +869,21 @@ export const selectedProject = derived(
   [projects, selectedProjectId],
   ([$projects, $id]) => $projects.find((p) => p.id === $id) ?? null,
 );
+
+// Projects grouped by their owning daemon scope, for the multi-daemon tree. The
+// project order WITHIN a scope is preserved from `projects` (daemon order). The
+// tree iterates `daemonScopesOrdered` and reads each scope's bucket here, so a
+// scope with no projects still renders its (currently only Local) header. Keyed
+// by scope id; a project with no explicit tag falls into Local (the only scope
+// this slice ingests).
+export const projectsByScope = derived([projects, projectScopes], ([$projects, $scopes]) => {
+  const map: Record<DaemonScopeId, Project[]> = {};
+  for (const project of $projects) {
+    const scopeId = $scopes[project.id] ?? LOCAL_SCOPE_ID;
+    (map[scopeId] ??= []).push(project);
+  }
+  return map;
+});
 
 export const projectWorktrees = derived(
   [worktrees, selectedProjectId],
@@ -1543,6 +1635,14 @@ export async function refreshAll(
     type: "list-projects",
   });
   projects.set(projectResponse.projects);
+  // Every project from `list-projects` over the local socket is owned by the
+  // Local scope (ADR 0014). A full snapshot replaces the scope map wholesale so
+  // a project removed out of band loses its tag. Issue #28 will instead tag a
+  // remote daemon's projects with its SSH Host scope at its own ingestion.
+  setProjectScopes(
+    projectResponse.projects.map((project) => project.id),
+    LOCAL_SCOPE_ID,
+  );
 
   const worktreeLists = await Promise.all(
     projectResponse.projects
@@ -1830,7 +1930,11 @@ function noteAgentStateTransition(
 
 export function applyHitchEvent(event: HitchEvent): void {
   if (event.type === "project-updated") {
-    projects.update((items) => upsert(items, event.project as Project));
+    const project = event.project as Project;
+    projects.update((items) => upsert(items, project));
+    // A project pushed over the local socket is Local-scoped (ADR 0014). Keep
+    // an existing tag (idempotent) so an upsert never re-homes a project.
+    tagProjectScope(project.id, LOCAL_SCOPE_ID);
   }
   if (event.type === "worktree-updated") {
     worktrees.update((items) => upsert(items, event.worktree as Worktree));
@@ -1985,6 +2089,9 @@ export function applyHitchEvent(event: HitchEvent): void {
     }
     projects.update((items) => items.filter((p) => p.id !== projectId));
     worktrees.update((items) => items.filter((w) => w.project_id !== projectId));
+    // Drop the removed project's scope tag so the map never retains a stale
+    // owner (and a re-added project with the same id can't inherit it).
+    projectScopes.update((current) => omitKey(current, projectId));
     // Evict every vanished worktree's per-worktree state (working-tree AND commit
     // diff caches, plus the PR-freshness maps), which are keyed per worktree and
     // would otherwise leak until disposeDaemon. We sweep directly rather than call
@@ -2084,6 +2191,14 @@ export async function initDaemon(): Promise<void> {
 export function applyDaemonStatus(status: DaemonStatus, reason: string | null): void {
   daemonStatus.set(status);
   daemonReason.set(reason);
+  // Mirror the local Daemon's liveness onto its tree scope so a collapsed Local
+  // header can show status alongside future SSH Host scopes (ADR 0014). Each
+  // scope owns its own Daemon Status; Local's tracks `daemonStatus` here.
+  daemonScopes.update((scopes) =>
+    scopes.map((scope) =>
+      scope.id === LOCAL_SCOPE_ID && scope.status !== status ? { ...scope, status } : scope,
+    ),
+  );
   if (status === "running") {
     connection.set("ready");
     error.set(null);
@@ -2116,6 +2231,10 @@ export function disposeDaemon(): void {
   commitLog.set(EMPTY_COMMIT_LOG);
   commitLogHeadId = null;
   compositeChains.set({});
+  // Reset scope state to just the Local scope (no projects tagged). SSH Host
+  // scopes (issue #27) are re-derived from saved hosts on the next boot.
+  projectScopes.set({});
+  daemonScopes.set([{ ...LOCAL_SCOPE }]);
   booted = false;
 }
 

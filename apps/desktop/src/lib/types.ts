@@ -40,6 +40,41 @@ export type KnownAgent = "claude-code" | "codex";
 // socket link (CONTEXT.md, ADR 0009). Mirrors src-tauri's `DaemonStatus`.
 export type DaemonStatus = "starting" | "running" | "unreachable" | "failed";
 
+// ---- Daemon scope (ADR 0014, issue #25) -----------------------------------
+//
+// A GUI window may attach to several Daemons at once: the local Daemon plus
+// zero or more remote Daemons reached through SSH Hosts (CONTEXT.md). Every
+// Project, Worktree, Session, and Job identifier is interpreted within its
+// OWNING daemon scope, never as globally unique across attached daemons (ADR
+// 0014). A `DaemonScopeId` names one such scope; the local Daemon is the
+// well-known `LOCAL_SCOPE_ID`. Saved SSH Hosts will mint their own scope ids in
+// issue #27 — this slice ships Local only.
+export type DaemonScopeId = string;
+
+// The well-known scope id of the local Daemon. Stable across reloads so a
+// persisted Local expand/collapse state and any scope-keyed selection survive
+// a restart. SSH Host scope ids (issue #27) are minted per saved host and will
+// never collide with this reserved value.
+export const LOCAL_SCOPE_ID: DaemonScopeId = "local";
+
+// Whether a scope is the local Daemon or a remote one reached through an SSH
+// Host. Only `local` exists today; `ssh-host` is reserved for issue #27 so the
+// tree, status surfaces, and selection model already branch on the kind.
+export type DaemonScopeKind = "local" | "ssh-host";
+
+// One attached Daemon presented as a top-level scope in the multi-daemon tree
+// (ADR 0014): Local first, saved SSH Hosts sorted alphabetically by target.
+// `label` is the row's mono caption (`LOCAL`, or an SSH target). `status` is the
+// scope's own Daemon Status — broader than this window's socket link — so a
+// collapsed scope can still show liveness. SSH-only fields (target, connection
+// backoff) are deliberately omitted here and added with the SSH Host model.
+export type DaemonScope = {
+  id: DaemonScopeId;
+  kind: DaemonScopeKind;
+  label: string;
+  status: DaemonStatus;
+};
+
 // Lifecycle of an async Job (CONTEXT.md, ADR 0008). Mirrors hitch-proto's
 // `JobStatus`.
 export type JobStatus =
