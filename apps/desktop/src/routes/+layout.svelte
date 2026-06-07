@@ -282,7 +282,14 @@
     // (typing, and Esc-to-close, which bits-ui handles itself). Returning here —
     // rather than special-casing Esc — keeps typing in the commit dialog /
     // palette from triggering single-key shortcuts and leaves Esc to the dialog.
-    if (anyOverlayOpen()) return;
+    // Carve-out: palette.open must survive the gate when the PALETTE itself is the
+    // open overlay, or its toggle-shaped openPalette() handler is unreachable in
+    // the close direction (Cmd+K could open the palette but never close it). The
+    // get(commandOpen) check keeps the gate intact for OTHER overlays — Cmd+K
+    // stays blocked while a commit/create-worktree dialog owns the keyboard.
+    if (anyOverlayOpen() && !(binding.id === "palette.open" && get(commandOpen))) {
+      return;
+    }
 
     // Bare-key bindings (no modifier) must not fire while typing in an editable
     // element. Modifier combos are always eligible.

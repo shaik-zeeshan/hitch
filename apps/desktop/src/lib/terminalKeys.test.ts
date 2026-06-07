@@ -116,8 +116,10 @@ describe("classifyTerminalKey — app pass-through (keymap-derived)", () => {
     { key: "b", metaKey: true, altKey: true },
     { key: "e", metaKey: true, shiftKey: true },
     { key: "g", metaKey: true, shiftKey: true },
-    { key: "[", metaKey: true, shiftKey: true },
-    { key: "]", metaKey: true, shiftKey: true },
+    // Shift held → browser reports the shifted glyph in event.key, so
+    // Cmd+Shift+[ arrives as "{" and Cmd+Shift+] as "}" (tab.prev/tab.next).
+    { key: "{", metaKey: true, shiftKey: true },
+    { key: "}", metaKey: true, shiftKey: true },
     { key: "k", metaKey: true },
     { key: ",", metaKey: true },
     // Ctrl-on-both combos:

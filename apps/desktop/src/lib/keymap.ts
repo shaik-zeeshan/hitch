@@ -337,14 +337,28 @@ export interface KeyEventLike {
   altKey: boolean;
 }
 
-// Case-insensitive compare for single-letter keys; exact for everything else
-// (named keys, digits, punctuation). Browsers report letter `key` lowercased
-// without Shift and uppercased with it, so "e" must match both "e" and "E".
+// US-layout shifted twins for the punctuation keys our combos use. Browsers put
+// the PRODUCED character in event.key, so Shift+"[" arrives as key:"{" (not "["
+// + shiftKey). A combo specced as the unshifted key must therefore also accept
+// its shifted form. This is safe: comboMatchesEvent still requires shiftKey to
+// match exactly, so a {key:"[", shift:false} combo can't be satisfied by a "{"
+// event (which always carries shiftKey:true) — only the shift-required brackets
+// (tab.next/tab.prev) ever benefit from this mapping.
+const SHIFTED: Record<string, string> = {
+  "[": "{",
+  "]": "}",
+};
+
+// Case-insensitive compare for single-letter keys; exact (plus shifted twin) for
+// everything else (named keys, digits, punctuation). Browsers report letter `key`
+// lowercased without Shift and uppercased with it, so "e" must match both "e" and
+// "E"; and report a Shift+punctuation press as its shifted glyph, so "[" must also
+// match "{".
 function keyMatches(spec: string, actual: string): boolean {
   if (spec.length === 1 && /[a-z]/i.test(spec)) {
     return spec.toLowerCase() === actual.toLowerCase();
   }
-  return spec === actual;
+  return spec === actual || SHIFTED[spec] === actual;
 }
 
 // Does this key event satisfy a combo's key + EXACT modifier requirements on the

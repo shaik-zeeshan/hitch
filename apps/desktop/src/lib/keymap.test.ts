@@ -90,6 +90,16 @@ describe("matchBinding — exact modifier discrimination", () => {
     expect(id("macos", { key: "Tab", ctrlKey: true, shiftKey: true })).toBe("tab.prev.ctrl");
   });
 
+  it("Cmd/Ctrl+Shift+]/[ resolve via the shifted glyph the browser reports", () => {
+    // With Shift held, browsers put the PRODUCED character in event.key, so the
+    // combo specced as "]"/"[" actually arrives as "}"/"{". Assert the REAL
+    // shape — synthesizing {key:"]", shiftKey:true} is something no browser emits.
+    expect(id("macos", { key: "}", metaKey: true, shiftKey: true })).toBe("tab.next");
+    expect(id("macos", { key: "{", metaKey: true, shiftKey: true })).toBe("tab.prev");
+    expect(id("windows", { key: "}", ctrlKey: true, shiftKey: true })).toBe("tab.next");
+    expect(id("linux", { key: "{", ctrlKey: true, shiftKey: true })).toBe("tab.prev");
+  });
+
   it("matches Cmd+1..9 tab jumps", () => {
     expect(id("macos", { key: "1", metaKey: true })).toBe("tab.jump.1");
     expect(id("macos", { key: "9", metaKey: true })).toBe("tab.jump.9");
