@@ -22,5 +22,6 @@ hitch-pty.workspace = true
 hitch-store.workspace = true
 hitch-agent.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 # Unix pidfile advisory locking.
 libc = "0.2"

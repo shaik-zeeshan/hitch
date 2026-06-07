@@ -2996,6 +2996,38 @@ fn send_session_input(
     Ok(Response::Ack)
 }
 
+/// Upload dropped local files into a remote Session (issue #31, ADR 0014). Only
+/// remote scopes reach here — the frontend handles local drops by inserting paths
+/// directly (unchanged). Streams each file over the scope's SSH connection on a
+/// blocking task so it never blocks the IPC thread; the streaming itself uses the
+/// same per-scope request path other commands do, so chunks interleave with PTY
+/// traffic. Returns the per-file results plus the remote OS family for quoting.
+#[tauri::command]
+async fn upload_files_to_session(
+    app: AppHandle,
+    ssh: State<'_, ssh_pool::SshConnections>,
+    scope: String,
+    batch_id: String,
+    session_id: SessionId,
+    paths: Vec<String>,
+) -> Result<ssh_pool::UploadBatchResult, String> {
+    if !is_remote_scope(Some(scope.as_str())) {
+        return Err("upload_files_to_session is only for remote sessions".to_string());
+    }
+    let pool = ssh.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        pool.upload_files(&app, &scope, &batch_id, session_id, paths)
+    })
+    .await
+    .map_err(|err| format!("upload task failed: {err}"))?
+}
+
+/// Cancel an in-flight upload batch before its paths are inserted (issue #31).
+#[tauri::command]
+fn cancel_upload(ssh: State<'_, ssh_pool::SshConnections>, batch_id: String) {
+    ssh.inner().cancel_upload(&batch_id);
+}
+
 /// Register the webview's per-session output channel (ADR 0007). Any bytes that
 /// arrived before registration are flushed immediately so a new session's first
 /// prompt isn't dropped. Re-registration (e.g. the same session re-subscribing)
@@ -4525,6 +4557,8 @@ pub fn run() {
             set_ssh_hosts,
             retry_ssh_host,
             send_session_input,
+            upload_files_to_session,
+            cancel_upload,
             register_session_output,
             unregister_session_output,
             get_daemon_status,

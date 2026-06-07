@@ -594,6 +594,7 @@ mod tests {
             Response::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 daemon_pid: 1234,
+                os_family: hitch_proto::OsFamily::Unix,
             },
         ))
         .unwrap();
@@ -619,6 +620,7 @@ mod tests {
                 Response::Hello {
                     protocol_version: PROTOCOL_VERSION,
                     daemon_pid: 9,
+                    os_family: hitch_proto::OsFamily::Unix,
                 },
             ))
             .unwrap(),

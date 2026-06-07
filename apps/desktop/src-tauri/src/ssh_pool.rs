@@ -39,6 +39,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -52,8 +53,8 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use hitch_core::SessionId;
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, ControlMessage, Event, Request, RequestId, Response,
-    PROTOCOL_VERSION,
+    encode_control_message, encode_pty_frame, ControlMessage, Event, OsFamily, Request, RequestId,
+    Response, PROTOCOL_VERSION, UPLOAD_CHUNK_BYTES,
 };
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
@@ -156,6 +157,10 @@ struct RemoteConnection {
     /// Reconnect attempt counter, for backoff. Reset on a successful connect and
     /// by `retry_ssh_host`.
     attempt: AtomicU64,
+    /// The remote daemon's OS family, captured from its Hello (issue #31). Drives
+    /// remote-platform path quoting when inserting uploaded paths. Defaults to Unix
+    /// until the first successful handshake fills it in.
+    os_family: Mutex<OsFamily>,
     /// Set while a removal/disconnect is intentional, so the reader thread's EOF
     /// does not trigger auto-reconnect.
     shutting_down: AtomicBool,
@@ -176,6 +181,7 @@ impl RemoteConnection {
             output_router: Mutex::new(OutputRouter::default()),
             child: Mutex::new(None),
             attempt: AtomicU64::new(0),
+            os_family: Mutex::new(OsFamily::Unix),
             shutting_down: AtomicBool::new(false),
             reconnecting: AtomicBool::new(false),
         }
@@ -199,12 +205,79 @@ pub struct SshConnections(Arc<SshConnectionsInner>);
 
 struct SshConnectionsInner {
     connections: Mutex<HashMap<String, Arc<RemoteConnection>>>,
+    /// Cancel flags for in-flight upload batches, keyed by batch id (issue #31).
+    /// `cancel_upload` flips a batch's flag; the streaming task checks it before
+    /// each file/chunk and aborts the in-flight upload so nothing is inserted.
+    upload_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+/// One file's result in an upload batch reported back to the frontend. `state`
+/// distinguishes a real upload from a per-file rejection (a dropped directory),
+/// so the frontend can toast the rejection copy and still insert the uploads.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UploadFileResult {
+    /// The file uploaded; `remote_path` is the actual remote path to insert.
+    Uploaded { name: String, remote_path: String },
+    /// The path was a directory; recursive upload isn't supported (ADR 0014).
+    RejectedDirectory { name: String },
+    /// The path could not be read/stat'd locally; carries the error for a toast.
+    Failed { name: String, error: String },
+}
+
+/// The outcome of an upload batch returned to the frontend (issue #31). `os_family`
+/// tells the frontend which shell quoting to use for the inserted remote paths;
+/// `cancelled` is true when the user cancelled before completion (nothing should
+/// be inserted then).
+#[derive(Debug, Clone, Serialize)]
+pub struct UploadBatchResult {
+    #[serde(rename = "osFamily")]
+    pub os_family: RemoteOsFamily,
+    pub cancelled: bool,
+    pub files: Vec<UploadFileResult>,
+}
+
+/// Serializable mirror of [`OsFamily`] for the upload batch result (the proto enum
+/// isn't `Serialize` for Tauri's IPC the way we want the casing).
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteOsFamily {
+    Unix,
+    Windows,
+}
+
+impl From<OsFamily> for RemoteOsFamily {
+    fn from(value: OsFamily) -> Self {
+        match value {
+            OsFamily::Unix => RemoteOsFamily::Unix,
+            OsFamily::Windows => RemoteOsFamily::Windows,
+        }
+    }
+}
+
+/// Per-file progress emitted to the webview as `hitch-upload-progress` while a
+/// batch streams (issue #31). The frontend updates a loading toast from it.
+#[derive(Debug, Clone, Serialize)]
+struct UploadProgress<'a> {
+    #[serde(rename = "batchId")]
+    batch_id: &'a str,
+    #[serde(rename = "fileIndex")]
+    file_index: usize,
+    #[serde(rename = "fileCount")]
+    file_count: usize,
+    #[serde(rename = "fileName")]
+    file_name: &'a str,
+    #[serde(rename = "sentBytes")]
+    sent_bytes: u64,
+    #[serde(rename = "totalBytes")]
+    total_bytes: u64,
 }
 
 impl SshConnections {
     pub fn new() -> Self {
         Self(Arc::new(SshConnectionsInner {
             connections: Mutex::new(HashMap::new()),
+            upload_cancels: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -319,6 +392,86 @@ impl SshConnections {
             return;
         };
         write_remote_input(&connection, session_id, &bytes);
+    }
+
+    /// Stream a batch of local files to a remote Session (issue #31, ADR 0014).
+    /// Runs synchronously on the caller's blocking task: each file is `begin`/
+    /// `chunk*`/`finish`'d through the same per-scope request path as every other
+    /// command, so each chunk is one request/response turn and interactive PTY
+    /// traffic interleaves naturally between chunks. Directories are rejected per
+    /// file (recursive upload isn't supported yet). Progress is emitted to the
+    /// webview as `hitch-upload-progress`; `cancel_upload(batch_id)` aborts the
+    /// in-flight file and stops the batch so nothing is inserted. Returns the
+    /// per-file results plus the remote OS family for path quoting.
+    pub fn upload_files(
+        &self,
+        app: &AppHandle,
+        scope_id: &str,
+        batch_id: &str,
+        session_id: SessionId,
+        paths: Vec<String>,
+    ) -> Result<UploadBatchResult, String> {
+        let connection = self
+            .connection(scope_id)
+            .ok_or_else(|| format!("no remote daemon connection for scope {scope_id}"))?;
+        let os_family = connection
+            .os_family
+            .lock()
+            .map(|f| *f)
+            .unwrap_or(OsFamily::Unix);
+
+        // Register a cancel flag for the batch so `cancel_upload` can stop it.
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Ok(mut map) = self.0.upload_cancels.lock() {
+            map.insert(batch_id.to_string(), cancel.clone());
+        }
+
+        let mut files = Vec::with_capacity(paths.len());
+        let file_count = paths.len();
+        let mut cancelled = false;
+        for (file_index, path) in paths.iter().enumerate() {
+            if cancel.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
+            match upload_one_file(
+                app,
+                &connection,
+                batch_id,
+                session_id,
+                Path::new(path),
+                file_index,
+                file_count,
+                &cancel,
+            ) {
+                Ok(Some(result)) => files.push(result),
+                // `None` = the in-flight file was cancelled; stop the batch.
+                Ok(None) => {
+                    cancelled = true;
+                    break;
+                }
+                Err(result) => files.push(result),
+            }
+        }
+
+        if let Ok(mut map) = self.0.upload_cancels.lock() {
+            map.remove(batch_id);
+        }
+        Ok(UploadBatchResult {
+            os_family: os_family.into(),
+            cancelled,
+            files,
+        })
+    }
+
+    /// Cancel an in-flight upload batch (issue #31). Flips its cancel flag so the
+    /// streaming task aborts the current file and stops; nothing is inserted.
+    pub fn cancel_upload(&self, batch_id: &str) {
+        if let Ok(map) = self.0.upload_cancels.lock() {
+            if let Some(flag) = map.get(batch_id) {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
     }
 
     /// Register a webview output channel for a session on a remote scope.
@@ -508,9 +661,11 @@ impl SshConnections {
         let (hs_tx, hs_rx) = mpsc::channel::<HandshakeResult>();
         // The reader is moved into the worker; on success it is handed back so the
         // event-pump reader can keep reading past the Hello (the daemon replays
-        // scrollback immediately after the Hello, ADR 0007).
+        // scrollback immediately after the Hello, ADR 0007). The connection clone
+        // lets the worker record the remote daemon's OS family from its Hello.
+        let os_family_slot = connection.clone();
         let worker = thread::spawn(move || {
-            let outcome = read_remote_hello(&mut reader, request_id);
+            let outcome = read_remote_hello(&mut reader, request_id, &os_family_slot);
             let _ = hs_tx.send(HandshakeResult { reader, outcome });
         });
 
@@ -702,13 +857,29 @@ fn spawn_dead_child() -> Child {
 /// Read newline-delimited control JSON from the remote until the Hello response
 /// for `request_id` arrives, skipping non-matching frames. Mirrors `ssh::read_hello`
 /// but takes a generic `BufRead`.
-fn read_remote_hello<R: BufRead>(reader: &mut R, request_id: RequestId) -> HandshakeOutcome {
+fn read_remote_hello<R: BufRead>(
+    reader: &mut R,
+    request_id: RequestId,
+    connection: &Arc<RemoteConnection>,
+) -> HandshakeOutcome {
     loop {
         match read_control_message(reader) {
             Ok(Some(ControlMessage::Response {
                 id,
-                response: Response::Hello { protocol_version, .. },
-            })) if id == request_id => return HandshakeOutcome::Hello { protocol_version },
+                response:
+                    Response::Hello {
+                        protocol_version,
+                        os_family,
+                        ..
+                    },
+            })) if id == request_id => {
+                // Record the remote daemon's platform so inserted upload paths get
+                // remote-appropriate quoting (issue #31).
+                if let Ok(mut slot) = connection.os_family.lock() {
+                    *slot = os_family;
+                }
+                return HandshakeOutcome::Hello { protocol_version };
+            }
             Ok(Some(_)) => {}
             Ok(None) => return HandshakeOutcome::NoResponse,
             Err(_) => return HandshakeOutcome::Malformed,
@@ -842,6 +1013,192 @@ fn dispatch_remote_request(
             Err("remote daemon response channel disconnected".into())
         }
     }
+}
+
+/// Stream one local file to the remote daemon (issue #31). Returns:
+/// - `Ok(Some(Uploaded|RejectedDirectory))` for a completed file or a directory
+///   rejection (a non-fatal per-file outcome the batch keeps going past),
+/// - `Ok(None)` when the in-flight file was cancelled (the batch must stop and
+///   insert nothing),
+/// - `Err(Failed)` for a local read error on this file (the batch keeps going).
+#[allow(clippy::too_many_arguments)]
+fn upload_one_file(
+    app: &AppHandle,
+    connection: &Arc<RemoteConnection>,
+    batch_id: &str,
+    session_id: SessionId,
+    path: &Path,
+    file_index: usize,
+    file_count: usize,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Option<UploadFileResult>, UploadFileResult> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+
+    let metadata = std::fs::metadata(path).map_err(|err| UploadFileResult::Failed {
+        name: name.clone(),
+        error: format!("could not read {}: {err}", path.display()),
+    })?;
+    if metadata.is_dir() {
+        // Recursive upload isn't supported in the first design (ADR 0014): reject
+        // the directory but keep the batch going for the regular files.
+        return Ok(Some(UploadFileResult::RejectedDirectory { name }));
+    }
+    let total_bytes = metadata.len();
+
+    let mut file = std::fs::File::open(path).map_err(|err| UploadFileResult::Failed {
+        name: name.clone(),
+        error: format!("could not open {}: {err}", path.display()),
+    })?;
+
+    // Begin the upload (daemon reserves a collision-suffixed final name).
+    let begin = dispatch_remote_request(
+        connection,
+        Request::BeginUpload {
+            session_id,
+            file_name: name.clone(),
+            total_bytes,
+        },
+        None,
+        REMOTE_REQUEST_TIMEOUT,
+    )
+    .map_err(|err| UploadFileResult::Failed {
+        name: name.clone(),
+        error: err,
+    })?;
+    let upload_id = match begin {
+        Response::UploadStarted { upload_id, .. } => upload_id,
+        Response::Error { error } => {
+            return Err(UploadFileResult::Failed {
+                name,
+                error: error.message,
+            });
+        }
+        other => {
+            return Err(UploadFileResult::Failed {
+                name,
+                error: format!("unexpected begin-upload response: {other:?}"),
+            });
+        }
+    };
+
+    // Stream the bytes in bounded chunks, one request/response turn each so PTY
+    // traffic interleaves. Emit progress and honour cancellation between chunks.
+    let mut sent: u64 = 0;
+    let mut buf = vec![0u8; UPLOAD_CHUNK_BYTES];
+    emit_upload_progress(app, batch_id, file_index, file_count, &name, sent, total_bytes);
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            let _ = dispatch_remote_request(
+                connection,
+                Request::AbortUpload {
+                    upload_id: upload_id.clone(),
+                },
+                None,
+                REMOTE_REQUEST_TIMEOUT,
+            );
+            return Ok(None);
+        }
+        let read = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) => {
+                let _ = dispatch_remote_request(
+                    connection,
+                    Request::AbortUpload {
+                        upload_id: upload_id.clone(),
+                    },
+                    None,
+                    REMOTE_REQUEST_TIMEOUT,
+                );
+                return Err(UploadFileResult::Failed {
+                    name,
+                    error: format!("read error on {}: {err}", path.display()),
+                });
+            }
+        };
+        let ack = dispatch_remote_request(
+            connection,
+            Request::UploadChunk {
+                upload_id: upload_id.clone(),
+                byte_count: read as u32,
+            },
+            Some(buf[..read].to_vec()),
+            REMOTE_REQUEST_TIMEOUT,
+        );
+        match ack {
+            Ok(Response::Ack) => {}
+            Ok(Response::Error { error }) => {
+                return Err(UploadFileResult::Failed {
+                    name,
+                    error: error.message,
+                });
+            }
+            Ok(other) => {
+                return Err(UploadFileResult::Failed {
+                    name,
+                    error: format!("unexpected chunk response: {other:?}"),
+                });
+            }
+            Err(err) => {
+                return Err(UploadFileResult::Failed { name, error: err });
+            }
+        }
+        sent += read as u64;
+        emit_upload_progress(app, batch_id, file_index, file_count, &name, sent, total_bytes);
+    }
+
+    // Finish: the daemon returns the actual final remote path to insert.
+    let finish = dispatch_remote_request(
+        connection,
+        Request::FinishUpload {
+            upload_id: upload_id.clone(),
+        },
+        None,
+        REMOTE_REQUEST_TIMEOUT,
+    )
+    .map_err(|err| UploadFileResult::Failed {
+        name: name.clone(),
+        error: err,
+    })?;
+    match finish {
+        Response::UploadFinished { remote_path } => {
+            Ok(Some(UploadFileResult::Uploaded { name, remote_path }))
+        }
+        Response::Error { error } => Err(UploadFileResult::Failed {
+            name,
+            error: error.message,
+        }),
+        other => Err(UploadFileResult::Failed {
+            name,
+            error: format!("unexpected finish-upload response: {other:?}"),
+        }),
+    }
+}
+
+/// Emit one `hitch-upload-progress` tick to the webview.
+fn emit_upload_progress(
+    app: &AppHandle,
+    batch_id: &str,
+    file_index: usize,
+    file_count: usize,
+    file_name: &str,
+    sent_bytes: u64,
+    total_bytes: u64,
+) {
+    let _ = app.emit(
+        "hitch-upload-progress",
+        UploadProgress {
+            batch_id,
+            file_index,
+            file_count,
+            file_name,
+            sent_bytes,
+            total_bytes,
+        },
+    );
 }
 
 /// Write one fire-and-forget input frame to a remote connection (best-effort).

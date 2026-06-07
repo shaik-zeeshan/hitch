@@ -34,12 +34,17 @@ vi.mock("@tauri-apps/plugin-notification", () => ({
   sendNotification: (...args: unknown[]) => sendNotificationMock(...args),
 }));
 
-// The file-drop guard toasts on a remote drop; spy on the toast so the no-op is
-// observable without a DOM. `getCurrentWebviewWindow().onDragDropEvent` is the
-// only Tauri surface fileDrop.ts touches at module load — stub it.
+// fileDrop.ts toasts upload progress/errors; stub the whole toast surface it uses
+// so the module loads headless. `getCurrentWebviewWindow().onDragDropEvent` is the
+// only other Tauri surface fileDrop.ts touches at module load — stub it too.
 const toastErrorMock = vi.fn();
 vi.mock("svelte-french-toast", () => ({
-  default: { error: (...args: unknown[]) => toastErrorMock(...args) },
+  default: {
+    error: (...args: unknown[]) => toastErrorMock(...args),
+    loading: vi.fn(() => "toast-id"),
+    success: vi.fn(),
+    dismiss: vi.fn(),
+  },
 }));
 vi.mock("@tauri-apps/api/webviewWindow", () => ({
   getCurrentWebviewWindow: () => ({ onDragDropEvent: vi.fn(async () => () => {}) }),
@@ -389,19 +394,30 @@ describe("tab strip stays scoped to the active parent across daemon scopes", () 
   });
 });
 
-describe("file-drop onto a remote session is a guarded no-op", () => {
-  it("toasts and inserts nothing for a remote session", async () => {
+describe("file-drop onto a remote session uploads (issue #31)", () => {
+  it("invokes the upload command with the owning scope and inserts nothing inline", async () => {
     const { handleDropForTest } = await import("./fileDrop");
     seedRemoteWorktree();
     applyScopeEvent(SCOPE, { type: "session-opened", session: session("rs1", "rw1") });
     invokeMock.mockReset();
+    // Keep the upload pending so the synchronous part of handleDrop is observable
+    // without resolving the insert flow.
+    invokeMock.mockReturnValue(new Promise(() => {}));
 
     handleDropForTest("rs1", ["/Users/me/file.txt"]);
+    // Let the async upload kick off its invoke.
+    await Promise.resolve();
 
-    expect(toastErrorMock).toHaveBeenCalledWith(
-      "File drop to remote sessions isn't supported yet",
+    // The remote drop routes to the upload command with the session's scope — not
+    // a bogus inline `send_session_input` of a local path.
+    expect(invokeMock).toHaveBeenCalledWith(
+      "upload_files_to_session",
+      expect.objectContaining({
+        scope: SCOPE,
+        sessionId: "rs1",
+        paths: ["/Users/me/file.txt"],
+      }),
     );
-    // No input was sent to the remote PTY.
     expect(
       invokeMock.mock.calls.some(([command]) => command === "send_session_input"),
     ).toBe(false);

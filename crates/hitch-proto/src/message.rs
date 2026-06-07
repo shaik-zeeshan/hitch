@@ -69,7 +69,57 @@ use serde::{Deserialize, Serialize};
 /// daemon user's readable directories (folders-first, hidden-folder toggle) and
 /// type an absolute path before sending the existing AddProject/CloneProject to
 /// that remote daemon. An old daemon at v24 has neither request nor response.
-pub const PROTOCOL_VERSION: u16 = 25;
+/// v26 adds the file-drop **upload** protocol (issue #31, ADR 0014): dropping
+/// local files onto a remote Session streams them over this same stream to the
+/// remote daemon, which writes them under `<data-dir>/uploads/<session-id>/` and
+/// returns the actual remote paths for the GUI to insert. The chunked exchange is
+/// `Request::BeginUpload` → `Response::UploadStarted`, repeated
+/// `Request::UploadChunk` (+ a length-prefixed PTY-style raw frame) → ack, then
+/// `Request::FinishUpload` → `Response::UploadFinished { remote_path }`, with
+/// `Request::AbortUpload` deleting a partial. Chunks are bounded (256 KiB) so
+/// they interleave with interactive PTY traffic. v26 also adds `os_family` to
+/// `Response::Hello` so the GUI quotes inserted remote paths for the remote
+/// platform (POSIX vs Windows). An old daemon at v25 has neither the upload
+/// messages nor the platform field.
+pub const PROTOCOL_VERSION: u16 = 26;
+
+/// Maximum bytes carried by one [`Request::UploadChunk`] frame (256 KiB). The
+/// upload stream is shared with interactive PTY traffic, so chunks are bounded
+/// well under [`crate::framing::MAX_PTY_FRAME_LEN`]: each chunk is one
+/// request/response turn, giving PTY frames a natural slot between chunks instead
+/// of letting one giant frame starve a live session.
+pub const UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Identifies one in-flight file upload, minted by the daemon in
+/// [`Response::UploadStarted`] and echoed by the client on every
+/// [`Request::UploadChunk`]/[`FinishUpload`]/[`AbortUpload`]. A plain string so
+/// the daemon picks the representation (it uses a uuid).
+pub type UploadId = String;
+
+/// The daemon host's OS family, carried on [`Response::Hello`] so the GUI can
+/// quote inserted remote upload paths for the right shell (issue #31). Only the
+/// POSIX/Windows split matters for path quoting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OsFamily {
+    Unix,
+    Windows,
+}
+
+impl OsFamily {
+    /// The family of the daemon currently running. Resolved at compile time from
+    /// the target so the daemon reports its own platform, not the GUI's.
+    pub fn current() -> Self {
+        #[cfg(windows)]
+        {
+            OsFamily::Windows
+        }
+        #[cfg(not(windows))]
+        {
+            OsFamily::Unix
+        }
+    }
+}
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -427,6 +477,33 @@ pub enum Request {
     StartJob { request: JobRequest },
     /// Cancel a running Job, signalling its worker to kill any git/agent child.
     CancelJob { job_id: JobId },
+
+    /// Begin a file-drop **upload** into a remote Session (issue #31, ADR 0014).
+    /// The daemon validates the session exists, creates its per-session upload dir
+    /// `<data-dir>/uploads/<session-id>/`, resolves a collision-suffixed final
+    /// name AT BEGIN time (reserving it by creating the file), and replies with
+    /// [`Response::UploadStarted`]. `file_name` is a bare name — the daemon rejects
+    /// path separators and `..`. `total_bytes` is advisory for progress only.
+    BeginUpload {
+        session_id: SessionId,
+        file_name: String,
+        total_bytes: u64,
+    },
+    /// Announce that a raw PTY-style frame of `byte_count` upload bytes follows
+    /// this request, appended to the upload identified by `upload_id`. The daemon
+    /// replies [`Response::Ack`] per chunk (sequential, windowed by the GUI). The
+    /// frame uses the same length-prefixed framing as [`SendSessionInput`].
+    UploadChunk {
+        upload_id: UploadId,
+        byte_count: u32,
+    },
+    /// Finish an upload: the daemon flushes/closes the file and replies with
+    /// [`Response::UploadFinished`] carrying the ACTUAL final absolute remote path
+    /// (post collision-suffixing) for the GUI to insert at the prompt.
+    FinishUpload { upload_id: UploadId },
+    /// Abort an in-flight upload: the daemon deletes the partial file and replies
+    /// [`Response::Ack`]. Sent on user cancellation before paths are inserted.
+    AbortUpload { upload_id: UploadId },
 }
 
 impl From<JobRequest> for Request {
@@ -624,6 +701,12 @@ pub enum Response {
     Hello {
         protocol_version: u16,
         daemon_pid: u32,
+        /// The daemon host's OS family (issue #31), so the GUI quotes inserted
+        /// remote upload paths for the right shell. `#[serde(default)]` to Unix
+        /// keeps an old daemon's Hello (no field) decodable during rolling
+        /// upgrades; the version check already gates real upload use.
+        #[serde(default = "os_family_default")]
+        os_family: OsFamily,
     },
     /// Command succeeded and has no body.
     Ack,
@@ -734,10 +817,31 @@ pub enum Response {
     JobStarted {
         job_id: JobId,
     },
+    /// A file-drop upload was accepted (reply to [`Request::BeginUpload`], issue
+    /// #31). `upload_id` keys the following chunks/finish/abort; `final_name` is
+    /// the collision-suffixed name the daemon reserved (e.g. `file-1.txt`), echoed
+    /// for diagnostics — the GUI inserts the path from [`UploadFinished`].
+    UploadStarted {
+        upload_id: UploadId,
+        final_name: String,
+    },
+    /// An upload finished (reply to [`Request::FinishUpload`]). `remote_path` is
+    /// the ACTUAL final absolute path on the daemon host, post collision-suffixing,
+    /// for the GUI to quote and insert at the Session prompt.
+    UploadFinished {
+        remote_path: String,
+    },
     /// Command failed. Kept in-band so clients can correlate by request id.
     Error {
         error: ProtocolError,
     },
+}
+
+/// Default OS family for an old daemon's Hello that predates the field (Unix —
+/// the historical-only platform before Windows support). Real upload use is gated
+/// by the protocol-version check, so this only affects decoding a stale Hello.
+fn os_family_default() -> OsFamily {
+    OsFamily::Unix
 }
 
 /// Lifecycle of an async **Job** (`CONTEXT.md`). A Job is *queued*, then
@@ -1548,6 +1652,77 @@ mod tests {
         assert!(matches!(reparsed_clear, Request::ReportAgentState { .. }));
     }
 
+    #[test]
+    fn upload_messages_round_trip_as_contract() {
+        let (_, _, session_id) = ids();
+
+        let begin = Request::BeginUpload {
+            session_id,
+            file_name: "report.pdf".into(),
+            total_bytes: 2048,
+        };
+        let value: serde_json::Value = serde_json::to_value(&begin).unwrap();
+        assert_eq!(value["type"], "begin-upload");
+        assert_eq!(value["file_name"], "report.pdf");
+        assert_eq!(value["total_bytes"], 2048);
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(begin, back);
+
+        let chunk = Request::UploadChunk {
+            upload_id: "upload-1".into(),
+            byte_count: 4096,
+        };
+        let value: serde_json::Value = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(value["type"], "upload-chunk");
+        assert_eq!(value["byte_count"], 4096);
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(chunk, back);
+
+        let started = Response::UploadStarted {
+            upload_id: "upload-1".into(),
+            final_name: "file-1.txt".into(),
+        };
+        let value: serde_json::Value = serde_json::to_value(&started).unwrap();
+        assert_eq!(value["type"], "upload-started");
+        assert_eq!(value["final_name"], "file-1.txt");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(started, back);
+
+        let finished = Response::UploadFinished {
+            remote_path: "/home/dev/.hitch/uploads/abc/file-1.txt".into(),
+        };
+        let value: serde_json::Value = serde_json::to_value(&finished).unwrap();
+        assert_eq!(value["type"], "upload-finished");
+        assert_eq!(value["remote_path"], "/home/dev/.hitch/uploads/abc/file-1.txt");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(finished, back);
+    }
+
+    #[test]
+    fn hello_reports_os_family_and_defaults_to_unix_for_rolling_upgrades() {
+        let hello = Response::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_pid: 7,
+            os_family: OsFamily::Windows,
+        };
+        let value: serde_json::Value = serde_json::to_value(&hello).unwrap();
+        assert_eq!(value["os_family"], "windows");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(hello, back);
+
+        // An old daemon's Hello without the field decodes with os_family = unix.
+        let legacy = serde_json::json!({
+            "type": "hello",
+            "protocol_version": PROTOCOL_VERSION,
+            "daemon_pid": 7,
+        });
+        let back: Response = serde_json::from_value(legacy).unwrap();
+        let Response::Hello { os_family, .. } = back else {
+            panic!("expected hello");
+        };
+        assert_eq!(os_family, OsFamily::Unix);
+    }
+
     fn value_tag(request: &Request) -> String {
         serde_json::to_value(request).unwrap()["type"]
             .as_str()
@@ -1685,7 +1860,7 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 25);
+        assert_eq!(PROTOCOL_VERSION, 26);
     }
 
     #[test]
@@ -2288,6 +2463,21 @@ mod tests {
             Request::CancelJob {
                 job_id: JobId::new(),
             },
+            Request::BeginUpload {
+                session_id,
+                file_name: "report.pdf".into(),
+                total_bytes: 1_048_576,
+            },
+            Request::UploadChunk {
+                upload_id: "upload-1".into(),
+                byte_count: 4096,
+            },
+            Request::FinishUpload {
+                upload_id: "upload-1".into(),
+            },
+            Request::AbortUpload {
+                upload_id: "upload-1".into(),
+            },
         ]
     }
 
@@ -2300,6 +2490,14 @@ mod tests {
             Response::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 daemon_pid: 42,
+                os_family: OsFamily::Unix,
+            },
+            Response::UploadStarted {
+                upload_id: "upload-1".into(),
+                final_name: "file-1.txt".into(),
+            },
+            Response::UploadFinished {
+                remote_path: "/home/dev/.hitch/uploads/abc/file-1.txt".into(),
             },
             Response::Ack,
             Response::Projects {

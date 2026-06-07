@@ -53,8 +53,9 @@ use hitch_proto::{
     ActiveJobInfo, ChangedFile, CommitAndPushResult, CommitDraft, CommitFileDiff, CommitInfo,
     CommitMeta, CompositeJobKind, CompositeJobResult, CompositeStep, ControlMessage, DirEntry,
     DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
-    JobRequest, JobStatus, KnownAgent, PrInfo, ProtocolError, PullRequestDraft, Request, Response,
-    StepPhase, WorktreeCreateMode, WorktreePr, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
+    JobRequest, JobStatus, KnownAgent, OsFamily, PrInfo, ProtocolError, PullRequestDraft, Request,
+    Response, StepPhase, UploadId, WorktreeCreateMode, WorktreePr, MAX_PTY_FRAME_LEN,
+    PROTOCOL_VERSION, UPLOAD_CHUNK_BYTES,
 };
 use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY};
 use hitch_store::Store;
@@ -115,6 +116,7 @@ struct Args {
     socket_path: PathBuf,
     store_path: PathBuf,
     managed_root: PathBuf,
+    uploads_root: PathBuf,
     hook_helper: PathBuf,
     git: PathBuf,
     gh: PathBuf,
@@ -127,6 +129,7 @@ impl Args {
         let mut socket_path = hitch_proto::transport::default_socket_path();
         let mut store_path = default_store_path();
         let mut managed_root = default_managed_worktree_root();
+        let mut uploads_root = default_uploads_root();
         let mut hook_helper = default_hook_helper_path();
         let mut git = PathBuf::from("git");
         let mut gh = PathBuf::from("gh");
@@ -152,6 +155,12 @@ impl Args {
                     managed_root = PathBuf::from(
                         args.next()
                             .ok_or_else(|| "--managed-root requires a path".to_string())?,
+                    );
+                }
+                "--uploads-root" => {
+                    uploads_root = PathBuf::from(
+                        args.next()
+                            .ok_or_else(|| "--uploads-root requires a path".to_string())?,
                     );
                 }
                 "--hook-helper" => {
@@ -207,7 +216,7 @@ impl Args {
                 "--detach" => detach = true,
                 "--help" | "-h" => {
                     println!(
-                        "usage: hitch-daemon [--socket PATH] [--store PATH] [--managed-root PATH] [--hook-helper PATH] [--git PATH] [--gh PATH] [--draft-provider stub|claude|codex] [--draft-model MODEL] [--claude PATH] [--codex PATH] [--draft-timeout-secs N] [--detach]"
+                        "usage: hitch-daemon [--socket PATH] [--store PATH] [--managed-root PATH] [--uploads-root PATH] [--hook-helper PATH] [--git PATH] [--gh PATH] [--draft-provider stub|claude|codex] [--draft-model MODEL] [--claude PATH] [--codex PATH] [--draft-timeout-secs N] [--detach]"
                     );
                     std::process::exit(0);
                 }
@@ -219,6 +228,7 @@ impl Args {
             socket_path,
             store_path,
             managed_root,
+            uploads_root,
             hook_helper,
             git,
             gh,
@@ -233,6 +243,10 @@ struct DaemonConfig {
     socket_path: PathBuf,
     store_path: PathBuf,
     managed_root: PathBuf,
+    /// Root of per-session file-drop upload dirs (issue #31). Each session's
+    /// uploads land under `<uploads_root>/<session-id>/`; the daemon deletes that
+    /// dir when the session closes. Defaults to `<data-dir>/uploads`.
+    uploads_root: PathBuf,
     hook_helper: PathBuf,
     git: PathBuf,
     gh: PathBuf,
@@ -245,6 +259,7 @@ impl From<Args> for DaemonConfig {
             socket_path: args.socket_path,
             store_path: args.store_path,
             managed_root: args.managed_root,
+            uploads_root: args.uploads_root,
             hook_helper: args.hook_helper,
             git: args.git,
             gh: args.gh,
@@ -270,6 +285,8 @@ fn detach_spawn(args: &Args) -> io::Result<()> {
         .arg(&args.store_path)
         .arg("--managed-root")
         .arg(&args.managed_root)
+        .arg("--uploads-root")
+        .arg(&args.uploads_root)
         .arg("--hook-helper")
         .arg(&args.hook_helper)
         .arg("--git")
@@ -647,6 +664,26 @@ struct DaemonState {
     /// [`JobControl`] plus the UI metadata a late-attaching client needs to
     /// rebuild its live Job store before later `JobCompleted` arrives.
     jobs: HashMap<JobId, ActiveJob>,
+    /// In-flight file-drop **uploads** keyed by upload id (issue #31). Uploads are
+    /// connection-scoped: a client disconnecting mid-upload aborts and deletes its
+    /// partial files (see `unregister_client`). A session closing deletes its whole
+    /// upload dir and drops any of its in-flight uploads here.
+    uploads: HashMap<UploadId, ActiveUpload>,
+}
+
+/// One in-flight file-drop upload (issue #31). Holds the open file handle the
+/// chunks append to plus the bookkeeping needed to abort it on client disconnect
+/// or session close.
+struct ActiveUpload {
+    /// The connection that began the upload; only it may chunk/finish/abort, and
+    /// its disconnect aborts the upload.
+    client_id: u64,
+    /// The session the upload targets; closing it deletes the partial.
+    session_id: SessionId,
+    /// The reserved, collision-suffixed absolute path being written.
+    path: PathBuf,
+    /// The open file, appended to per chunk. `None` once finished/aborted.
+    file: Option<fs::File>,
 }
 
 impl DaemonState {
@@ -663,6 +700,7 @@ impl DaemonState {
             git,
             broadcaster: OutputBroadcaster::default(),
             jobs: HashMap::new(),
+            uploads: HashMap::new(),
         }
     }
 }
@@ -1008,6 +1046,9 @@ fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &DaemonStream) -> io
 }
 
 fn unregister_client(state: &Arc<Mutex<DaemonState>>, client_id: u64) {
+    // A disconnect mid-upload leaves partial files no one will finish; abort and
+    // delete this connection's in-flight uploads (issue #31).
+    cleanup_client_uploads(state, client_id);
     if let Ok(mut state) = state.lock() {
         state.clients.remove(&client_id);
         state.broadcaster.forget_client(client_id);
@@ -1115,6 +1156,7 @@ fn handle_request<R: Read>(
                 Response::Hello {
                     protocol_version: PROTOCOL_VERSION,
                     daemon_pid: std::process::id(),
+                    os_family: OsFamily::current(),
                 },
             )?;
             // Replay must run ON the dispatcher thread so the snapshot it sends
@@ -1432,6 +1474,69 @@ fn handle_request<R: Read>(
             }
             // Cancelling an unknown/finished Job is a no-op success: the worker
             // may have already completed and removed itself from the registry.
+            send_response(state, client_id, request_id, Response::Ack)?;
+        }
+        Request::BeginUpload {
+            session_id,
+            file_name,
+            total_bytes,
+        } => {
+            let (upload_id, final_name) =
+                begin_upload(state, client_id, session_id, &file_name, total_bytes)?;
+            send_response(
+                state,
+                client_id,
+                request_id,
+                Response::UploadStarted {
+                    upload_id,
+                    final_name,
+                },
+            )?;
+        }
+        Request::UploadChunk {
+            upload_id,
+            byte_count,
+        } => {
+            // The raw frame ALWAYS follows the control message on the stream, so it
+            // must be drained even on a rejected/oversize chunk or the next control
+            // message would desync. Read it first, then validate.
+            let payload = read_pty_payload(reader)?;
+            if payload.len() != byte_count as usize {
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "upload chunk frame length {} did not match announced byte_count {byte_count}",
+                        payload.len()
+                    ),
+                ));
+            }
+            if payload.len() > UPLOAD_CHUNK_BYTES {
+                // Abort the upload so its partial file is cleaned up, then error.
+                let _ = abort_upload(state, client_id, &upload_id);
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "upload chunk {} bytes exceeds max {UPLOAD_CHUNK_BYTES}",
+                        payload.len()
+                    ),
+                ));
+            }
+            write_upload_chunk(state, client_id, &upload_id, &payload)?;
+            send_response(state, client_id, request_id, Response::Ack)?;
+        }
+        Request::FinishUpload { upload_id } => {
+            let remote_path = finish_upload(state, client_id, &upload_id)?;
+            send_response(
+                state,
+                client_id,
+                request_id,
+                Response::UploadFinished { remote_path },
+            )?;
+        }
+        Request::AbortUpload { upload_id } => {
+            // Aborting an unknown upload is a no-op success (it may already be gone
+            // via a session close or client disconnect).
+            let _ = abort_upload(state, client_id, &upload_id);
             send_response(state, client_id, request_id, Response::Ack)?;
         }
         Request::Ping => {
@@ -2644,7 +2749,245 @@ fn close_session(
     if kill_process {
         let _ = removed.pty.kill();
     }
+    // The session is gone: delete its per-session upload dir and drop any of its
+    // in-flight uploads. ADR 0014: "The remote Daemon owns upload cleanup and
+    // deletes that per-session directory when the Session closes."
+    cleanup_session_uploads(state, session_id);
     Ok(())
+}
+
+/// Delete a session's per-session upload dir and drop any of its in-flight uploads
+/// from the registry (issue #31). Called from every session-close path: explicit
+/// `CloseSession`, worktree/project removal, and the PTY-exit dispatcher. Partial
+/// files are closed (their handles dropped) before the dir is removed so Windows
+/// can delete them. Best-effort: a failed remove just leaves a stale dir, which
+/// the next same-session upload reuses anyway.
+fn cleanup_session_uploads(state: &Arc<Mutex<DaemonState>>, session_id: SessionId) {
+    let dir = {
+        let Ok(mut guard) = state.lock() else { return };
+        // Drop in-flight uploads for this session (closes their file handles).
+        let ids: Vec<UploadId> = guard
+            .uploads
+            .iter()
+            .filter(|(_, upload)| upload.session_id == session_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            guard.uploads.remove(&id);
+        }
+        session_upload_dir(&guard.config.uploads_root, session_id)
+    };
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The per-session upload directory: `<uploads_root>/<session-id>/`.
+fn session_upload_dir(uploads_root: &Path, session_id: SessionId) -> PathBuf {
+    uploads_root.join(session_id.to_string())
+}
+
+/// Begin a file-drop upload (issue #31). Validates the session, sanitizes the
+/// bare file name, creates the per-session dir, and reserves a collision-suffixed
+/// final name by creating (truncating) the file. Returns `(upload_id, final_name)`.
+fn begin_upload(
+    state: &Arc<Mutex<DaemonState>>,
+    client_id: u64,
+    session_id: SessionId,
+    file_name: &str,
+    _total_bytes: u64,
+) -> Result<(String, String), ProtocolError> {
+    let sanitized = sanitize_upload_name(file_name)?;
+    let dir = {
+        let guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        if !guard.sessions.contains_key(&session_id) {
+            return Err(ProtocolError::new(ErrorCode::NotFound, "session not found"));
+        }
+        session_upload_dir(&guard.config.uploads_root, session_id)
+    };
+    fs::create_dir_all(&dir)
+        .map_err(|err| internal(format!("could not create upload dir: {err}")))?;
+
+    // Reserve a non-colliding final name by atomically creating the file. Loop so a
+    // concurrent upload that reserved `file-1.txt` between our probe and create
+    // can't make two uploads share a path.
+    let (path, final_name) = reserve_upload_path(&dir, &sanitized)?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(|err| internal(format!("could not open upload file: {err}")))?;
+
+    let upload_id = uuid::Uuid::new_v4().to_string();
+    let mut guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    guard.uploads.insert(
+        upload_id.clone(),
+        ActiveUpload {
+            client_id,
+            session_id,
+            path,
+            file: Some(file),
+        },
+    );
+    Ok((upload_id, final_name))
+}
+
+/// Reserve a non-colliding path inside `dir` for `name`, creating the file with
+/// `create_new` so the reservation is atomic. Returns `(path, final_name)`.
+/// Collision suffixing inserts `-N` before the extension (splitting on the LAST
+/// dot): `file.txt` → `file-1.txt`; a dotfile `.env` → `.env-1` (no extension to
+/// split, since the leading dot isn't an extension separator).
+fn reserve_upload_path(dir: &Path, name: &str) -> Result<(PathBuf, String), ProtocolError> {
+    for attempt in 0..10_000 {
+        let candidate = if attempt == 0 {
+            name.to_string()
+        } else {
+            suffix_name(name, attempt)
+        };
+        let path = dir.join(&candidate);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok((path, candidate)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(internal(format!("could not reserve upload path: {err}")));
+            }
+        }
+    }
+    Err(internal("too many upload name collisions"))
+}
+
+/// Insert `-{n}` before the file extension. Splits on the LAST dot, but only when
+/// that dot is not the leading character (so `.env` is treated as having no
+/// extension and becomes `.env-1`, not `-1.env`).
+fn suffix_name(name: &str, n: usize) -> String {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 => format!("{}-{}{}", &name[..dot], n, &name[dot..]),
+        _ => format!("{name}-{n}"),
+    }
+}
+
+/// Sanitize a client-supplied upload file name. The GUI sends a bare name; the
+/// daemon enforces it: reject empties, `.`/`..`, and any path separator so a name
+/// can never escape the per-session dir.
+fn sanitize_upload_name(name: &str) -> Result<String, ProtocolError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('\0')
+    {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("invalid upload file name: {name:?}"),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Append one chunk's bytes to an in-flight upload. Enforces that the chunk comes
+/// from the client that began the upload.
+fn write_upload_chunk(
+    state: &Arc<Mutex<DaemonState>>,
+    client_id: u64,
+    upload_id: &str,
+    bytes: &[u8],
+) -> Result<(), ProtocolError> {
+    use io::Write as _;
+    let mut guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    let upload = guard
+        .uploads
+        .get_mut(upload_id)
+        .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "upload not found"))?;
+    if upload.client_id != client_id {
+        return Err(ProtocolError::new(
+            ErrorCode::Unauthorized,
+            "upload belongs to another connection",
+        ));
+    }
+    let file = upload
+        .file
+        .as_mut()
+        .ok_or_else(|| internal("upload file already closed"))?;
+    file.write_all(bytes)
+        .map_err(|err| internal(format!("could not write upload chunk: {err}")))?;
+    Ok(())
+}
+
+/// Finish an upload: flush/close the file and return its actual final absolute
+/// path for the GUI to insert. Removes it from the registry on success.
+fn finish_upload(
+    state: &Arc<Mutex<DaemonState>>,
+    client_id: u64,
+    upload_id: &str,
+) -> Result<String, ProtocolError> {
+    let mut guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    let upload = guard
+        .uploads
+        .get(upload_id)
+        .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "upload not found"))?;
+    if upload.client_id != client_id {
+        return Err(ProtocolError::new(
+            ErrorCode::Unauthorized,
+            "upload belongs to another connection",
+        ));
+    }
+    let mut upload = guard.uploads.remove(upload_id).expect("checked above");
+    if let Some(file) = upload.file.take() {
+        file.sync_all()
+            .map_err(|err| internal(format!("could not flush upload: {err}")))?;
+    }
+    Ok(upload.path.to_string_lossy().into_owned())
+}
+
+/// Abort an in-flight upload: drop the file handle and delete the partial file.
+/// Returns an error only on a wrong-connection abort; an unknown upload is `Ok`.
+fn abort_upload(
+    state: &Arc<Mutex<DaemonState>>,
+    client_id: u64,
+    upload_id: &str,
+) -> Result<(), ProtocolError> {
+    let path = {
+        let mut guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        match guard.uploads.get(upload_id) {
+            Some(upload) if upload.client_id != client_id => {
+                return Err(ProtocolError::new(
+                    ErrorCode::Unauthorized,
+                    "upload belongs to another connection",
+                ));
+            }
+            Some(_) => guard.uploads.remove(upload_id).map(|u| u.path),
+            None => None,
+        }
+    };
+    if let Some(path) = path {
+        let _ = fs::remove_file(&path);
+    }
+    Ok(())
+}
+
+/// Abort and delete every in-flight upload owned by a disconnecting client
+/// (issue #31). Uploads are connection-scoped: a dropped connection mid-upload
+/// leaves a partial that no one will finish, so we clean it up here.
+fn cleanup_client_uploads(state: &Arc<Mutex<DaemonState>>, client_id: u64) {
+    let paths = {
+        let Ok(mut guard) = state.lock() else { return };
+        let ids: Vec<UploadId> = guard
+            .uploads
+            .iter()
+            .filter(|(_, upload)| upload.client_id == client_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| guard.uploads.remove(&id).map(|u| u.path))
+            .collect::<Vec<_>>()
+    };
+    for path in paths {
+        let _ = fs::remove_file(&path);
+    }
 }
 
 fn rename_session(
@@ -3422,6 +3765,13 @@ fn spawn_pty_dispatcher(
                             if !shutting_down {
                                 let _ = state.store.delete_session(session_id);
                             }
+                        }
+                        // A session whose process exited while Hitch runs is truly
+                        // closed: delete its upload dir (issue #31). During a
+                        // graceful Quit the session is kept for layout restore, so
+                        // its uploads are left for the restored session to reuse.
+                        if !shutting_down {
+                            cleanup_session_uploads(&state, session_id);
                         }
                         let _ = broadcast_event(
                             &state,
@@ -5256,6 +5606,14 @@ fn default_managed_worktree_root() -> PathBuf {
     data_dir().join("worktrees")
 }
 
+/// Root of per-session file-drop upload dirs (issue #31). The ADR phrases this as
+/// `~/.hitch/uploads/<session-id>/`; we resolve it under the daemon's actual
+/// data dir so a dev-namespaced instance (`.hitch-dev`) keeps its uploads
+/// isolated rather than colliding in a literal `~/.hitch`.
+fn default_uploads_root() -> PathBuf {
+    data_dir().join("uploads")
+}
+
 fn default_hook_helper_path() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -5476,6 +5834,7 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
@@ -5569,6 +5928,7 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
@@ -5655,6 +6015,7 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hitch-hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
@@ -5748,6 +6109,7 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hitch-hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
@@ -5831,6 +6193,7 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hitch-hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
@@ -5894,6 +6257,7 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hitch-hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
@@ -6171,6 +6535,7 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
@@ -6262,6 +6627,7 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
@@ -6376,6 +6742,7 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root,
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
@@ -6487,6 +6854,7 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root,
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
@@ -6598,6 +6966,7 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: managed_root.clone(),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
@@ -6663,6 +7032,7 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hitch-hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
@@ -7470,6 +7840,7 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),

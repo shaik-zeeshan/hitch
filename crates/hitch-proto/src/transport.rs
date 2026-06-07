@@ -547,6 +547,7 @@ mod tests {
                 Response::Hello {
                     protocol_version: PROTOCOL_VERSION,
                     daemon_pid: 42,
+                    os_family: crate::OsFamily::Unix,
                 },
             ))
             .unwrap();
@@ -571,6 +572,7 @@ mod tests {
                 Response::Hello {
                     protocol_version: PROTOCOL_VERSION,
                     daemon_pid: 42,
+                    os_family: crate::OsFamily::Unix,
                 }
             )]
         );

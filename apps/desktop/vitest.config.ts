@@ -19,6 +19,23 @@ const stubVirtualIcons = (): Plugin => ({
   },
 });
 
+// `.svelte` component imports are real Svelte source the node-based runner can't
+// parse. A few pure-logic modules (fileDrop's UploadToast, appToast's AppToast)
+// import a component only to hand it to the toast library as a renderable — the
+// unit tests never render it. Stub every `*.svelte` import to an inert component
+// so importing those modules stays cheap and hermetic, mirroring the `~icons/*`
+// and toast stubs.
+const stubSvelteComponents = (): Plugin => ({
+  name: "stub-svelte-components",
+  enforce: "pre",
+  resolveId(id) {
+    return id.endsWith(".svelte") ? `\0virtual-svelte:${id}` : null;
+  },
+  load(id) {
+    return id.startsWith("\0virtual-svelte:") ? "export default () => null;" : null;
+  },
+});
+
 // `svelte-french-toast` ships only browser/svelte export conditions, so vite's
 // node resolver can't find an entry for the bare specifier under the node-based
 // test config (it throws "No known conditions for '.'"). The toast UI is never
@@ -49,7 +66,7 @@ const stubToast = (): Plugin => ({
 // need. Keep this minimal and node-based so `vitest run` stays fast and
 // hermetic. Scope it to *.test.ts so it never tries to drive Svelte components.
 export default defineConfig({
-  plugins: [stubVirtualIcons(), stubToast()],
+  plugins: [stubVirtualIcons(), stubSvelteComponents(), stubToast()],
   test: {
     environment: "node",
     include: ["src/**/*.test.ts"],
