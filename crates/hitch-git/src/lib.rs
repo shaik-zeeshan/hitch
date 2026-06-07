@@ -883,22 +883,10 @@ pub struct LogCommit {
 /// parent (vs the empty tree for a root commit), for the Commit Tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitDiff {
-    pub meta: CommitDiffMeta,
+    /// Reuses [`LogCommit`] as the metadata header; `ahead_of_base` is not
+    /// meaningful for a commit-diff snapshot and is always `false` here.
+    pub meta: LogCommit,
     pub files: Vec<CommitFileDiff>,
-}
-
-/// Metadata header for a [`CommitDiff`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommitDiffMeta {
-    pub id: String,
-    pub summary: Option<String>,
-    pub body: Option<String>,
-    pub author_name: Option<String>,
-    pub author_email: Option<String>,
-    pub time_seconds: i64,
-    pub is_merge: bool,
-    pub additions: usize,
-    pub deletions: usize,
 }
 
 /// One file's unified diff within a [`CommitDiff`], mirroring the shape of the
@@ -1200,36 +1188,48 @@ fn detect_diff_renames(diff: &mut git2::Diff<'_>) -> Result<()> {
 }
 
 /// Fold one libgit2 [`Diff`] into a per-path stats map and return its aggregate
-/// (additions, deletions). Per-delta counts come from each [`git2::Patch`]'s
-/// `line_stats` so the same diff the aggregate would sum also yields the
-/// per-file numbers — no extra git work. Binary deltas have no patch and
-/// contribute nothing (matching the frontend `parseDiff`, which shows binary
-/// files with no +/− counts).
+/// (additions, deletions). A single streaming `foreach` pass tallies +/− lines
+/// instead of building a [`git2::Patch`] per delta — that per-file `from_diff`
+/// allocate/free ran for every dirty file on both diff sides of the 1s status
+/// poll. Counts come from the line callback's `+`/`-` origins. Binary deltas
+/// emit no line callbacks, so they contribute nothing and get no entry — same
+/// observable 0/0 the old `Patch::line_stats` path produced (and matching the
+/// frontend `parseDiff`, which shows binary files with no +/− counts).
 fn accumulate_diff_line_stats(
     diff: &git2::Diff<'_>,
     per_path: &mut HashMap<PathBuf, (usize, usize)>,
 ) -> Result<(usize, usize)> {
     let mut total_additions = 0;
     let mut total_deletions = 0;
-    for (idx, delta) in diff.deltas().enumerate() {
+
+    // A no-op file callback is required by `foreach`; counts come from lines.
+    let mut file_cb = |_delta: git2::DiffDelta<'_>, _progress: f32| true;
+    let mut line_cb = |delta: git2::DiffDelta<'_>,
+                       _hunk: Option<git2::DiffHunk<'_>>,
+                       line: git2::DiffLine<'_>| {
+        let (additions, deletions) = match line.origin_value() {
+            git2::DiffLineType::Addition => (1, 0),
+            git2::DiffLineType::Deletion => (0, 1),
+            // Skip context, file/hunk headers and EOF-marker lines.
+            _ => return true,
+        };
+        total_additions += additions;
+        total_deletions += deletions;
+        // Renames key on the new path, falling back to the old path for
+        // deletions — preserving the old delta path resolution.
         let path = delta
             .new_file()
             .path()
-            .or_else(|| delta.old_file().path())
-            .map(Path::to_path_buf);
-        let Some(patch) = git2::Patch::from_diff(diff, idx)? else {
-            continue;
-        };
-        // `line_stats` is (context, additions, deletions).
-        let (_context, additions, deletions) = patch.line_stats()?;
-        total_additions += additions;
-        total_deletions += deletions;
+            .or_else(|| delta.old_file().path());
         if let Some(path) = path {
-            let entry = per_path.entry(path).or_insert((0, 0));
+            let entry = per_path.entry(path.to_path_buf()).or_insert((0, 0));
             entry.0 += additions;
             entry.1 += deletions;
         }
-    }
+        true
+    };
+
+    diff.foreach(&mut file_cb, None, None, Some(&mut line_cb))?;
     Ok((total_additions, total_deletions))
 }
 
@@ -1536,13 +1536,19 @@ pub fn commit_diff(repo_path: impl AsRef<Path>, commit_id: &str) -> Result<Commi
         Ok(parent) => Some(parent.tree()?),
         Err(_) => None,
     };
-    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), None)?;
+    let mut diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), None)?;
+    // Without `find_similar` a rename reads as a full delete + full add, so a
+    // tiny edit on a renamed file inflates both the per-file and total counts to
+    // the whole file. `for_untracked(true)` is a no-op for tree-to-tree diffs
+    // (no untracked side exists) but keeps one rename-detection helper for every
+    // diff path.
+    detect_diff_renames(&mut diff)?;
 
     let (additions, deletions) = diff_totals(&diff)?;
     let files = commit_file_diffs(&diff)?;
 
     Ok(CommitDiff {
-        meta: CommitDiffMeta {
+        meta: LogCommit {
             id: commit.id().to_string(),
             summary: commit.summary().map(str::to_owned),
             body: commit.body().map(str::to_owned),
@@ -1550,6 +1556,9 @@ pub fn commit_diff(repo_path: impl AsRef<Path>, commit_id: &str) -> Result<Commi
             author_email: author.email().map(str::to_owned),
             time_seconds: commit.time().seconds(),
             is_merge: commit.parent_count() > 1,
+            // Not meaningful for a commit-diff snapshot; the proto CommitMeta
+            // never carries it.
+            ahead_of_base: false,
             additions,
             deletions,
         },
@@ -1953,7 +1962,11 @@ fn commit_line_totals(repo: &Repository, commit: &git2::Commit<'_>) -> Result<(u
     // does for the Commit Tab.
     let mut opts = DiffOptions::new();
     opts.context_lines(0).interhunk_lines(0);
-    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), Some(&mut opts))?;
+    let mut diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), Some(&mut opts))?;
+    // Detect renames so a renamed-with-small-edit file contributes only its real
+    // edit to the log totals instead of a full delete + full add (see
+    // `commit_diff`); `find_similar` must run before `stats()`.
+    detect_diff_renames(&mut diff)?;
     let stats = diff.stats()?;
     let totals = (stats.insertions(), stats.deletions());
 
@@ -2865,6 +2878,20 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_zero_line_counts_for_binary_files() {
+        let fixture = RepoFixture::new();
+        // A NUL byte makes libgit2 treat the blob as binary; binary deltas
+        // emit no +/− line callbacks, so the counts stay 0/0.
+        fs::write(fixture.path().join("blob.bin"), [0u8, 1, 2, 3, 0, 255]).unwrap();
+
+        let summary = status(fixture.path()).unwrap();
+        let blob = summary.entry_for("blob.bin").unwrap();
+        assert_eq!((blob.worktree_additions, blob.worktree_deletions), (0, 0));
+        assert_eq!((blob.staged_additions, blob.staged_deletions), (0, 0));
+        assert_eq!((summary.additions, summary.deletions), (0, 0));
+    }
+
+    #[test]
     fn status_attaches_staged_renamed_and_edited_line_counts_to_new_path() {
         let fixture = RepoFixture::new();
         fixture.write("tracked.txt", "one\ntwo\nthree\nfour\n");
@@ -3524,6 +3551,47 @@ mod tests {
         // already on the first parent, so it must not appear.
         let paths: Vec<_> = diff.files.iter().map(|f| f.path.clone()).collect();
         assert_eq!(paths, vec![PathBuf::from("side.txt")]);
+    }
+
+    #[test]
+    fn commit_diff_detects_a_rename_with_a_small_edit() {
+        let fixture = RepoFixture::new();
+        // A file large enough that a one-line edit stays well above libgit2's
+        // rename-similarity threshold, so without `find_similar` it would read as
+        // a full delete + full add and inflate the counts to the whole file.
+        let original: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+        fixture.write("big.txt", &original);
+        fixture.git(["add", "big.txt"]);
+        fixture.git(["commit", "-m", "add big file"]);
+
+        // Rename and tweak a single line in one commit.
+        fixture.git(["mv", "big.txt", "renamed.txt"]);
+        let edited = original.replace("line 5\n", "line five\n");
+        fixture.write("renamed.txt", &edited);
+        fixture.git(["add", "renamed.txt"]);
+        fixture.git(["commit", "-m", "rename and edit"]);
+
+        let id = head_sha(&fixture);
+        let diff = commit_diff(fixture.path(), &id).unwrap();
+
+        // One Renamed entry on the new path — not a delete + add pair.
+        assert_eq!(diff.files.len(), 1);
+        let file = &diff.files[0];
+        assert_eq!(file.status, DeltaStatus::Renamed);
+        assert_eq!(file.path, PathBuf::from("renamed.txt"));
+        // The patch body carries the old → new mapping libgit2 emits for renames.
+        assert!(file.diff.contains("rename from big.txt"));
+        assert!(file.diff.contains("rename to renamed.txt"));
+
+        // Only the single edited line counts, not the whole 10-line file.
+        assert_eq!(diff.meta.additions, 1);
+        assert_eq!(diff.meta.deletions, 1);
+
+        // The History-row path (commit_line_totals) must agree.
+        let repo = Repository::open(fixture.path()).unwrap();
+        let commit = repo.find_commit(Oid::from_str(&id).unwrap()).unwrap();
+        let (additions, deletions) = commit_line_totals(&repo, &commit).unwrap();
+        assert_eq!((additions, deletions), (1, 1));
     }
 
     fn head_sha(fixture: &RepoFixture) -> String {
