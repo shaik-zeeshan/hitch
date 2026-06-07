@@ -41,8 +41,29 @@ use serde::{Deserialize, Serialize};
 /// replay so a newly attached client starts with the correct gate value instead
 /// of assuming. v21 adds optional `agent_run_id` to agent hook reports/announces
 /// so the daemon can drop stale lifecycle hooks from a previous agent process
-/// after a newer `SessionStart`.
-pub const PROTOCOL_VERSION: u16 = 21;
+/// after a newer `SessionStart`. v22 extends the diff wire contract:
+/// `Request::GitDiff` gains `staged`/`ignore_whitespace`/`context_lines` so the
+/// client can request the correct diff side and rendering, and `ChangedFile`
+/// gains `additions`/`deletions` line counts — an old daemon at v21 would
+/// otherwise serve wrong-side diffs and zeroed counts. v23 adds the History
+/// reads: `Request::GitLog`/`Response::CommitLog` (paginated enriched commit
+/// log) and `Request::CommitDiff`/`Response::CommitDiff` (one commit's
+/// first-parent per-file diff), and adds `head_commit_id` to `GitStatus` so the
+/// log can refetch off the existing status backbone — an old daemon at v22 has
+/// neither request nor the head id. v24 adds optional `commit_instructions`/
+/// `pr_instructions` to `DraftGenerationSettings` — the Composer's Draft
+/// Instructions, appended to the built-in draft prompts as an extra block
+/// (ADR 0007 amendment 2026-06-07); an old daemon at v23 ignores them, so a
+/// client's instructions would silently not reach the prompt. v24 also adds the
+/// daemon-owned composite Job chains (ADR 0013 amendment 2026-06-07): the
+/// `JobRequest::CommitAndPush`/`JobRequest::CreatePr` kinds, the per-step
+/// `Event::CompositeJobProgress` broadcast, the `Response::CommitAndPushed`
+/// completion payload (and `Response::CompositeJobFailed` for a mid-chain
+/// failure carrying prior steps' results), and the `Request::ActiveJobs` /
+/// `Response::ActiveJobs` query a re-attaching GUI uses to restore button state
+/// from a worktree's in-flight chains. An old daemon at v23 has none of these,
+/// so a client's composite chain would never run.
+pub const PROTOCOL_VERSION: u16 = 24;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -129,6 +150,26 @@ pub enum JobRequest {
         body: Option<String>,
         base: Option<String>,
         draft: bool,
+    },
+    /// The auto commit-and-push **composite Job** (ADR 0013 amendment
+    /// 2026-06-07): one daemon-owned chain of staging -> drafting -> committing
+    /// -> pushing, so the chain survives GUI navigation/quit. Per-step progress
+    /// rides [`Event::CompositeJobProgress`]; the [`Event::JobCompleted`] carries
+    /// [`Response::CommitAndPushed`] on success or [`Response::CompositeJobFailed`]
+    /// on a mid-chain failure (a draft failure aborts before any commit is made).
+    CommitAndPush {
+        worktree_id: WorktreeId,
+        settings: Option<DraftGenerationSettings>,
+    },
+    /// The autonomous PR **composite Job** (ADR 0013 amendment 2026-06-07): a
+    /// daemon-owned chain of pushing -> drafting (title/body) -> creating a
+    /// GitHub **draft** PR. Completion carries the created PR URL inside
+    /// [`Response::PullRequestCreated`]; the daemon never opens a browser (an
+    /// attached GUI does that off the completion event).
+    CreatePr {
+        worktree_id: WorktreeId,
+        base: Option<String>,
+        settings: Option<DraftGenerationSettings>,
     },
 }
 
@@ -220,10 +261,37 @@ pub enum Request {
     PrStatus { worktree_id: WorktreeId },
     /// Look up the PR for every worktree in a project via a Job (batched).
     ProjectPrStatuses { project_id: ProjectId },
-    /// Read a file-level diff for a path in a worktree.
+    /// Read a file-level diff for a path in a worktree. `staged == Some(true)`
+    /// selects HEAD↔index; `Some(false)` selects index↔worktree. `None` keeps
+    /// the legacy worktree-first, staged-fallback behavior for older clients.
+    /// `ignore_whitespace == Some(true)` drops whitespace-only changes;
+    /// `context_lines` overrides the surrounding context size (git default 3).
+    /// Both are omitted by older clients and keep today's behavior when absent.
     GitDiff {
         worktree_id: WorktreeId,
         path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        staged: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ignore_whitespace: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_lines: Option<u32>,
+    },
+    /// Read a page of the worktree's enriched `HEAD` commit log for the History
+    /// view, newest first. `offset` skips that many commits; `limit` caps the
+    /// page. Replies with [`Response::CommitLog`] (`has_more` flags more past
+    /// the page). A fast synchronous git read, not a Job.
+    GitLog {
+        worktree_id: WorktreeId,
+        limit: u32,
+        offset: u32,
+    },
+    /// Read one commit's full diff — metadata plus per-file unified patches vs
+    /// its first parent (the empty tree for a root commit) — in one round-trip.
+    /// Replies with [`Response::CommitDiff`]. A fast synchronous git read.
+    CommitDiff {
+        worktree_id: WorktreeId,
+        commit_id: String,
     },
     /// Stage whole files.
     StageFiles {
@@ -276,6 +344,24 @@ pub enum Request {
         base: Option<String>,
         draft: bool,
     },
+    /// Run the auto commit-and-push composite Job for a worktree (the bare form
+    /// of [`JobRequest::CommitAndPush`]; dispatches through the async Job path).
+    CommitAndPush {
+        worktree_id: WorktreeId,
+        settings: Option<DraftGenerationSettings>,
+    },
+    /// Run the autonomous PR composite Job for a worktree (the bare form of
+    /// [`JobRequest::CreatePr`]; dispatches through the async Job path).
+    CreatePr {
+        worktree_id: WorktreeId,
+        base: Option<String>,
+        settings: Option<DraftGenerationSettings>,
+    },
+    /// Return a worktree's currently in-flight **Jobs** (ADR 0008 + ADR 0013
+    /// amendment), so a (re)attaching GUI can restore the Composer/button state
+    /// for chains already running in the daemon. A fast in-memory read, not a
+    /// Job; Jobs remain ephemeral across daemon restarts.
+    ActiveJobs { worktree_id: WorktreeId },
 
     /// Install/merge known-agent hooks in the target worktree.
     InstallAgentHooks { worktree_id: WorktreeId },
@@ -386,6 +472,22 @@ impl From<JobRequest> for Request {
                 base,
                 draft,
             },
+            JobRequest::CommitAndPush {
+                worktree_id,
+                settings,
+            } => Request::CommitAndPush {
+                worktree_id,
+                settings,
+            },
+            JobRequest::CreatePr {
+                worktree_id,
+                base,
+                settings,
+            } => Request::CreatePr {
+                worktree_id,
+                base,
+                settings,
+            },
         }
     }
 }
@@ -453,6 +555,22 @@ impl TryFrom<Request> for JobRequest {
                 body,
                 base,
                 draft,
+            }),
+            Request::CommitAndPush {
+                worktree_id,
+                settings,
+            } => Ok(JobRequest::CommitAndPush {
+                worktree_id,
+                settings,
+            }),
+            Request::CreatePr {
+                worktree_id,
+                base,
+                settings,
+            } => Ok(JobRequest::CreatePr {
+                worktree_id,
+                base,
+                settings,
             }),
             other => Err(other),
         }
@@ -531,8 +649,41 @@ pub enum Response {
     FileDiff {
         diff: FileDiff,
     },
+    /// A page of the History commit log (reply to [`Request::GitLog`]).
+    /// `has_more` is `true` when commits remain past this page.
+    CommitLog {
+        commits: Vec<CommitInfo>,
+        has_more: bool,
+    },
+    /// One commit's metadata and per-file diff (reply to [`Request::CommitDiff`]).
+    CommitDiff {
+        meta: CommitMeta,
+        files: Vec<CommitFileDiff>,
+    },
     PullRequestCreated {
         url: String,
+    },
+    /// Terminal payload of a successful `commit-and-push` composite Job, carried
+    /// inside [`Event::JobCompleted`]. The GUI builds its completion toast from
+    /// this (subject, short sha, pushed commit count, file count).
+    CommitAndPushed {
+        result: CommitAndPushResult,
+    },
+    /// Terminal payload of a composite Job that failed mid-chain, carried inside
+    /// [`Event::JobCompleted`]. `failed_step` names the step that failed and
+    /// `reason` is its error; `result` carries whatever prior steps completed
+    /// (e.g. the commit that landed before a push failure) so the GUI can report
+    /// the partial chain accurately.
+    CompositeJobFailed {
+        kind: CompositeJobKind,
+        failed_step: CompositeStep,
+        reason: String,
+        result: CompositeJobResult,
+    },
+    /// A worktree's in-flight composite Jobs (reply to [`Request::ActiveJobs`]),
+    /// so a (re)attaching GUI restores chain/button state. Empty when none run.
+    ActiveJobs {
+        jobs: Vec<ActiveJobInfo>,
     },
     CommitDraft {
         draft: CommitDraft,
@@ -659,6 +810,20 @@ pub enum Event {
         /// Stable UI-facing job kind (e.g. `push`, `pr-draft`) when known.
         kind: Option<String>,
     },
+    /// A **composite Job** (ADR 0013 amendment) advanced to a new step, or that
+    /// step finished. Broadcast per step start/finish so an attached GUI morphs
+    /// the action button's label in place (staging -> drafting -> committing ->
+    /// pushing for `commit-and-push`; pushing -> drafting -> creating-pr for
+    /// `create-pr`). `worktree_id` lets a worktree-scoped client route it without
+    /// a Job lookup; `kind` and `step` identify the chain and its current rung,
+    /// and `phase` distinguishes the step starting from it finishing.
+    CompositeJobProgress {
+        job_id: JobId,
+        worktree_id: WorktreeId,
+        kind: CompositeJobKind,
+        step: CompositeStep,
+        phase: StepPhase,
+    },
     /// A **Job** finished. The wrapped request's final [`Response`] rides inside
     /// (`Response::Ack` / `PullRequestCreated` / `CommitDraft` / …, or
     /// `Response::Error` on failure). The GUI resolves the awaiting caller from
@@ -667,6 +832,78 @@ pub enum Event {
         job_id: JobId,
         response: Box<Response>,
     },
+}
+
+/// Which daemon-owned **composite Job** chain a step/result belongs to (ADR 0013
+/// amendment 2026-06-07). The string tags match the UI-facing job kinds carried
+/// by [`Event::JobProgress::kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompositeJobKind {
+    /// staging -> drafting -> committing -> pushing.
+    CommitAndPush,
+    /// pushing -> drafting -> creating the GitHub draft PR.
+    CreatePr,
+}
+
+/// One rung of a composite Job chain, reported on [`Event::CompositeJobProgress`].
+/// The two chains use overlapping subsets: `commit-and-push` runs `Staging`,
+/// `Drafting`, `Committing`, `Pushing`; `create-pr` runs `Pushing`, `Drafting`,
+/// `CreatingPr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompositeStep {
+    Staging,
+    Drafting,
+    Committing,
+    Pushing,
+    CreatingPr,
+}
+
+/// Whether a [`CompositeStep`] is starting or has finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StepPhase {
+    Started,
+    Finished,
+}
+
+/// Result of a successful `commit-and-push` composite Job. The GUI's completion
+/// toast reads all four fields (subject - short sha - pushed count - file count).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitAndPushResult {
+    /// The committed subject line.
+    pub subject: String,
+    /// Short (7-char) SHA of the new commit.
+    pub short_sha: String,
+    /// Number of commits pushed to the remote in the push step.
+    pub pushed_commits: u32,
+    /// Number of files in the commit.
+    pub file_count: u32,
+}
+
+/// Whatever a composite Job completed before failing, so a failure can report
+/// prior steps' results intact (ADR 0013 amendment): the commit that landed
+/// before a push failure. `None` when the chain aborted before producing
+/// anything (e.g. a draft-generation failure that aborts before any commit).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CompositeJobResult {
+    /// The commit produced by a `commit-and-push` chain before a later step
+    /// failed (the commit stays — only the push failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<CommitAndPushResult>,
+}
+
+/// One in-flight composite Job for a worktree (entry in [`Response::ActiveJobs`]).
+/// Carries enough for a re-attaching GUI to restore the action button's state:
+/// which chain, which step it is currently on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveJobInfo {
+    pub job_id: JobId,
+    pub worktree_id: WorktreeId,
+    pub kind: CompositeJobKind,
+    /// The step the chain is currently executing.
+    pub step: CompositeStep,
 }
 
 /// A branch name with remote flag for branch-picker UI.
@@ -688,6 +925,22 @@ pub struct GitStatus {
     pub additions: u32,
     #[serde(default)]
     pub deletions: u32,
+    /// Full SHA of the current `HEAD` commit, or `None` on an unborn HEAD. The
+    /// History view refetches its log when this changes (~1s status backbone).
+    /// `#[serde(default)]` keeps older daemons/clients decodable during rolling
+    /// upgrades, matching the other added GitStatus fields.
+    #[serde(default)]
+    pub head_commit_id: Option<String>,
+    /// The daemon-resolved "base branch" for this worktree — the branch checked
+    /// out in the project's main worktree (falling back to the repo's default
+    /// branch), or `None` when neither resolves. This is the SINGLE definition of
+    /// the base convention: the History `ahead_of_base` markers and the
+    /// frontend's PR-base default / "from {base}" labels both read it from here
+    /// instead of each recomputing it. `#[serde(default)]` keeps older
+    /// daemons/clients decodable during rolling upgrades, matching the other
+    /// added GitStatus fields.
+    #[serde(default)]
+    pub base_branch: Option<String>,
     pub files: Vec<ChangedFile>,
 }
 
@@ -715,6 +968,13 @@ pub struct ChangedFile {
     pub path: PathBuf,
     pub status: FileStatus,
     pub staged: bool,
+    /// Added/deleted line counts for this path (the side shown: staged counts
+    /// when staged, worktree counts otherwise). `#[serde(default)]` keeps older
+    /// daemons/clients decodable during rolling upgrades, matching GitStatus.
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
 }
 
 /// Coarse file status values needed by the UI.
@@ -738,6 +998,53 @@ pub struct FileDiff {
     pub diff: String,
 }
 
+/// One commit in a [`Response::CommitLog`] page (the History view's row data).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitInfo {
+    /// Full commit SHA.
+    pub id: String,
+    /// Commit summary (first line), `None` when absent.
+    pub summary: Option<String>,
+    /// Commit message body (after the summary), `None` when absent.
+    pub body: Option<String>,
+    pub author: Option<String>,
+    /// Author time in unix seconds.
+    pub time: i64,
+    /// Whether this commit has more than one parent (carries a merge badge).
+    pub is_merge: bool,
+    /// Whether this commit is ahead of the base branch (branch-work marker).
+    /// Always `false` when no base is resolvable (e.g. the main worktree).
+    pub ahead_of_base: bool,
+    /// Added/deleted line totals vs the first parent (empty tree for a root).
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+/// Metadata header for a [`Response::CommitDiff`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitMeta {
+    /// Full commit SHA.
+    pub id: String,
+    pub summary: Option<String>,
+    pub body: Option<String>,
+    pub author: Option<String>,
+    /// Author time in unix seconds.
+    pub time: i64,
+    pub is_merge: bool,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+/// One file's unified diff within a [`Response::CommitDiff`]. Mirrors the
+/// working-tree per-file diff shape (path + status + patch text) so the frontend
+/// can reuse its diff renderer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitFileDiff {
+    pub path: PathBuf,
+    pub status: FileStatus,
+    pub diff: String,
+}
+
 /// Client-selected Draft Generator provider settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftGenerationSettings {
@@ -745,6 +1052,16 @@ pub struct DraftGenerationSettings {
     pub model: Option<String>,
     pub claude_path: Option<PathBuf>,
     pub codex_path: Option<PathBuf>,
+    /// Optional Draft Instructions appended to the built-in commit prompt as an
+    /// extra block; never replaces the prompt or its JSON output contract (ADR
+    /// 0007 amendment 2026-06-07). `#[serde(default)]` keeps older clients that
+    /// omit the field decodable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_instructions: Option<String>,
+    /// Optional Draft Instructions appended to the built-in pull-request prompt;
+    /// same append-never-replace contract as `commit_instructions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_instructions: Option<String>,
 }
 
 /// Headless provider used for Draft Generator runs.
@@ -876,6 +1193,195 @@ mod tests {
         };
         assert_eq!(status.additions, 0);
         assert_eq!(status.deletions, 0);
+        // An old daemon's status without the head id decodes to None.
+        assert_eq!(status.head_commit_id, None);
+        // An old daemon's status without the daemon-resolved base also decodes to
+        // None — the frontend then falls back to its worktree-derived base for the
+        // rolling-upgrade window.
+        assert_eq!(status.base_branch, None);
+    }
+
+    #[test]
+    fn git_status_carries_daemon_resolved_base_branch_as_contract() {
+        let (_, worktree_id, _) = ids();
+        let status = GitStatus {
+            worktree_id,
+            branch: "feature".into(),
+            dirty: false,
+            ahead: 2,
+            behind: 0,
+            additions: 0,
+            deletions: 0,
+            head_commit_id: Some("a".repeat(40)),
+            base_branch: Some("main".into()),
+            files: vec![],
+        };
+        let response = Response::GitStatus { status };
+        let value: serde_json::Value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "git-status");
+        // The base rides on the status backbone under a snake_case key so the
+        // frontend's `defaultBase` can read it without recomputing the convention.
+        assert_eq!(value["status"]["base_branch"], "main");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(response, back);
+
+        // A main worktree whose own branch is the base resolves to null; that is a
+        // distinct, intentional shape (no cross-branch default), not the
+        // rolling-upgrade missing-field case.
+        let no_base = GitStatus {
+            worktree_id,
+            branch: "main".into(),
+            dirty: false,
+            ahead: 0,
+            behind: 0,
+            additions: 0,
+            deletions: 0,
+            head_commit_id: Some("a".repeat(40)),
+            base_branch: None,
+            files: vec![],
+        };
+        let value: serde_json::Value = serde_json::to_value(&no_base).unwrap();
+        assert!(value["base_branch"].is_null());
+    }
+
+    #[test]
+    fn git_log_request_and_commit_log_response_round_trip_as_contract() {
+        let (_, worktree_id, _) = ids();
+
+        let request = Request::GitLog {
+            worktree_id,
+            limit: 100,
+            offset: 200,
+        };
+        let value: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["type"], "git-log");
+        assert_eq!(value["worktree_id"], worktree_id.to_string());
+        assert_eq!(value["limit"], 100);
+        assert_eq!(value["offset"], 200);
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(request, back);
+
+        let response = Response::CommitLog {
+            commits: vec![CommitInfo {
+                id: "a".repeat(40),
+                summary: Some("feat: add proto".into()),
+                body: None,
+                author: Some("Hitch Test".into()),
+                time: 1_700_000_000,
+                is_merge: true,
+                ahead_of_base: true,
+                additions: 5,
+                deletions: 1,
+            }],
+            has_more: false,
+        };
+        let value: serde_json::Value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "commit-log");
+        assert_eq!(value["has_more"], false);
+        assert_eq!(value["commits"][0]["is_merge"], true);
+        assert_eq!(value["commits"][0]["ahead_of_base"], true);
+        assert!(value["commits"][0]["body"].is_null());
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(response, back);
+    }
+
+    #[test]
+    fn commit_diff_request_and_response_round_trip_as_contract() {
+        let (_, worktree_id, _) = ids();
+
+        let request = Request::CommitDiff {
+            worktree_id,
+            commit_id: "a".repeat(40),
+        };
+        let value: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["type"], "commit-diff");
+        assert_eq!(value["commit_id"], "a".repeat(40));
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(request, back);
+
+        let response = Response::CommitDiff {
+            meta: CommitMeta {
+                id: "a".repeat(40),
+                summary: Some("feat: add proto".into()),
+                body: Some("Body".into()),
+                author: Some("Hitch Test".into()),
+                time: 1_700_000_000,
+                is_merge: false,
+                additions: 5,
+                deletions: 1,
+            },
+            files: vec![CommitFileDiff {
+                path: "src/lib.rs".into(),
+                status: FileStatus::Added,
+                diff: "diff --git a/src/lib.rs b/src/lib.rs".into(),
+            }],
+        };
+        let value: serde_json::Value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "commit-diff");
+        assert_eq!(value["meta"]["id"], "a".repeat(40));
+        // The per-file diff reuses the FileStatus enum so the frontend renderer
+        // can be shared with working-tree diffs.
+        assert_eq!(value["files"][0]["status"], "added");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(response, back);
+    }
+
+    #[test]
+    fn changed_file_deserializes_without_line_counts_for_rolling_upgrades() {
+        let json = r#"{"path":"src/lib.rs","status":"modified","staged":true}"#;
+        let file: ChangedFile = serde_json::from_str(json).unwrap();
+        assert_eq!(file.additions, 0);
+        assert_eq!(file.deletions, 0);
+
+        let with_counts = r#"{"path":"src/lib.rs","status":"modified","staged":true,"additions":7,"deletions":2}"#;
+        let file: ChangedFile = serde_json::from_str(with_counts).unwrap();
+        assert_eq!(file.additions, 7);
+        assert_eq!(file.deletions, 2);
+    }
+
+    #[test]
+    fn git_diff_deserializes_without_side_for_rolling_upgrades() {
+        let (_, worktree_id, _) = ids();
+        let json =
+            format!(r#"{{"type":"git-diff","worktree_id":"{worktree_id}","path":"src/lib.rs"}}"#);
+        let request: Request = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            request,
+            Request::GitDiff {
+                worktree_id,
+                path: "src/lib.rs".into(),
+                staged: None,
+                ignore_whitespace: None,
+                context_lines: None,
+            }
+        );
+    }
+
+    #[test]
+    fn git_diff_carries_whitespace_and_context_view_options() {
+        let (_, worktree_id, _) = ids();
+        let json = format!(
+            r#"{{"type":"git-diff","worktree_id":"{worktree_id}","path":"src/lib.rs","ignore_whitespace":true,"context_lines":10}}"#
+        );
+        let request: Request = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            request,
+            Request::GitDiff {
+                worktree_id,
+                path: "src/lib.rs".into(),
+                staged: None,
+                ignore_whitespace: Some(true),
+                context_lines: Some(10),
+            }
+        );
+
+        // The same field names round-trip back out (snake_case, like the rest of
+        // the request payload).
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["ignore_whitespace"], true);
+        assert_eq!(value["context_lines"], 10);
     }
 
     #[test]
@@ -1087,6 +1593,8 @@ mod tests {
             model: Some("sonnet".into()),
             claude_path: Some(r"C:\Program Files\Claude\claude.exe".into()),
             codex_path: None,
+            commit_instructions: Some("Reference the ticket id".into()),
+            pr_instructions: None,
         };
 
         let request = Request::ListDraftModels {
@@ -1103,6 +1611,13 @@ mod tests {
             r"C:\Program Files\Claude\claude.exe"
         );
         assert!(value["settings"]["codex_path"].is_null());
+        // Draft Instructions ride the same settings payload; an unset field is
+        // omitted entirely so older daemons still decode it.
+        assert_eq!(
+            value["settings"]["commit_instructions"],
+            "Reference the ticket id"
+        );
+        assert!(value["settings"].get("pr_instructions").is_none());
         let back: Request = serde_json::from_value(value).unwrap();
 
         let job = JobRequest::try_from(request.clone()).unwrap();
@@ -1128,7 +1643,7 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 21);
+        assert_eq!(PROTOCOL_VERSION, 24);
     }
 
     #[test]
@@ -1241,6 +1756,126 @@ mod tests {
         assert_eq!(progress["kind"], "push");
     }
 
+    #[test]
+    fn composite_job_messages_serialize_as_contract() {
+        let (_, worktree_id, _) = ids();
+        let job_id = JobId::new();
+
+        // The composite chains start through the StartJob allowlist and map back
+        // and forth across the bare-request boundary.
+        let start = Request::StartJob {
+            request: JobRequest::CommitAndPush {
+                worktree_id,
+                settings: None,
+            },
+        };
+        let value: serde_json::Value = serde_json::to_value(&start).unwrap();
+        assert_eq!(value["request"]["type"], "commit-and-push");
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(start, back);
+        assert_eq!(
+            JobRequest::try_from(Request::CommitAndPush {
+                worktree_id,
+                settings: None,
+            })
+            .unwrap(),
+            JobRequest::CommitAndPush {
+                worktree_id,
+                settings: None,
+            }
+        );
+        assert_eq!(
+            JobRequest::try_from(Request::CreatePr {
+                worktree_id,
+                base: Some("main".into()),
+                settings: None,
+            })
+            .unwrap(),
+            JobRequest::CreatePr {
+                worktree_id,
+                base: Some("main".into()),
+                settings: None,
+            }
+        );
+
+        // Per-step progress identifies job, worktree, chain kind, step, and phase.
+        let progress = Event::CompositeJobProgress {
+            job_id,
+            worktree_id,
+            kind: CompositeJobKind::CommitAndPush,
+            step: CompositeStep::Pushing,
+            phase: StepPhase::Started,
+        };
+        let value: serde_json::Value = serde_json::to_value(&progress).unwrap();
+        assert_eq!(value["type"], "composite-job-progress");
+        assert_eq!(value["kind"], "commit-and-push");
+        assert_eq!(value["step"], "pushing");
+        assert_eq!(value["phase"], "started");
+        assert_eq!(value["worktree_id"], worktree_id.to_string());
+        let back: Event = serde_json::from_value(value).unwrap();
+        assert_eq!(progress, back);
+
+        // The success completion payload carries the toast's four fields.
+        let done = Response::CommitAndPushed {
+            result: CommitAndPushResult {
+                subject: "feat: add proto".into(),
+                short_sha: "abc1234".into(),
+                pushed_commits: 1,
+                file_count: 2,
+            },
+        };
+        let value: serde_json::Value = serde_json::to_value(&done).unwrap();
+        assert_eq!(value["type"], "commit-and-pushed");
+        assert_eq!(value["result"]["short_sha"], "abc1234");
+        assert_eq!(value["result"]["pushed_commits"], 1);
+        assert_eq!(value["result"]["file_count"], 2);
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(done, back);
+
+        // A push failure keeps the landed commit in `result.commit`.
+        let failed = Response::CompositeJobFailed {
+            kind: CompositeJobKind::CommitAndPush,
+            failed_step: CompositeStep::Pushing,
+            reason: "remote rejected push".into(),
+            result: CompositeJobResult {
+                commit: Some(CommitAndPushResult {
+                    subject: "feat: add proto".into(),
+                    short_sha: "abc1234".into(),
+                    pushed_commits: 0,
+                    file_count: 2,
+                }),
+            },
+        };
+        let value: serde_json::Value = serde_json::to_value(&failed).unwrap();
+        assert_eq!(value["type"], "composite-job-failed");
+        assert_eq!(value["failed_step"], "pushing");
+        assert_eq!(value["result"]["commit"]["short_sha"], "abc1234");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(failed, back);
+
+        // The active-Jobs query and reply round-trip.
+        let query = Request::ActiveJobs { worktree_id };
+        let value: serde_json::Value = serde_json::to_value(&query).unwrap();
+        assert_eq!(value["type"], "active-jobs");
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(query, back);
+
+        let reply = Response::ActiveJobs {
+            jobs: vec![ActiveJobInfo {
+                job_id,
+                worktree_id,
+                kind: CompositeJobKind::CreatePr,
+                step: CompositeStep::Drafting,
+            }],
+        };
+        let value: serde_json::Value = serde_json::to_value(&reply).unwrap();
+        assert_eq!(value["type"], "active-jobs");
+        assert_eq!(value["jobs"][0]["kind"], "create-pr");
+        assert_eq!(value["jobs"][0]["step"], "drafting");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(reply, back);
+    }
+
     fn ids() -> (ProjectId, WorktreeId, SessionId) {
         (ProjectId::new(), WorktreeId::new(), SessionId::new())
     }
@@ -1285,6 +1920,8 @@ mod tests {
                     model: None,
                     claude_path: None,
                     codex_path: Some(r"C:\Program Files\Codex\codex.exe".into()),
+                    commit_instructions: None,
+                    pr_instructions: None,
                 }),
             },
             JobRequest::GenerateCommitDraft {
@@ -1294,6 +1931,8 @@ mod tests {
                     model: Some("sonnet".into()),
                     claude_path: Some(r"C:\Program Files\Claude\claude.exe".into()),
                     codex_path: None,
+                    commit_instructions: None,
+                    pr_instructions: None,
                 }),
             },
             JobRequest::GeneratePullRequestDraft {
@@ -1304,6 +1943,8 @@ mod tests {
                     model: Some("gpt-5-codex".into()),
                     claude_path: None,
                     codex_path: Some(r"C:\Program Files\Codex\codex.exe".into()),
+                    commit_instructions: None,
+                    pr_instructions: None,
                 }),
             },
             JobRequest::Push { worktree_id },
@@ -1316,6 +1957,15 @@ mod tests {
                 body: Some("Body".into()),
                 base: Some("main".into()),
                 draft: true,
+            },
+            JobRequest::CommitAndPush {
+                worktree_id,
+                settings: None,
+            },
+            JobRequest::CreatePr {
+                worktree_id,
+                base: Some("main".into()),
+                settings: None,
             },
         ]
     }
@@ -1338,10 +1988,14 @@ mod tests {
             behind: 0,
             additions: 12,
             deletions: 3,
+            head_commit_id: Some("a".repeat(40)),
+            base_branch: Some("main".into()),
             files: vec![ChangedFile {
                 path: "src/lib.rs".into(),
                 status: FileStatus::Modified,
                 staged: false,
+                additions: 12,
+                deletions: 3,
             }],
         }
     }
@@ -1420,6 +2074,18 @@ mod tests {
             Request::GitDiff {
                 worktree_id,
                 path: "src/lib.rs".into(),
+                staged: Some(false),
+                ignore_whitespace: Some(true),
+                context_lines: Some(10),
+            },
+            Request::GitLog {
+                worktree_id,
+                limit: 100,
+                offset: 0,
+            },
+            Request::CommitDiff {
+                worktree_id,
+                commit_id: "a".repeat(40),
             },
             Request::StageFiles {
                 worktree_id,
@@ -1445,6 +2111,8 @@ mod tests {
                     model: None,
                     claude_path: None,
                     codex_path: Some(r"C:\Program Files\Codex\codex.exe".into()),
+                    commit_instructions: None,
+                    pr_instructions: None,
                 }),
             },
             Request::GenerateCommitDraft {
@@ -1454,6 +2122,8 @@ mod tests {
                     model: Some("sonnet".into()),
                     claude_path: Some(r"C:\Program Files\Claude\claude.exe".into()),
                     codex_path: None,
+                    commit_instructions: None,
+                    pr_instructions: None,
                 }),
             },
             Request::GeneratePullRequestDraft {
@@ -1464,6 +2134,8 @@ mod tests {
                     model: Some("gpt-5-codex".into()),
                     claude_path: None,
                     codex_path: Some(r"C:\Program Files\Codex\codex.exe".into()),
+                    commit_instructions: None,
+                    pr_instructions: None,
                 }),
             },
             Request::Fetch { worktree_id },
@@ -1476,6 +2148,16 @@ mod tests {
                 base: Some("main".into()),
                 draft: true,
             },
+            Request::CommitAndPush {
+                worktree_id,
+                settings: None,
+            },
+            Request::CreatePr {
+                worktree_id,
+                base: Some("main".into()),
+                settings: None,
+            },
+            Request::ActiveJobs { worktree_id },
             Request::InstallAgentHooks { worktree_id },
             Request::ReportAgentState {
                 agent: KnownAgent::ClaudeCode,
@@ -1542,8 +2224,68 @@ mod tests {
             Response::FileDiff {
                 diff: sample_diff(worktree_id),
             },
+            Response::CommitLog {
+                commits: vec![CommitInfo {
+                    id: "a".repeat(40),
+                    summary: Some("feat: add proto".into()),
+                    body: Some("Body line".into()),
+                    author: Some("Hitch Test".into()),
+                    time: 1_700_000_000,
+                    is_merge: false,
+                    ahead_of_base: true,
+                    additions: 12,
+                    deletions: 3,
+                }],
+                has_more: true,
+            },
+            Response::CommitDiff {
+                meta: CommitMeta {
+                    id: "a".repeat(40),
+                    summary: Some("feat: add proto".into()),
+                    body: Some("Body line".into()),
+                    author: Some("Hitch Test".into()),
+                    time: 1_700_000_000,
+                    is_merge: false,
+                    additions: 12,
+                    deletions: 3,
+                },
+                files: vec![CommitFileDiff {
+                    path: "src/lib.rs".into(),
+                    status: FileStatus::Modified,
+                    diff: "diff --git a/src/lib.rs b/src/lib.rs".into(),
+                }],
+            },
             Response::PullRequestCreated {
                 url: "https://github.com/example/hitch/pull/1".into(),
+            },
+            Response::CommitAndPushed {
+                result: CommitAndPushResult {
+                    subject: "feat: add proto".into(),
+                    short_sha: "abc1234".into(),
+                    pushed_commits: 1,
+                    file_count: 2,
+                },
+            },
+            Response::CompositeJobFailed {
+                kind: CompositeJobKind::CommitAndPush,
+                failed_step: CompositeStep::Pushing,
+                reason: "remote rejected push".into(),
+                result: CompositeJobResult {
+                    commit: Some(CommitAndPushResult {
+                        subject: "feat: add proto".into(),
+                        short_sha: "abc1234".into(),
+                        pushed_commits: 0,
+                        file_count: 2,
+                    }),
+                },
+            },
+            Response::ActiveJobs {
+                jobs: vec![ActiveJobInfo {
+                    job_id: JobId::new(),
+                    worktree_id,
+                    kind: CompositeJobKind::CreatePr,
+                    step: CompositeStep::Drafting,
+                }],
             },
             Response::CommitDraft {
                 draft: CommitDraft {
@@ -1630,6 +2372,13 @@ mod tests {
                 status: JobStatus::Running,
                 message: Some("Pushing…".into()),
                 kind: Some("push".into()),
+            },
+            Event::CompositeJobProgress {
+                job_id: JobId::new(),
+                worktree_id,
+                kind: CompositeJobKind::CommitAndPush,
+                step: CompositeStep::Committing,
+                phase: StepPhase::Started,
             },
             Event::JobCompleted {
                 job_id: JobId::new(),

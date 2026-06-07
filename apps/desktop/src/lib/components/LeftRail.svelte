@@ -1,168 +1,218 @@
 <script lang="ts">
-  // Left rail (mockup .rail-left): scrollable Projects→Worktrees tree above a
-  // pinned footer (Add project · Settings). The brand block lives in the top
-  // nav, not here, so the rail opens straight onto the tree.
-  //
-  // "Add project" is a split control: the primary click opens the native folder
-  // picker directly (the common case — add a local repo/folder). The chevron
-  // menu keeps that fast path, adds an explicit manual local-path fallback, and
-  // leaves remote clone in its own dialog.
-  import { goto } from "$app/navigation";
+  // Left rail (Paper Terminal shell): a 38px PROJECTS header over the scrolling
+  // Projects→Worktrees tree over a counts-only footer. The header's add button
+  // is a split control — primary click opens the native folder picker (the
+  // common case: add a local repo/folder); the caret menu keeps that fast path,
+  // adds an explicit manual local-path fallback, and leaves remote clone in its
+  // own dialog. Settings is no longer footed here (it lives on the /settings
+  // route and the command palette); the footer is counts only.
   import { DropdownMenu } from "bits-ui";
+  import Plus from "~icons/lucide/plus";
+  import ChevronDown from "~icons/lucide/chevron-down";
+  import Folder from "~icons/lucide/folder";
+  import FileText from "~icons/lucide/file-text";
+  import GitBranch from "~icons/lucide/git-branch";
   import ProjectTree from "./ProjectTree.svelte";
-  import { pickAndAddProject } from "../daemon";
+  import { pickAndAddProject, sessions, worktrees } from "../daemon";
   import { addProjectOpen, cloneProjectOpen } from "../overlays";
 
   let { collapsed = false }: { collapsed?: boolean } = $props();
+
+  // The tree owns roving-row focus; the rail forwards root focus (from the
+  // Cmd+Shift+E command, which focuses [data-pane="tree"]) onto the active row.
+  let tree = $state<ProjectTree>();
+
+  // Footer counts: plain totals only ("4 sessions · 3 worktrees"). An earlier
+  // "2 of 4 worktrees active" form read as a puzzle, not a count.
+  const sessionCount = $derived($sessions.length);
+  const worktreeCount = $derived($worktrees.length);
+  const plural = (n: number, word: string) => `${word}${n === 1 ? "" : "s"}`;
 </script>
 
-<aside class="rail-left" class:collapsed>
-  <div class="rail-scroll">
-    <ProjectTree />
-  </div>
-
-  <div class="rail-foot">
+<!-- data-pane + tabindex let the keymap's focus.tree command move DOM focus into
+     this rail (the dispatcher queries [data-pane="tree"] and focuses it). The
+     roving-row focus lands here in slice 3; for now focusing the root is enough
+     to set the pane and route bare-key bindings (when === focusedPane). -->
+<aside
+  class="rail-left"
+  class:collapsed
+  data-pane="tree"
+  tabindex="-1"
+  onfocus={(e) => {
+    // Only when focus landed on the inert root itself (the focus.tree command),
+    // not bubbling up from a row/button inside — forward onto the active row.
+    if (e.target === e.currentTarget) tree?.focusActiveRow();
+  }}
+>
+  <header class="rail-head">
+    <span class="rail-title">Projects</span>
     <div class="add-split">
-      <button class="foot-row add-main" onclick={() => void pickAndAddProject()}>
-        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"
-          ><line x1="8" y1="3" x2="8" y2="13" /><line x1="3" y1="8" x2="13" y2="8" /></svg
-        >
-        Add project
+      <button
+        class="add"
+        aria-label="Add project"
+        title="Add project"
+        onclick={() => void pickAndAddProject()}
+      >
+        <Plus class="icon" />
       </button>
       <DropdownMenu.Root>
         <DropdownMenu.Trigger>
           {#snippet child({ props })}
             <button {...props} class="add-more" aria-label="More add options" title="More add options">
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
-                ><path d="M4 6l4 4 4-4" /></svg
-              >
+              <ChevronDown class="icon" />
             </button>
           {/snippet}
         </DropdownMenu.Trigger>
         <DropdownMenu.Portal>
-          <DropdownMenu.Content class="menu" align="end" side="top" sideOffset={6}>
+          <DropdownMenu.Content class="menu" align="end" side="bottom" sideOffset={6}>
             <DropdownMenu.Item class="mi" onSelect={() => void pickAndAddProject()}>
-              <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                ><path d="M1.5 4.5a2 2 0 0 1 2-2h3l1.5 1.6h4.5a2 2 0 0 1 2 2v5.4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2z" /></svg
-              >
+              <Folder class="mi-ico icon" />
               Add local folder…
             </DropdownMenu.Item>
             <DropdownMenu.Item class="mi" onSelect={() => addProjectOpen.set(true)}>
-              <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-                ><path d="M2.5 3.5h11v9h-11z" /><path d="M4.5 6.25h7M4.5 8h5M4.5 9.75h4" /></svg
-              >
+              <FileText class="mi-ico icon" />
               Enter local path…
             </DropdownMenu.Item>
             <DropdownMenu.Item class="mi" onSelect={() => cloneProjectOpen.set(true)}>
-              <svg class="mi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
-                ><circle cx="4" cy="3.5" r="1.6" /><circle cx="4" cy="12.5" r="1.6" /><circle cx="12" cy="5" r="1.6" /><path
-                  d="M4 5.1v5.8M12 6.6C12 9.8 8.8 11 4.6 11"
-                /></svg
-              >
+              <GitBranch class="mi-ico icon" />
               Clone remote repository…
             </DropdownMenu.Item>
           </DropdownMenu.Content>
         </DropdownMenu.Portal>
       </DropdownMenu.Root>
     </div>
-    <button class="foot-row" onclick={() => goto("/settings")}>
-      <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"
-        ><circle cx="8" cy="8" r="2.2" /><path
-          d="M8 1.5v1.8M8 12.7v1.8M14.5 8h-1.8M3.3 8H1.5M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3M12.6 12.6l-1.3-1.3M4.7 4.7 3.4 3.4"
-        /></svg
-      >
-      Settings
-    </button>
+  </header>
+
+  <div class="rail-scroll">
+    <ProjectTree bind:this={tree} />
   </div>
+
+  <footer class="rail-foot">
+    <span class="k">{sessionCount}</span>
+    {plural(sessionCount, "session")}
+    <span class="sep">·</span>
+    <span class="k">{worktreeCount}</span>
+    {plural(worktreeCount, "worktree")}
+  </footer>
 </aside>
 
 <style>
   .rail-left {
-    background: var(--bg-2);
+    background: var(--paper-1);
     border-right: 1px solid var(--line);
-    display: grid;
-    grid-template-rows: 1fr auto;
+    display: flex;
+    flex-direction: column;
     height: 100%;
     min-height: 0;
     overflow: hidden;
-    transition: opacity var(--t);
+    transition: opacity 0.18s ease-out;
   }
   .rail-left.collapsed {
     opacity: 0;
     pointer-events: none;
   }
 
-  .rail-scroll {
-    overflow-y: auto;
-    min-height: 0;
-  }
-
-  .rail-foot {
-    border-top: 1px solid var(--line-soft);
-    padding: 7px 8px;
-    display: grid;
-    gap: 1px;
-  }
-  .foot-row {
+  /* 38px header on the shared baseline grid (matches the center tab strip and
+     the right rail header so the three columns read as one aligned system). */
+  .rail-head {
+    flex: 0 0 38px;
+    height: 38px;
     display: flex;
     align-items: center;
-    gap: 9px;
-    padding: 7px 8px;
-    border-radius: var(--radius);
-    color: var(--tx-md);
-    cursor: pointer;
-    font: inherit;
-    background: transparent;
-    border: 1px solid transparent;
-    width: 100%;
-    text-align: left;
-    transition:
-      background var(--t-fast),
-      color var(--t-fast);
+    gap: 8px;
+    padding: 0 8px 0 12px;
+    border-bottom: 1px solid var(--line);
   }
-  .foot-row:hover {
-    background: var(--bg-3);
-    color: var(--tx-hi);
-  }
-  .foot-row .ico {
-    width: 15px;
-    height: 15px;
-    color: var(--tx-lo);
-    flex: none;
+  .rail-title {
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: var(--ink-2);
   }
 
-  /* split "Add project": primary action + a chevron that opens the add menu */
   .add-split {
+    margin-left: auto;
     display: flex;
     align-items: stretch;
     gap: 1px;
   }
-  .add-split .add-main {
-    flex: 1;
-    min-width: 0;
-  }
-  .add-more {
+  .add {
+    width: 20px;
+    height: 20px;
     display: grid;
     place-items: center;
-    width: 30px;
-    flex: none;
     padding: 0;
-    border-radius: var(--radius);
-    border: 1px solid transparent;
-    background: transparent;
-    color: var(--tx-lo);
+    border: 1px solid var(--line);
+    border-radius: 0;
+    background: var(--paper-2);
+    color: var(--ink-2);
     cursor: pointer;
     transition:
-      background var(--t-fast),
-      color var(--t-fast);
+      color 0.18s ease-out,
+      border-color 0.18s ease-out,
+      background 0.18s ease-out;
   }
-  .add-more svg {
-    width: 12px;
-    height: 12px;
+  .add :global(svg) {
+    width: 13px;
+    height: 13px;
+  }
+  .add:hover {
+    color: var(--ink-1);
+    border-color: var(--ink-3);
+  }
+  .add-more {
+    width: 16px;
+    height: 20px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-left: none;
+    border-radius: 0;
+    background: var(--paper-2);
+    color: var(--ink-3);
+    cursor: pointer;
+    transition:
+      color 0.18s ease-out,
+      border-color 0.18s ease-out,
+      background 0.18s ease-out;
+  }
+  .add-more :global(svg) {
+    width: 11px;
+    height: 11px;
   }
   .add-more:hover,
   .add-more[data-state="open"] {
-    background: var(--bg-3);
-    color: var(--tx-hi);
+    color: var(--ink-1);
+    border-color: var(--ink-3);
+  }
+
+  .rail-scroll {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+  }
+
+  /* counts-only footer: a single quiet line, emphasised numerals (.k). No
+     daemon-ownership line (the daemon indicator lives in the top bar) and no
+     add/settings buttons (those moved to the header / the /settings route). */
+  .rail-foot {
+    flex: 0 0 auto;
+    border-top: 1px solid var(--line);
+    background: linear-gradient(var(--paper-1), var(--paper-3));
+    padding: 7px 12px;
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    line-height: 1.6;
+    color: var(--ink-2);
+  }
+  .rail-foot .k {
+    color: var(--ink-1);
+    font-weight: 600;
+  }
+  .rail-foot .sep {
+    color: var(--ink-3);
+    margin: 0 2px;
   }
 </style>

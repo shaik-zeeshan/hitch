@@ -42,17 +42,18 @@ use hitch_core::{
     Worktree, WorktreeId,
 };
 use hitch_git::{
-    staged_diff, CommandControl, CreatePrRequest, CreateWorktreeRequest, DiffTarget, FileState,
-    GitClient, GitRepository, StatusEntry, WorktreeCheckout,
+    staged_diff, CommandControl, CreatePrRequest, CreateWorktreeRequest, DiffFileOptions,
+    DiffTarget, FileState, GitClient, GitRepository, StatusEntry, WorktreeCheckout,
 };
 use hitch_process::{DrainOutcome, PipeReader, ProcessTree};
 use hitch_proto::{
     encode_control_message, encode_pty_frame,
     transport::{connect_daemon, DaemonListener, DaemonStream},
-    ChangedFile, CommitDraft, ControlMessage, DraftGenerationSettings, DraftProvider, ErrorCode,
-    Event, FileDiff, FileStatus, GitStatus, JobRequest, JobStatus, KnownAgent, PrInfo,
-    ProtocolError, PullRequestDraft, Request, Response, WorktreeCreateMode, WorktreePr,
-    MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
+    ActiveJobInfo, ChangedFile, CommitAndPushResult, CommitDraft, CommitFileDiff, CommitInfo,
+    CommitMeta, CompositeJobKind, CompositeJobResult, CompositeStep, ControlMessage,
+    DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
+    JobRequest, JobStatus, KnownAgent, PrInfo, ProtocolError, PullRequestDraft, Request, Response,
+    StepPhase, WorktreeCreateMode, WorktreePr, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
 };
 use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY};
 use hitch_store::Store;
@@ -659,6 +660,21 @@ struct ActiveJob {
     control: Arc<JobControl>,
     kind: Option<&'static str>,
     message: Option<String>,
+    /// Set for the daemon-owned composite chains (`commit-and-push`,
+    /// `create-pr`, ADR 0013 amendment). Lets [`Request::ActiveJobs`] report a
+    /// worktree's in-flight chains and their current step so a (re)attaching GUI
+    /// restores the action button's state. `None` for the simple Jobs.
+    composite: Option<CompositeJobState>,
+}
+
+/// The live, mutable step state of one in-flight composite Job, shared between
+/// the Job registry (read by [`Request::ActiveJobs`]) and the worker thread
+/// (which advances `step` as the chain progresses). Cheap `Mutex` because both
+/// sides already hold the daemon `state` lock when they touch it.
+struct CompositeJobState {
+    worktree_id: WorktreeId,
+    kind: CompositeJobKind,
+    step: Mutex<CompositeStep>,
 }
 
 /// Shared control handle for one running **Job** (ADR 0008). The Job registry on
@@ -1293,9 +1309,47 @@ fn handle_request<R: Read>(
             let status = git_status(state, worktree_id)?;
             send_response(state, client_id, request_id, Response::GitStatus { status })?;
         }
-        Request::GitDiff { worktree_id, path } => {
-            let diff = git_diff(state, worktree_id, path)?;
+        Request::GitDiff {
+            worktree_id,
+            path,
+            staged,
+            ignore_whitespace,
+            context_lines,
+        } => {
+            let diff = git_diff(
+                state,
+                worktree_id,
+                path,
+                staged,
+                ignore_whitespace,
+                context_lines,
+            )?;
             send_response(state, client_id, request_id, Response::FileDiff { diff })?;
+        }
+        Request::GitLog {
+            worktree_id,
+            limit,
+            offset,
+        } => {
+            let (commits, has_more) = git_log(state, worktree_id, limit, offset)?;
+            send_response(
+                state,
+                client_id,
+                request_id,
+                Response::CommitLog { commits, has_more },
+            )?;
+        }
+        Request::CommitDiff {
+            worktree_id,
+            commit_id,
+        } => {
+            let (meta, files) = commit_diff(state, worktree_id, &commit_id)?;
+            send_response(
+                state,
+                client_id,
+                request_id,
+                Response::CommitDiff { meta, files },
+            )?;
         }
         Request::StageFiles { worktree_id, paths } => {
             let (git, worktree_path) = git_context(state, worktree_id)?;
@@ -1339,10 +1393,16 @@ fn handle_request<R: Read>(
         | Request::Pull { .. }
         | Request::PrStatus { .. }
         | Request::ProjectPrStatuses { .. }
-        | Request::CreatePullRequest { .. } => {
+        | Request::CreatePullRequest { .. }
+        | Request::CommitAndPush { .. }
+        | Request::CreatePr { .. } => {
             let request = JobRequest::try_from(request)
                 .map_err(|_| internal("job-capable request rejected during dispatch"))?;
             dispatch_job(state, client_id, request_id, request)?;
+        }
+        Request::ActiveJobs { worktree_id } => {
+            let jobs = active_jobs_for_worktree(state, worktree_id)?;
+            send_response(state, client_id, request_id, Response::ActiveJobs { jobs })?;
         }
         Request::StartJob { request } => {
             dispatch_job(state, client_id, request_id, request)?;
@@ -2510,6 +2570,10 @@ fn git_status(
     let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
     let summary = repo.status().map_err(git_error)?;
     let (ahead, behind) = repo.ahead_behind().unwrap_or((0, 0));
+    // Resolve the base branch here so the frontend's `defaultBase` consumes the
+    // daemon's single definition (shared with `git_log`) instead of recomputing
+    // it client-side.
+    let base_branch = resolve_base_branch(state, &worktree, &repo);
     if branch_changed {
         broadcast_event(
             state,
@@ -2526,7 +2590,9 @@ fn git_status(
         behind,
         additions: summary.additions.min(u32::MAX as usize) as u32,
         deletions: summary.deletions.min(u32::MAX as usize) as u32,
-        files: summary.entries.iter().map(status_entry_to_proto).collect(),
+        head_commit_id: summary.head_commit_id,
+        base_branch,
+        files: status_entries_to_proto(&summary.entries),
     })
 }
 
@@ -2603,6 +2669,9 @@ fn git_diff(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
     path: PathBuf,
+    staged: Option<bool>,
+    ignore_whitespace: Option<bool>,
+    context_lines: Option<u32>,
 ) -> Result<FileDiff, ProtocolError> {
     let worktree = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
@@ -2614,19 +2683,176 @@ fn git_diff(
     };
     let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
     let diff_path = diff_path_for_worktree(&worktree.path, &path);
-    let mut diff = repo
-        .diff_file(&diff_path, DiffTarget::Worktree)
-        .map_err(git_error)?;
-    if diff.is_empty() {
-        diff = repo
-            .diff_file(&diff_path, DiffTarget::Staged)
-            .map_err(git_error)?;
-    }
+    let view = DiffFileOptions {
+        ignore_whitespace: ignore_whitespace.unwrap_or(false),
+        context_lines,
+    };
+    let diff = match staged {
+        Some(true) => repo
+            .diff_file(&diff_path, DiffTarget::Staged, view)
+            .map_err(git_error)?,
+        Some(false) => repo
+            .diff_file(&diff_path, DiffTarget::Worktree, view)
+            .map_err(git_error)?,
+        None => {
+            let mut diff = repo
+                .diff_file(&diff_path, DiffTarget::Worktree, view)
+                .map_err(git_error)?;
+            if diff.is_empty() {
+                diff = repo
+                    .diff_file(&diff_path, DiffTarget::Staged, view)
+                    .map_err(git_error)?;
+            }
+            diff
+        }
+    };
     Ok(FileDiff {
         worktree_id,
         path,
         diff,
     })
+}
+
+/// The branch of the project's main worktree, if one is known to the daemon.
+/// This is the first half of the base convention (see [`resolve_base_branch`]);
+/// it is read under the state lock so callers that already hold a worktree can
+/// resolve the base without re-locking.
+fn main_worktree_branch(state: &DaemonState, project_id: ProjectId) -> Option<String> {
+    state
+        .worktrees
+        .values()
+        .find(|w| w.project_id == project_id && w.is_main)
+        .map(|w| w.branch.clone())
+}
+
+/// The single definition of the "base branch" convention, shared by `git_log`'s
+/// `ahead_of_base` markers and the `GitStatus.base_branch` the frontend's
+/// `defaultBase` consumes. The base is the branch checked out in the project's
+/// main worktree, NOT the repo's default branch: a remote-less linked worktree
+/// has no `refs/remotes/origin/HEAD`, so `default_branch()` falls back to the
+/// worktree's OWN branch and nothing would ever be marked ahead. We fall back to
+/// the repo's default branch only when no main worktree is known.
+///
+/// Returns `None` when neither resolves, OR when the resolved base IS the
+/// worktree's own branch (the main worktree relative to itself): there is then no
+/// cross-branch work to mark and no sensible PR-base default. Callers therefore
+/// get the exact value they should act on without re-applying the self-branch
+/// filter.
+fn resolve_base_branch(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree: &Worktree,
+    repo: &GitRepository,
+) -> Option<String> {
+    let main_branch = {
+        let state = state.lock().ok()?;
+        main_worktree_branch(&state, worktree.project_id)
+    };
+    let resolved = match main_branch {
+        Some(branch) => Some(branch),
+        None => repo.default_branch().ok(),
+    };
+    resolved.filter(|base| *base != worktree.branch)
+}
+
+fn git_log(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+    limit: u32,
+    offset: u32,
+) -> Result<(Vec<CommitInfo>, bool), ProtocolError> {
+    let worktree = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        state
+            .worktrees
+            .get(&worktree_id)
+            .cloned()
+            .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?
+    };
+    let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
+    // Mark commits ahead of the resolved base branch (the shared convention).
+    // `resolve_base_branch` already returns `None` on the main worktree (its own
+    // branch is the base, so there is no branch work to mark) and when no base is
+    // resolvable; an unresolvable base degrades to no markers in the git layer.
+    let base = resolve_base_branch(state, &worktree, &repo);
+    let (commits, has_more) = repo
+        .log_enriched(base.as_deref(), offset as usize, limit as usize)
+        .map_err(git_error)?;
+    Ok((
+        commits.into_iter().map(log_commit_to_proto).collect(),
+        has_more,
+    ))
+}
+
+fn commit_diff(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+    commit_id: &str,
+) -> Result<(CommitMeta, Vec<CommitFileDiff>), ProtocolError> {
+    let worktree = {
+        let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        state
+            .worktrees
+            .get(&worktree_id)
+            .cloned()
+            .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?
+    };
+    let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
+    let diff = repo.commit_diff(commit_id).map_err(git_error)?;
+    let meta = CommitMeta {
+        id: diff.meta.id,
+        summary: diff.meta.summary,
+        body: diff.meta.body,
+        author: diff.meta.author_name,
+        time: diff.meta.time_seconds,
+        is_merge: diff.meta.is_merge,
+        additions: clamp_u32(diff.meta.additions),
+        deletions: clamp_u32(diff.meta.deletions),
+    };
+    let files = diff
+        .files
+        .into_iter()
+        .map(|file| CommitFileDiff {
+            path: file.path,
+            status: delta_status_to_proto(file.status),
+            diff: file.diff,
+        })
+        .collect();
+    Ok((meta, files))
+}
+
+fn log_commit_to_proto(commit: hitch_git::LogCommit) -> CommitInfo {
+    CommitInfo {
+        id: commit.id,
+        summary: commit.summary,
+        body: commit.body,
+        author: commit.author_name,
+        time: commit.time_seconds,
+        is_merge: commit.is_merge,
+        ahead_of_base: commit.ahead_of_base,
+        additions: clamp_u32(commit.additions),
+        deletions: clamp_u32(commit.deletions),
+    }
+}
+
+/// Map a git-layer per-file delta status to the proto `FileStatus` the frontend
+/// already renders. `Typechange`/`Unmodified` have no proto peer and fold into
+/// `Modified`, matching how status entries already coalesce them.
+fn delta_status_to_proto(status: hitch_git::DeltaStatus) -> FileStatus {
+    match status {
+        hitch_git::DeltaStatus::Added => FileStatus::Added,
+        hitch_git::DeltaStatus::Deleted => FileStatus::Deleted,
+        hitch_git::DeltaStatus::Modified => FileStatus::Modified,
+        hitch_git::DeltaStatus::Renamed => FileStatus::Renamed,
+        hitch_git::DeltaStatus::Copied => FileStatus::Copied,
+        hitch_git::DeltaStatus::Conflicted => FileStatus::Conflicted,
+        hitch_git::DeltaStatus::Typechange | hitch_git::DeltaStatus::Unmodified => {
+            FileStatus::Modified
+        }
+    }
+}
+
+fn clamp_u32(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
 }
 
 fn diff_path_for_worktree<'a>(worktree_path: &Path, path: &'a Path) -> std::borrow::Cow<'a, Path> {
@@ -2660,6 +2886,12 @@ fn generate_commit_draft(
     cancel: Option<&JobControl>,
 ) -> Result<CommitDraft, ProtocolError> {
     let worktree = refreshed_worktree_context(state, worktree_id)?.1;
+    // Draft Instructions are draft-text, not provider config: pull them out
+    // before `with_settings` consumes the rest of the settings (ADR 0007
+    // amendment 2026-06-07).
+    let instructions = settings
+        .as_ref()
+        .and_then(|settings| settings.commit_instructions.clone());
     let provider = draft_provider_config(state)?.with_settings(settings);
     let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
     let summary = repo.status().map_err(git_error)?;
@@ -2684,9 +2916,25 @@ fn generate_commit_draft(
             worktree_path: worktree.path,
             staged_paths,
             staged_patch,
+            instructions,
         },
         cancel,
     )
+}
+
+/// Trim and require a non-empty PR base branch, returning the same
+/// `InvalidRequest` the Drafting step would have produced. Used both by the
+/// draft generator and up front by the create-PR chain so a missing base fails
+/// before anything is pushed (ADR 0013 amendment).
+fn normalize_pr_base(base: Option<String>) -> Result<String, ProtocolError> {
+    base.map(|base| base.trim().to_string())
+        .filter(|base| !base.is_empty())
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "enter a base branch before generating a PR draft",
+            )
+        })
 }
 
 fn generate_pull_request_draft(
@@ -2697,17 +2945,15 @@ fn generate_pull_request_draft(
     cancel: Option<&JobControl>,
 ) -> Result<PullRequestDraft, ProtocolError> {
     let worktree = refreshed_worktree_context(state, worktree_id)?.1;
+    // Draft Instructions are draft-text, not provider config: pull them out
+    // before `with_settings` consumes the rest of the settings (ADR 0007
+    // amendment 2026-06-07).
+    let instructions = settings
+        .as_ref()
+        .and_then(|settings| settings.pr_instructions.clone());
     let provider = draft_provider_config(state)?.with_settings(settings);
     let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
-    let base = base
-        .map(|base| base.trim().to_string())
-        .filter(|base| !base.is_empty())
-        .ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::InvalidRequest,
-                "enter a base branch before generating a PR draft",
-            )
-        })?;
+    let base = normalize_pr_base(base)?;
     if base == worktree.branch {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
@@ -2733,6 +2979,7 @@ fn generate_pull_request_draft(
             commits: commit_summaries,
             changed_paths: comparison.changed_paths,
             diff: comparison.diff,
+            instructions,
         },
         cancel,
     )
@@ -2808,13 +3055,39 @@ fn index_is_staged(state: FileState) -> bool {
     !matches!(state, FileState::Unmodified | FileState::Conflicted)
 }
 
-fn status_entry_to_proto(entry: &StatusEntry) -> ChangedFile {
-    let staged = index_is_staged(entry.index);
-    let state = if staged {
-        entry.index
-    } else {
-        entry.working_tree
-    };
+fn status_entries_to_proto(entries: &[StatusEntry]) -> Vec<ChangedFile> {
+    let mut files = Vec::with_capacity(entries.len() * 2);
+    for entry in entries {
+        let staged = index_is_staged(entry.index);
+        if staged {
+            files.push(status_entry_to_proto(
+                entry,
+                true,
+                entry.index,
+                entry.staged_additions,
+                entry.staged_deletions,
+            ));
+        }
+        if !staged || entry.working_tree != FileState::Unmodified {
+            files.push(status_entry_to_proto(
+                entry,
+                false,
+                entry.working_tree,
+                entry.worktree_additions,
+                entry.worktree_deletions,
+            ));
+        }
+    }
+    files
+}
+
+fn status_entry_to_proto(
+    entry: &StatusEntry,
+    staged: bool,
+    state: FileState,
+    additions: usize,
+    deletions: usize,
+) -> ChangedFile {
     ChangedFile {
         path: entry.path.clone(),
         status: match state {
@@ -2827,6 +3100,8 @@ fn status_entry_to_proto(entry: &StatusEntry) -> ChangedFile {
             FileState::Unmodified => FileStatus::Modified,
         },
         staged,
+        additions: additions.min(u32::MAX as usize) as u32,
+        deletions: deletions.min(u32::MAX as usize) as u32,
     }
 }
 
@@ -3360,12 +3635,23 @@ fn store_agent_announce(
         return Ok(None);
     }
 
+    // A run boundary always refreshes the bookkeeping (run id, late-arrival
+    // guard, stale state), but only a *visible* change broadcasts: announces
+    // are idempotent (ADR 0011), so a same-identity boundary over an
+    // already-null state is "already current" and clients hear nothing.
+    let visible_changed = identity_changed
+        || daemon_session.agent_state.is_some()
+        || daemon_session.agent_detail.is_some();
+
     let worktree_id = session_worktree_id(&daemon_session.session);
     daemon_session.agent = Some(agent);
     daemon_session.agent_run_id = agent_run_id;
     daemon_session.agent_state = None;
     daemon_session.agent_detail = None;
     daemon_session.agent_report_requires_running = true;
+    if !visible_changed {
+        return Ok(None);
+    }
     Ok(Some(AgentStateBroadcast {
         session_id,
         worktree_id,
@@ -3613,6 +3899,37 @@ where
         + Send
         + 'static,
 {
+    start_job_inner(
+        name,
+        state,
+        client_id,
+        request_id,
+        kind,
+        progress,
+        None,
+        move |_job_id, state, control| work(state, control),
+    )
+}
+
+/// Shared Job harness behind [`start_job`] and [`start_composite_job`]. The
+/// `composite` argument registers a composite chain's live step state (`None`
+/// for simple Jobs), and `work` additionally receives the assigned [`JobId`] so
+/// a composite runner can broadcast per-step events keyed by it.
+fn start_job_inner<F>(
+    name: &'static str,
+    state: &Arc<Mutex<DaemonState>>,
+    client_id: u64,
+    request_id: u64,
+    kind: Option<&'static str>,
+    progress: Option<&str>,
+    composite: Option<CompositeJobState>,
+    work: F,
+) -> Result<(), ProtocolError>
+where
+    F: FnOnce(JobId, &Arc<Mutex<DaemonState>>, &JobControl) -> Result<Response, ProtocolError>
+        + Send
+        + 'static,
+{
     let job_id = JobId::new();
     let control = Arc::new(JobControl::default());
     let message = progress.map(str::to_string);
@@ -3624,6 +3941,7 @@ where
                 control: Arc::clone(&control),
                 kind,
                 message: message.clone(),
+                composite,
             },
         );
     }
@@ -3639,7 +3957,7 @@ where
         }
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            work(&worker_state, &control)
+            work(job_id, &worker_state, &control)
         }));
         let result = match result {
             Ok(inner) => inner,
@@ -3718,6 +4036,404 @@ where
         },
     );
     Ok(())
+}
+
+/// The per-step driver passed to a composite-Job chain runner (ADR 0013
+/// amendment). The runner calls [`CompositeContext::enter_step`] before each
+/// rung — it advances the Job registry's recorded step (so a concurrent
+/// [`Request::ActiveJobs`] reports the right one) and broadcasts a `Started`
+/// [`Event::CompositeJobProgress`] — and [`CompositeContext::finish_step`] after
+/// the rung succeeds to broadcast `Finished`. [`CompositeContext::check_cancel`]
+/// lets the runner stop *before* the next step begins when a cancel arrived.
+struct CompositeContext<'a> {
+    job_id: JobId,
+    worktree_id: WorktreeId,
+    kind: CompositeJobKind,
+    state: &'a Arc<Mutex<DaemonState>>,
+    control: &'a JobControl,
+}
+
+impl CompositeContext<'_> {
+    /// Record `step` as the chain's current step in the Job registry and
+    /// broadcast its `Started` progress event. Called at the top of each rung.
+    fn enter_step(&self, step: CompositeStep) {
+        if let Ok(guard) = self.state.lock() {
+            if let Some(job) = guard.jobs.get(&self.job_id) {
+                if let Some(composite) = &job.composite {
+                    if let Ok(mut current) = composite.step.lock() {
+                        *current = step;
+                    }
+                }
+            }
+        }
+        let _ = broadcast_job_event(
+            self.state,
+            Event::CompositeJobProgress {
+                job_id: self.job_id,
+                worktree_id: self.worktree_id,
+                kind: self.kind,
+                step,
+                phase: StepPhase::Started,
+            },
+        );
+    }
+
+    /// Broadcast a `Finished` progress event for `step` after its work succeeded.
+    fn finish_step(&self, step: CompositeStep) {
+        let _ = broadcast_job_event(
+            self.state,
+            Event::CompositeJobProgress {
+                job_id: self.job_id,
+                worktree_id: self.worktree_id,
+                kind: self.kind,
+                step,
+                phase: StepPhase::Finished,
+            },
+        );
+    }
+
+    /// Whether a cancel has arrived; the runner checks this between steps so no
+    /// new step starts after cancellation (in-flight git may still complete).
+    fn is_cancelled(&self) -> bool {
+        self.control.is_cancelled()
+    }
+
+    /// Drive one rung of a composite chain: broadcast `step`'s `Started`, run
+    /// `work`, then on success broadcast `Finished` and yield the value; on
+    /// failure short-circuit with the in-band `CompositeJobFailed` response built
+    /// from `on_error` (the prior-step results to carry). The runner uses `?` on
+    /// the returned `Result<T, Response>` so an `Err(Response)` bubbles straight
+    /// to the harness as the chain's completion. Cancel checks stay between
+    /// `run_step` calls in the runner so ordering is unchanged.
+    fn run_step<T, W>(
+        &self,
+        step: CompositeStep,
+        on_error: CompositeJobResult,
+        work: W,
+    ) -> Result<T, Response>
+    where
+        W: FnOnce() -> Result<T, ProtocolError>,
+    {
+        self.enter_step(step);
+        match work() {
+            Ok(value) => {
+                self.finish_step(step);
+                Ok(value)
+            }
+            Err(err) => Err(composite_failed(self.kind, step, err, on_error)),
+        }
+    }
+}
+
+/// Run a daemon-owned **composite Job** chain off the request loop (ADR 0013
+/// amendment 2026-06-07). Wraps [`start_job`]'s harness — immediate `JobStarted`
+/// reply, panic catching, registry cleanup, terminal `JobProgress`/`JobCompleted`
+/// broadcast — and additionally registers the chain's live [`CompositeJobState`]
+/// so [`Request::ActiveJobs`] can report it by worktree and step. The chain
+/// runner drives per-step progress through the [`CompositeContext`]; it returns
+/// `Ok(Response::CommitAndPushed | PullRequestCreated)` on success, or
+/// `Ok(Response::CompositeJobFailed { .. })` when a step fails (carrying prior
+/// steps' results — a draft failure aborts before any commit). A cancel between
+/// steps surfaces as `Err`, which the harness maps to a `Cancelled` terminal.
+fn start_composite_job<F>(
+    name: &'static str,
+    state: &Arc<Mutex<DaemonState>>,
+    client_id: u64,
+    request_id: u64,
+    worktree_id: WorktreeId,
+    kind: CompositeJobKind,
+    initial_step: CompositeStep,
+    run: F,
+) -> Result<(), ProtocolError>
+where
+    F: FnOnce(
+            &CompositeContext<'_>,
+            &Arc<Mutex<DaemonState>>,
+            &JobControl,
+        ) -> Result<Response, ProtocolError>
+        + Send
+        + 'static,
+{
+    let ui_kind = match kind {
+        CompositeJobKind::CommitAndPush => "commit-and-push",
+        CompositeJobKind::CreatePr => "create-pr",
+    };
+    start_job_inner(
+        name,
+        state,
+        client_id,
+        request_id,
+        Some(ui_kind),
+        None,
+        Some(CompositeJobState {
+            worktree_id,
+            kind,
+            step: Mutex::new(initial_step),
+        }),
+        move |job_id, state, control| {
+            let ctx = CompositeContext {
+                job_id,
+                worktree_id,
+                kind,
+                state,
+                control,
+            };
+            run(&ctx, state, control)
+        },
+    )
+}
+
+/// Collapse a [`CompositeContext::run_step`] result inside a composite runner:
+/// yield the step's value on `Ok`, or early-`return Ok(failed_response)` with
+/// the `CompositeJobFailed` the helper built (the chain's terminal response).
+macro_rules! step {
+    ($run:expr) => {
+        match $run {
+            Ok(value) => value,
+            Err(response) => return Ok(response),
+        }
+    };
+}
+
+/// The `commit-and-push` chain: staging -> drafting -> committing -> pushing
+/// (ADR 0013 amendment). Honors the staged set, auto-staging all only when
+/// nothing is staged (the interactive flow's rule). A draft-generation failure
+/// aborts before any commit is made (a fallback message is never committed). A
+/// push failure keeps the landed commit and reports the failed step with the
+/// commit's results intact.
+fn run_commit_and_push(
+    ctx: &CompositeContext<'_>,
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+    settings: Option<DraftGenerationSettings>,
+    control: &JobControl,
+) -> Result<Response, ProtocolError> {
+    // Each rung runs through `ctx.run_step` (enter -> work -> finish on Ok,
+    // CompositeJobFailed on Err); `step!` collapses that to the runner's
+    // terminal `Ok(response)`. Cancel checks stay between rungs.
+    let (git, worktree) = step!(ctx.run_step(
+        CompositeStep::Staging,
+        CompositeJobResult::default(),
+        || {
+            let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
+            stage_for_commit_and_push(&git, &worktree.path)?;
+            Ok((git, worktree))
+        },
+    ));
+    let _ = broadcast_dirty(state, worktree_id);
+    if ctx.is_cancelled() {
+        return Err(cancelled_error());
+    }
+
+    // --- Drafting --- a failure here aborts BEFORE any commit is made.
+    let draft = step!(ctx.run_step(
+        CompositeStep::Drafting,
+        CompositeJobResult::default(),
+        || generate_commit_draft(state, worktree_id, settings, Some(control)),
+    ));
+    if ctx.is_cancelled() {
+        return Err(cancelled_error());
+    }
+
+    // --- Committing ---
+    let commit_result = step!(ctx.run_step(
+        CompositeStep::Committing,
+        CompositeJobResult::default(),
+        || commit_and_describe(&git, &worktree.path, &draft),
+    ));
+    let _ = broadcast_dirty(state, worktree_id);
+    if ctx.is_cancelled() {
+        return Err(cancelled_error());
+    }
+
+    // --- Pushing --- a failure here leaves the commit in place; report it with
+    // the commit's results intact.
+    step!(ctx.run_step(
+        CompositeStep::Pushing,
+        CompositeJobResult {
+            commit: Some(commit_result.clone()),
+        },
+        || {
+            git.push_with_control(&worktree.path, "origin", &worktree.branch, true, control)
+                .map_err(git_error)
+        },
+    ));
+
+    Ok(Response::CommitAndPushed {
+        result: commit_result,
+    })
+}
+
+/// The `create-pr` chain: pushing -> drafting (title/body) -> creating a GitHub
+/// **draft** PR (ADR 0013 amendment). The completion carries the PR URL; the
+/// daemon never opens a browser. A draft failure aborts before the PR is created.
+fn run_create_pr(
+    ctx: &CompositeContext<'_>,
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+    base: Option<String>,
+    settings: Option<DraftGenerationSettings>,
+    control: &JobControl,
+) -> Result<Response, ProtocolError> {
+    // Validate the base BEFORE pushing: a missing base would otherwise only be
+    // caught in Drafting, after the push had already run. Fail with the same
+    // Drafting `CompositeJobFailed` (identical message) the chain would have
+    // produced, so the frontend toast reads the same — but without pushing.
+    let base = match normalize_pr_base(base) {
+        Ok(base) => base,
+        Err(err) => {
+            return Ok(composite_failed(
+                CompositeJobKind::CreatePr,
+                CompositeStep::Drafting,
+                err,
+                CompositeJobResult::default(),
+            ))
+        }
+    };
+
+    // --- Pushing ---
+    let (git, worktree) = step!(ctx.run_step(
+        CompositeStep::Pushing,
+        CompositeJobResult::default(),
+        || {
+            let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
+            git.push_with_control(&worktree.path, "origin", &worktree.branch, true, control)
+                .map_err(git_error)?;
+            Ok((git, worktree))
+        },
+    ));
+    if ctx.is_cancelled() {
+        return Err(cancelled_error());
+    }
+
+    // --- Drafting --- a failure aborts before the PR is created.
+    let draft = step!(ctx.run_step(
+        CompositeStep::Drafting,
+        CompositeJobResult::default(),
+        || generate_pull_request_draft(
+            state,
+            worktree_id,
+            Some(base.clone()),
+            settings,
+            Some(control),
+        ),
+    ));
+    if ctx.is_cancelled() {
+        return Err(cancelled_error());
+    }
+
+    // --- Creating the GitHub draft PR ---
+    let url = step!(ctx.run_step(
+        CompositeStep::CreatingPr,
+        CompositeJobResult::default(),
+        || {
+            git.create_pr_with_control(
+                &worktree.path,
+                &CreatePrRequest {
+                    title: draft.title,
+                    body: Some(draft.body),
+                    base: Some(base),
+                    head: Some(worktree.branch.clone()),
+                    remote: None,
+                    draft: true,
+                },
+                control,
+            )
+            .map_err(git_error)
+        },
+    ));
+
+    Ok(Response::PullRequestCreated { url })
+}
+
+/// Build the in-band failure response for a composite chain step.
+fn composite_failed(
+    kind: CompositeJobKind,
+    failed_step: CompositeStep,
+    reason: ProtocolError,
+    result: CompositeJobResult,
+) -> Response {
+    Response::CompositeJobFailed {
+        kind,
+        failed_step,
+        reason: reason.message,
+        result,
+    }
+}
+
+/// The marker error a composite runner returns when a cancel arrives between
+/// steps. The Job harness sees `control.is_cancelled()` and maps it to a
+/// `Cancelled` terminal, so the chain stops before the next step begins.
+fn cancelled_error() -> ProtocolError {
+    ProtocolError::new(ErrorCode::Unavailable, "composite job cancelled").retryable(true)
+}
+
+/// Apply the commit-and-push staging rule: respect the staged set, auto-staging
+/// every changed path only when nothing is currently staged (the same rule the
+/// interactive Composer uses). No-op when something is already staged.
+fn stage_for_commit_and_push(git: &GitClient, repo_path: &Path) -> Result<(), ProtocolError> {
+    let repo = GitRepository::discover(repo_path).map_err(git_error)?;
+    let summary = repo.status().map_err(git_error)?;
+    let already_staged = summary
+        .entries
+        .iter()
+        .any(|entry| index_is_staged(entry.index));
+    if already_staged {
+        return Ok(());
+    }
+    let paths = summary
+        .entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "nothing to commit",
+        ));
+    }
+    git.stage_files(repo_path, &paths).map_err(git_error)?;
+    Ok(())
+}
+
+/// Commit the staged set with `draft`'s subject/body, then read back the new
+/// HEAD commit to describe it for the completion toast (subject, short sha,
+/// pushed-commit count vs upstream, file count).
+fn commit_and_describe(
+    git: &GitClient,
+    repo_path: &Path,
+    draft: &CommitDraft,
+) -> Result<CommitAndPushResult, ProtocolError> {
+    let body = (!draft.body.trim().is_empty()).then(|| draft.body.as_str());
+    git.commit(repo_path, &draft.subject, body)
+        .map_err(git_error)?;
+
+    let repo = GitRepository::discover(repo_path).map_err(git_error)?;
+    let summary = repo.status().map_err(git_error)?;
+    let short_sha = summary
+        .head_commit_id
+        .as_deref()
+        .map(|sha| sha.chars().take(7).collect::<String>())
+        .unwrap_or_default();
+    // Files in the new commit = its first-parent diff file list.
+    let file_count = summary
+        .head_commit_id
+        .as_deref()
+        .and_then(|sha| repo.commit_diff(sha).ok())
+        .map(|diff| diff.files.len())
+        .unwrap_or(0);
+    // Commits queued to push = how far HEAD is ahead of its upstream. A branch
+    // with no upstream yet (first push) reports 0 ahead, so fall back to 1 — the
+    // commit we just made is the one being pushed.
+    let (ahead, _) = repo.ahead_behind().unwrap_or((0, 0));
+    let pushed_commits = if ahead == 0 { 1 } else { ahead };
+
+    Ok(CommitAndPushResult {
+        subject: draft.subject.clone(),
+        short_sha,
+        pushed_commits,
+        file_count: file_count.min(u32::MAX as usize) as u32,
+    })
 }
 
 /// Dispatch the long-running request `request` as a **Job**. Reached both from a
@@ -3902,6 +4618,37 @@ fn dispatch_job(
                 let draft =
                     generate_pull_request_draft(state, worktree_id, base, settings, Some(control))?;
                 Ok(Response::PullRequestDraft { draft })
+            },
+        ),
+        JobRequest::CommitAndPush {
+            worktree_id,
+            settings,
+        } => start_composite_job(
+            "hitch-commit-and-push",
+            state,
+            client_id,
+            request_id,
+            worktree_id,
+            CompositeJobKind::CommitAndPush,
+            CompositeStep::Staging,
+            move |ctx, state, control| {
+                run_commit_and_push(ctx, state, worktree_id, settings, control)
+            },
+        ),
+        JobRequest::CreatePr {
+            worktree_id,
+            base,
+            settings,
+        } => start_composite_job(
+            "hitch-create-pr-chain",
+            state,
+            client_id,
+            request_id,
+            worktree_id,
+            CompositeJobKind::CreatePr,
+            CompositeStep::Pushing,
+            move |ctx, state, control| {
+                run_create_pr(ctx, state, worktree_id, base, settings, control)
             },
         ),
     }
@@ -4281,6 +5028,38 @@ fn write_output_to_sink(sink: &ClientSink, session_id: SessionId, bytes: &[u8]) 
     writer.flush()
 }
 
+/// Snapshot a worktree's in-flight composite Jobs (ADR 0013 amendment) so a
+/// (re)attaching GUI can restore the action button's state. Only the daemon-owned
+/// composite chains are reported (the simple Jobs have no Composer/button state
+/// to restore); each entry carries the chain kind and the step it is currently
+/// on. Returns an empty list when none run. Jobs are in-memory only (ADR 0008).
+fn active_jobs_for_worktree(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree_id: WorktreeId,
+) -> Result<Vec<ActiveJobInfo>, ProtocolError> {
+    let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    let mut jobs = state
+        .jobs
+        .iter()
+        .filter_map(|(job_id, job)| {
+            let composite = job.composite.as_ref()?;
+            if composite.worktree_id != worktree_id {
+                return None;
+            }
+            let step = composite.step.lock().ok().map(|step| *step)?;
+            Some(ActiveJobInfo {
+                job_id: *job_id,
+                worktree_id,
+                kind: composite.kind,
+                step,
+            })
+        })
+        .collect::<Vec<_>>();
+    // Stable order for deterministic clients/tests.
+    jobs.sort_by_key(|job| job.job_id.to_string());
+    Ok(jobs)
+}
+
 fn cancel_active_jobs(state: &Arc<Mutex<DaemonState>>) {
     let jobs = match state.lock() {
         Ok(state) => state
@@ -4377,8 +5156,9 @@ fn poisoned(name: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{best_pr_for_branch, OutputBroadcaster};
+    use super::{best_pr_for_branch, status_entries_to_proto, OutputBroadcaster};
     use hitch_core::SessionId;
+    use hitch_git::{FileState, StatusEntry};
 
     fn git_pr(number: u64, state: &str) -> hitch_git::PrInfo {
         hitch_git::PrInfo {
@@ -4387,6 +5167,26 @@ mod tests {
             state: state.to_string(),
             draft: false,
         }
+    }
+
+    #[test]
+    fn status_entries_emit_both_sides_for_partially_staged_files() {
+        let files = status_entries_to_proto(&[StatusEntry {
+            path: "src/lib.rs".into(),
+            old_path: None,
+            index: FileState::Modified,
+            working_tree: FileState::Modified,
+            staged_additions: 2,
+            staged_deletions: 1,
+            worktree_additions: 3,
+            worktree_deletions: 4,
+        }]);
+
+        assert_eq!(files.len(), 2);
+        assert!(files[0].staged);
+        assert_eq!((files[0].additions, files[0].deletions), (2, 1));
+        assert!(!files[1].staged);
+        assert_eq!((files[1].additions, files[1].deletions), (3, 4));
     }
 
     #[test]
@@ -5339,6 +6139,7 @@ mod tests {
                 control: Arc::clone(&control),
                 kind: Some("push"),
                 message: Some("Pushing…".into()),
+                composite: None,
             },
         );
 
@@ -6440,6 +7241,576 @@ mod tests {
             edges.is_empty(),
             "never-active session yields no falling edge"
         );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Slice 2: composite Jobs (commit-and-push / create-pr) ---
+
+    /// Build a DaemonState backed by a real git repo on `feature` whose `origin`
+    /// is a local bare repo (so pushes succeed) plus a registered client sink to
+    /// read broadcasts off the wire. `bad_draft_provider` forces the Draft
+    /// Generator to fail (a non-existent CLI) so the draft-failure path is
+    /// deterministic; otherwise the stub provider is used. Returns the state, the
+    /// worktree id, the client read end, and the temp dir.
+    #[cfg(unix)]
+    fn composite_state(
+        bad_draft_provider: bool,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<super::DaemonState>>,
+        hitch_core::WorktreeId,
+        std::os::unix::net::UnixStream,
+        std::path::PathBuf,
+    ) {
+        use hitch_core::{Project, ProjectKind, Worktree};
+        use std::os::unix::net::UnixStream;
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        fn run(command: &mut Command, what: &str) {
+            let status = command.status().unwrap();
+            assert!(status.success(), "{what} failed with {status}");
+        }
+        fn git(dir: &std::path::Path, args: &[&str], what: &str) {
+            let mut cmd = Command::new("git");
+            cmd.arg("-C").arg(dir).args(args);
+            run(&mut cmd, what);
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-composite-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project_root = dir.join("repo");
+        let remote = dir.join("remote.git");
+
+        let mut init = Command::new("git");
+        init.arg("init").arg(&project_root);
+        run(&mut init, "git init");
+        git(&project_root, &["config", "user.email", "h@e.com"], "email");
+        git(&project_root, &["config", "user.name", "Hitch"], "name");
+        git(&project_root, &["branch", "-M", "main"], "branch -M main");
+        std::fs::write(project_root.join("README.md"), "hello\n").unwrap();
+        git(&project_root, &["add", "README.md"], "add");
+        git(&project_root, &["commit", "-m", "initial"], "commit");
+        git(
+            &project_root,
+            &["checkout", "-b", "feature/work"],
+            "checkout feature",
+        );
+
+        // A bare remote that accepts the chain's push.
+        let mut bare = Command::new("git");
+        bare.arg("init").arg("--bare").arg(&remote);
+        run(&mut bare, "git init --bare");
+        git(
+            &project_root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+            "remote add origin",
+        );
+
+        // A working change for the chain to stage + commit.
+        std::fs::write(project_root.join("feature.txt"), "work\n").unwrap();
+
+        let store_path = dir.join("state.db");
+        let mut draft_provider = crate::drafts::DraftProviderConfig::from_env().unwrap();
+        if bad_draft_provider {
+            // A non-existent provider CLI makes generation fail deterministically.
+            draft_provider.kind = crate::drafts::DraftProviderKind::Claude;
+            draft_provider.claude = PathBuf::from("/nonexistent/hitch-claude-cli");
+        }
+        let config = super::DaemonConfig {
+            socket_path: dir.join("daemon.sock"),
+            store_path: store_path.clone(),
+            managed_root: dir.join("managed"),
+            hook_helper: dir.join("hook"),
+            git: PathBuf::from("git"),
+            gh: PathBuf::from("gh"),
+            draft_provider,
+        };
+        let store = hitch_store::Store::open(&store_path).unwrap();
+        let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
+
+        let project = Project::new("hitch", &project_root, ProjectKind::GitBacked);
+        let worktree = Worktree::new(project.id, &project_root, "feature/work", true, false);
+        let worktree_id = worktree.id;
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let sink = Arc::new(super::ClientSink {
+            writer: Mutex::new(super::DaemonStream::new(writer)),
+            live: AtomicBool::new(true),
+            jobs_live: AtomicBool::new(true),
+            agent_state_live: AtomicBool::new(true),
+            pending: Mutex::new(Vec::new()),
+            pending_job_events: Mutex::new(Vec::new()),
+            pending_agent_state_events: Mutex::new(Vec::new()),
+        });
+        {
+            let mut guard = state.lock().unwrap();
+            guard.store.insert_project(&project).unwrap();
+            guard.store.insert_worktree(&worktree).unwrap();
+            guard.projects.insert(project.id, project);
+            guard.worktrees.insert(worktree.id, worktree);
+            guard.clients.insert(1, sink);
+        }
+
+        (state, worktree_id, reader, dir)
+    }
+
+    /// Read control messages off `reader` until a `JobCompleted` arrives,
+    /// returning every event in order (including the completion).
+    #[cfg(unix)]
+    fn drain_until_completed(reader: std::os::unix::net::UnixStream) -> Vec<hitch_proto::Event> {
+        use hitch_proto::{ControlLineDecoder, ControlMessage, Event};
+        use std::io::Read as _;
+        use std::time::Duration;
+
+        let mut reader = reader;
+        reader
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut decoder = ControlLineDecoder::new();
+        let mut buf = [0u8; 8192];
+        let mut events: Vec<Event> = Vec::new();
+        loop {
+            let n = reader.read(&mut buf).expect("read job event stream");
+            assert!(n > 0, "client sink closed before JobCompleted");
+            for message in decoder.push(&buf[..n]).unwrap() {
+                if let ControlMessage::Event { event } = message {
+                    let done = matches!(event, Event::JobCompleted { .. });
+                    events.push(event);
+                    if done {
+                        return events;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_and_push_emits_step_sequence_and_completion() {
+        use hitch_proto::{CompositeStep, Event, JobRequest, Response, StepPhase};
+
+        let (state, worktree_id, reader, dir) = composite_state(false);
+
+        super::dispatch_job(
+            &state,
+            1,
+            7,
+            JobRequest::CommitAndPush {
+                worktree_id,
+                settings: None,
+            },
+        )
+        .unwrap();
+
+        let events = drain_until_completed(reader);
+
+        // The composite step progression, in order.
+        let steps: Vec<(CompositeStep, StepPhase)> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::CompositeJobProgress { step, phase, .. } => Some((*step, *phase)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                (CompositeStep::Staging, StepPhase::Started),
+                (CompositeStep::Staging, StepPhase::Finished),
+                (CompositeStep::Drafting, StepPhase::Started),
+                (CompositeStep::Drafting, StepPhase::Finished),
+                (CompositeStep::Committing, StepPhase::Started),
+                (CompositeStep::Committing, StepPhase::Finished),
+                (CompositeStep::Pushing, StepPhase::Started),
+                (CompositeStep::Pushing, StepPhase::Finished),
+            ],
+            "commit-and-push runs staging -> drafting -> committing -> pushing"
+        );
+
+        // Completion carries the toast payload.
+        let completed = events
+            .iter()
+            .find_map(|event| match event {
+                Event::JobCompleted { response, .. } => Some(response),
+                _ => None,
+            })
+            .expect("a JobCompleted event");
+        match completed.as_ref() {
+            Response::CommitAndPushed { result } => {
+                assert!(!result.subject.is_empty());
+                assert_eq!(result.short_sha.len(), 7);
+                assert_eq!(result.file_count, 1, "one staged file in the commit");
+                assert!(result.pushed_commits >= 1);
+            }
+            other => panic!("expected CommitAndPushed, got {other:?}"),
+        }
+
+        // The commit really landed.
+        let repo = super::GitRepository::discover(dir.join("repo")).unwrap();
+        assert_eq!(repo.log(1).unwrap().len(), 1);
+        assert!(repo
+            .log(1)
+            .unwrap()
+            .first()
+            .and_then(|c| c.summary.clone())
+            .is_some());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_and_push_draft_failure_aborts_before_commit() {
+        use hitch_proto::{CompositeJobKind, CompositeStep, Event, JobRequest, Response};
+
+        let (state, worktree_id, reader, dir) = composite_state(true);
+
+        // HEAD before the chain runs.
+        let repo = super::GitRepository::discover(dir.join("repo")).unwrap();
+        let head_before = repo.status().unwrap().head_commit_id;
+
+        super::dispatch_job(
+            &state,
+            1,
+            7,
+            JobRequest::CommitAndPush {
+                worktree_id,
+                settings: None,
+            },
+        )
+        .unwrap();
+
+        let events = drain_until_completed(reader);
+
+        // The chain never reached Committing.
+        let reached_commit = events.iter().any(|event| {
+            matches!(
+                event,
+                Event::CompositeJobProgress {
+                    step: CompositeStep::Committing,
+                    ..
+                }
+            )
+        });
+        assert!(
+            !reached_commit,
+            "a draft failure must abort before the committing step"
+        );
+
+        // The failure names the drafting step and produced no commit result.
+        let completed = events
+            .iter()
+            .find_map(|event| match event {
+                Event::JobCompleted { response, .. } => Some(response),
+                _ => None,
+            })
+            .expect("a JobCompleted event");
+        match completed.as_ref() {
+            Response::CompositeJobFailed {
+                kind,
+                failed_step,
+                result,
+                ..
+            } => {
+                assert_eq!(*kind, CompositeJobKind::CommitAndPush);
+                assert_eq!(*failed_step, CompositeStep::Drafting);
+                assert!(result.commit.is_none(), "no commit on a draft abort");
+            }
+            other => panic!("expected CompositeJobFailed, got {other:?}"),
+        }
+
+        // No new commit was created (a fallback message is never committed).
+        let head_after = repo.status().unwrap().head_commit_id;
+        assert_eq!(head_before, head_after, "HEAD must be unchanged");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_and_push_push_failure_reports_step_with_commit_result() {
+        use hitch_proto::{CompositeStep, Event, JobRequest, Response};
+        use std::process::Command;
+
+        let (state, worktree_id, reader, dir) = composite_state(false);
+
+        // Break the push target so the push step fails but the commit still lands.
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(dir.join("repo")).args([
+            "remote",
+            "set-url",
+            "origin",
+            "/nonexistent/remote.git",
+        ]);
+        assert!(cmd.status().unwrap().success());
+
+        super::dispatch_job(
+            &state,
+            1,
+            7,
+            JobRequest::CommitAndPush {
+                worktree_id,
+                settings: None,
+            },
+        )
+        .unwrap();
+
+        let events = drain_until_completed(reader);
+
+        // Committing finished before the push step failed.
+        let committing_finished = events.iter().any(|event| {
+            matches!(
+                event,
+                Event::CompositeJobProgress {
+                    step: CompositeStep::Committing,
+                    phase: hitch_proto::StepPhase::Finished,
+                    ..
+                }
+            )
+        });
+        assert!(committing_finished, "the commit step completed");
+
+        let completed = events
+            .iter()
+            .find_map(|event| match event {
+                Event::JobCompleted { response, .. } => Some(response),
+                _ => None,
+            })
+            .expect("a JobCompleted event");
+        match completed.as_ref() {
+            Response::CompositeJobFailed {
+                failed_step,
+                result,
+                ..
+            } => {
+                assert_eq!(*failed_step, CompositeStep::Pushing);
+                let commit = result
+                    .commit
+                    .as_ref()
+                    .expect("the landed commit's result survives a push failure");
+                assert!(!commit.subject.is_empty());
+                assert_eq!(commit.short_sha.len(), 7);
+            }
+            other => panic!("expected CompositeJobFailed, got {other:?}"),
+        }
+
+        // The commit stayed (a push failure does not roll it back).
+        let repo = super::GitRepository::discover(dir.join("repo")).unwrap();
+        assert_eq!(repo.log(2).unwrap().len(), 2, "the commit remains");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_pr_missing_base_fails_before_pushing() {
+        use hitch_proto::{CompositeJobKind, CompositeStep, Event, JobRequest, Response};
+        use std::process::Command;
+
+        let (state, worktree_id, reader, dir) = composite_state(false);
+
+        // Point origin at a dead URL: had the chain pushed before validating the
+        // base (the bug), the Pushing step would still emit a Started event — so
+        // the "no Pushing progress" assertion below catches a regression.
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(dir.join("repo")).args([
+            "remote",
+            "set-url",
+            "origin",
+            "/nonexistent/remote.git",
+        ]);
+        assert!(cmd.status().unwrap().success());
+
+        super::dispatch_job(
+            &state,
+            1,
+            7,
+            JobRequest::CreatePr {
+                worktree_id,
+                base: None,
+                settings: None,
+            },
+        )
+        .unwrap();
+
+        let events = drain_until_completed(reader);
+
+        // The chain must not push: no Pushing progress event was emitted.
+        let reached_push = events.iter().any(|event| {
+            matches!(
+                event,
+                Event::CompositeJobProgress {
+                    step: CompositeStep::Pushing,
+                    ..
+                }
+            )
+        });
+        assert!(
+            !reached_push,
+            "a missing base must fail before any push step runs"
+        );
+
+        // The failure names the drafting step with the base-branch message and
+        // carries no prior-step result.
+        let completed = events
+            .iter()
+            .find_map(|event| match event {
+                Event::JobCompleted { response, .. } => Some(response),
+                _ => None,
+            })
+            .expect("a JobCompleted event");
+        match completed.as_ref() {
+            Response::CompositeJobFailed {
+                kind,
+                failed_step,
+                reason,
+                result,
+            } => {
+                assert_eq!(*kind, CompositeJobKind::CreatePr);
+                assert_eq!(*failed_step, CompositeStep::Drafting);
+                assert!(
+                    reason.contains("base branch"),
+                    "reason carries the base-branch message, got {reason:?}"
+                );
+                assert!(result.commit.is_none(), "no prior-step result on this abort");
+            }
+            other => panic!("expected CompositeJobFailed, got {other:?}"),
+        }
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn composite_chain_cancel_stops_before_next_step() {
+        use hitch_proto::{CompositeJobKind, CompositeStep};
+
+        let (state, worktree_id, _reader, dir) = composite_state(false);
+
+        // Pre-cancel: a control whose flag is already set. The runner checks
+        // `is_cancelled()` between steps, so no step past the first should start.
+        let control = super::JobControl::default();
+        control.cancel();
+        let job_id = hitch_core::JobId::new();
+        {
+            let mut guard = state.lock().unwrap();
+            guard.jobs.insert(
+                job_id,
+                super::ActiveJob {
+                    control: std::sync::Arc::new(super::JobControl::default()),
+                    kind: Some("commit-and-push"),
+                    message: None,
+                    composite: Some(super::CompositeJobState {
+                        worktree_id,
+                        kind: CompositeJobKind::CommitAndPush,
+                        step: std::sync::Mutex::new(CompositeStep::Staging),
+                    }),
+                },
+            );
+        }
+
+        let ctx = super::CompositeContext {
+            job_id,
+            worktree_id,
+            kind: CompositeJobKind::CommitAndPush,
+            state: &state,
+            control: &control,
+        };
+
+        let result =
+            super::run_commit_and_push(&ctx, &state, worktree_id, None, &control).unwrap_err();
+        assert!(
+            result.message.contains("cancelled"),
+            "a cancelled chain stops before the next step: {}",
+            result.message
+        );
+
+        // It stopped after staging, before drafting/committing — no commit landed
+        // beyond the repo's initial commit.
+        let repo = super::GitRepository::discover(dir.join("repo")).unwrap();
+        assert_eq!(
+            repo.log(5).unwrap().len(),
+            1,
+            "cancellation before committing leaves no new commit"
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_jobs_query_returns_inflight_chains_by_worktree() {
+        use hitch_core::{JobId, WorktreeId};
+        use hitch_proto::{CompositeJobKind, CompositeStep};
+
+        let (state, worktree_id, _reader, dir) = composite_state(false);
+
+        // No composite Jobs registered yet: the query is empty.
+        let empty = super::active_jobs_for_worktree(&state, worktree_id).unwrap();
+        assert!(empty.is_empty(), "no in-flight chains yields an empty list");
+
+        // Register two composite Jobs: one for this worktree, one for another.
+        let other_worktree = WorktreeId::new();
+        let mine = JobId::new();
+        let theirs = JobId::new();
+        {
+            let mut guard = state.lock().unwrap();
+            guard.jobs.insert(
+                mine,
+                super::ActiveJob {
+                    control: std::sync::Arc::new(super::JobControl::default()),
+                    kind: Some("create-pr"),
+                    message: None,
+                    composite: Some(super::CompositeJobState {
+                        worktree_id,
+                        kind: CompositeJobKind::CreatePr,
+                        step: std::sync::Mutex::new(CompositeStep::Drafting),
+                    }),
+                },
+            );
+            guard.jobs.insert(
+                theirs,
+                super::ActiveJob {
+                    control: std::sync::Arc::new(super::JobControl::default()),
+                    kind: Some("commit-and-push"),
+                    message: None,
+                    composite: Some(super::CompositeJobState {
+                        worktree_id: other_worktree,
+                        kind: CompositeJobKind::CommitAndPush,
+                        step: std::sync::Mutex::new(CompositeStep::Pushing),
+                    }),
+                },
+            );
+            // A non-composite Job for our worktree must NOT appear.
+            guard.jobs.insert(
+                JobId::new(),
+                super::ActiveJob {
+                    control: std::sync::Arc::new(super::JobControl::default()),
+                    kind: Some("push"),
+                    message: Some("Pushing…".into()),
+                    composite: None,
+                },
+            );
+        }
+
+        let jobs = super::active_jobs_for_worktree(&state, worktree_id).unwrap();
+        assert_eq!(jobs.len(), 1, "only this worktree's composite chain");
+        assert_eq!(jobs[0].job_id, mine);
+        assert_eq!(jobs[0].kind, CompositeJobKind::CreatePr);
+        assert_eq!(jobs[0].step, CompositeStep::Drafting);
 
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);

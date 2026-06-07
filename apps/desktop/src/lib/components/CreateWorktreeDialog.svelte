@@ -293,7 +293,7 @@
 
 <style>
   .remote-badge {
-    color: var(--tx-lo);
+    color: var(--ink-2);
     margin-right: 5px;
     font-size: 10px;
   }
@@ -303,19 +303,19 @@
     display: flex;
     align-items: center;
     gap: 9px;
-    background: var(--bg-0);
+    background: var(--paper-3);
     border: 1px solid var(--line);
-    border-radius: var(--radius);
+    border-radius: 0;
     padding: 0 10px;
-    transition: border-color var(--t-fast);
+    transition: border-color 0.18s ease-out;
   }
   .wt-search:focus-within {
-    border-color: var(--ac);
+    border-color: var(--iris);
   }
   .wt-search svg {
     width: 14px;
     height: 14px;
-    color: var(--tx-lo);
+    color: var(--ink-2);
     flex: none;
   }
   .wt-search input {
@@ -324,22 +324,22 @@
     background: transparent;
     border: 0;
     outline: 0;
-    color: var(--tx-hi);
+    color: var(--ink-0);
     font: inherit;
     font-size: 12.5px;
     padding: 8px 0;
   }
   .wt-search input::placeholder {
-    color: var(--tx-lo);
+    color: var(--ink-2);
   }
 
   /* Results list — a permanent panel in the dialog body, not a popover. */
   .wt-list {
     max-height: 188px;
     overflow-y: auto;
-    background: var(--bg-0);
+    background: var(--paper-3);
     border: 1px solid var(--line);
-    border-radius: var(--radius);
+    border-radius: 0;
     padding: 4px;
     display: grid;
     gap: 1px;
@@ -353,27 +353,28 @@
     font: inherit;
     padding: 7px 8px;
     border: 0;
-    border-radius: 5px;
+    border-radius: 0;
     background: transparent;
-    color: var(--tx-md);
+    color: var(--ink-1);
     cursor: pointer;
     min-width: 0;
   }
   .wt-row.active {
-    background: var(--ac-wash);
-    color: var(--tx-hi);
+    background: var(--iris-wash);
+    color: var(--ink-0);
+    box-shadow: inset 0 0 0 1px var(--iris-line);
   }
   .wt-ico {
     width: 15px;
     height: 15px;
-    color: var(--tx-lo);
+    color: var(--ink-2);
     flex: none;
   }
   .wt-ico.create {
-    color: var(--ac-bright);
+    color: var(--iris-ink);
   }
   .wt-row.active .wt-ico {
-    color: var(--ac-bright);
+    color: var(--iris-ink);
   }
   .wt-lab {
     flex: 1;
@@ -390,13 +391,13 @@
   .wt-hint {
     flex: none;
     font-size: 10px;
-    color: var(--tx-lo);
+    color: var(--ink-2);
     white-space: nowrap;
   }
   .wt-empty {
     padding: 14px 10px;
     text-align: center;
     font-size: 11.5px;
-    color: var(--tx-lo);
+    color: var(--ink-2);
   }
 </style>

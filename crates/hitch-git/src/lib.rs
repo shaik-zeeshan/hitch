@@ -9,10 +9,13 @@
 //! A feature crate: depends only on `hitch-core`, never on another Hitch feature
 //! crate.
 
-use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
+use git2::{
+    BranchType, DiffFindOptions, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions,
+};
 use hitch_core::{ProjectId, Worktree};
 use hitch_process::{DrainOutcome, PipeReader, ProcessTree, ProcessTreeRegistration};
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
@@ -20,6 +23,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tempfile::NamedTempFile;
 
@@ -59,8 +63,13 @@ impl GitRepository {
     }
 
     /// Read a file-level patch for either the staged or unstaged/worktree side.
-    pub fn diff_file(&self, path: impl AsRef<Path>, target: DiffTarget) -> Result<String> {
-        diff_file(&self.root, path, target)
+    pub fn diff_file(
+        &self,
+        path: impl AsRef<Path>,
+        target: DiffTarget,
+        options: DiffFileOptions,
+    ) -> Result<String> {
+        diff_file(&self.root, path, target, options)
     }
 
     /// List local and remote branches.
@@ -71,6 +80,21 @@ impl GitRepository {
     /// Return recent commits from `HEAD`, newest first.
     pub fn log(&self, limit: usize) -> Result<Vec<CommitInfo>> {
         log(&self.root, limit)
+    }
+
+    /// Read a page of the enriched `HEAD` log for the History view, newest first.
+    pub fn log_enriched(
+        &self,
+        base: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<LogCommit>, bool)> {
+        log_enriched(&self.root, base, offset, limit)
+    }
+
+    /// Read one commit's full diff vs its first parent (empty tree for a root).
+    pub fn commit_diff(&self, commit_id: &str) -> Result<CommitDiff> {
+        commit_diff(&self.root, commit_id)
     }
 
     /// Return commits reachable from `HEAD` but not from `base`, newest first.
@@ -763,6 +787,12 @@ pub struct StatusEntry {
     pub old_path: Option<PathBuf>,
     pub index: FileState,
     pub working_tree: FileState,
+    /// Added/deleted line counts on the staged side (HEAD↔index) for this path.
+    pub staged_additions: usize,
+    pub staged_deletions: usize,
+    /// Added/deleted line counts on the worktree side (index↔worktree).
+    pub worktree_additions: usize,
+    pub worktree_deletions: usize,
 }
 
 /// Complete status snapshot for a repository.
@@ -772,6 +802,9 @@ pub struct StatusSummary {
     pub dirty: bool,
     pub additions: usize,
     pub deletions: usize,
+    /// Full SHA of the current `HEAD` commit, or `None` on an unborn HEAD. Lets
+    /// the History view ride the status backbone: a changed id refetches the log.
+    pub head_commit_id: Option<String>,
 }
 
 impl StatusSummary {
@@ -794,6 +827,16 @@ pub enum DiffTarget {
     Worktree,
 }
 
+/// View knobs for a file-level diff. The [`Default`] keeps libgit2's defaults
+/// (whitespace-sensitive, three context lines), matching the legacy behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiffFileOptions {
+    /// Collapse whitespace-only changes (`DiffOptions::ignore_whitespace`).
+    pub ignore_whitespace: bool,
+    /// Override the surrounding context size. `None` keeps git's default (3).
+    pub context_lines: Option<u32>,
+}
+
 /// Branch metadata for local and remote refs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchInfo {
@@ -811,6 +854,61 @@ pub struct CommitInfo {
     pub author_name: Option<String>,
     pub author_email: Option<String>,
     pub time_seconds: i64,
+}
+
+/// An enriched commit for the History log: [`CommitInfo`] plus the separate
+/// body, the merge flag, per-commit add/delete totals (vs the first parent, or
+/// the empty tree for a root commit), and whether it is ahead of the base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogCommit {
+    pub id: String,
+    pub summary: Option<String>,
+    /// Commit message body (everything after the summary), `None` when absent.
+    pub body: Option<String>,
+    pub author_name: Option<String>,
+    pub author_email: Option<String>,
+    pub time_seconds: i64,
+    /// Whether this commit has more than one parent.
+    pub is_merge: bool,
+    /// Whether this commit is reachable from `HEAD` but not from the base — the
+    /// branch-work marker. Always `false` when no base is resolvable.
+    pub ahead_of_base: bool,
+    /// Added/deleted line totals for this commit vs its first parent (vs the
+    /// empty tree for a root commit).
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+/// A single commit's full diff: metadata plus per-file patches vs the first
+/// parent (vs the empty tree for a root commit), for the Commit Tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDiff {
+    /// Reuses [`LogCommit`] as the metadata header; `ahead_of_base` is not
+    /// meaningful for a commit-diff snapshot and is always `false` here.
+    pub meta: LogCommit,
+    pub files: Vec<CommitFileDiff>,
+}
+
+/// One file's unified diff within a [`CommitDiff`], mirroring the shape of the
+/// working-tree per-file diff so the frontend can reuse its renderer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitFileDiff {
+    pub path: PathBuf,
+    pub status: DeltaStatus,
+    pub diff: String,
+}
+
+/// Coarse per-file change kind within a commit diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    Typechange,
+    Conflicted,
+    Unmodified,
 }
 
 /// `HEAD`-vs-`base` comparison computed in a single pass: commits, changed
@@ -996,41 +1094,143 @@ pub fn status(repo_path: impl AsRef<Path>) -> Result<StatusSummary> {
             old_path,
             index: index_state(status),
             working_tree: worktree_state(status),
+            staged_additions: 0,
+            staged_deletions: 0,
+            worktree_additions: 0,
+            worktree_deletions: 0,
         });
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
-    let (additions, deletions) = diff_line_stats(&repo)?;
+    let line_stats = diff_line_stats(&repo)?;
+    for entry in &mut entries {
+        if let Some((additions, deletions)) = line_stats.staged.get(entry.path.as_path()) {
+            entry.staged_additions = *additions;
+            entry.staged_deletions = *deletions;
+        }
+        if let Some((additions, deletions)) = line_stats.worktree.get(entry.path.as_path()) {
+            entry.worktree_additions = *additions;
+            entry.worktree_deletions = *deletions;
+        }
+    }
+    let additions = line_stats.additions;
+    let deletions = line_stats.deletions;
+    let head_commit_id = head_commit_oid(&repo).map(|oid| oid.to_string());
     Ok(StatusSummary {
         dirty: !entries.is_empty(),
         entries,
         additions,
         deletions,
+        head_commit_id,
     })
 }
 
-fn diff_line_stats(repo: &Repository) -> Result<(usize, usize)> {
-    let mut additions = 0;
-    let mut deletions = 0;
+/// Aggregate and per-path add/delete line counts from one status pass. The
+/// per-path maps are keyed by the new-side path (the path libgit2 status
+/// reports), so a rename's counts land on the entry the Changes panel shows.
+/// Staged and worktree sides are kept apart so a partially-staged file's row
+/// can show the counts for the side it represents.
+struct DiffLineStats {
+    additions: usize,
+    deletions: usize,
+    staged: HashMap<PathBuf, (usize, usize)>,
+    worktree: HashMap<PathBuf, (usize, usize)>,
+}
+
+fn diff_line_stats(repo: &Repository) -> Result<DiffLineStats> {
+    let mut stats = DiffLineStats {
+        additions: 0,
+        deletions: 0,
+        staged: HashMap::new(),
+        worktree: HashMap::new(),
+    };
 
     let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
     let index = repo.index()?;
-    let staged = repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), None)?;
-    let staged_stats = staged.stats()?;
-    additions += staged_stats.insertions();
-    deletions += staged_stats.deletions();
+    // line_stats only needs add/del counts; zero context so libgit2 skips
+    // generating context content on the 1s status poll.
+    let mut staged_options = DiffOptions::new();
+    staged_options.context_lines(0).interhunk_lines(0);
+    let mut staged =
+        repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), Some(&mut staged_options))?;
+    detect_diff_renames(&mut staged)?;
+    let mut staged_per_path = HashMap::new();
+    let (sa, sd) = accumulate_diff_line_stats(&staged, &mut staged_per_path)?;
+    stats.additions += sa;
+    stats.deletions += sd;
+    stats.staged = staged_per_path;
 
     let mut options = DiffOptions::new();
     options
         .include_untracked(true)
         .recurse_untracked_dirs(false)
-        .show_untracked_content(true);
+        .show_untracked_content(true)
+        // line_stats only needs add/del counts; zero context so libgit2 skips
+        // generating context content on the 1s status poll.
+        .context_lines(0)
+        .interhunk_lines(0);
     let index = repo.index()?;
-    let worktree = repo.diff_index_to_workdir(Some(&index), Some(&mut options))?;
-    let worktree_stats = worktree.stats()?;
-    additions += worktree_stats.insertions();
-    deletions += worktree_stats.deletions();
+    let mut worktree = repo.diff_index_to_workdir(Some(&index), Some(&mut options))?;
+    detect_diff_renames(&mut worktree)?;
+    let mut worktree_per_path = HashMap::new();
+    let (wa, wd) = accumulate_diff_line_stats(&worktree, &mut worktree_per_path)?;
+    stats.additions += wa;
+    stats.deletions += wd;
+    stats.worktree = worktree_per_path;
 
-    Ok((additions, deletions))
+    Ok(stats)
+}
+
+fn detect_diff_renames(diff: &mut git2::Diff<'_>) -> Result<()> {
+    let mut options = DiffFindOptions::new();
+    options.renames(true).for_untracked(true);
+    diff.find_similar(Some(&mut options))?;
+    Ok(())
+}
+
+/// Fold one libgit2 [`Diff`] into a per-path stats map and return its aggregate
+/// (additions, deletions). A single streaming `foreach` pass tallies +/− lines
+/// instead of building a [`git2::Patch`] per delta — that per-file `from_diff`
+/// allocate/free ran for every dirty file on both diff sides of the 1s status
+/// poll. Counts come from the line callback's `+`/`-` origins. Binary deltas
+/// emit no line callbacks, so they contribute nothing and get no entry — same
+/// observable 0/0 the old `Patch::line_stats` path produced (and matching the
+/// frontend `parseDiff`, which shows binary files with no +/− counts).
+fn accumulate_diff_line_stats(
+    diff: &git2::Diff<'_>,
+    per_path: &mut HashMap<PathBuf, (usize, usize)>,
+) -> Result<(usize, usize)> {
+    let mut total_additions = 0;
+    let mut total_deletions = 0;
+
+    // A no-op file callback is required by `foreach`; counts come from lines.
+    let mut file_cb = |_delta: git2::DiffDelta<'_>, _progress: f32| true;
+    let mut line_cb = |delta: git2::DiffDelta<'_>,
+                       _hunk: Option<git2::DiffHunk<'_>>,
+                       line: git2::DiffLine<'_>| {
+        let (additions, deletions) = match line.origin_value() {
+            git2::DiffLineType::Addition => (1, 0),
+            git2::DiffLineType::Deletion => (0, 1),
+            // Skip context, file/hunk headers and EOF-marker lines.
+            _ => return true,
+        };
+        total_additions += additions;
+        total_deletions += deletions;
+        // Renames key on the new path, falling back to the old path for
+        // deletions — preserving the old delta path resolution.
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path());
+        if let Some(path) = path {
+            let entry = per_path.entry(path.to_path_buf()).or_insert((0, 0));
+            entry.0 += additions;
+            entry.1 += deletions;
+        }
+        true
+    };
+
+    diff.foreach(&mut file_cb, None, None, Some(&mut line_cb))?;
+    Ok((total_additions, total_deletions))
 }
 
 /// Fast dirty check for badge/event refreshes that only need a boolean.
@@ -1044,11 +1244,13 @@ pub fn is_dirty(repo_path: impl AsRef<Path>) -> Result<bool> {
     Ok(!statuses.is_empty())
 }
 
-/// Read a file-level diff using libgit2.
+/// Read a file-level diff using libgit2. `view` carries the optional
+/// whitespace/context knobs; its [`Default`] reproduces the legacy behavior.
 pub fn diff_file(
     repo_path: impl AsRef<Path>,
     path: impl AsRef<Path>,
     target: DiffTarget,
+    view: DiffFileOptions,
 ) -> Result<String> {
     let repo = Repository::discover(repo_path.as_ref())?;
     let pathspec = diff_pathspec(&repo, path.as_ref());
@@ -1058,8 +1260,17 @@ pub fn diff_file(
         .include_untracked(true)
         .recurse_untracked_dirs(true)
         .show_untracked_content(true);
+    if view.ignore_whitespace {
+        options.ignore_whitespace(true);
+    }
+    if let Some(context_lines) = view.context_lines {
+        options.context_lines(context_lines);
+    }
+    if let Some(old_path) = diff_rename_old_path(&repo, pathspec.as_ref(), target)? {
+        options.pathspec(old_path);
+    }
 
-    let diff = match target {
+    let mut diff = match target {
         DiffTarget::Staged => {
             let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
             let index = repo.index()?;
@@ -1070,18 +1281,133 @@ pub fn diff_file(
             repo.diff_index_to_workdir(Some(&index), Some(&mut options))?
         }
     };
+    detect_diff_renames(&mut diff)?;
 
     diff_to_string(&diff)
 }
 
-fn diff_pathspec<'a>(repo: &Repository, path: &'a Path) -> Cow<'a, Path> {
-    if path.is_absolute() {
-        if let Some(workdir) = repo.workdir() {
-            if let Ok(relative) = path.strip_prefix(workdir) {
-                return Cow::Owned(relative.to_path_buf());
+fn diff_rename_old_path(
+    repo: &Repository,
+    path: &Path,
+    target: DiffTarget,
+) -> Result<Option<PathBuf>> {
+    // libgit2 only pairs a rename when both the new file's add and the old
+    // file's delete survive the status walk, so a pathspec scoped to just the
+    // new path hides the delete and the rename is never detected. Most renames
+    // keep the file in the same directory, so scope the (otherwise full-repo)
+    // walk to the new path plus its parent directory — the old side rides along
+    // and the walk stays bounded. Cross-directory renames fall through to an
+    // unbounded walk below, preserving the previous behaviour exactly.
+    match diff_rename_old_path_scoped(repo, path, target, true)? {
+        RenameLookup::Found(old) => Ok(old),
+        // The file shows up modified/typechanged (its old and new side share a
+        // path), so it cannot be the new side of a rename — no fallback needed.
+        RenameLookup::PresentNonRename => Ok(None),
+        // The scoped walk either didn't see the file, or saw it as a bare add
+        // whose matching delete may live outside the parent directory (a
+        // cross-directory rename). Redo the walk over the whole repo, exactly
+        // as before this optimisation, to settle it.
+        RenameLookup::AddedOrAbsent => {
+            match diff_rename_old_path_scoped(repo, path, target, false)? {
+                RenameLookup::Found(old) => Ok(old),
+                _ => Ok(None),
             }
         }
     }
+}
+
+/// Outcome of a single (possibly path-scoped) status walk while resolving a
+/// file's rename source.
+enum RenameLookup {
+    /// The file is the new side of a detected rename; carries the old path.
+    Found(Option<PathBuf>),
+    /// The file appeared with a single (modified/typechange/delete) status
+    /// whose old and new paths match — it cannot be a rename target, so a
+    /// scoped walk that finds this needs no full-repo fallback.
+    PresentNonRename,
+    /// The file is absent from this walk, or present only as a bare add whose
+    /// rename partner (the old path's delete) might lie outside the scope.
+    AddedOrAbsent,
+}
+
+fn diff_rename_old_path_scoped(
+    repo: &Repository,
+    path: &Path,
+    target: DiffTarget,
+    scope_to_parent: bool,
+) -> Result<RenameLookup> {
+    let mut options = StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .renames_head_to_index(true)
+        .renames_index_to_workdir(true);
+    if scope_to_parent {
+        options.pathspec(path.to_string_lossy().into_owned());
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                options.pathspec(format!("{}/*", parent.to_string_lossy()));
+            }
+            // File at the repo root: a bare `*` keeps the walk to root-level
+            // entries without recursing into subdirectories.
+            _ => {
+                options.pathspec("*");
+            }
+        }
+    }
+    let statuses = repo.statuses(Some(&mut options))?;
+    let mut result = RenameLookup::AddedOrAbsent;
+    for entry in statuses.iter() {
+        let status = entry.status();
+        let Some((new_path, old_path)) = status_paths(entry) else {
+            continue;
+        };
+        if new_path != path {
+            continue;
+        }
+        let renamed = match target {
+            DiffTarget::Staged => status.contains(Status::INDEX_RENAMED),
+            DiffTarget::Worktree => status.contains(Status::WT_RENAMED),
+        };
+        if renamed {
+            return Ok(RenameLookup::Found(old_path));
+        }
+        // Present, not a rename. A bare add (new file, no old side) could still
+        // be the surviving half of a cross-dir rename whose delete the scope
+        // dropped, so only treat clearly non-add states as terminal.
+        let added = match target {
+            DiffTarget::Staged => status.contains(Status::INDEX_NEW),
+            DiffTarget::Worktree => status.contains(Status::WT_NEW),
+        };
+        if !added {
+            result = RenameLookup::PresentNonRename;
+        }
+    }
+    Ok(result)
+}
+
+fn diff_pathspec<'a>(repo: &Repository, path: &'a Path) -> Cow<'a, Path> {
+    if !path.is_absolute() {
+        return Cow::Borrowed(path);
+    }
+
+    let Some(workdir) = repo.workdir() else {
+        return Cow::Borrowed(path);
+    };
+    if let Ok(relative) = path.strip_prefix(workdir) {
+        return Cow::Owned(relative.to_path_buf());
+    }
+
+    // On macOS, temp dirs often cross the /var → /private/var symlink boundary:
+    // callers hand us /var/..., while libgit2 reports the workdir as /private/var/....
+    // Fall back to physical paths for existing files so absolute pathspecs still
+    // become repository-relative.
+    if let (Ok(real_path), Ok(real_workdir)) = (fs::canonicalize(path), fs::canonicalize(workdir)) {
+        if let Ok(relative) = real_path.strip_prefix(real_workdir) {
+            return Cow::Owned(relative.to_path_buf());
+        }
+    }
+
     Cow::Borrowed(path)
 }
 
@@ -1133,6 +1459,116 @@ pub fn log(repo_path: impl AsRef<Path>, limit: usize) -> Result<Vec<CommitInfo>>
     revwalk.push_head()?;
 
     commits_from_revwalk(&repo, revwalk, limit)
+}
+
+/// Read a page of the `HEAD` log, enriched for the History view, newest first.
+///
+/// `offset` skips that many commits before collecting `limit`; `has_more` is
+/// `true` when the walk still had commits past the page (so the frontend can
+/// lazily load more). Each commit carries its body, merge flag, per-commit
+/// add/delete totals (vs its first parent, or the empty tree for a root
+/// commit), and `ahead_of_base`. When `base` is `Some` and resolvable, the set
+/// of commits reachable from `HEAD` but not the base is precomputed once and
+/// each returned commit is marked; an unresolvable or absent base degrades to
+/// no markers (e.g. the main worktree), matching how `commits_since` tolerates
+/// a missing HEAD.
+pub fn log_enriched(
+    repo_path: impl AsRef<Path>,
+    base: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<LogCommit>, bool)> {
+    let repo = Repository::discover(repo_path.as_ref())?;
+    let Some(head) = head_commit_oid(&repo) else {
+        // An unborn HEAD has no commits to log.
+        return Ok((Vec::new(), false));
+    };
+
+    // Precompute the ahead-of-base set in one walk; absent/unresolvable base
+    // means no markers.
+    let ahead = ahead_of_base_set(&repo, head, base);
+
+    let mut revwalk = repo.revwalk()?;
+    revwalk.push(head)?;
+
+    // Skip the offset, take one extra to detect whether more remain past the
+    // page, then enrich exactly the page.
+    //
+    // `limit` is client-controlled, so clamp the pre-allocation: a huge value
+    // (e.g. `u32::MAX`) must not drive an unbounded up-front allocation. The Vec
+    // still grows normally past the cap if the limit is genuinely larger.
+    const PREALLOC_CAP: usize = 1024;
+    let mut commits = Vec::with_capacity(limit.min(PREALLOC_CAP));
+    let mut has_more = false;
+    for oid in revwalk.skip(offset) {
+        let oid = oid?;
+        if commits.len() == limit {
+            has_more = true;
+            break;
+        }
+        let commit = repo.find_commit(oid)?;
+        let author = commit.author();
+        let (additions, deletions) = commit_line_totals(&repo, &commit)?;
+        commits.push(LogCommit {
+            id: commit.id().to_string(),
+            summary: commit.summary().map(str::to_owned),
+            body: commit.body().map(str::to_owned),
+            author_name: author.name().map(str::to_owned),
+            author_email: author.email().map(str::to_owned),
+            time_seconds: commit.time().seconds(),
+            is_merge: commit.parent_count() > 1,
+            ahead_of_base: ahead.as_ref().is_some_and(|set| set.contains(&oid)),
+            additions,
+            deletions,
+        });
+    }
+    Ok((commits, has_more))
+}
+
+/// Read one commit's full diff vs its first parent (vs the empty tree for a
+/// root commit), with per-file patches, for the Commit Tab. Merge commits diff
+/// against their first parent only.
+pub fn commit_diff(repo_path: impl AsRef<Path>, commit_id: &str) -> Result<CommitDiff> {
+    let repo = Repository::discover(repo_path.as_ref())?;
+    let oid = Oid::from_str(commit_id)?;
+    let commit = repo.find_commit(oid)?;
+    let author = commit.author();
+
+    let new_tree = commit.tree()?;
+    // First parent only; a root commit has no parent and diffs vs the empty
+    // tree (passing `None` as the old tree to libgit2).
+    let parent_tree = match commit.parent(0) {
+        Ok(parent) => Some(parent.tree()?),
+        Err(_) => None,
+    };
+    let mut diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), None)?;
+    // Without `find_similar` a rename reads as a full delete + full add, so a
+    // tiny edit on a renamed file inflates both the per-file and total counts to
+    // the whole file. `for_untracked(true)` is a no-op for tree-to-tree diffs
+    // (no untracked side exists) but keeps one rename-detection helper for every
+    // diff path.
+    detect_diff_renames(&mut diff)?;
+
+    let (additions, deletions) = diff_totals(&diff)?;
+    let files = commit_file_diffs(&diff)?;
+
+    Ok(CommitDiff {
+        meta: LogCommit {
+            id: commit.id().to_string(),
+            summary: commit.summary().map(str::to_owned),
+            body: commit.body().map(str::to_owned),
+            author_name: author.name().map(str::to_owned),
+            author_email: author.email().map(str::to_owned),
+            time_seconds: commit.time().seconds(),
+            is_merge: commit.parent_count() > 1,
+            // Not meaningful for a commit-diff snapshot; the proto CommitMeta
+            // never carries it.
+            ahead_of_base: false,
+            additions,
+            deletions,
+        },
+        files,
+    })
 }
 
 /// Return commits reachable from `HEAD` but not from `base`, newest first.
@@ -1460,6 +1896,139 @@ fn diff_since_base<'repo>(repo: &'repo Repository, base: &str) -> Result<git2::D
 /// Resolve the OID of the current `HEAD` commit, or `None` on an unborn HEAD.
 fn head_commit_oid(repo: &Repository) -> Option<Oid> {
     repo.head().ok().and_then(|head| head.target())
+}
+
+/// The set of commit OIDs reachable from `head` but not from `base`, computed in
+/// one revwalk. `None` when `base` is absent or cannot be resolved — the caller
+/// then renders no branch-work markers (e.g. the main worktree).
+fn ahead_of_base_set(repo: &Repository, head: Oid, base: Option<&str>) -> Option<HashSet<Oid>> {
+    let base = base?;
+    let base_oid = resolve_base_oid(repo, base).ok()?;
+    let merge_base = repo.merge_base(head, base_oid).unwrap_or(base_oid);
+    let mut revwalk = repo.revwalk().ok()?;
+    revwalk.push(head).ok()?;
+    revwalk.hide(merge_base).ok()?;
+    Some(revwalk.filter_map(|oid| oid.ok()).collect())
+}
+
+/// Process-wide cache of per-commit add/delete totals, keyed by commit [`Oid`].
+///
+/// A commit's diff vs its first parent is immutable for a given sha, so an entry
+/// never goes stale and the cache needs no invalidation. Oids are globally
+/// unique, so a single process-wide map is safe across repos. The History rail
+/// pages the log repeatedly (page size 20) and re-walks overlapping commits, so
+/// caching turns repeated `diff_tree_to_tree` work into a hash lookup. Bounded
+/// to keep memory flat under long scrolling: when full it is cleared wholesale
+/// (cheap, and the hot recent pages refill immediately) rather than pulling in
+/// an LRU dependency the workspace does not already have.
+const LINE_TOTALS_CACHE_CAP: usize = 4096;
+
+fn line_totals_cache() -> &'static Mutex<HashMap<Oid, (usize, usize)>> {
+    static CACHE: OnceLock<Mutex<HashMap<Oid, (usize, usize)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_line_totals(oid: Oid) -> Option<(usize, usize)> {
+    line_totals_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&oid).copied())
+}
+
+fn store_line_totals(oid: Oid, totals: (usize, usize)) {
+    if let Ok(mut cache) = line_totals_cache().lock() {
+        // Wholesale clear when full keeps memory bounded without an LRU dep; the
+        // few hot pages the user is scrolling refill on their next fetch.
+        if cache.len() >= LINE_TOTALS_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(oid, totals);
+    }
+}
+
+/// Add/delete line totals for a commit vs its first parent (vs the empty tree
+/// for a root commit). Mirrors `commit_diff`'s first-parent rule so log totals
+/// and the Commit Tab header agree. Results are memoised by commit sha; see
+/// [`line_totals_cache`].
+fn commit_line_totals(repo: &Repository, commit: &git2::Commit<'_>) -> Result<(usize, usize)> {
+    let oid = commit.id();
+    if let Some(totals) = cached_line_totals(oid) {
+        return Ok(totals);
+    }
+
+    let new_tree = commit.tree()?;
+    let parent_tree = match commit.parent(0) {
+        Ok(parent) => Some(parent.tree()?),
+        Err(_) => None,
+    };
+    // The log only needs add/delete sums, not per-file patches or context, so
+    // skip context lines and ask libgit2 for the aggregate via `Diff::stats()`
+    // (a single pass) instead of building a `Patch` per delta as `diff_totals`
+    // does for the Commit Tab.
+    let mut opts = DiffOptions::new();
+    opts.context_lines(0).interhunk_lines(0);
+    let mut diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), Some(&mut opts))?;
+    // Detect renames so a renamed-with-small-edit file contributes only its real
+    // edit to the log totals instead of a full delete + full add (see
+    // `commit_diff`); `find_similar` must run before `stats()`.
+    detect_diff_renames(&mut diff)?;
+    let stats = diff.stats()?;
+    let totals = (stats.insertions(), stats.deletions());
+
+    store_line_totals(oid, totals);
+    Ok(totals)
+}
+
+/// Sum a diff's added/deleted lines. Delegates to `accumulate_diff_line_stats`
+/// so the binary-delta/`line_stats` handling lives in exactly one place; the
+/// per-path map is discarded here since this cold path only needs the aggregate.
+fn diff_totals(diff: &git2::Diff<'_>) -> Result<(usize, usize)> {
+    let mut sink = HashMap::new();
+    accumulate_diff_line_stats(diff, &mut sink)
+}
+
+/// Split a tree-to-tree diff into per-file patches, mirroring the working-tree
+/// per-file diff shape (path, status, patch text) so the frontend can reuse its
+/// renderer. Each delta's patch text carries its own file/hunk headers.
+fn commit_file_diffs(diff: &git2::Diff<'_>) -> Result<Vec<CommitFileDiff>> {
+    let mut files = Vec::with_capacity(diff.deltas().len());
+    for (idx, delta) in diff.deltas().enumerate() {
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let diff_text = match git2::Patch::from_diff(diff, idx)? {
+            Some(mut patch) => {
+                let buf = patch.to_buf()?;
+                String::from_utf8_lossy(&buf).into_owned()
+            }
+            // Binary deltas have no textual patch; surface the path/status with
+            // an empty body, matching the working-tree diff's binary handling.
+            None => String::new(),
+        };
+        files.push(CommitFileDiff {
+            path,
+            status: delta_status(delta.status()),
+            diff: diff_text,
+        });
+    }
+    Ok(files)
+}
+
+/// Map a libgit2 [`git2::Delta`] to our coarse [`DeltaStatus`].
+fn delta_status(delta: git2::Delta) -> DeltaStatus {
+    match delta {
+        git2::Delta::Added => DeltaStatus::Added,
+        git2::Delta::Deleted => DeltaStatus::Deleted,
+        git2::Delta::Modified => DeltaStatus::Modified,
+        git2::Delta::Renamed => DeltaStatus::Renamed,
+        git2::Delta::Copied => DeltaStatus::Copied,
+        git2::Delta::Typechange => DeltaStatus::Typechange,
+        git2::Delta::Conflicted => DeltaStatus::Conflicted,
+        _ => DeltaStatus::Unmodified,
+    }
 }
 
 /// Collect the changed file paths from a diff, sorted and deduped.
@@ -2181,7 +2750,13 @@ mod tests {
         assert_eq!(summary.additions, 2);
         assert_eq!(summary.deletions, 1);
 
-        let diff = diff_file(fixture.path(), "tracked.txt", DiffTarget::Worktree).unwrap();
+        let diff = diff_file(
+            fixture.path(),
+            "tracked.txt",
+            DiffTarget::Worktree,
+            DiffFileOptions::default(),
+        )
+        .unwrap();
         assert!(diff.contains("changed"), "diff was {diff:?}");
 
         GitClient::default()
@@ -2196,8 +2771,261 @@ mod tests {
             summary.entry_for("tracked.txt").unwrap().working_tree,
             FileState::Unmodified
         );
-        let staged = diff_file(fixture.path(), "tracked.txt", DiffTarget::Staged).unwrap();
+        let staged = diff_file(
+            fixture.path(),
+            "tracked.txt",
+            DiffTarget::Staged,
+            DiffFileOptions::default(),
+        )
+        .unwrap();
         assert!(staged.contains("changed"), "staged diff was {staged:?}");
+    }
+
+    #[test]
+    fn diff_file_ignore_whitespace_drops_whitespace_only_changes() {
+        let fixture = RepoFixture::new();
+        // Commit a known baseline, then re-indent the same line — a pure
+        // whitespace change.
+        fixture.write("tracked.txt", "value\n");
+        fixture.git(["add", "tracked.txt"]);
+        fixture.git(["commit", "-m", "set tracked value"]);
+        fixture.write("tracked.txt", "    value\n");
+
+        let default = diff_file(
+            fixture.path(),
+            "tracked.txt",
+            DiffTarget::Worktree,
+            DiffFileOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            default.contains("+    value"),
+            "whitespace-sensitive diff was {default:?}"
+        );
+
+        let ignored = diff_file(
+            fixture.path(),
+            "tracked.txt",
+            DiffTarget::Worktree,
+            DiffFileOptions {
+                ignore_whitespace: true,
+                ..DiffFileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            ignored.is_empty(),
+            "ignore_whitespace diff should be empty, was {ignored:?}"
+        );
+    }
+
+    #[test]
+    fn diff_file_context_lines_controls_hunk_context_size() {
+        let fixture = RepoFixture::new();
+        // Ten committed lines; flip the middle one so the hunk has equal context
+        // available on both sides.
+        let base: String = (1..=10).map(|n| format!("line{n}\n")).collect();
+        fixture.write("tracked.txt", &base);
+        fixture.git(["add", "tracked.txt"]);
+        fixture.git(["commit", "-m", "ten lines"]);
+        let changed = base.replace("line5\n", "line5-changed\n");
+        fixture.write("tracked.txt", &changed);
+
+        let count_context = |context: u32| -> usize {
+            let diff = diff_file(
+                fixture.path(),
+                "tracked.txt",
+                DiffTarget::Worktree,
+                DiffFileOptions {
+                    context_lines: Some(context),
+                    ..DiffFileOptions::default()
+                },
+            )
+            .unwrap();
+            // Context lines render with a leading space (not +/-/@/diff headers).
+            diff.lines().filter(|line| line.starts_with(' ')).count()
+        };
+
+        // Zero context shows only the changed line; ten shows every other line.
+        assert_eq!(count_context(0), 0);
+        assert_eq!(count_context(10), 9);
+    }
+
+    #[test]
+    fn status_reports_per_file_line_counts_on_the_relevant_side() {
+        let fixture = RepoFixture::new();
+        // tracked.txt: "initial\n" -> "changed\n" is 1 add + 1 del on the
+        // worktree side. new.txt is a fresh file: 1 add, 0 del.
+        fixture.write("tracked.txt", "changed\n");
+        fixture.write("new.txt", "hello\n");
+
+        let summary = status(fixture.path()).unwrap();
+        let tracked = summary.entry_for("tracked.txt").unwrap();
+        assert_eq!(
+            (tracked.worktree_additions, tracked.worktree_deletions),
+            (1, 1)
+        );
+        assert_eq!((tracked.staged_additions, tracked.staged_deletions), (0, 0));
+        let new = summary.entry_for("new.txt").unwrap();
+        assert_eq!((new.worktree_additions, new.worktree_deletions), (1, 0));
+
+        // Staging tracked.txt moves its counts to the staged (HEAD↔index) side.
+        GitClient::default()
+            .stage_files(fixture.path(), &[PathBuf::from("tracked.txt")])
+            .unwrap();
+        let summary = status(fixture.path()).unwrap();
+        let tracked = summary.entry_for("tracked.txt").unwrap();
+        assert_eq!((tracked.staged_additions, tracked.staged_deletions), (1, 1));
+        assert_eq!(
+            (tracked.worktree_additions, tracked.worktree_deletions),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn status_reports_zero_line_counts_for_binary_files() {
+        let fixture = RepoFixture::new();
+        // A NUL byte makes libgit2 treat the blob as binary; binary deltas
+        // emit no +/− line callbacks, so the counts stay 0/0.
+        fs::write(fixture.path().join("blob.bin"), [0u8, 1, 2, 3, 0, 255]).unwrap();
+
+        let summary = status(fixture.path()).unwrap();
+        let blob = summary.entry_for("blob.bin").unwrap();
+        assert_eq!((blob.worktree_additions, blob.worktree_deletions), (0, 0));
+        assert_eq!((blob.staged_additions, blob.staged_deletions), (0, 0));
+        assert_eq!((summary.additions, summary.deletions), (0, 0));
+    }
+
+    #[test]
+    fn status_attaches_staged_renamed_and_edited_line_counts_to_new_path() {
+        let fixture = RepoFixture::new();
+        fixture.write("tracked.txt", "one\ntwo\nthree\nfour\n");
+        fixture.git(["add", "tracked.txt"]);
+        fixture.git(["commit", "-m", "expand tracked"]);
+
+        fs::rename(
+            fixture.path().join("tracked.txt"),
+            fixture.path().join("moved.txt"),
+        )
+        .unwrap();
+        fixture.write("moved.txt", "one\nTWO\nthree\nfour\n");
+        fixture.git(["add", "-A"]);
+
+        let summary = status(fixture.path()).unwrap();
+        assert_eq!(summary.entries.len(), 1, "entries were {summary:?}");
+        assert!(summary.entry_for("tracked.txt").is_none());
+        let moved = summary.entry_for("moved.txt").unwrap();
+        assert_eq!(moved.old_path.as_deref(), Some(Path::new("tracked.txt")));
+        assert_eq!(moved.index, FileState::Renamed);
+        assert_eq!((moved.staged_additions, moved.staged_deletions), (1, 1));
+        assert_eq!((moved.worktree_additions, moved.worktree_deletions), (0, 0));
+        assert_eq!((summary.additions, summary.deletions), (1, 1));
+
+        let diff = diff_file(
+            fixture.path(),
+            "moved.txt",
+            DiffTarget::Staged,
+            DiffFileOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            diff.contains("rename from tracked.txt"),
+            "diff was {diff:?}"
+        );
+        assert!(diff.contains("rename to moved.txt"), "diff was {diff:?}");
+        assert!(diff.contains("-two"), "diff was {diff:?}");
+        assert!(diff.contains("+TWO"), "diff was {diff:?}");
+        assert!(!diff.contains("+one\n"), "diff was {diff:?}");
+    }
+
+    #[test]
+    fn status_attaches_worktree_renamed_and_edited_line_counts_to_new_path() {
+        let fixture = RepoFixture::new();
+        fixture.write("tracked.txt", "one\ntwo\nthree\nfour\n");
+        fixture.git(["add", "tracked.txt"]);
+        fixture.git(["commit", "-m", "expand tracked"]);
+
+        fs::rename(
+            fixture.path().join("tracked.txt"),
+            fixture.path().join("moved.txt"),
+        )
+        .unwrap();
+        fixture.write("moved.txt", "one\nTWO\nthree\nfour\n");
+
+        let summary = status(fixture.path()).unwrap();
+        assert_eq!(summary.entries.len(), 1, "entries were {summary:?}");
+        assert!(summary.entry_for("tracked.txt").is_none());
+        let moved = summary.entry_for("moved.txt").unwrap();
+        assert_eq!(moved.old_path.as_deref(), Some(Path::new("tracked.txt")));
+        assert_eq!(moved.working_tree, FileState::Renamed);
+        assert_eq!((moved.worktree_additions, moved.worktree_deletions), (1, 1));
+        assert_eq!((moved.staged_additions, moved.staged_deletions), (0, 0));
+        assert_eq!((summary.additions, summary.deletions), (1, 1));
+
+        let diff = diff_file(
+            fixture.path(),
+            "moved.txt",
+            DiffTarget::Worktree,
+            DiffFileOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            diff.contains("rename from tracked.txt"),
+            "diff was {diff:?}"
+        );
+        assert!(diff.contains("rename to moved.txt"), "diff was {diff:?}");
+        assert!(diff.contains("-two"), "diff was {diff:?}");
+        assert!(diff.contains("+TWO"), "diff was {diff:?}");
+        assert!(!diff.contains("+one\n"), "diff was {diff:?}");
+    }
+
+    // A rename across directories puts the old (deleted) side outside the new
+    // path's parent directory, so the scoped status walk can't see the pairing.
+    // diff_file must fall back to the full-repo walk and still report the rename
+    // and its old path, for both the staged and worktree views. `dst/` already
+    // holds a committed file so the new side never lands in a fresh untracked
+    // directory (which `recurse_untracked_dirs(false)` would collapse out of
+    // view — a limitation that predates this change and is orthogonal to it).
+    #[test]
+    fn diff_file_reports_cross_directory_rename() {
+        for target in [DiffTarget::Staged, DiffTarget::Worktree] {
+            let fixture = RepoFixture::new();
+            fs::create_dir_all(fixture.path().join("src")).unwrap();
+            fs::create_dir_all(fixture.path().join("dst")).unwrap();
+            fixture.write("src/tracked.txt", "one\ntwo\nthree\nfour\n");
+            fixture.write("dst/keep.txt", "keep\n");
+            fixture.git(["add", "-A"]);
+            fixture.git(["commit", "-m", "seed"]);
+
+            fs::rename(
+                fixture.path().join("src/tracked.txt"),
+                fixture.path().join("dst/moved.txt"),
+            )
+            .unwrap();
+            fixture.write("dst/moved.txt", "one\nTWO\nthree\nfour\n");
+            if matches!(target, DiffTarget::Staged) {
+                fixture.git(["add", "-A"]);
+            }
+
+            let diff = diff_file(
+                fixture.path(),
+                "dst/moved.txt",
+                target,
+                DiffFileOptions::default(),
+            )
+            .unwrap();
+            assert!(
+                diff.contains("rename from src/tracked.txt"),
+                "{target:?} diff was {diff:?}"
+            );
+            assert!(
+                diff.contains("rename to dst/moved.txt"),
+                "{target:?} diff was {diff:?}"
+            );
+            assert!(diff.contains("-two"), "{target:?} diff was {diff:?}");
+            assert!(diff.contains("+TWO"), "{target:?} diff was {diff:?}");
+            assert!(!diff.contains("+one\n"), "{target:?} diff was {diff:?}");
+        }
     }
 
     #[test]
@@ -2218,7 +3046,13 @@ mod tests {
         let entry = summary.entry_for(&file).unwrap();
         assert_eq!(entry.working_tree, FileState::Modified);
 
-        let relative = diff_file(fixture.path(), &file, DiffTarget::Worktree).unwrap();
+        let relative = diff_file(
+            fixture.path(),
+            &file,
+            DiffTarget::Worktree,
+            DiffFileOptions::default(),
+        )
+        .unwrap();
         assert!(
             relative.contains("changed"),
             "relative diff was {relative:?}"
@@ -2228,6 +3062,7 @@ mod tests {
             fixture.path(),
             fixture.path().join(&file),
             DiffTarget::Worktree,
+            DiffFileOptions::default(),
         )
         .unwrap();
         assert!(
@@ -2253,6 +3088,7 @@ mod tests {
             fixture.path(),
             fixture.path().join(&file),
             DiffTarget::Staged,
+            DiffFileOptions::default(),
         )
         .unwrap();
         assert!(diff.contains("staged"), "staged diff was {diff:?}");
@@ -2268,7 +3104,7 @@ mod tests {
     }
 
     #[test]
-    fn status_collapses_untracked_directories_for_fast_app_reads() {
+    fn status_collapses_untracked_directories_without_recursing_for_stats() {
         let fixture = RepoFixture::new();
         fs::create_dir(fixture.path().join("generated")).unwrap();
         fs::write(fixture.path().join("generated/one.txt"), "one\n").unwrap();
@@ -2282,7 +3118,11 @@ mod tests {
             path == "generated" || path == "generated/",
             "path was {path:?}"
         );
-        assert_eq!(summary.entries[0].working_tree, FileState::New);
+        let entry = &summary.entries[0];
+        assert_eq!(entry.working_tree, FileState::New);
+        assert_eq!((entry.worktree_additions, entry.worktree_deletions), (0, 0));
+        assert_eq!((entry.staged_additions, entry.staged_deletions), (0, 0));
+        assert_eq!((summary.additions, summary.deletions), (0, 0));
     }
 
     #[test]
@@ -2551,6 +3391,261 @@ mod tests {
     }
 
     #[test]
+    fn log_enriched_paginates_and_flags_has_more_at_the_boundary() {
+        // RepoFixture seeds one commit; add two more for three total.
+        let fixture = RepoFixture::new();
+        fixture.write("a.txt", "a\n");
+        fixture.git(["add", "a.txt"]);
+        fixture.git(["commit", "-m", "second"]);
+        fixture.write("b.txt", "b\n");
+        fixture.git(["add", "b.txt"]);
+        fixture.git(["commit", "-m", "third"]);
+
+        // First page of two: more remains.
+        let (page, has_more) = log_enriched(fixture.path(), None, 0, 2).unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|c| c.summary.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["third", "second"],
+        );
+        assert!(has_more);
+
+        // Offset past the first page returns the tail with no more.
+        let (page, has_more) = log_enriched(fixture.path(), None, 2, 2).unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|c| c.summary.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["initial commit"],
+        );
+        assert!(!has_more);
+
+        // A page exactly covering the remaining commits reports no more.
+        let (page, has_more) = log_enriched(fixture.path(), None, 0, 3).unwrap();
+        assert_eq!(page.len(), 3);
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn log_enriched_marks_commits_ahead_of_base() {
+        let fixture = RepoFixture::new();
+        fixture.git(["checkout", "-b", "feature/ahead"]);
+        fixture.write("feature.txt", "feature\n");
+        fixture.git(["add", "feature.txt"]);
+        fixture.git(["commit", "-m", "branch work"]);
+
+        // With a resolvable base, only the branch commit is ahead; the inherited
+        // base commit is not.
+        let (page, _) = log_enriched(fixture.path(), Some("main"), 0, 10).unwrap();
+        let branch = page
+            .iter()
+            .find(|c| c.summary.as_deref() == Some("branch work"));
+        let base = page
+            .iter()
+            .find(|c| c.summary.as_deref() == Some("initial commit"));
+        assert!(branch.unwrap().ahead_of_base);
+        assert!(!base.unwrap().ahead_of_base);
+
+        // No base (the main-worktree fallback): no markers at all.
+        let (page, _) = log_enriched(fixture.path(), None, 0, 10).unwrap();
+        assert!(page.iter().all(|c| !c.ahead_of_base));
+
+        // An unresolvable base also degrades to no markers rather than erroring.
+        let (page, _) = log_enriched(fixture.path(), Some("does-not-exist"), 0, 10).unwrap();
+        assert!(page.iter().all(|c| !c.ahead_of_base));
+    }
+
+    #[test]
+    fn log_enriched_reports_merge_flag_body_and_line_totals() {
+        let fixture = RepoFixture::new();
+        // A commit with a body and a known +/− shape vs its parent.
+        fixture.write("tracked.txt", "initial\nadded line\n");
+        fixture.git(["add", "tracked.txt"]);
+        fixture.git(["commit", "-m", "edit subject", "-m", "body paragraph"]);
+
+        // A real merge commit: branch off, commit, merge back with --no-ff.
+        fixture.git(["checkout", "-b", "side"]);
+        fixture.write("side.txt", "side\n");
+        fixture.git(["add", "side.txt"]);
+        fixture.git(["commit", "-m", "side commit"]);
+        fixture.git(["checkout", "main"]);
+        fixture.git(["merge", "--no-ff", "side", "-m", "merge side"]);
+
+        let (page, _) = log_enriched(fixture.path(), None, 0, 10).unwrap();
+
+        let merge = page
+            .iter()
+            .find(|c| c.summary.as_deref() == Some("merge side"))
+            .unwrap();
+        assert!(merge.is_merge);
+
+        let edit = page
+            .iter()
+            .find(|c| c.summary.as_deref() == Some("edit subject"))
+            .unwrap();
+        assert!(!edit.is_merge);
+        assert_eq!(edit.body.as_deref(), Some("body paragraph"));
+        // One line added, none deleted vs the parent ("initial\n" → +"added line").
+        assert_eq!(edit.additions, 1);
+        assert_eq!(edit.deletions, 0);
+    }
+
+    #[test]
+    fn commit_diff_diffs_a_normal_commit_against_its_parent() {
+        let fixture = RepoFixture::new();
+        fixture.write("tracked.txt", "initial\nsecond line\n");
+        fixture.git(["add", "tracked.txt"]);
+        fixture.git(["commit", "-m", "add second line", "-m", "the body"]);
+
+        let id = head_sha(&fixture);
+        let diff = commit_diff(fixture.path(), &id).unwrap();
+
+        assert_eq!(diff.meta.id, id);
+        assert_eq!(diff.meta.summary.as_deref(), Some("add second line"));
+        assert_eq!(diff.meta.body.as_deref(), Some("the body"));
+        assert!(!diff.meta.is_merge);
+        assert_eq!(diff.meta.additions, 1);
+        assert_eq!(diff.meta.deletions, 0);
+
+        assert_eq!(diff.files.len(), 1);
+        let file = &diff.files[0];
+        assert_eq!(file.path, PathBuf::from("tracked.txt"));
+        assert_eq!(file.status, DeltaStatus::Modified);
+        assert!(file.diff.contains("+second line"));
+    }
+
+    #[test]
+    fn commit_diff_of_root_commit_diffs_against_the_empty_tree() {
+        let fixture = RepoFixture::new();
+        // The seed commit is the root: it has no parent, so the whole file is an
+        // addition vs the empty tree.
+        let root = first_commit_sha(&fixture);
+        let diff = commit_diff(fixture.path(), &root).unwrap();
+
+        assert_eq!(diff.meta.summary.as_deref(), Some("initial commit"));
+        assert_eq!(diff.files.len(), 1);
+        let file = &diff.files[0];
+        assert_eq!(file.path, PathBuf::from("tracked.txt"));
+        assert_eq!(file.status, DeltaStatus::Added);
+        assert!(file.diff.contains("+initial"));
+        assert_eq!(diff.meta.additions, 1);
+        assert_eq!(diff.meta.deletions, 0);
+    }
+
+    #[test]
+    fn commit_diff_of_merge_uses_first_parent_only() {
+        let fixture = RepoFixture::new();
+        // First parent (main) adds main.txt; the merged branch adds side.txt.
+        fixture.write("main.txt", "main\n");
+        fixture.git(["add", "main.txt"]);
+        fixture.git(["commit", "-m", "main work"]);
+        fixture.git(["checkout", "-b", "side"]);
+        fixture.write("side.txt", "side\n");
+        fixture.git(["add", "side.txt"]);
+        fixture.git(["commit", "-m", "side work"]);
+        fixture.git(["checkout", "main"]);
+        fixture.git(["merge", "--no-ff", "side", "-m", "merge side"]);
+
+        let merge = head_sha(&fixture);
+        let diff = commit_diff(fixture.path(), &merge).unwrap();
+        assert!(diff.meta.is_merge);
+
+        // Diffing the merge against its FIRST parent (main, before the merge)
+        // shows only what the side branch brought in: side.txt. main.txt was
+        // already on the first parent, so it must not appear.
+        let paths: Vec<_> = diff.files.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from("side.txt")]);
+    }
+
+    #[test]
+    fn commit_diff_detects_a_rename_with_a_small_edit() {
+        let fixture = RepoFixture::new();
+        // A file large enough that a one-line edit stays well above libgit2's
+        // rename-similarity threshold, so without `find_similar` it would read as
+        // a full delete + full add and inflate the counts to the whole file.
+        let original: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+        fixture.write("big.txt", &original);
+        fixture.git(["add", "big.txt"]);
+        fixture.git(["commit", "-m", "add big file"]);
+
+        // Rename and tweak a single line in one commit.
+        fixture.git(["mv", "big.txt", "renamed.txt"]);
+        let edited = original.replace("line 5\n", "line five\n");
+        fixture.write("renamed.txt", &edited);
+        fixture.git(["add", "renamed.txt"]);
+        fixture.git(["commit", "-m", "rename and edit"]);
+
+        let id = head_sha(&fixture);
+        let diff = commit_diff(fixture.path(), &id).unwrap();
+
+        // One Renamed entry on the new path — not a delete + add pair.
+        assert_eq!(diff.files.len(), 1);
+        let file = &diff.files[0];
+        assert_eq!(file.status, DeltaStatus::Renamed);
+        assert_eq!(file.path, PathBuf::from("renamed.txt"));
+        // The patch body carries the old → new mapping libgit2 emits for renames.
+        assert!(file.diff.contains("rename from big.txt"));
+        assert!(file.diff.contains("rename to renamed.txt"));
+
+        // Only the single edited line counts, not the whole 10-line file.
+        assert_eq!(diff.meta.additions, 1);
+        assert_eq!(diff.meta.deletions, 1);
+
+        // The History-row path (commit_line_totals) must agree.
+        let repo = Repository::open(fixture.path()).unwrap();
+        let commit = repo.find_commit(Oid::from_str(&id).unwrap()).unwrap();
+        let (additions, deletions) = commit_line_totals(&repo, &commit).unwrap();
+        assert_eq!((additions, deletions), (1, 1));
+    }
+
+    fn head_sha(fixture: &RepoFixture) -> String {
+        sha_of(fixture, "HEAD")
+    }
+
+    fn first_commit_sha(fixture: &RepoFixture) -> String {
+        // Oldest commit (the root) via a reverse-ordered rev-list.
+        let output = Command::new("git")
+            .current_dir(fixture.path())
+            .args(["rev-list", "--max-parents=0", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn sha_of(fixture: &RepoFixture, rev: &str) -> String {
+        let output = Command::new("git")
+            .current_dir(fixture.path())
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn status_carries_the_head_commit_id() {
+        let fixture = RepoFixture::new();
+        let summary = status(fixture.path()).unwrap();
+        assert_eq!(
+            summary.head_commit_id.as_deref(),
+            Some(head_sha(&fixture).as_str())
+        );
+    }
+
+    #[test]
+    fn log_enriched_is_empty_on_unborn_head() {
+        let fixture = RepoFixture::new();
+        fixture.git(["checkout", "--orphan", "feature/unborn"]);
+        fixture.git(["rm", "-rf", "--cached", "."]);
+
+        let (page, has_more) = log_enriched(fixture.path(), None, 0, 10).unwrap();
+        assert!(page.is_empty());
+        assert!(!has_more);
+    }
+
+    #[test]
     fn branch_queries_degrade_gracefully_on_unborn_head() {
         // A repo with a committed `main` but a fresh unborn branch checked out:
         // commits/diff "since main" must not error on the missing HEAD.
@@ -2676,6 +3771,72 @@ mod tests {
 
     fn canonical_or_self(path: &Path) -> PathBuf {
         path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// Regression for the `git_log` base-pick bug: in a remote-less repo a
+    /// linked worktree has no `refs/remotes/origin/HEAD`, so `default_branch()`
+    /// falls back to the worktree's OWN branch. The daemon must NOT use that as
+    /// the base (it would filter the base out and mark nothing); it must use the
+    /// project's main-worktree branch instead. This test pins both halves: the
+    /// trap (default_branch returns the linked branch) and the correct base
+    /// (the main worktree's branch marks the ahead commits).
+    #[test]
+    fn linked_worktree_in_remoteless_repo_marks_commits_ahead_of_main_branch() {
+        let fixture = RepoFixture::new();
+        let managed = TempDir::new().unwrap();
+        let client = GitClient::default();
+
+        // A linked worktree on a feature branch, branched from `main`.
+        let request = CreateWorktreeRequest {
+            project_id: ProjectId::new(),
+            project_name: "hitch".into(),
+            managed_root: managed.path().into(),
+            branch: "feature/ahead".into(),
+            checkout: WorktreeCheckout::NewBranch,
+            base: Some("main".into()),
+        };
+        let created = client.create_worktree(fixture.path(), &request).unwrap();
+
+        // Commit branch work past the merge-base inside the linked worktree.
+        run_real_git(&created.path, ["config", "user.name", "Hitch Test"]);
+        run_real_git(
+            &created.path,
+            ["config", "user.email", "hitch@example.test"],
+        );
+        fs::write(created.path.join("feature.txt"), "feature\n").unwrap();
+        run_real_git(&created.path, ["add", "feature.txt"]);
+        run_real_git(&created.path, ["commit", "-m", "branch work"]);
+
+        // The trap: with no remote HEAD, `default_branch()` on the linked
+        // worktree resolves to the worktree's OWN branch, which the daemon used
+        // to filter out (base == worktree branch) => nothing marked.
+        assert_eq!(
+            default_branch(&created.path).unwrap(),
+            "feature/ahead",
+            "default_branch must fall back to the worktree's own branch here, \
+             which is exactly why git_log can't use it as the base"
+        );
+
+        // The fix: using the project's main-worktree branch (`main`) as the base
+        // correctly marks the branch commit ahead and leaves the inherited base
+        // commit unmarked.
+        let (page, _) = log_enriched(&created.path, Some("main"), 0, 10).unwrap();
+        let branch = page
+            .iter()
+            .find(|c| c.summary.as_deref() == Some("branch work"))
+            .expect("branch commit present");
+        let base = page
+            .iter()
+            .find(|c| c.summary.as_deref() == Some("initial commit"))
+            .expect("inherited base commit present");
+        assert!(
+            branch.ahead_of_base,
+            "branch commit must be marked ahead of the main-worktree branch"
+        );
+        assert!(
+            !base.ahead_of_base,
+            "inherited base commit must not be marked ahead"
+        );
     }
 
     #[test]

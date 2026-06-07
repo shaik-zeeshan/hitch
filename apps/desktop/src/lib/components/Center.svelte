@@ -16,9 +16,11 @@
   // so live GPU contexts stay well under the browser cap.
   import {
     activeSessionId,
+    ALL_CHANGES_TAB,
     connection,
+    activeDiffPath,
     diffActive,
-    diffPath,
+    commitShaFromTab,
     error,
     reconnect,
     selectedParent,
@@ -28,9 +30,30 @@
     worktrees,
   } from "../daemon";
   import { sessionBelongsTo } from "../types";
+  import { isDark } from "../theme";
+  import {
+    terminalSurfaceOverride,
+    terminalThemeDark,
+    terminalThemeLight,
+  } from "../terminal-themes";
   import SessionTabs from "./SessionTabs.svelte";
   import Terminal from "./Terminal.svelte";
   import DiffTab from "./DiffTab.svelte";
+  import DiffAllTab from "./DiffAllTab.svelte";
+  import CommitTab from "./CommitTab.svelte";
+
+  // Re-theme every --term-* consumer in the center column at one bind point: the
+  // tab strip's active tab, the terminal panels' insets/overlays, and the diff
+  // view all read --term-bg2/--term-fg/--term-dim/--term-line, and .center is the
+  // tightest box that scopes them as a group (the empty states use only paper/ink
+  // vars, so they're unaffected). Without this the active tab would keep the
+  // built-in surface color while the terminal below shows the theme background,
+  // leaving a visible seam. Re-derives on every app-mode flip and either selection
+  // change (same axes as Terminal's palette $effect): $isDark picks the mode, the
+  // two selection stores pick the id; "" for the built-in theme.
+  const surfaceOverride = $derived(
+    terminalSurfaceOverride($isDark ? $terminalThemeDark : $terminalThemeLight),
+  );
 
   const parentLabel = $derived(
     $selectedParent?.kind === "worktree"
@@ -40,7 +63,7 @@
   );
 </script>
 
-<main class="center">
+<main class="center" style={surfaceOverride}>
   {#if $selectedParent}
     <SessionTabs parent={$selectedParent} />
   {/if}
@@ -94,7 +117,19 @@
           shell or launch an agent.
         </p>
       </div>
-    {:else if $diffActive && $diffPath}
+    {:else if $diffActive && $activeDiffPath === ALL_CHANGES_TAB}
+      <!-- The all-changes view: every changed file in one scroll, as collapsible
+           sections. Same overlay behavior as a single-file diff. -->
+      <DiffAllTab />
+    {:else if $diffActive && $activeDiffPath && commitShaFromTab($activeDiffPath) !== null}
+      <!-- A Commit Tab: one immutable commit's metadata header + collapsible
+           per-file sections, keyed by sha. Keyed on the sha so switching between
+           open commit tabs remounts with the right commit (the per-sha diff
+           cache means a remount never refetches an already-loaded commit). -->
+      {#key $activeDiffPath}
+        <CommitTab sha={commitShaFromTab($activeDiffPath)!} />
+      {/key}
+    {:else if $diffActive && $activeDiffPath}
       <!-- The diff OVERLAYS the (now hidden) terminals rather than replacing
            them; closing it reveals the active terminal with scroll + buffer
            intact, since it was never destroyed. -->
@@ -119,7 +154,7 @@
     min-height: 0;
     height: 100%;
     overflow: hidden;
-    background: var(--bg-1);
+    background: var(--paper-3);
   }
   .view {
     flex: 1;
@@ -151,36 +186,39 @@
     padding: 24px;
   }
   .empty h3 {
-    font-size: 13px;
-    font-weight: 560;
-    color: var(--tx-hi);
+    font-family: var(--ui);
+    font-size: var(--r1);
+    font-weight: 600;
+    color: var(--ink-1);
   }
   .empty p {
-    font-size: 12px;
-    color: var(--tx-lo);
+    font-family: var(--ui);
+    font-size: var(--r0);
+    color: var(--ink-2);
     max-width: 300px;
     line-height: 1.55;
   }
   .empty .mono {
     font-family: var(--mono);
-    color: var(--tx-md);
+    color: var(--ink-1);
   }
+  /* Quiet letterpress button: hairline, square, paper fill. */
   .empty .action {
     margin-top: 5px;
-    padding: 5px 12px;
-    font: inherit;
-    font-size: 11.5px;
-    border-radius: var(--radius);
+    padding: 6px 12px;
+    font-family: var(--ui);
+    font-size: var(--r0);
+    border-radius: 0;
     border: 1px solid var(--line);
-    background: var(--bg-3);
-    color: var(--tx-md);
+    background: var(--paper-2);
+    color: var(--ink-1);
     cursor: pointer;
     transition:
-      background var(--t-fast),
-      color var(--t-fast);
+      border-color 0.15s ease-out,
+      color 0.15s ease-out;
   }
   .empty .action:hover {
-    background: var(--bg-4);
-    color: var(--tx-hi);
+    border-color: var(--ink-3);
+    color: var(--ink-0);
   }
 </style>

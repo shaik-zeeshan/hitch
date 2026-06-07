@@ -9,6 +9,16 @@ description = "Git reads (libgit2), writes (system git), worktrees, and PRs (gh)
 [dependencies]
 hitch-core.workspace = true
 hitch-process.workspace = true
-git2 = "0.20"
+# We use libgit2 (git2) only for LOCAL repo reads — branches, diffs, reading
+# the configured remote URL, etc. All network operations (clone/fetch/push/
+# pull) go through the system `git` executable (see run_git below), never
+# libgit2 transport. So we disable git2's default features, which would
+# otherwise pull in `https` (openssl-sys → Homebrew libssl/libcrypto) and
+# `ssh` (libssh2-sys). Those dylibs are loaded from /opt/homebrew and carry a
+# different/absent Team ID, which a hardened-runtime (--options runtime),
+# code-signed build rejects under macOS library validation, aborting the
+# daemon at launch. Dropping the transport features removes the dynamic
+# OpenSSL link entirely without changing behavior.
+git2 = { version = "0.20", default-features = false }
 serde_json.workspace = true
 tempfile = "3"

@@ -1,11 +1,59 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   desktopPlatformFromPlatform,
   revealItemLabel,
   isShortcutModifier,
   shortcutLabel,
+  shortcutKeys,
   shellSessionShortcutLabel,
 } from "./desktopPlatform";
+import { get } from "svelte/store";
+
+class LocalStorageStub {
+  readonly values = new Map<string, string>();
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null;
+  }
+
+  setItem(key: string, value: string): void {
+    this.values.set(key, value);
+  }
+}
+
+beforeEach(() => {
+  vi.unstubAllGlobals();
+  vi.resetModules();
+});
+
+describe("editorApp settings persistence", () => {
+  async function loadEditorApp(stored: string) {
+    const storage = new LocalStorageStub();
+    storage.values.set("hitch.editorApp", stored);
+    vi.stubGlobal("localStorage", storage);
+
+    const settings = await import("./settings");
+
+    return { storage, settings };
+  }
+
+  it("keeps explicit Visual Studio Code selection intact", async () => {
+    const { storage, settings } = await loadEditorApp("Visual Studio Code");
+
+    expect(get(settings.editorApp)).toBe("Visual Studio Code");
+    expect(storage.values.get("hitch.editorApp")).toBe("Visual Studio Code");
+  });
+
+  it("keeps explicit non-default editor values intact", async () => {
+    for (const stored of ["Cursor", "Zed", "/Applications/Custom Editor.app"]) {
+      const { storage, settings } = await loadEditorApp(stored);
+
+      expect(get(settings.editorApp)).toBe(stored);
+      expect(storage.values.get("hitch.editorApp")).toBe(stored);
+      vi.resetModules();
+    }
+  });
+});
 
 describe("desktopPlatformFromPlatform", () => {
   it("normalizes browser platform strings", () => {
@@ -39,6 +87,14 @@ describe("shortcutLabel", () => {
     expect(shortcutLabel("macos", "K")).toBe("⌘K");
     expect(shortcutLabel("windows", "K")).toBe("Ctrl+K");
     expect(shortcutLabel("linux", "Enter")).toBe("Ctrl+Enter");
+  });
+});
+
+describe("shortcutKeys", () => {
+  it("splits the shortcut into one entry per keycap", () => {
+    expect(shortcutKeys("macos", "K")).toEqual(["⌘", "K"]);
+    expect(shortcutKeys("windows", "K")).toEqual(["Ctrl", "K"]);
+    expect(shortcutKeys("linux", "Enter")).toEqual(["Ctrl", "Enter"]);
   });
 });
 

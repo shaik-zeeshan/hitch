@@ -88,7 +88,7 @@
         <span class="field-row disabled">
           <span class="check" aria-hidden="true"></span>
           <span class="lab"
-            >Also delete the branch <span class="mono" style="color:var(--tx-lo)">(only when merged)</span></span
+            >Also delete the branch <span class="mono" style="color:var(--ink-2)">(only when merged)</span></span
           >
         </span>
         {#if errMsg}<p class="m-error">{errMsg}</p>{/if}

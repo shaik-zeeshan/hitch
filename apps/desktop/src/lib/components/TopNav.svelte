@@ -1,45 +1,50 @@
 <script lang="ts">
-  // Unified top nav (mockup .topnav). The macOS window uses titleBarStyle
-  // "Overlay" (ADR 0006), so the real traffic lights are drawn by the OS in the
-  // top-left — we reserve left padding for them rather than drawing fakes, and
-  // mark the bar a drag region so it moves the window.
+  // Paper Terminal top bar (doc-design/structure.md "Top bar"). One 42px bar,
+  // three zones: OS traffic lights (left, drawn by the macOS Overlay titlebar —
+  // ADR 0006, we only reserve their room), the window-centered command palette
+  // trigger, and a right cluster (settings + theme toggle + daemon indicator).
+  // The whole bar is the window drag region; interactive children opt out via
+  // no-drag.
+  //
+  // There is NO app name, breadcrumb, or git ahead/behind status here — git
+  // sync moved to the right rail. The left/right rail toggle buttons were also
+  // removed (the design's bar has three zones only); rail collapse is driven by
+  // the keymap chords (Cmd+B / Cmd+⌥B) and the command palette's toggle
+  // commands, so this bar takes no rail props.
+  import { goto } from "$app/navigation";
   import {
     daemonReason,
     daemonStatus,
-    gitStatus,
     openDaemonLog,
-    refreshAll,
     restartDaemon,
   } from "../daemon";
   import { commandOpen } from "../overlays";
-  import { currentDesktopPlatform, shortcutLabel } from "../desktopPlatform";
+  import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
+  import { theme, toggleTheme } from "../theme";
+  import Search from "~icons/lucide/search";
+  import SettingsIcon from "~icons/lucide/settings-2";
+  import Sun from "~icons/lucide/sun";
+  import Moon from "~icons/lucide/moon";
 
   // Title-bar integration differs per OS (ADR 0006): macOS reserves space for
   // the native Overlay traffic lights on the left; Windows is frameless and
   // draws its own caption controls on the right.
   const platform = currentDesktopPlatform();
 
-  let {
-    rightCollapsed = false,
-    onToggleLeft,
-    onToggleRight,
-  }: {
-    rightCollapsed?: boolean;
-    onToggleLeft: () => void;
-    onToggleRight: () => void;
-  } = $props();
+  const commandPaletteKeys = shortcutKeys(platform, "K");
+  const settingsShortcut = shortcutLabel(platform, ",");
 
-  const ahead = $derived($gitStatus?.ahead ?? 0);
-  const behind = $derived($gitStatus?.behind ?? 0);
-
-  const commandPaletteShortcut = shortcutLabel(currentDesktopPlatform(), "K");
-
-  // Daemon Status indicator (ADR 0009). Always a colored dot + a word — never
-  // color alone (design principle #3) — and a click-to-open popover carrying the
-  // failure reason plus View log / Restart actions.
+  // Daemon Status indicator (ADR 0009). A standalone quiet instrument: dot +
+  // "daemon" + a status word — never color alone (design principle #3) — with a
+  // click-to-open letterpress popover carrying the failure reason plus
+  // View log / Restart. The four daemon states map to one word + dot class:
+  //   running     → "connected"   (--st-ok dot w/ glow, word --ink-1 / 600)
+  //   starting    → "starting"    (plain --ink-3 dot)
+  //   unreachable → "unreachable" (--st-need dot)
+  //   failed      → "failed"      (--st-need dot)
   const STATUS_LABEL = {
     starting: "starting",
-    running: "ready",
+    running: "connected",
     unreachable: "unreachable",
     failed: "failed",
   } as const;
@@ -61,30 +66,47 @@
 </script>
 
 <nav
-  class="topnav"
+  class="topbar"
   class:mac={platform === "macos"}
   class:win={platform === "windows"}
   data-tauri-drag-region
 >
-  <button class="iconbtn" title="Toggle sidebar" aria-label="Toggle sidebar" onclick={onToggleLeft}>
-    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-      ><rect x="1.5" y="2.5" width="13" height="11" rx="2" /><line x1="6" y1="2.5" x2="6" y2="13.5" /></svg
-    >
+  <!-- Center: command palette trigger, absolutely centered to the window. -->
+  <button class="palette-trigger no-drag" onclick={() => commandOpen.set(true)} aria-label="Open command palette">
+    <Search class="icon seek" />
+    <span class="ph">Jump to worktree, session, or action…</span>
+    <span class="keys">
+      {#each commandPaletteKeys as k (k)}<kbd>{k}</kbd>{/each}
+    </span>
   </button>
 
-  <div class="nav-grow" data-tauri-drag-region></div>
+  <!-- Right cluster: flex spacer pushes it right; theme toggle then daemon. -->
+  <div class="grow" data-tauri-drag-region></div>
 
-  <button class="cmdk" onclick={() => commandOpen.set(true)} aria-label="Search or jump to">
-    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-      ><circle cx="7" cy="7" r="4.5" /><line x1="10.5" y1="10.5" x2="14" y2="14" /></svg
+  <div class="right no-drag">
+    <button
+      class="bar-btn"
+      title="Settings ({settingsShortcut})"
+      aria-label="Open settings"
+      onclick={() => void goto("/settings")}
     >
-    <span class="cmdk-label">Search or jump to…</span>
-    <span class="k">{commandPaletteShortcut}</span>
-  </button>
+      <SettingsIcon class="icon" />
+    </button>
 
-  <div class="nav-grow" data-tauri-drag-region></div>
+    <button
+      class="bar-btn"
+      title={$theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+      aria-label={$theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+      aria-pressed={$theme === "dark"}
+      onclick={() => toggleTheme()}
+    >
+      {#if $theme === "dark"}
+        <Moon class="icon" />
+      {:else}
+        <Sun class="icon" />
+      {/if}
+    </button>
 
-  <div class="nav-right">
     <div class="daemon-wrap">
       <button
         class="daemon {$daemonStatus}"
@@ -94,7 +116,8 @@
         onclick={() => (statusOpen = !statusOpen)}
       >
         <span class="dot"></span>
-        <span class="lbl">{statusLabel}</span>
+        <span class="word">daemon</span>
+        <span class="status">{statusLabel}</span>
       </button>
       {#if statusOpen}
         <!-- click-away backdrop closes the popover -->
@@ -122,99 +145,124 @@
         </div>
       {/if}
     </div>
-    <span class="nav-sep"></span>
-
-    <button class="iconbtn" title="Fetch from origin" aria-label="Fetch" onclick={() => void refreshAll()}>
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-        ><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5V5h-2.5" /></svg
-      >
-    </button>
-    {#if ahead > 0}<span class="ahead" title="{ahead} commits ahead of origin">↑{ahead}</span>{/if}
-    {#if behind > 0}<span class="behind" title="{behind} commits behind origin">↓{behind}</span>{/if}
-
-    {#if rightCollapsed}
-      <button class="iconbtn" title="Show changes panel" aria-label="Show changes panel" onclick={onToggleRight}>
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
-          ><rect x="1.5" y="2.5" width="13" height="11" rx="2" /><line x1="10.5" y1="2.5" x2="10.5" y2="13.5" /></svg
-        >
-      </button>
-    {/if}
   </div>
 </nav>
 
 <style>
-  .topnav {
+  .topbar {
+    position: relative;
     display: flex;
     align-items: center;
-    gap: 10px;
     height: 100%;
-    background: var(--bg-2);
+    padding: 0 16px;
+    background: linear-gradient(var(--paper-2), var(--paper-1));
     border-bottom: 1px solid var(--line);
-    padding: 0 12px;
     user-select: none;
   }
-  /* macOS traffic lights are inset to x 16 / y 23 in tauri.conf.json so their
-     centers sit on the 44px top-nav row, level with the sidebar toggle icon;
-     this reserves their horizontal room. */
-  .topnav.mac {
+  /* macOS traffic lights are inset in tauri.conf.json so their centers sit on
+     the top-bar row; this reserves their horizontal room. */
+  .topbar.mac {
     padding-left: 78px;
   }
-  /* Windows is frameless: the caption controls (WindowControls) are rendered as
-     a fixed top-right layer at the layout level (so they stay visible on routes
-     that hide the shell, e.g. /settings). The nav reserves their width on the
-     right (3 × 46px) so its own content never slides under the controls. */
-  .topnav.win {
+  /* Windows is frameless: the caption controls (WindowControls) are a fixed
+     top-right layer; reserve their width (3 × 46px) so the bar's content never
+     slides under them. */
+  .topbar.win {
     padding-right: 138px;
   }
 
-  .nav-grow {
+  /* Interactive children opt out of the drag region. */
+  .no-drag {
+    -webkit-app-region: no-drag;
+  }
+
+  .grow {
     flex: 1;
     align-self: stretch;
   }
 
-  .cmdk {
-    display: flex;
+  /* ---- Command palette trigger: centered to the window width, not the flex
+     remainder (components.md ".palette"). ---- */
+  .palette-trigger {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    translate: -50% -50%;
+    display: inline-flex;
     align-items: center;
     gap: 8px;
-    flex: 0 1 340px;
-    min-width: 120px;
-    padding: 5px 8px 5px 10px;
-    background: var(--bg-1);
+    width: 300px;
+    max-width: 42vw;
+    height: 26px;
+    padding: 0 8px 0 9px;
+    background: var(--paper-2);
     border: 1px solid var(--line);
-    border-radius: var(--radius);
-    color: var(--tx-lo);
+    border-radius: 0;
+    color: var(--ink-3);
     font: inherit;
-    font-size: 11.5px;
     text-align: left;
     cursor: text;
-    transition: border-color var(--t-fast);
+    transition: border-color 0.18s ease-out;
   }
-  .cmdk:hover {
-    border-color: oklch(36% 0.012 265);
+  .palette-trigger:hover {
+    border-color: var(--ink-3);
   }
-  .cmdk svg {
+  .palette-trigger :global(.seek) {
     width: 13px;
     height: 13px;
-    color: var(--tx-lo);
+    color: var(--ink-3);
     flex: none;
   }
-  .cmdk-label {
+  .palette-trigger .ph {
     flex: 1;
+    min-width: 0;
+    font-size: var(--r0);
+    color: var(--ink-3);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
-  .cmdk .k {
-    font-family: var(--mono);
-    font-size: 10px;
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    padding: 1px 5px;
-    color: var(--tx-md);
+  .palette-trigger .keys {
+    flex: none;
   }
 
-  .nav-right {
+  /* ---- Right cluster ---- */
+  .right {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 4px;
   }
+
+  /* Shared 28px square bar button (settings, theme toggle). */
+  .bar-btn {
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--line);
+    border-radius: 0;
+    background: var(--paper-2);
+    color: var(--ink-2);
+    cursor: pointer;
+    transition:
+      color 0.18s ease-out,
+      border-color 0.18s ease-out,
+      background 0.18s ease-out;
+  }
+  .bar-btn:hover {
+    color: var(--ink-1);
+    border-color: var(--ink-3);
+  }
+  .bar-btn :global(svg) {
+    width: 15px;
+    height: 15px;
+  }
+  .bar-btn:focus-visible {
+    outline: 2px solid var(--iris);
+    outline-offset: 1px;
+  }
+
+  /* ---- Daemon indicator: standalone, no shared border/background ---- */
   .daemon-wrap {
     position: relative;
     display: flex;
@@ -223,65 +271,56 @@
   .daemon {
     display: flex;
     align-items: center;
-    gap: 6px;
-    font-size: 11px;
-    color: var(--tx-md);
+    gap: 7px;
+    padding: 0 4px;
     background: transparent;
-    border: 1px solid transparent;
-    border-radius: var(--radius);
-    padding: 3px 7px;
+    border: 0;
+    font-family: var(--mono);
+    font-size: var(--r0);
+    color: var(--ink-2);
     cursor: pointer;
-    font: inherit;
-    font-size: 11px;
-    transition:
-      background var(--t-fast),
-      border-color var(--t-fast);
-  }
-  .daemon:hover {
-    background: var(--bg-3);
-    border-color: var(--line);
   }
   .daemon:focus-visible {
-    outline: 2px solid var(--ac);
+    outline: 2px solid var(--iris);
     outline-offset: 1px;
   }
+  .daemon .word {
+    color: var(--ink-2);
+  }
+  .daemon .status {
+    color: var(--ink-2);
+  }
+  /* Running ("connected"): emphasized word + ok dot with soft glow ring. */
+  .daemon.running .status {
+    color: var(--ink-1);
+    font-weight: 600;
+  }
+
   .dot {
     width: 7px;
     height: 7px;
     border-radius: 50%;
-    background: var(--tx-lo);
+    background: var(--ink-3);
     flex: none;
-  }
-  /* Four-state color (paired with the always-present word label). */
-  .daemon.starting,
-  .dot.starting {
-    color: var(--warn);
-  }
-  .daemon.starting .dot,
-  .dot.starting {
-    background: var(--warn);
-    box-shadow: 0 0 0 3px oklch(81% 0.13 75 / 0.16);
-  }
-  .daemon.running {
-    color: var(--tx-md);
   }
   .daemon.running .dot,
   .dot.running {
-    background: var(--ok);
-    box-shadow: 0 0 0 3px oklch(72% 0.16 150 / 0.16);
+    background: var(--st-ok);
+    box-shadow: 0 0 0 3px var(--st-ok-glow);
   }
-  .daemon.unreachable,
-  .daemon.failed {
-    color: oklch(78% 0.08 25);
-  }
+  /* Non-running attention states share the oxide need color. */
   .daemon.unreachable .dot,
   .daemon.failed .dot,
   .dot.unreachable,
   .dot.failed {
-    background: var(--err);
-    box-shadow: 0 0 0 3px oklch(68% 0.17 25 / 0.16);
+    background: var(--st-need);
+  }
+  .dot.starting {
+    background: var(--ink-3);
   }
 
+  /* ---- Status popover: letterpress (paper-2, hairline, radius 0, crisp
+     act-menu shadow via --shadow-pop). ---- */
   .sp-backdrop {
     position: fixed;
     inset: 0;
@@ -296,10 +335,10 @@
     right: 0;
     z-index: 41;
     width: 280px;
-    background: var(--bg-2);
+    background: var(--paper-2);
     border: 1px solid var(--line);
-    border-radius: var(--radius);
-    box-shadow: 0 8px 28px oklch(0% 0 0 / 0.4);
+    border-radius: 0;
+    box-shadow: var(--shadow-pop);
     padding: 12px;
     display: flex;
     flex-direction: column;
@@ -311,15 +350,15 @@
     gap: 7px;
   }
   .sp-title {
-    font-size: 12px;
+    font-size: var(--r1);
     font-weight: 600;
-    color: var(--tx-hi);
+    color: var(--ink-0);
     text-transform: capitalize;
   }
   .sp-reason {
-    font-size: 11px;
+    font-size: var(--r0);
     line-height: 1.5;
-    color: var(--tx-md);
+    color: var(--ink-2);
     font-family: var(--mono);
     white-space: pre-wrap;
     word-break: break-word;
@@ -329,7 +368,7 @@
   }
   .sp-reason.ok {
     font-family: var(--ui);
-    color: var(--tx-lo);
+    color: var(--ink-2);
   }
   .sp-actions {
     display: flex;
@@ -338,65 +377,25 @@
   .sp-btn {
     flex: 1;
     font: inherit;
-    font-size: 11px;
+    font-size: var(--r0);
     padding: 5px 8px;
-    border-radius: var(--radius);
+    border-radius: 0;
     border: 1px solid var(--line);
-    background: var(--bg-3);
-    color: var(--tx-md);
+    background: var(--paper-2);
+    color: var(--ink-1);
     cursor: pointer;
     transition:
-      background var(--t-fast),
-      color var(--t-fast);
+      background 0.18s ease-out,
+      color 0.18s ease-out,
+      border-color 0.18s ease-out;
   }
   .sp-btn:hover {
-    background: var(--bg-4);
-    color: var(--tx-hi);
+    background: var(--paper-3);
+    border-color: var(--ink-3);
+    color: var(--ink-0);
   }
   .sp-btn:disabled {
     opacity: 0.5;
     cursor: default;
-  }
-  .nav-sep {
-    width: 1px;
-    height: 18px;
-    background: var(--line);
-  }
-  .ahead {
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--ok);
-  }
-  .behind {
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--warn);
-  }
-
-  .iconbtn {
-    width: 26px;
-    height: 26px;
-    display: grid;
-    place-items: center;
-    border-radius: var(--radius);
-    color: var(--tx-md);
-    border: 1px solid transparent;
-    background: transparent;
-    cursor: pointer;
-    transition:
-      background var(--t-fast),
-      color var(--t-fast);
-  }
-  .iconbtn:hover {
-    background: var(--bg-3);
-    color: var(--tx-hi);
-  }
-  .iconbtn svg {
-    width: 15px;
-    height: 15px;
-  }
-  .iconbtn:focus-visible {
-    outline: 2px solid var(--ac);
-    outline-offset: 1px;
   }
 </style>

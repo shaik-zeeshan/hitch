@@ -1,5 +1,6 @@
 <script lang="ts">
-  // Live PTY terminal (mockup .term). Ported from the React TerminalPane: one
+  // Live PTY terminal (Paper Terminal .terminal panel). Ported from the React
+  // TerminalPane: one
   // xterm instance per session, fed from the daemon's per-session binary output
   // channel (ADR 0007). Center.svelte keys a Terminal off EVERY session (across
   // all parents, not just the active one) and toggles visibility (the `active`
@@ -19,11 +20,19 @@
   // and let the ring repopulate. Keystrokes go straight to the daemon; a
   // ResizeObserver fits the grid and reports the new cols/rows.
   import { onDestroy, onMount, tick } from "svelte";
+  import { get } from "svelte/store";
   import {
     Terminal as Xterm,
     type IDisposable,
     type ITheme,
   } from "@xterm/xterm";
+  import { isDark } from "../theme";
+  import {
+    HITCH_THEME_ID,
+    getTerminalTheme,
+    terminalThemeDark,
+    terminalThemeLight,
+  } from "../terminal-themes";
   import { FitAddon } from "@xterm/addon-fit";
   import { WebLinksAddon } from "@xterm/addon-web-links";
   import { SearchAddon } from "@xterm/addon-search";
@@ -39,6 +48,9 @@
   import { WebglAddon } from "@xterm/addon-webgl";
   import type { Session } from "../types";
   import { classifyTerminalKey } from "../terminalKeys";
+  import { terminalFontFamily, terminalFontStack } from "../settings";
+  import { ensureTerminalFontLoaded } from "../terminalFont";
+  import { focusedPane, registerTerminalFocus } from "../keymap";
   import { createOutputBatcher } from "../outputBatch";
   import { releaseWebgl, retainWebgl, touchWebgl } from "../webglBudget";
   import { dropTargetSession } from "../fileDrop";
@@ -84,6 +96,9 @@
   let written = 0;
   let resizeObserver: ResizeObserver | null = null;
   let unsubOutput: (() => void) | null = null;
+  // Unregister thunk for the keymap's terminal-focus registry (focus.terminal
+  // command). Registered in onMount, dropped in onDestroy.
+  let unregisterFocus: (() => void) | null = null;
   // Pending rAF handle for the coalesced local fit (see `scheduleFit`).
   let fitFrame: number | null = null;
 
@@ -142,6 +157,17 @@
     void navigator.clipboard.readText().then((t) => term?.paste(t));
   }
 
+  // Clicking (or otherwise moving DOM focus) into the live xterm marks the
+  // terminal pane focused. Tab selection already does this, but a direct click
+  // into the terminal body did not — so after Cmd+Shift+G the pane stayed "git"
+  // while typing here, and Cmd+Enter would wrongly open the commit dialog. xterm
+  // has no focus event; its hidden textarea is the focusable target, so a
+  // bubbling `focusin` on the host (which already owns the contextmenu listener)
+  // catches it idiomatically.
+  function onHostFocusIn() {
+    focusedPane.set("terminal");
+  }
+
   function onSearchKeydown(e: KeyboardEvent) {
     if (e.key === "Enter") {
       e.preventDefault();
@@ -154,9 +180,22 @@
     }
   }
 
-  // Resolve the design tokens (OKLCH) to rgb() via the browser so xterm's
-  // canvas parser — which doesn't speak OKLCH — gets values it can render, and
-  // the terminal palette tracks the locked theme exactly.
+  // Resolve the Paper Terminal palette for xterm. xterm's parser (esp. the WebGL
+  // renderer) doesn't speak OKLCH or CSS var(), so we resolve everything to the
+  // browser's USED rgb() string via a detached probe: setting an oklch/var()
+  // color on an element and reading getComputedStyle(el).color back returns the
+  // normalized rgb() value WebKit actually computed.
+  //
+  // Two layers (doc-design/colors.md):
+  //  - SURFACE tokens (--term-bg2/--term-fg/--term-dim) differ per theme, so we
+  //    resolve the live CSS var values — they track the active theme exactly.
+  //    Background is the FLAT --term-bg2 (the active-tab/gradient top); the
+  //    panel's CSS gradient shows in the host padding, while xterm's own grid
+  //    sits on the flat fill so the WebGL renderer stays crisp.
+  //  - In-terminal ANSI accents are LITERAL oklch values from colors.md
+  //    ("In-terminal ANSI-ish accents"), one set per theme: the terminal
+  //    surface follows the theme, so light gets darker accent inks tuned for
+  //    the paper surface and dusk gets the brighter set tuned for deep ink.
   function resolveTheme(): ITheme {
     const probe = document.createElement("span");
     probe.style.display = "none";
@@ -166,31 +205,76 @@
       probe.style.color = color;
       return getComputedStyle(probe).color || "#d4d6da";
     };
+    // colors.md in-terminal accents (literal; per theme). The active mode comes
+    // from the theme store (get(isDark)) — same resolved light/dark the rest of
+    // the app reads — not a DOM `data-theme` lookup.
+    const dark = get(isDark);
+    const a = dark
+      ? {
+          grn: "oklch(82% 0.13 150)",
+          red: "oklch(78% 0.13 28)",
+          cy: "oklch(82% 0.10 195)",
+          yl: "oklch(86% 0.12 92)",
+          iris: "oklch(80% 0.10 280)",
+          b: "oklch(96% 0.01 90)",
+          // "black" must stay visible on the dark surface: the seam hairline.
+          blk: "var(--term-line)",
+          cursor: "oklch(82% 0.10 92)",
+          sel: "oklch(60% 0.10 280 / 0.32)",
+        }
+      : {
+          grn: "oklch(52% 0.13 150)",
+          red: "oklch(52% 0.16 28)",
+          cy: "oklch(52% 0.10 195)",
+          yl: "oklch(58% 0.11 92)",
+          iris: "oklch(48% 0.13 280)",
+          // "white" must stay visible on the paper surface: a mid grey ink.
+          b: "oklch(45% 0.012 90)",
+          blk: "oklch(30% 0.02 265)",
+          cursor: "oklch(48% 0.11 92)",
+          sel: "oklch(50% 0.12 280 / 0.22)",
+        };
     const theme: ITheme = {
-      background: rgb("var(--bg-0)"),
-      foreground: rgb("oklch(86% 0.008 265)"),
-      cursor: rgb("var(--ac)"),
-      cursorAccent: rgb("var(--bg-0)"),
-      selectionBackground: rgb("oklch(50% 0.08 265 / 0.35)"),
-      black: rgb("oklch(30% 0.008 265)"),
-      red: rgb("var(--err)"),
-      green: rgb("oklch(80% 0.14 150)"),
-      yellow: rgb("var(--warn)"),
-      blue: rgb("var(--ac-bright)"),
-      magenta: rgb("oklch(78% 0.13 320)"),
-      cyan: rgb("oklch(82% 0.10 200)"),
-      white: rgb("var(--tx-md)"),
-      brightBlack: rgb("var(--tx-lo)"),
-      brightRed: rgb("oklch(74% 0.17 25)"),
-      brightGreen: rgb("oklch(85% 0.14 150)"),
-      brightYellow: rgb("oklch(87% 0.13 75)"),
-      brightBlue: rgb("oklch(82% 0.13 265)"),
-      brightMagenta: rgb("oklch(83% 0.13 320)"),
-      brightCyan: rgb("oklch(87% 0.10 200)"),
-      brightWhite: rgb("var(--tx-hi)"),
+      background: rgb("var(--term-bg2)"),
+      foreground: rgb("var(--term-fg)"),
+      cursor: rgb(a.cursor),
+      cursorAccent: rgb("var(--term-bg2)"),
+      selectionBackground: rgb(a.sel),
+      black: rgb(a.blk),
+      red: rgb(a.red),
+      green: rgb(a.grn),
+      yellow: rgb(a.yl),
+      blue: rgb(a.iris),
+      magenta: rgb(a.iris),
+      cyan: rgb(a.cy),
+      white: rgb(a.b),
+      brightBlack: rgb("var(--term-dim)"),
+      brightRed: rgb(a.red),
+      brightGreen: rgb(a.grn),
+      brightYellow: rgb(a.yl),
+      brightBlue: rgb(a.iris),
+      brightMagenta: rgb(a.iris),
+      brightCyan: rgb(a.cy),
+      brightWhite: rgb(a.b),
     };
     probe.remove();
     return theme;
+  }
+
+  // Resolve the ITheme to actually apply, honoring the user's per-mode terminal
+  // theme selection. Dark mode reads `terminalThemeDark`, light reads
+  // `terminalThemeLight` (same theme-store axis resolveTheme() keys off). The
+  // default — and the fallback for the Hitch sentinel OR any unknown/stale id —
+  // is the built-in palette, so this can never break the out-of-box look. A
+  // curated theme's `colors` is already an ITheme-shaped hex map covering every
+  // field resolveTheme() sets, so a straight spread produces a complete ITheme.
+  function currentTheme(): ITheme {
+    const dark = get(isDark);
+    const id = dark ? get(terminalThemeDark) : get(terminalThemeLight);
+    if (id === HITCH_THEME_ID) return resolveTheme();
+    const def = getTerminalTheme(id);
+    if (!def) return resolveTheme();
+    return { ...def.colors };
   }
 
   // Coalesce PTY output to one xterm write per animation frame. The daemon
@@ -383,12 +467,72 @@
     wasActive = active;
   });
 
+  // The surface CSS vars (--term-bg2/--term-fg/--term-dim/--term-line) that the
+  // panel inset + on-surface overlays read are re-themed for a custom terminal
+  // theme one level up, in Center.svelte: it binds terminalSurfaceOverride() on
+  // .center so the same override reaches the tab strip, every terminal panel, and
+  // the diff view from a single point. We only repaint the xterm PALETTE here.
+
+  // Re-resolve and reapply the xterm palette whenever the theme flips OR the
+  // user picks a different terminal theme for the current mode. The surface
+  // tokens (--term-bg2/--term-fg/--term-dim) differ per theme, so a light↔dark
+  // swap must repaint every mounted terminal — including hidden ones, so they're
+  // already correct when re-shown; a per-mode selection change must too. Reading
+  // $isDark and BOTH selection stores here registers all three dependencies
+  // (currentTheme() reads the stores via get(), which doesn't register, so we
+  // touch them explicitly). No first-run gating: the effect's first run happens
+  // before onMount creates `term` (so it bails on !term), and `term` isn't
+  // reactive — gating on "first real change" here would swallow the first toggle
+  // instead. Reapplying is idempotent and cheap, so every store change repaints.
+  $effect(() => {
+    void $isDark;
+    void $terminalThemeDark;
+    void $terminalThemeLight;
+    if (!term) return;
+    term.options.theme = currentTheme();
+  });
+
+  // Apply the user's terminal font. The picked family must first be
+  // registered as a WEB font (see terminalFont.ts — the WKWebView sandbox
+  // hides user-installed fonts), and xterm must only be pointed at it AFTER
+  // the faces are usable: xterm measures cell metrics and rasterizes its glyph
+  // atlas at the moment the option changes, so flipping the option before the
+  // font loads would freeze fallback metrics. Hence: xterm is constructed on
+  // the BASE stack (always available), and this routine swaps the full stack
+  // in post-load — the option change re-measures cells and rebuilds the WebGL
+  // atlas, so refit and tell the daemon, exactly like a resize. Stale-guarded
+  // for a font change racing a slower earlier load; the same-value check makes
+  // reapplying a no-op (xterm would ignore it anyway).
+  function applyTerminalFont() {
+    const family = get(terminalFontFamily);
+    const stack = terminalFontStack(family);
+    void ensureTerminalFontLoaded(family).then(() => {
+      if (!term) return;
+      if (get(terminalFontFamily) !== family) return; // superseded by a newer pick
+      if (term.options.fontFamily === stack) return;
+      term.options.fontFamily = stack;
+      scheduleFit();
+    });
+  }
+
+  // Re-trigger on a Settings change. Same shape as the theme effect above:
+  // the first run happens before onMount creates `term` (bails), so onMount
+  // calls applyTerminalFont() itself for the initial application.
+  $effect(() => {
+    void $terminalFontFamily;
+    if (!term) return;
+    applyTerminalFont();
+  });
+
   onMount(() => {
     term = new Xterm({
-      fontFamily:
-        '"Berkeley Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace',
-      fontSize: 12.5,
-      theme: resolveTheme(),
+      // Construct on the BASE stack (the shell's --mono stack; panel type is
+      // 0.8125rem / 13px from doc-design/components.md). The user's picked
+      // family is swapped in by applyTerminalFont() below once its web-font
+      // faces are loaded — see the comment on that function.
+      fontFamily: terminalFontStack(""),
+      fontSize: 13,
+      theme: currentTheme(),
       cursorBlink: true,
       scrollback: 5000,
     });
@@ -430,6 +574,12 @@
     // route) — is verifiable without a live DOM.
     term.attachCustomKeyEventHandler((e) => {
       switch (classifyTerminalKey(e)) {
+        case "app":
+          // App-level combo (pane focus, tab switching, rail toggles, palette,
+          // settings — see keymap.ts). The window-capture dispatcher in
+          // +layout.svelte already handled it; xterm must NOT also process it,
+          // so consume the event here.
+          return false;
         case "newline":
           // Send Shift+Enter as a line feed (\n) rather than carriage return
           // (\r) so apps (e.g. Claude Code) can tell Enter (execute) apart from
@@ -461,6 +611,11 @@
 
     term.onData((data) => sendInput(sessionId, data));
 
+    // Expose focusing this terminal to the keymap's focus.terminal command. The
+    // dispatcher focuses the ACTIVE session's terminal, so registering every
+    // mounted terminal is safe (only the active id is ever called).
+    unregisterFocus = registerTerminalFocus(sessionId, () => term?.focus());
+
     // Output subscription is deferred to the first open + fit (see
     // ensureSubscribed): the visible-mount path below for a tab that mounts
     // active, or activate()/scheduleFit() for one that mounts hidden — so the
@@ -476,6 +631,9 @@
     // Own the right-click menu (paste). On `host` so it covers the whole
     // terminal area; removed in onDestroy.
     host.addEventListener("contextmenu", onContextMenu);
+    // Mark the terminal pane focused on any focus into the host (xterm's hidden
+    // textarea) — see onHostFocusIn. focusin bubbles, so the host catches it.
+    host.addEventListener("focusin", onHostFocusIn);
 
     // Open + fit + focus only if we mounted visible. A non-active tab in the
     // same parent mounts hidden (`display:none`) alongside the active one; even
@@ -492,12 +650,20 @@
       term.focus();
       resizeSessionDebounced(sessionId, term.cols, term.rows);
     }
+
+    // Swap in the user's terminal font once its web-font faces are loaded.
+    // After the visible-mount fit above so the fallback-metrics grid is never
+    // what the daemon hears last: the apply path refits + re-notifies.
+    applyTerminalFont();
   });
 
   onDestroy(() => {
+    unregisterFocus?.();
+    unregisterFocus = null;
     unsubOutput?.();
     resizeObserver?.disconnect();
     host?.removeEventListener("contextmenu", onContextMenu);
+    host?.removeEventListener("focusin", onHostFocusIn);
     // Cancel any frame queued by scheduleFit so it can't run against a disposed
     // term. The per-session daemon debounce timer is cleared centrally in
     // daemon.ts on session close (closeSessionOutput); a parent-switch unmount
@@ -539,15 +705,21 @@
   });
 </script>
 
-<!-- Outer .term provides the visual padding; the inner host is a clean
-     unpadded box so FitAddon measures the true content area and the rows it
-     computes leave the padding (incl. the bottom) intact. -->
-<div class="term">
+<!-- .terminal is the edge-to-edge panel (gradient ink, meets the column
+     dividers + window bottom) and carries the panel inset (14px 16px 4px);
+     .term-body is a clean UNPADDED host. FitAddon measures the host via
+     getComputedStyle height/width, which WKWebView resolves to the PADDED
+     border-box — padding on the host makes fit() over-count by ~a row/col and
+     the grid's bottom row clips past the panel. Keep all inset on the wrapper
+     so fit reads the true content area. -->
+<!-- --term-* surface vars are re-themed by Center.svelte (.center binds the
+     override once for the tab strip, every panel, and the diff view). -->
+<div class="terminal">
   <!-- data-session-id lets the app-wide file-drop listener hit-test a drop
        point back to this session (see fileDrop.ts); the drop-target ring shows
        where dragged paths will land before release. -->
   <div
-    class="term-host"
+    class="term-body"
     class:drop-target={$dropTargetSession === sessionId}
     data-session-id={sessionId}
     bind:this={host}
@@ -583,49 +755,64 @@
 </div>
 
 <style>
-  .term {
+  /* Edge-to-edge terminal panel: zero gutter, meets the column dividers and the
+     window bottom directly. The panel carries the inset; its fill is the SAME
+     flat --term-bg2 the xterm grid sits on, so the padding reads as part of
+     the terminal (a gradient here visibly seams against the flat grid,
+     especially on the light surface). */
+  .terminal {
     position: relative;
+    flex: 1;
+    min-height: 0;
     height: 100%;
     width: 100%;
-    background: var(--bg-0);
-    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    background: var(--term-bg2);
+    border: none;
+    border-radius: 0;
+    padding: 14px 16px 4px;
     overflow: hidden;
+  }
+  /* Clean unpadded host so fit.fit() reads an exact content size (see the
+     template comment — host padding skews FitAddon's measurement). */
+  .term-body {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
   }
   /* Compact search overlay pinned to the top-right of the terminal. */
   .term-search {
     position: absolute;
-    top: 8px;
-    right: 12px;
+    top: 10px;
+    right: 14px;
     z-index: 5;
     display: flex;
     align-items: center;
-    background: var(--bg-2);
-    border: 1px solid var(--line);
-    border-radius: 6px;
+    background: var(--term-bg2);
+    border: 1px solid var(--term-line);
+    border-radius: 0;
     padding: 3px 6px;
-    box-shadow: 0 4px 14px rgb(0 0 0 / 0.35);
+    box-shadow: var(--shadow-pop);
   }
   .term-search input {
     width: 180px;
     border: none;
     outline: none;
     background: transparent;
-    color: var(--tx-hi);
-    font-family:
-      "Berkeley Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo,
-      monospace;
-    font-size: 12px;
+    color: var(--term-fg);
+    font-family: var(--mono);
+    font-size: var(--r1);
     line-height: 1.4;
   }
   .term-search input::placeholder {
-    color: var(--tx-lo);
+    color: var(--term-dim);
   }
   .term-search:focus-within {
-    border-color: var(--ac);
+    border-color: var(--iris-ink);
   }
   /* "New output ↓" nudge: compact, on-theme, pinned bottom-right above the
-     terminal. Sits inside the .term padding so it never overlaps the scrollbar
-     edge. Accent-tinted so it reads as actionable without shouting. */
+     terminal. Sits inside the panel so it never overlaps the scrollbar edge. */
   .term-new-output {
     position: absolute;
     bottom: 12px;
@@ -634,41 +821,33 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    background: var(--bg-2);
-    border: 1px solid var(--ac);
-    border-radius: 999px;
+    background: var(--term-bg2);
+    border: 1px solid var(--iris-ink);
+    border-radius: 0;
     padding: 4px 10px;
-    color: var(--tx-hi);
-    font-family:
-      "Berkeley Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo,
-      monospace;
-    font-size: 11px;
+    color: var(--term-fg);
+    font-family: var(--mono);
+    font-size: 0.6875rem;
     line-height: 1.2;
     cursor: pointer;
-    box-shadow: 0 4px 14px rgb(0 0 0 / 0.35);
+    box-shadow: var(--shadow-pop);
+    transition: color 0.15s ease-out;
   }
   .term-new-output:hover {
-    background: var(--bg-1);
-    color: var(--ac);
+    color: var(--iris-ink);
   }
-  /* Clean inner box (no padding) so fit.fit() reads an exact content size. */
-  .term-host {
+  /* Drop-target affordance: an inset iris ring while an OS file drag hovers this
+     terminal. inset box-shadow stays inside the host and doesn't shift xterm's
+     layout (no reflow/fit). */
+  .term-body.drop-target {
+    box-shadow: inset 0 0 0 2px var(--iris-ink);
+  }
+  /* xterm injects its own canvas/layout; keep its viewport on theme. */
+  .term-body :global(.xterm) {
     height: 100%;
     width: 100%;
   }
-  /* Drop-target affordance: an inset accent ring while an OS file drag hovers
-     this terminal, so it's clear the paths will land here. inset box-shadow
-     stays inside the host and doesn't shift xterm's layout (no reflow/fit). */
-  .term-host.drop-target {
-    box-shadow: inset 0 0 0 2px var(--ac);
-    border-radius: 4px;
-  }
-  /* xterm injects its own canvas/layout; keep its viewport scrollbar on theme. */
-  .term-host :global(.xterm) {
-    height: 100%;
-    width: 100%;
-  }
-  .term-host :global(.xterm-viewport) {
+  .term-body :global(.xterm-viewport) {
     background: transparent !important;
   }
 </style>

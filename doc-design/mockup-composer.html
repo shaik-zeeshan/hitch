@@ -1,0 +1,1533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Composer — Option 4: Button Morph</title>
+<!--
+  Composer mockup — Option 4: BUTTON MORPH.
+  Self-contained, no external deps. Tokens copied verbatim from
+  apps/desktop/src/app.css (both themes). Rail markup/styles mirror
+  apps/desktop/src/lib/components/RightRail.svelte exactly (square edges,
+  hairlines, iris split button, mono file rows).
+
+  Direction: the action split button IS the composer. Its rectangle extends
+  downward into an anchored overlay card that floats over the dimmed file list
+  with NO backdrop and ZERO layout shift. The button row stays put as the card's
+  header; its label morphs contextually (Commit ▾ → Commit ⏎ → Commit on ready…
+  → Create draft PR ⏎ → pushing ↑3…). Below the header is the thinnest possible
+  content: a borderless subject that reads like an input only on focus, a quiet
+  auto-growing body textarea, and one muted footer line (scope · esc). The
+  generating affordance is a single 1px iris hairline along the card's top edge;
+  error swaps it for the oxide attention color + one error line.
+-->
+<style>
+  /* ============================================================
+     Hitch tokens — copied verbatim from apps/desktop/src/app.css.
+     Light ("paper") on :root; dark ("dusk") on [data-theme="dark"].
+     ============================================================ */
+  :root {
+    --paper-0: oklch(97.4% 0.008 80);
+    --paper-1: oklch(96.6% 0.010 78);
+    --paper-2: oklch(98.0% 0.008 82);
+    --paper-3: oklch(94.0% 0.012 76);
+    --line: oklch(88.0% 0.014 74);
+    --line-soft: oklch(91.5% 0.012 76);
+    --ink-0: oklch(28.0% 0.020 70);
+    --ink-1: oklch(42.0% 0.018 70);
+    --ink-2: oklch(56.0% 0.016 72);
+    --ink-3: oklch(66.0% 0.014 74);
+
+    --iris: oklch(48.0% 0.150 275);
+    --iris-ink: oklch(40.0% 0.160 275);
+    --iris-wash: oklch(93.5% 0.030 275);
+    --iris-line: oklch(82.0% 0.060 275);
+    --iris-on: oklch(98% 0.01 280);
+    --iris-on-sc: oklch(92% 0.04 280);
+    --iris-on-sc-line: oklch(60% 0.10 280);
+
+    --st-run: oklch(48.0% 0.090 195);
+    --st-need: oklch(47.0% 0.150 32);
+    --st-need-wash: oklch(94.0% 0.035 32);
+    --st-need-line: oklch(83.0% 0.080 32);
+    --st-stall: oklch(52.0% 0.075 75);
+    --st-ok: oklch(50.0% 0.095 150);
+    --st-ok-glow: oklch(50% 0.095 150 / 0.14);
+    --st-ok-wash: oklch(94.0% 0.035 150);
+    --st-ok-line: oklch(83.0% 0.080 150);
+
+    --pr-merged: oklch(48.0% 0.140 300);
+    --pr-merged-wash: oklch(94.0% 0.035 300);
+    --pr-merged-line: oklch(83.0% 0.080 300);
+
+    --diff-add: oklch(46.0% 0.095 150);
+    --diff-del: oklch(50.0% 0.130 28);
+
+    --page-glow: oklch(98.4% 0.010 82);
+    --light-inset: oklch(100% 0 0 / 0.6);
+    --shadow-pop:
+      0 1px 0 var(--light-inset) inset,
+      0 14px 30px -14px oklch(30% 0.03 70 / 0.35),
+      0 4px 10px -6px oklch(30% 0.03 70 / 0.25);
+
+    --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+    --r0: 0.75rem;
+    --r1: 0.8125rem;
+    --r2: 0.875rem;
+    --r3: 1rem;
+  }
+
+  [data-theme="dark"] {
+    --paper-0: oklch(16.5% 0.012 72);
+    --paper-1: oklch(19.0% 0.013 72);
+    --paper-2: oklch(22.0% 0.014 74);
+    --paper-3: oklch(17.5% 0.012 70);
+    --line: oklch(31.0% 0.016 74);
+    --line-soft: oklch(26.0% 0.014 72);
+    --ink-0: oklch(91.0% 0.014 82);
+    --ink-1: oklch(78.0% 0.014 80);
+    --ink-2: oklch(64.0% 0.014 78);
+    --ink-3: oklch(52.0% 0.013 76);
+
+    --iris: oklch(64.0% 0.150 278);
+    --iris-ink: oklch(80.0% 0.120 280);
+    --iris-wash: oklch(28.0% 0.060 278);
+    --iris-line: oklch(42.0% 0.090 278);
+    --iris-on: oklch(18% 0.03 280);
+    --iris-on-sc: oklch(28% 0.06 280);
+    --iris-on-sc-line: oklch(56% 0.10 280);
+
+    --st-run: oklch(74.0% 0.120 195);
+    --st-need: oklch(72.0% 0.150 32);
+    --st-need-wash: oklch(28.0% 0.060 32);
+    --st-need-line: oklch(42.0% 0.090 32);
+    --st-stall: oklch(78.0% 0.110 78);
+    --st-ok: oklch(74.0% 0.120 152);
+    --st-ok-glow: oklch(74% 0.120 152 / 0.18);
+    --st-ok-wash: oklch(28.0% 0.060 152);
+    --st-ok-line: oklch(42.0% 0.090 152);
+
+    --pr-merged: oklch(72.0% 0.130 300);
+    --pr-merged-wash: oklch(28.0% 0.060 300);
+    --pr-merged-line: oklch(42.0% 0.090 300);
+
+    --diff-add: oklch(76.0% 0.120 152);
+    --diff-del: oklch(74.0% 0.140 28);
+
+    --page-glow: oklch(20.0% 0.016 74);
+    --light-inset: oklch(100% 0 0 / 0.04);
+    --shadow-pop:
+      0 0 0 1px oklch(8% 0.01 72 / 0.5),
+      0 16px 34px -16px oklch(4% 0.01 72 / 0.7);
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body { margin: 0; }
+  body {
+    background: var(--paper-0);
+    color: var(--ink-0);
+    font-family: var(--ui);
+    font-size: var(--r0);
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* keycap recipe (app.css base layer) */
+  kbd {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 15px;
+    min-width: 20px;
+    padding: 0 5px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.02em;
+    line-height: 1;
+    color: var(--ink-2);
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: 0;
+    vertical-align: baseline;
+    translate: 0 1px;
+  }
+  .on-iris kbd {
+    color: var(--iris-on);
+    border-color: var(--iris-on-sc-line);
+  }
+  .keys { display: inline-flex; align-items: center; gap: 3px; }
+
+  /* ---- page chrome (gallery only) ------------------------------------- */
+  .page {
+    max-width: 1340px;
+    margin: 0 auto;
+    padding: 40px 32px 72px;
+  }
+  .lede h1 {
+    font-size: 1.45rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin: 0 0 12px;
+  }
+  .lede p {
+    max-width: 720px;
+    color: var(--ink-1);
+    font-size: var(--r2);
+    line-height: 1.6;
+    margin: 0 0 6px;
+  }
+  .lede p .em {
+    font-family: var(--mono);
+    font-size: var(--r1);
+    color: var(--iris-ink);
+    font-weight: 600;
+  }
+  .theme-band {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin: 46px 0 18px;
+    padding-bottom: 9px;
+    border-bottom: 1px solid var(--line);
+  }
+  .theme-band h2 {
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-2);
+    font-weight: 700;
+    margin: 0;
+  }
+  .theme-band span {
+    font-family: var(--mono);
+    font-size: var(--r0);
+    color: var(--ink-3);
+  }
+
+  /* The gallery is a wrapping row of fixed-width rail instances. Each pane is
+     rendered inside its own theming context so light + dark sit on one page. */
+  .gallery {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 28px 24px;
+  }
+  .pane { width: 300px; }
+  .pane .cap {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    margin-bottom: 9px;
+    min-height: 30px;
+  }
+  .pane .cap .n {
+    font-size: 0.625rem;
+    font-weight: 700;
+    font-family: var(--mono);
+    letter-spacing: 0.06em;
+    color: var(--iris-ink);
+  }
+  .pane .cap .t {
+    font-size: var(--r1);
+    font-weight: 600;
+    color: var(--ink-0);
+  }
+  .pane .cap .d {
+    flex: 1;
+    font-size: 0.6875rem;
+    color: var(--ink-2);
+    line-height: 1.35;
+  }
+  /* a tiny muted "restored" annotation — caption only (state itself is identical) */
+  .pane .cap .restored {
+    font-family: var(--mono);
+    font-size: 0.5625rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: var(--ink-3);
+    border: 1px solid var(--line);
+    padding: 1px 5px;
+    border-radius: 0;
+  }
+
+  /* The dark gallery section paints its own paper backdrop so the panes read on
+     the correct ground (this page's <body> stays the light backdrop). */
+  .surface-dark {
+    background: var(--paper-0);
+    border: 1px solid var(--line);
+    border-radius: 0;
+    padding: 28px 26px 34px;
+    margin-top: 6px;
+  }
+
+  /* ============================================================
+     The rail — mirrors RightRail.svelte's .rail-right and children.
+     ============================================================ */
+  .rail-right {
+    position: relative;
+    background: var(--paper-1);
+    border: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    height: 520px;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .changes-head {
+    flex: 0 0 38px;
+    height: 38px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .changes-head .title {
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .view-toggle { display: inline-flex; align-items: center; gap: 12px; }
+  .vtab {
+    font-family: var(--ui);
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: var(--ink-3);
+    background: transparent;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+  }
+  .vtab.on { color: var(--iris-ink); }
+  .head-right { display: inline-flex; align-items: center; gap: 8px; }
+  .net {
+    font-family: var(--mono);
+    font-size: var(--r0);
+    font-variant-numeric: tabular-nums;
+  }
+  .net .a { color: var(--diff-add); font-weight: 600; }
+  .net .d { color: var(--diff-del); font-weight: 600; }
+  .refresh {
+    display: grid;
+    place-items: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+  }
+  .refresh svg { width: 13px; height: 13px; }
+
+  .changes-ctx {
+    flex: none;
+    padding: 11px 16px 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  .branchline {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+    font-family: var(--mono);
+    font-size: var(--r1);
+    color: var(--ink-0);
+  }
+  .branchline .ic { width: 14px; height: 14px; flex: 0 0 14px; color: var(--ink-2); }
+  .branchline .b {
+    flex: 0 1 auto;
+    min-width: 0;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .branchline .from { flex: none; color: var(--ink-2); white-space: nowrap; }
+  .branchline .ahead {
+    margin-left: auto;
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    font-family: var(--mono);
+    font-size: var(--r0);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--st-ok);
+  }
+  .branchline .ahead .arr { font-size: 0.8rem; line-height: 1; }
+
+  /* ---- actions block: the split button + composer anchor ----------------- */
+  .actions {
+    flex: none;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+    position: relative; /* anchor for the composer card */
+  }
+  .splitbtn {
+    display: flex;
+    align-items: stretch;
+    width: 100%;
+    border-radius: 0;
+    overflow: hidden;
+    box-shadow: 0 1px 0 oklch(100% 0 0 / 0.14) inset;
+  }
+  .split-main {
+    flex: 1;
+    min-width: 0;
+    justify-content: center;
+    font-family: var(--ui);
+    font-size: var(--r1);
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--iris);
+    color: var(--iris-on);
+    border: 1px solid var(--iris-ink);
+    border-right: none;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .split-main .btnic { width: 14px; height: 14px; flex: 0 0 14px; color: var(--iris-on); }
+  .split-main .keys { margin-left: 2px; }
+  .split-caret {
+    flex: 0 0 30px;
+    display: grid;
+    place-items: center;
+    background: var(--iris);
+    color: var(--iris-on);
+    border: 1px solid var(--iris-ink);
+    box-shadow: inset 1px 0 0 var(--iris-on-sc-line);
+    cursor: pointer;
+  }
+  .split-caret svg { width: 13px; height: 13px; display: block; }
+
+  .why-primary {
+    margin-top: 8px;
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.01em;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .why-primary .sep { color: var(--ink-3); }
+
+  /* ============================================================
+     THE COMPOSER — in-place button morph. Button Morph variant.
+     CRITICAL: the morph happens IN PLACE. The split-button row NEVER leaves its
+     in-flow slot in .actions. When the composer opens, that same row (same
+     geometry, same position, same iris fill) becomes the card's HEADER — only its
+     label morphs. The card BODY is the only thing that overlays: it is positioned
+     absolutely directly beneath the in-flow header row and extends downward over
+     the dimmed file list. Result: ZERO layout shift — the file list never moves,
+     the button never moves, and no gap ever appears in the actions slot.
+
+     .composer is a normal-flow wrapper occupying the button slot; it is the
+     positioning context for the absolute body. The header reads as a continuous
+     rectangle with the body below it via a shared iris-ink border (the header
+     keeps its bottom border off so the seam is just the hairline / body top).
+     ============================================================ */
+
+  /* When the composer is open, the file list behind it dims (no layout shift). */
+  .rail-right.composing .files { opacity: 0.32; filter: saturate(0.6); pointer-events: none; }
+  .rail-right.composing .files { transition: none; }
+
+  /* The in-flow composer wrapper. Sits exactly where .splitbtn sat (same slot,
+     same width via .actions padding); it is the anchor for the overlay body. */
+  .composer {
+    position: relative;
+    z-index: 30;
+  }
+
+  /* The morphed button row = the card header, KEPT IN FLOW in the button slot.
+     Same iris fill + geometry + inset highlight as the .splitbtn it replaces;
+     a split into a morphing label half + a close-affordance half (the old caret).
+     Its label morphs per state; it never moves. */
+  .cmp-head {
+    position: relative;
+    z-index: 2; /* above the body's top border so the seam reads as one edge */
+    display: flex;
+    align-items: stretch;
+    width: 100%;
+    border: 1px solid var(--iris-ink);
+    border-radius: 0;
+    overflow: hidden;
+    box-shadow: 0 1px 0 oklch(100% 0 0 / 0.14) inset;
+  }
+  .cmp-head .label {
+    flex: 1;
+    min-width: 0;
+    justify-content: center;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--iris);
+    color: var(--iris-on);
+    font-family: var(--ui);
+    font-size: var(--r1);
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .cmp-head .btnic { width: 14px; height: 14px; flex: 0 0 14px; color: var(--iris-on); }
+  .cmp-head .keys { margin-left: 2px; }
+  /* the close half — the old ▾ caret morphs into the dismiss affordance (×). */
+  .cmp-head .close {
+    flex: 0 0 30px;
+    display: grid;
+    place-items: center;
+    background: var(--iris);
+    color: var(--iris-on);
+    box-shadow: inset 1px 0 0 var(--iris-on-sc-line);
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 14px;
+    line-height: 1;
+  }
+  /* a tiny inline spinner glyph that can ride in the morphed label */
+  .cmp-head .spin {
+    width: 11px; height: 11px;
+    border: 1.5px solid var(--iris-on-sc-line);
+    border-top-color: var(--iris-on);
+    border-radius: 50%;
+    animation: cmpSpin 0.8s linear infinite;
+    flex: 0 0 11px;
+  }
+  @keyframes cmpSpin { to { transform: rotate(360deg); } }
+  /* a queued header is quieter — the label reads "Commit on ready…" but stays
+     on the iris fill so it still reads as the same morphing button. */
+  .cmp-head.queued .label { color: var(--iris-on-sc); }
+
+  /* the 1px hairline progress edge — sits at the SEAM (bottom edge of the header
+     row) so it reads as part of the unified card, not floating above it. */
+  .cmp-head .hairline {
+    position: absolute;
+    left: 0; right: 0; bottom: -1px; /* straddle the header/body seam */
+    height: 1px;
+    overflow: hidden;
+    z-index: 3;
+  }
+  .cmp-head .hairline::before {
+    content: "";
+    position: absolute;
+    top: 0; height: 1px;
+    width: 38%;
+    left: -38%;
+    background: var(--iris);
+    animation: cmpScan 1.15s ease-in-out infinite;
+  }
+  @keyframes cmpScan {
+    0%   { left: -38%; }
+    100% { left: 100%; }
+  }
+
+  /* the card BODY — the ONLY overlaying element. Absolutely positioned directly
+     beneath the in-flow header row; extends downward over the dimmed file list.
+     Its top border tucks under the header's bottom so the two read as one
+     continuous rectangle (shared iris-ink frame, no seam but the hairline). */
+  .cmp-body {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 100%;
+    margin-top: -1px; /* overlap the header's bottom border → shared edge */
+    background: var(--paper-2);
+    border: 1px solid var(--iris-ink);
+    border-top: none;
+    border-radius: 0;
+    box-shadow: var(--shadow-pop);
+    padding: 10px 12px 9px;
+  }
+
+  /* error swaps the scanning hairline for a solid oxide edge + recolors the
+     unified card frame (header + body) to the oxide attention color. */
+  .composer.is-error .cmp-head,
+  .composer.is-error .cmp-body { border-color: var(--st-need-line); }
+  .composer.is-error .cmp-head .hairline { height: 1px; background: var(--st-need); }
+  .composer.is-error .cmp-head .hairline::before { display: none; }
+
+  /* subject: styled like an input ONLY on focus/hover; borderless at rest. */
+  .cmp-subject {
+    width: 100%;
+    display: block;
+    font-family: var(--mono);
+    font-size: var(--r1);
+    font-weight: 600;
+    color: var(--ink-0);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 0;
+    padding: 4px 5px;
+    margin: 0 -5px; /* bleed so the rest at-rest text aligns flush */
+    outline: none;
+  }
+  .cmp-subject::placeholder { color: var(--ink-3); font-weight: 500; }
+  .cmp-subject:hover { border-color: var(--line); }
+  .cmp-subject:focus { border-color: var(--iris); background: var(--paper-3); }
+
+  /* body: quiet auto-growing textarea; borderless at rest like the subject.
+     auto-grows to its content up to ~10 text lines (line-height 1.55 × var(--r1))
+     plus the 8px vertical padding, then clamps and scrolls inside the card so a
+     long draft can't push the overlay past the file list. */
+  .cmp-bodytext {
+    width: 100%;
+    display: block;
+    font-family: var(--mono);
+    font-size: var(--r1);
+    line-height: 1.55;
+    color: var(--ink-1);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 0;
+    padding: 4px 5px;
+    margin: 4px -5px 0;
+    max-height: calc(10 * 1.55 * var(--r1) + 8px);
+    resize: none;
+    outline: none;
+    overflow-x: hidden;
+    overflow-y: auto;
+    /* thin neutral scrollbar, matching the app's global convention. */
+    scrollbar-width: thin;
+    scrollbar-color: var(--ink-3) transparent;
+  }
+  .cmp-bodytext::placeholder { color: var(--ink-3); }
+  .cmp-bodytext:hover { border-color: var(--line); }
+  .cmp-bodytext:focus { border-color: var(--iris); background: var(--paper-3); }
+
+  /* the single muted footer line: scope on the left, esc hint on the right.
+     it must never wrap — the scope truncates while the controls stay intact. */
+  .cmp-foot {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 8px;
+    margin-top: 7px;
+    padding-top: 7px;
+    border-top: 1px solid var(--line);
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    color: var(--ink-3);
+  }
+  /* the scope is the one thing that gives way: it shrinks and ellipsises. */
+  .cmp-foot .scope { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); }
+  .cmp-foot .scope b { color: var(--ink-1); font-weight: 600; }
+  .cmp-foot .spacer { flex: 1; }
+  /* the right-side controls never shrink or wrap — they stay fully visible. */
+  .cmp-foot .act {
+    flex: none;
+    white-space: nowrap;
+    color: var(--iris-ink);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .cmp-foot .esc { flex: none; white-space: nowrap; color: var(--ink-3); display: inline-flex; align-items: center; gap: 4px; }
+  .cmp-foot .esc kbd { translate: 0 0; }
+
+  /* error line inside the body */
+  .cmp-error {
+    font-family: var(--mono);
+    font-size: var(--r0);
+    color: var(--st-need);
+    line-height: 1.5;
+    margin: 0 0 8px;
+    word-break: break-word;
+  }
+
+  /* PR pre-flight: a base-branch select that reuses the app's .select-trigger. */
+  .cmp-prerow { margin-bottom: 2px; }
+  .cmp-prerow .lab {
+    display: block;
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-2);
+    font-weight: 700;
+    margin: 0 0 6px;
+  }
+  .select-trigger {
+    width: 100%;
+    min-height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    background: var(--paper-3);
+    border: 1px solid var(--line);
+    border-radius: 0;
+    color: var(--ink-0);
+    font: inherit;
+    font-size: var(--r1);
+    font-family: var(--mono);
+    padding: 8px 10px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .select-chev { color: var(--ink-2); font-size: 12px; flex: none; }
+
+  /* PR progress steps shown in the body (the action stays in the morphed label) */
+  .cmp-steps {
+    list-style: none;
+    margin: 2px 0 4px;
+    padding: 0;
+    font-family: var(--mono);
+    font-size: var(--r1);
+    color: var(--ink-2);
+  }
+  .cmp-steps li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+  }
+  .cmp-steps li .mk { width: 13px; text-align: center; flex: 0 0 13px; font-size: 0.75rem; }
+  .cmp-steps li.done { color: var(--ink-1); }
+  .cmp-steps li.done .mk { color: var(--st-ok); }
+  .cmp-steps li.now { color: var(--ink-0); }
+  .cmp-steps li.now .mk { color: var(--iris-ink); }
+  .cmp-steps li.now .mk .spin2 {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border: 1.5px solid var(--iris-line);
+    border-top-color: var(--iris-ink);
+    border-radius: 50%;
+    animation: cmpSpin 0.8s linear infinite;
+    vertical-align: -1px;
+  }
+  .cmp-steps li.todo { color: var(--ink-3); }
+  .cmp-steps li .lk { color: var(--iris-ink); }
+
+  /* ============================================================
+     AUTO MODE — header-only morph. No card body ever opens; the action label
+     morphs in place (◌ staging… → ◌ drafting… → ◌ pushing… → ✓ committed) and
+     the file list behind it stays fully visible and UNDIMMED (nothing overlays).
+     Reuses the exact .cmp-head recipe so the morphing button is geometrically
+     identical to the resting split button; the close half holds the × that
+     cancels the remaining steps. The progress affordance is the same 1px iris
+     scanning hairline as the manual composer, sitting on the head's bottom edge.
+     ============================================================ */
+  /* a small dotted-ring glyph that rides at the head of an auto label */
+  .cmp-head .iris-dot {
+    flex: 0 0 13px;
+    width: 13px; height: 13px;
+    border-radius: 50%;
+    border: 1.5px dashed var(--iris-on-sc-line);
+    color: var(--iris-on);
+    animation: cmpSpin 2.4s linear infinite;
+  }
+  /* calm success head: no hairline, label reads ✓ committed; mark is the ok color
+     painted onto the iris fill via the on-iris success token so it stays legible. */
+  .cmp-head .ok-mk { color: var(--iris-on); font-size: 13px; line-height: 1; }
+  /* a single muted reason line shown directly under the header on the failed
+     chain (header-only — no card body opens). */
+  .auto-reason {
+    margin-top: 8px;
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    line-height: 1.5;
+    color: var(--ink-3);
+    word-break: break-word;
+  }
+
+  /* failed-chain head: oxide attention treatment (matches the manual error
+     frame), label reads ✗ push failed — retry ▾, with a retry caret half. */
+  .cmp-head.is-error {
+    border-color: var(--st-need-line);
+  }
+  .cmp-head.is-error .label {
+    background: var(--st-need-wash);
+    color: var(--st-need);
+  }
+  .cmp-head.is-error .close {
+    background: var(--st-need-wash);
+    color: var(--st-need);
+    box-shadow: inset 1px 0 0 var(--st-need-line);
+    font-family: var(--ui);
+    font-size: 12px;
+  }
+  .cmp-head.is-error .label .err-mk { font-size: 13px; line-height: 1; }
+
+  /* ---- the app's REAL toast, transplanted verbatim --------------------------
+     Recipe is svelte-french-toast's ToastBar .base merged with the app's
+     toastOptions.style from apps/desktop/src/routes/+layout.svelte:430. In the
+     app, <Toaster position="bottom-right"> renders app-wide, fixed to the
+     viewport's bottom-right corner. For this static gallery we anchor the toast
+     to the bottom-right INSIDE the rail pane (the rail is the right-most pane in
+     the app, so this is where the real toast visually lands), noted in the pane
+     caption. Colors/border/radius/padding/shadow/type are NOT invented — they
+     are the live tokens + the library defaults. */
+  .rail-right .toast-host {
+    position: absolute;
+    right: 12px;
+    bottom: 12px;
+    left: 12px;
+    z-index: 60;
+    display: flex;
+    justify-content: flex-end;
+    pointer-events: none;
+  }
+  .toast {
+    /* svelte-french-toast .base defaults */
+    display: flex;
+    align-items: center;
+    line-height: 1.3;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.1), 0 3px 3px rgba(0, 0, 0, 0.05);
+    max-width: 350px;
+    /* app toastOptions.style overrides (+layout.svelte) */
+    background: var(--paper-2);
+    color: var(--ink-0);
+    border: 1px solid var(--line);
+    border-radius: 0;
+    font-size: 12px;
+    padding: 10px 14px;
+  }
+  /* success icon — svelte-french-toast CheckmarkIcon: 20px circle, iris primary
+     fill, the tick drawn in the secondary (paper-2) color. */
+  .toast .ticon {
+    flex: 0 0 20px;
+    width: 20px; height: 20px;
+    border-radius: 10px;
+    background: var(--iris); /* iconTheme.primary */
+    position: relative;
+    transform: rotate(45deg);
+  }
+  .toast .ticon::after {
+    content: "";
+    box-sizing: border-box;
+    position: absolute;
+    border-right: 2px solid var(--paper-2); /* iconTheme.secondary */
+    border-bottom: 2px solid var(--paper-2);
+    bottom: 6px; left: 6px;
+    height: 10px; width: 6px;
+  }
+  /* ToastMessage .message: flex, margin 4px 10px, inherits color. */
+  .toast .tmsg {
+    margin: 4px 10px;
+    flex: 1 1 auto;
+    white-space: pre-line;
+    font-family: var(--ui);
+  }
+  /* the commit-info payload reads in mono so the sha/counts line up. */
+  .toast .tmsg .tsub { font-weight: 600; color: var(--ink-0); }
+  .toast .tmsg .tmeta {
+    display: block;
+    margin-top: 3px;
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink-2);
+  }
+  .toast .tmsg .tmeta .sha { color: var(--ink-1); font-weight: 600; }
+  .toast .tmsg .tmeta .ok { color: var(--st-ok); font-weight: 600; }
+  .toast .tmsg .tmeta .sep { color: var(--ink-3); }
+
+  /* ---- file list (mirrors RightRail.svelte) ----------------------------- */
+  .files {
+    flex: 1;
+    overflow: hidden;
+    min-height: 0;
+    padding: 6px 10px 12px;
+    transition: opacity 0.18s ease-out;
+  }
+  .fgroup { margin-top: 8px; }
+  .fgroup h3 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-2);
+    font-weight: 700;
+    padding: 6px 8px 5px;
+    margin: 0;
+  }
+  .fgroup h3 .group-label {
+    font: inherit;
+    color: var(--ink-2);
+    background: transparent;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+  }
+  .fgroup h3 .ct { color: var(--ink-3); font-weight: 600; }
+  .fgroup h3 .hr { flex: 1; height: 1px; background: var(--line); }
+  .fgroup h3 .all {
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    color: var(--iris-ink);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: none;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+  }
+  .fgroup h3 .all.discard-all { color: var(--st-need); }
+
+  .frow {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    text-align: left;
+    font-family: var(--mono);
+    font-size: var(--r1);
+    padding: 5px 8px;
+    border-radius: 0;
+    color: var(--ink-2);
+    cursor: pointer;
+    background: transparent;
+    border: 0;
+  }
+  .frow.active { background: var(--paper-3); box-shadow: inset 0 0 0 1px var(--line); }
+  .frow .chk {
+    width: 14px; height: 14px;
+    border-radius: 0;
+    flex: 0 0 14px;
+    border: 1px solid var(--line);
+    display: grid;
+    place-items: center;
+    font-size: 0.6rem;
+    color: var(--paper-2);
+    background: var(--paper-1);
+  }
+  .frow .chk.on { background: var(--iris); border-color: var(--iris-ink); color: var(--iris-on); }
+  .frow .st { width: 13px; text-align: center; font-weight: 700; font-size: 0.75rem; flex: 0 0 13px; }
+  .frow .st.M { color: var(--st-stall); }
+  .frow .st.A { color: var(--st-ok); }
+  .frow .st.D { color: var(--diff-del); }
+  /* file-type glyph placeholder (the real app renders Material Icons here). */
+  .frow .ftype {
+    flex: 0 0 16px; width: 16px; height: 16px;
+    display: grid; place-items: center;
+  }
+  .frow .ftype svg { width: 15px; height: 15px; display: block; }
+  .frow .path {
+    flex: 1; min-width: 0;
+    color: var(--ink-2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .frow .path .dir { color: var(--ink-2); }
+  .frow .path b { color: var(--ink-0); font-weight: 500; }
+  .frow .fdiff {
+    flex: 0 0 auto;
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: var(--r0);
+    font-variant-numeric: tabular-nums;
+  }
+  .frow .fdiff .a { color: var(--diff-add); font-weight: 600; }
+  .frow .fdiff .d { color: var(--diff-del); font-weight: 600; }
+
+  /* ---- footer keyboard legend ------------------------------------------- */
+  .rail-r-foot {
+    flex: none;
+    border-top: 1px solid var(--line);
+    padding: 8px 16px;
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    color: var(--ink-2);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .rail-r-foot span { display: inline-flex; align-items: center; gap: 5px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+    }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="lede">
+    <h1>Composer — Option 4: Button Morph</h1>
+    <p>
+      The quietest option. The action split button <em></em><span class="em">becomes</span>
+      the composer: its rectangle extends straight down into an anchored overlay
+      card that floats over the dimmed file list — no backdrop, <span class="em">Esc</span> dismisses,
+      zero layout shift. The button row stays put as the card's header, and its
+      label morphs with the state (<span class="em">Commit ▾</span> →
+      <span class="em">Commit ⏎</span> → <span class="em">Commit on ready…</span> →
+      <span class="em">Create draft PR ⏎</span> → <span class="em">pushing ↑3…</span>).
+    </p>
+    <p>
+      Below the header sits the thinnest possible content: a subject that reads
+      like an input only on hover/focus, a borderless auto-growing body, and one
+      muted footer line carrying the scope and the esc hint. The generating
+      affordance is a single 1px iris hairline along the card's top edge; an
+      error swaps it for the oxide attention color plus one error line. PR
+      progress lives entirely in the morphing button label with the hairline
+      running. Exact app tokens, rectangles only — the card almost reads as part
+      of the rail.
+    </p>
+    <p>
+      <span class="em">Auto mode</span> never opens the body. The auto-commit-push
+      toggle runs an autonomous chain — <span class="em">stage → draft → commit → push</span>
+      — as a single daemon-owned composite <span class="em">Job</span>. Progress shows by the
+      action button morphing its label in place (<span class="em">◌ staging 4 files…</span> →
+      <span class="em">◌ drafting message…</span> → <span class="em">◌ pushing ↑1…</span>),
+      the file list staying fully visible and undimmed since nothing overlays it.
+      The chain survives navigating away: a returning GUI re-attaches and restores
+      the button mid-chain from the worktree's active Jobs — indistinguishable from
+      never having left. On completion the label settles to a calm
+      <span class="em">✓ committed</span> and the app's real bottom-right
+      <span class="em">toast</span> carries the commit info (subject · short sha · pushed). A
+      failed step puts the button in the oxide error treatment with one muted reason
+      line; nothing is committed beyond what already succeeded.
+    </p>
+  </div>
+
+  <!-- ====================== LIGHT GALLERY ====================== -->
+  <div class="theme-band">
+    <h2>Light — paper</h2>
+    <span>:root</span>
+  </div>
+  <div class="gallery" id="light-gallery"></div>
+
+  <!-- ====================== DARK GALLERY ====================== -->
+  <div class="theme-band">
+    <h2>Dark — dusk</h2>
+    <span>[data-theme="dark"]</span>
+  </div>
+  <div class="surface-dark" data-theme="dark">
+    <div class="gallery" id="dark-gallery"></div>
+  </div>
+
+</div>
+
+<!-- ============================================================
+     Templates. One <template> per pane; cloned into both galleries so light
+     and dark render identical content. Pure markup — the only JS is the clone
+     loop at the bottom (no framework, no interactivity needed for a static gallery).
+     ============================================================ -->
+
+<!-- inline icon defs reused across panes -->
+<template id="icons">
+  <svg style="display:none" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="i-branch" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol>
+    <symbol id="i-commit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><line x1="3" x2="9" y1="12" y2="12"/><line x1="15" x2="21" y1="12" y2="12"/></symbol>
+    <symbol id="i-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-pr" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><line x1="6" x2="6" y1="9" y2="21"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 7-7 7 7"/><path d="M12 19V5"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5z"/><path d="M14 2v6h6"/></symbol>
+  </svg>
+</template>
+
+<!-- The shared rail header + branch context, reused at the top of every pane. -->
+<template id="rail-head">
+  <div class="changes-head">
+    <div class="title">
+      <div class="view-toggle">
+        <span class="vtab on">Changes</span>
+        <span class="vtab">History</span>
+      </div>
+      <span class="head-right">
+        <span class="net"><span class="a">+42</span> <span class="d">−7</span></span>
+        <button class="refresh" title="Fetch remote and refresh status"><svg><use href="#i-refresh"/></svg></button>
+      </span>
+    </div>
+  </div>
+  <div class="changes-ctx">
+    <div class="branchline">
+      <svg class="ic"><use href="#i-branch"/></svg>
+      <span class="b">wild-dune-78</span>
+      <span class="from">from main</span>
+      <span class="ahead"><span class="arr">↑</span>3</span>
+    </div>
+  </div>
+</template>
+
+<!-- The realistic file list, reused as the dimmed backdrop in every pane. -->
+<template id="file-list">
+  <div class="files">
+    <div class="fgroup">
+      <h3>
+        <span class="group-label">Staged</span><span class="ct">3</span><span class="hr"></span>
+        <span class="all">unstage all</span>
+      </h3>
+      <div class="frow active">
+        <span class="chk on">✓</span><span class="st M">M</span>
+        <span class="ftype"><svg><use href="#i-file"/></svg></span>
+        <span class="path"><span class="dir">lib/components/</span><b>RightRail.svelte</b></span>
+        <span class="fdiff"><span class="a">+24</span><span class="d">−6</span></span>
+      </div>
+      <div class="frow">
+        <span class="chk on">✓</span><span class="st M">M</span>
+        <span class="ftype"><svg><use href="#i-file"/></svg></span>
+        <span class="path"><span class="dir">lib/</span><b>daemon.ts</b></span>
+        <span class="fdiff"><span class="a">+9</span><span class="d">−1</span></span>
+      </div>
+      <div class="frow">
+        <span class="chk on">✓</span><span class="st A">A</span>
+        <span class="ftype"><svg><use href="#i-file"/></svg></span>
+        <span class="path"><span class="dir">lib/components/</span><b>Composer.svelte</b></span>
+        <span class="fdiff"><span class="a">+9</span><span class="d">−0</span></span>
+      </div>
+    </div>
+    <div class="fgroup">
+      <h3>
+        <span class="group-label">Changes</span><span class="ct">1</span><span class="hr"></span>
+        <span class="all">stage all</span>
+        <span class="all discard-all">discard</span>
+      </h3>
+      <div class="frow">
+        <span class="chk"></span><span class="st M">M</span>
+        <span class="ftype"><svg><use href="#i-file"/></svg></span>
+        <span class="path"><span class="dir">lib/</span><b>settings.ts</b></span>
+        <span class="fdiff"><span class="a">+0</span><span class="d">−0</span></span>
+      </div>
+    </div>
+  </div>
+</template>
+
+<!-- The footer keyboard legend, reused at the bottom of every pane. -->
+<template id="rail-foot">
+  <div class="rail-r-foot">
+    <span><kbd>␣</kbd> stage</span>
+    <span><kbd>↵</kbd> open diff</span>
+    <span><span class="keys"><kbd>⌘</kbd><kbd>↵</kbd></span> commit</span>
+  </div>
+</template>
+
+<!-- =============== PANE 0 — CLOSED / NORMAL RAIL =============== -->
+<template class="pane-tpl"
+  data-n="0" data-t="Closed (normal)"
+  data-d="The resting rail. The split button is the only action chrome; the composer is closed.">
+  <div class="rail-right">
+    <!--HEAD-->
+    <div class="actions">
+      <div class="splitbtn">
+        <button class="split-main on-iris">
+          <svg class="btnic"><use href="#i-commit"/></svg>
+          Commit
+          <span class="keys"><kbd>⌘</kbd><kbd>↵</kbd></span>
+        </button>
+        <button class="split-caret"><svg><use href="#i-chev"/></svg></button>
+      </div>
+      <div class="why-primary">
+        <span>3 staged</span><span class="sep">·</span><span>↑3</span><span class="sep">·</span><span>PR #142 open</span>
+      </div>
+    </div>
+    <!--FILES-->
+    <!--FOOT-->
+  </div>
+</template>
+
+<!-- =============== PANE 1 — COMMIT: GENERATING =============== -->
+<template class="pane-tpl"
+  data-n="1" data-t="Commit · generating"
+  data-d="Opening starts the AI draft. Hairline scans; subject/body editable but empty with placeholders.">
+  <div class="rail-right composing">
+    <!--HEAD-->
+    <div class="actions">
+      <div class="composer">
+        <div class="cmp-head">
+          <span class="label on-iris"><span class="spin"></span> Drafting commit…</span>
+          <span class="close" title="Cancel">×</span>
+          <div class="hairline"></div>
+        </div>
+        <div class="cmp-body">
+          <input class="cmp-subject" placeholder="subject — generating…" value="" />
+          <textarea class="cmp-bodytext" rows="2" placeholder="body — generating…"></textarea>
+          <div class="cmp-foot">
+            <span class="scope">committing <b>3 staged files</b></span>
+            <span class="spacer"></span>
+            <span class="esc"><kbd>esc</kbd> cancel</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!--FILES-->
+    <!--FOOT-->
+  </div>
+</template>
+
+<!-- =============== PANE 2 — COMMIT: DRAFT READY =============== -->
+<template class="pane-tpl"
+  data-n="2" data-t="Commit · draft ready"
+  data-d="Generated subject + body bullets, both editable. Header morphs to Commit ⏎; regenerate + esc in the footer.">
+  <div class="rail-right composing">
+    <!--HEAD-->
+    <div class="actions">
+      <div class="composer">
+        <div class="cmp-head">
+          <span class="label on-iris">
+            <svg class="btnic"><use href="#i-commit"/></svg>
+            Commit
+            <span class="keys"><kbd>↵</kbd></span>
+          </span>
+          <span class="close" title="Close">×</span>
+        </div>
+        <div class="cmp-body">
+          <input class="cmp-subject" value="feat: add inline composer to right rail" />
+          <textarea class="cmp-bodytext" rows="4">- anchor commit/PR flows in a floating card over the file list
+- morph the split button into the card header
+- start AI draft on open; commit on ⏎</textarea>
+          <div class="cmp-foot">
+            <span class="scope">committing <b>3 staged files</b></span>
+            <span class="spacer"></span>
+            <span class="act">↻ regenerate</span>
+            <span class="esc"><kbd>esc</kbd></span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!--FILES-->
+    <!--FOOT-->
+  </div>
+</template>
+
+<!-- =============== PANE 3 — COMMIT: QUEUED (commit on arrival) =============== -->
+<template class="pane-tpl"
+  data-n="3" data-t="Commit · queued"
+  data-d="User pressed ⏎ while generating. Header reads Commit on ready…; hairline still scanning; esc cancels the queue.">
+  <div class="rail-right composing">
+    <!--HEAD-->
+    <div class="actions">
+      <div class="composer">
+        <div class="cmp-head queued">
+          <span class="label on-iris"><span class="spin"></span> Commit on ready…</span>
+          <span class="close" title="Cancel queue">×</span>
+          <div class="hairline"></div>
+        </div>
+        <div class="cmp-body">
+          <input class="cmp-subject" placeholder="subject — generating…" value="" />
+          <textarea class="cmp-bodytext" rows="2" placeholder="body — generating…"></textarea>
+          <div class="cmp-foot">
+            <span class="scope">will commit on ready · <b>3 staged files</b></span>
+            <span class="spacer"></span>
+            <span class="esc"><kbd>esc</kbd> cancel queue</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!--FILES-->
+    <!--FOOT-->
+  </div>
+</template>
+
+<!-- =============== PANE 4 — COMMIT: ERROR =============== -->
+<template class="pane-tpl"
+  data-n="4" data-t="Commit · error"
+  data-d="Generation failed. Oxide edge replaces the hairline; one error line, then an empty editable area for manual typing + retry.">
+  <div class="rail-right composing">
+    <!--HEAD-->
+    <div class="actions">
+      <div class="composer is-error">
+        <div class="cmp-head">
+          <span class="label on-iris">
+            <svg class="btnic"><use href="#i-commit"/></svg>
+            Commit
+            <span class="keys"><kbd>↵</kbd></span>
+          </span>
+          <span class="close" title="Close">×</span>
+          <div class="hairline"></div>
+        </div>
+        <div class="cmp-body">
+          <p class="cmp-error">claude exited 1: credit balance too low</p>
+          <input class="cmp-subject" placeholder="type a subject…" value="" />
+          <textarea class="cmp-bodytext" rows="2" placeholder="type a body (optional)…"></textarea>
+          <div class="cmp-foot">
+            <span class="scope">committing <b>3 staged files</b></span>
+            <span class="spacer"></span>
+            <span class="act">↻ retry draft</span>
+            <span class="esc"><kbd>esc</kbd></span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!--FILES-->
+    <!--FOOT-->
+  </div>
+</template>
+
+<!-- =============== PANE 5 — PR: PRE-FLIGHT =============== -->
+<template class="pane-tpl"
+  data-n="5" data-t="PR · pre-flight"
+  data-d="Autonomous mode. Only a base-branch select (main) + Create draft PR ⏎. Title/body are never reviewed locally.">
+  <div class="rail-right composing">
+    <!--HEAD-->
+    <div class="actions">
+      <div class="composer">
+        <div class="cmp-head">
+          <span class="label on-iris">
+            <svg class="btnic"><use href="#i-pr"/></svg>
+            Create draft PR
+            <span class="keys"><kbd>↵</kbd></span>
+          </span>
+          <span class="close" title="Close">×</span>
+        </div>
+        <div class="cmp-body">
+          <div class="cmp-prerow">
+            <span class="lab">base branch</span>
+            <div class="select-trigger">
+              <span>main</span>
+              <span class="select-chev">▾</span>
+            </div>
+          </div>
+          <div class="cmp-foot">
+            <span class="scope">drafts a GitHub <b>draft PR</b></span>
+            <span class="spacer"></span>
+            <span class="esc"><kbd>esc</kbd></span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!--FILES-->
+    <!--FOOT-->
+  </div>
+</template>
+
+<!-- =============== PANE 6 — PR: PROGRESS =============== -->
+<template class="pane-tpl"
+  data-n="6" data-t="PR · progress"
+  data-d="Hands-off sequence. The action lives in the morphing label (pushing ↑3…) with the hairline running; the steps confirm below.">
+  <div class="rail-right composing">
+    <!--HEAD-->
+    <div class="actions">
+      <div class="composer">
+        <div class="cmp-head">
+          <span class="label on-iris">
+            <svg class="btnic"><use href="#i-up"/></svg>
+            drafting PR…
+          </span>
+          <span class="close" title="Close">×</span>
+          <div class="hairline"></div>
+        </div>
+        <div class="cmp-body">
+          <ul class="cmp-steps">
+            <li class="done"><span class="mk">✓</span> pushed <span style="font-variant-numeric:tabular-nums">↑3</span></li>
+            <li class="now"><span class="mk"><span class="spin2"></span></span> drafting PR…</li>
+            <li class="todo"><span class="mk">·</span> create #142</li>
+            <li class="todo"><span class="mk">·</span> open in browser</li>
+          </ul>
+          <div class="cmp-foot">
+            <span class="scope">creating a GitHub <b>draft PR</b></span>
+            <span class="spacer"></span>
+            <span class="esc">hands-off</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!--FILES-->
+    <!--FOOT-->
+  </div>
+</template>
+
+<!-- =============== PANE 7 — AUTO · STAGING =============== -->
+<template class="pane-tpl"
+  data-n="7" data-t="Auto · staging"
+  data-d="Auto-commit-push toggle fired. Header-only morph — no body opens, file list stays fully visible & undimmed. Label reads ◌ staging…; × cancels remaining steps.">
+  <div class="rail-right">
+    <!--HEAD-->
+    <div class="actions">
+      <div class="composer">
+        <div class="cmp-head">
+          <span class="label on-iris"><span class="iris-dot"></span> staging 4 files…</span>
+          <span class="close" title="Cancel chain">×</span>
+          <div class="hairline"></div>
+        </div>
+      </div>
+      <div class="why-primary">
+        <span>auto · commit &amp; push</span><span class="sep">·</span><span>daemon Job</span>
+      </div>
+    </div>
+    <!--FILES-->
+    <!--FOOT-->
+  </div>
+</template>
+
+<!-- =============== PANE 8 — AUTO · DRAFTING =============== -->
+<template class="pane-tpl"
+  data-n="8" data-t="Auto · drafting"
+  data-d="Same header-only morph, next step. The Draft Generator runs as part of the chain; label reads ◌ drafting message…. A draft failure here aborts before commit.">
+  <div class="rail-right">
+    <!--HEAD-->
+    <div class="actions">
+      <div class="composer">
+        <div class="cmp-head">
+          <span class="label on-iris"><span class="iris-dot"></span> drafting message…</span>
+          <span class="close" title="Cancel chain">×</span>
+          <div class="hairline"></div>
+        </div>
+      </div>
+      <div class="why-primary">
+        <span>auto · commit &amp; push</span><span class="sep">·</span><span>daemon Job</span>
+      </div>
+    </div>
+    <!--FILES-->
+    <!--FOOT-->
+  </div>
+</template>
+
+<!-- =============== PANE 9 — AUTO · PUSHING =============== -->
+<template class="pane-tpl"
+  data-n="9" data-t="Auto · pushing"
+  data-d="Committed; pushing the new commit. Label reads ◌ pushing ↑1…, hairline still scanning. × still cancels what remains.">
+  <div class="rail-right">
+    <!--HEAD-->
+    <div class="actions">
+      <div class="composer">
+        <div class="cmp-head">
+          <span class="label on-iris"><span class="iris-dot"></span> pushing ↑1…</span>
+          <span class="close" title="Cancel chain">×</span>
+          <div class="hairline"></div>
+        </div>
+      </div>
+      <div class="why-primary">
+        <span>auto · commit &amp; push</span><span class="sep">·</span><span>daemon Job</span>
+      </div>
+    </div>
+    <!--FILES-->
+    <!--FOOT-->
+  </div>
+</template>
+
+<!-- =============== PANE 10 — AUTO · DONE + TOAST =============== -->
+<template class="pane-tpl"
+  data-n="10" data-t="Auto · done + toast"
+  data-d="Chain complete. Button settles to a calm ✓ committed (no hairline). The app's real toast (svelte-french-toast, bottom-right, paper-2/--line, radius 0) carries the commit info — shown anchored bottom-right INSIDE the rail pane, where the app's app-wide toast visually lands.">
+  <div class="rail-right">
+    <!--HEAD-->
+    <div class="actions">
+      <div class="composer">
+        <div class="cmp-head">
+          <span class="label on-iris"><span class="ok-mk">✓</span> committed</span>
+          <span class="close" title="Done">×</span>
+        </div>
+      </div>
+      <div class="why-primary">
+        <span>auto · committed</span><span class="sep">·</span><span>pushed ↑1</span>
+      </div>
+    </div>
+    <!--FILES-->
+    <div class="toast-host">
+      <div class="toast">
+        <span class="ticon"></span>
+        <span class="tmsg">
+          <span class="tsub">feat: add inline composer to right rail</span>
+          <span class="tmeta"><span class="sha">3f2c1a9</span> <span class="sep">·</span> <span class="ok">pushed ↑1</span> <span class="sep">·</span> 4 files</span>
+        </span>
+      </div>
+    </div>
+    <!--FOOT-->
+  </div>
+</template>
+
+<!-- =============== PANE 11 — AUTO · CHAIN FAILED =============== -->
+<template class="pane-tpl"
+  data-n="11" data-t="Auto · chain failed"
+  data-d="Push step failed. Button in the oxide attention treatment reads ✗ push failed — retry ▾; the reason sits as one muted line under it (header-only, no body). Nothing committed beyond what succeeded.">
+  <div class="rail-right">
+    <!--HEAD-->
+    <div class="actions">
+      <div class="composer">
+        <div class="cmp-head is-error">
+          <span class="label"><span class="err-mk">✗</span> push failed — retry</span>
+          <span class="close" title="Retry">▾</span>
+        </div>
+      </div>
+      <div class="auto-reason">! remote rejected: updates were rejected — fetch first</div>
+    </div>
+    <!--FILES-->
+    <!--FOOT-->
+  </div>
+</template>
+
+<!-- =============== PANE 12 — RESTORED MID-CHAIN =============== -->
+<template class="pane-tpl"
+  data-n="12" data-t="Restored mid-chain" data-restored="restored"
+  data-d="User left during the chain and came back — the rail re-attached and restored from the daemon's active Jobs. Visually identical to Auto · pushing; the state is indistinguishable from never having left.">
+  <div class="rail-right">
+    <!--HEAD-->
+    <div class="actions">
+      <div class="composer">
+        <div class="cmp-head">
+          <span class="label on-iris"><span class="iris-dot"></span> pushing ↑1…</span>
+          <span class="close" title="Cancel chain">×</span>
+          <div class="hairline"></div>
+        </div>
+      </div>
+      <div class="why-primary">
+        <span>auto · commit &amp; push</span><span class="sep">·</span><span>daemon Job</span>
+      </div>
+    </div>
+    <!--FILES-->
+    <!--FOOT-->
+  </div>
+</template>
+
+<script>
+  // Static gallery assembly: clone each pane template into BOTH galleries so the
+  // light and dark sections render identical content. The dark section's wrapper
+  // carries data-theme="dark", so cloned panes inherit the dusk tokens via the
+  // cascade. No interactivity — every state is shown statically, side by side.
+  (function () {
+    document.body.appendChild(document.getElementById("icons").content.cloneNode(true));
+
+    const headHTML = document.getElementById("rail-head").innerHTML;
+    const filesHTML = document.getElementById("file-list").innerHTML;
+    const footHTML = document.getElementById("rail-foot").innerHTML;
+
+    const panes = Array.from(document.querySelectorAll(".pane-tpl"));
+    const light = document.getElementById("light-gallery");
+    const dark = document.getElementById("dark-gallery");
+
+    for (const tpl of panes) {
+      let html = tpl.innerHTML
+        .replace("<!--HEAD-->", headHTML)
+        .replace("<!--FILES-->", filesHTML)
+        .replace("<!--FOOT-->", footHTML);
+
+      const n = tpl.dataset.n;
+      const t = tpl.dataset.t;
+      const d = tpl.dataset.d;
+      const restored = tpl.dataset.restored;
+      const capHTML =
+        '<div class="cap"><span class="n">' + (Number(n) + 1) + "</span>" +
+        '<span class="t">' + t + "</span>" +
+        (restored ? '<span class="restored">' + restored + "</span>" : "") +
+        "</div>" +
+        '<div class="cap" style="min-height:0;margin-top:-4px"><span class="d">' + d + "</span></div>";
+
+      for (const gallery of [light, dark]) {
+        const pane = document.createElement("div");
+        pane.className = "pane";
+        pane.innerHTML = capHTML + html;
+        gallery.appendChild(pane);
+      }
+    }
+  })();
+</script>
+</body>
+</html>

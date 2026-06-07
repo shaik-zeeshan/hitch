@@ -41,6 +41,13 @@ export function shortcutLabel(platform: DesktopPlatform, key: string): string {
     : `${shortcutModifierLabel(platform)}+${key}`;
 }
 
+// For keycap rendering: one entry per key so each gets its own <kbd> in a
+// .keys row (components.md "Keycap"). shortcutLabel stays for plain-text
+// contexts (titles, aria labels).
+export function shortcutKeys(platform: DesktopPlatform, key: string): string[] {
+  return [shortcutModifierLabel(platform), key];
+}
+
 export function shellSessionShortcutLabel(platform: DesktopPlatform): string {
   return shortcutLabel(platform, "T");
 }

@@ -19,6 +19,21 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => () => {}),
 }));
 
+// Wrap `./notifications` so its real behavior is preserved but `forgetSession`
+// (the per-session turn-clock cleanup) is observable: the reconnect-prune test
+// asserts daemon.ts forgets sessions that a reconnect snapshot silently dropped.
+const forgetSessionSpy = vi.fn();
+vi.mock("./notifications", async (importActual) => {
+  const actual = await importActual<typeof import("./notifications")>();
+  return {
+    ...actual,
+    forgetSession: (sessionId: string) => {
+      forgetSessionSpy(sessionId);
+      return actual.forgetSession(sessionId);
+    },
+  };
+});
+
 import {
   addProject,
   activeSessionId,
@@ -30,14 +45,42 @@ import {
   applyJobProgress,
   cancellableJobForSelectedWorktree,
   cancelJob,
+  cancelCompositeChain,
+  clearCompositeChain,
+  closeDiff,
   commit,
   completeJob,
+  compositeChains,
+  compositeChainForSelectedWorktree,
+  refreshActiveJobs,
+  startCommitAndPush,
+  startCreatePr,
   connection,
+  ALL_CHANGES_TAB,
+  COMMIT_TAB_PREFIX,
+  allChangesExpanded,
+  allChangesFiles,
+  allChangesRowKey,
+  setAllChangesAllExpanded,
+  commitLog,
+  commitShaFromTab,
+  commitTabPath,
+  fetchCommitDiff,
+  isCommitTab,
+  loadCommitLog,
+  loadMoreCommits,
+  openCommitTab,
+  refreshOpenDiffs,
+  fetchAllChangesRow,
+  invalidateDiffCacheVariants,
+  viewAllChanges,
   createWorktree,
   daemonReason,
+  defaultBase,
   displaySessionStates,
+  activeDiffPath,
   diffActive,
-  diffPath,
+  diffTabs,
   diffText,
   dirtyWorktrees,
   daemonStatus,
@@ -45,13 +88,16 @@ import {
   error,
   fetchRemote,
   generateCommitDraft,
+  generatePullRequestDraft,
   gitStatus,
   initDaemon,
   isJobCancellable,
   jobs,
   listDraftModels,
+  loadGitStatus,
   loadPrStatus,
   loadProjectPrStatuses,
+  __prFreshnessTracked,
   prByWorktree,
   prInfo,
   prUrl,
@@ -63,15 +109,30 @@ import {
   runJob,
   selectedProjectId,
   selectedWorktreeId,
+  setFileStaged,
   sessionAgents,
   sessionCommands,
   sessionOutputActive,
   sessions,
+  orderedTabs,
+  activeTabIndex,
+  activateTabIndex,
+  closeActiveTab,
   viewDiff,
   worktreeLineStats,
   worktrees,
 } from "./daemon";
-import { draftClaudePath, draftCodexPath, draftModel, draftProvider } from "./settings";
+import {
+  diffIgnoreWhitespace,
+  draftClaudePath,
+  draftCodexPath,
+  draftCommitInstructions,
+  draftModel,
+  draftPrInstructions,
+  draftProvider,
+  railView,
+} from "./settings";
+import type { ChangedFile } from "./types";
 
 // Flush the StartJob promise chain (runJob -> daemonRequest -> invoke) so the
 // pending resolver is registered before we deliver the JobCompleted event.
@@ -80,6 +141,7 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 beforeEach(() => {
   disposeDaemon();
   invokeMock.mockReset();
+  forgetSessionSpy.mockReset();
   jobs.set({});
   error.set(null);
   daemonReason.set(null);
@@ -96,17 +158,26 @@ beforeEach(() => {
   dirtyWorktrees.set({});
   worktreeLineStats.set({});
   gitStatus.set(null);
-  diffPath.set(null);
+  diffTabs.set([]);
+  activeDiffPath.set(null);
+  allChangesFiles.set([]);
+  allChangesExpanded.set(new Set());
   prByWorktree.set({});
   prInfo.set(null);
   prUrl.set(null);
   sessionCommands.set({});
-  diffText.set(null);
   diffActive.set(false);
   draftProvider.set(null);
   draftModel.set("");
   draftClaudePath.set("");
   draftCodexPath.set("");
+  draftCommitInstructions.set("");
+  draftPrInstructions.set("");
+  selectedProjectId.set(null);
+  diffIgnoreWhitespace.set(false);
+  railView.set("changes");
+  commitLog.set({ worktreeId: null, commits: [], hasMore: false, loading: false, prependedCount: 0, tick: 0 });
+  compositeChains.set({});
 });
 
 describe("daemon status mapping", () => {
@@ -332,42 +403,6 @@ describe("agent state propagation", () => {
     expect(get(agentStateByWorktree)).toEqual({ w1: "needs-approval", w2: "error" });
   });
 
-  it("hides selected-worktree running only when the active tab is the running session", () => {
-    projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
-    worktrees.set([
-      { id: "w1", project_id: "p1", path: "/repo", branch: "main", is_main: true, is_hitch_managed: false },
-      {
-        id: "w2",
-        project_id: "p1",
-        path: "/repo/.hitch/worktrees/feature",
-        branch: "feature",
-        is_main: false,
-        is_hitch_managed: true,
-      },
-    ]);
-    sessions.set([
-      { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
-      { id: "s2", name: "shell", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
-    ]);
-    agentStates.set({ s1: "running" });
-    sessionOutputActive.set({ s1: true });
-
-    selectedWorktreeId.set("w1");
-    activeSessionId.set("s1");
-    expect(get(agentStateByWorktree)).toEqual({});
-
-    activeSessionId.set("s2");
-    expect(get(agentStateByWorktree)).toEqual({ w1: "running" });
-
-    diffActive.set(true);
-    activeSessionId.set("s1");
-    expect(get(agentStateByWorktree)).toEqual({ w1: "running" });
-
-    diffActive.set(false);
-    selectedWorktreeId.set("w2");
-    expect(get(agentStateByWorktree)).toEqual({ w1: "running" });
-  });
-
   it("rolls up a per-project act-state pill with its count, collapsing to the highest priority", () => {
     projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
     worktrees.set([
@@ -427,6 +462,109 @@ describe("agent state propagation", () => {
     expect(get(sessionAgents)).toEqual({});
     expect(get(sessionOutputActive)).toEqual({});
     expect(get(agentStateByWorktree)).toEqual({});
+  });
+
+  it("forgets notification turn state for a session a reconnect silently dropped", () => {
+    // A reconnect snapshot can replace `sessions` wholesale without a
+    // session-closed event for the vanished session. The prune subscription must
+    // still clear that session's per-session notification bookkeeping (the
+    // notifications module's turn-start clock), not just the store-backed maps —
+    // otherwise turnStartAt leaks across the app's lifetime.
+    sessions.set([
+      { id: "s-gone", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+      { id: "s-live", name: "shell", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+    ]);
+    agentStates.set({ "s-gone": "running", "s-live": "running" });
+    forgetSessionSpy.mockClear();
+
+    // Reconnect drops s-gone, keeps s-live.
+    sessions.set([
+      { id: "s-live", name: "shell", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+    ]);
+
+    expect(forgetSessionSpy).toHaveBeenCalledWith("s-gone");
+    expect(forgetSessionSpy).not.toHaveBeenCalledWith("s-live");
+    // The store-backed maps are pruned to the live set too.
+    expect(get(agentStates)).toEqual({ "s-live": "running" });
+  });
+});
+
+describe("defaultBase: daemon owns the base, worktree-derived is the fallback", () => {
+  const mainWt = {
+    id: "w-main",
+    project_id: "p1",
+    path: "/repo",
+    branch: "main",
+    is_main: true,
+    is_hitch_managed: false,
+  } as const;
+  const featureWt = {
+    id: "w-feat",
+    project_id: "p1",
+    path: "/repo/.hitch/worktrees/feature",
+    branch: "feature",
+    is_main: false,
+    is_hitch_managed: true,
+  } as const;
+
+  function statusFor(worktreeId: string, base: string | null | "absent") {
+    const status: Record<string, unknown> = {
+      worktree_id: worktreeId,
+      branch: worktreeId === mainWt.id ? "main" : "feature",
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+      additions: 0,
+      deletions: 0,
+      files: [],
+    };
+    // "absent" models an OLD daemon that omits base_branch entirely; an explicit
+    // value (including null) models a NEW daemon that resolved it.
+    if (base !== "absent") status.base_branch = base;
+    return status as never;
+  }
+
+  beforeEach(() => {
+    projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
+    worktrees.set([mainWt, featureWt]);
+    selectedProjectId.set("p1");
+  });
+
+  it("falls back to the main-worktree branch before any status loads", () => {
+    // CreateWorktreeDialog can run with no selection/status; the worktree-derived
+    // base must still be available (never regress to null), exactly as before.
+    expect(get(gitStatus)).toBeNull();
+    expect(get(defaultBase)).toBe("main");
+  });
+
+  it("uses the daemon-provided base for the selected worktree", () => {
+    selectedWorktreeId.set(featureWt.id);
+    gitStatus.set(statusFor(featureWt.id, "main"));
+    expect(get(defaultBase)).toBe("main");
+  });
+
+  it("honors an explicit null base from a new daemon (main worktree, no cross-branch base)", () => {
+    selectedWorktreeId.set(mainWt.id);
+    // New daemon resolved base_branch to null (the main worktree relative to
+    // itself). That is authoritative — not the rolling-upgrade absent case.
+    gitStatus.set(statusFor(mainWt.id, null));
+    expect(get(defaultBase)).toBeNull();
+  });
+
+  it("falls back to the worktree-derived base for an OLD daemon that omits the field", () => {
+    selectedWorktreeId.set(featureWt.id);
+    gitStatus.set(statusFor(featureWt.id, "absent"));
+    // Field absent → can't trust its absence as "no base"; recompute client-side.
+    expect(get(defaultBase)).toBe("main");
+  });
+
+  it("ignores a status that belongs to a different worktree than the selection", () => {
+    // The loaded status is for the main worktree but the feature worktree is
+    // selected: the stale/foreign status doesn't speak for the selection, so we
+    // fall back to the worktree-derived base rather than its null.
+    selectedWorktreeId.set(featureWt.id);
+    gitStatus.set(statusFor(mainWt.id, null));
+    expect(get(defaultBase)).toBe("main");
   });
 });
 
@@ -869,6 +1007,108 @@ describe("job store: StartJob -> JobCompleted", () => {
     await expect(promise).resolves.toEqual({ subject: "feat: generated", body: "- Generated" });
   });
 
+  it("includes non-empty commit Draft Instructions in the commit-draft request", async () => {
+    draftProvider.set("claude");
+    draftCommitInstructions.set("Use Conventional Commits.");
+    // PR instructions are set too, but the commit request must NOT carry them.
+    draftPrInstructions.set("Write in past tense.");
+    invokeMock.mockResolvedValueOnce({ type: "job-started", job_id: "j-ci" });
+
+    const promise = generateCommitDraft("w-ci");
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "generate-commit-draft",
+          worktree_id: "w-ci",
+          settings: {
+            provider: "claude",
+            model: null,
+            claude_path: null,
+            codex_path: null,
+            commit_instructions: "Use Conventional Commits.",
+          },
+        },
+      },
+    });
+
+    completeJob("j-ci", { type: "commit-draft", draft: { subject: "x", body: "" } });
+    await promise;
+  });
+
+  it("omits whitespace-only commit Draft Instructions from the commit-draft request", async () => {
+    draftProvider.set("claude");
+    draftCommitInstructions.set("   \n  ");
+    invokeMock.mockResolvedValueOnce({ type: "job-started", job_id: "j-cw" });
+
+    const promise = generateCommitDraft("w-cw");
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "generate-commit-draft",
+          worktree_id: "w-cw",
+          settings: {
+            provider: "claude",
+            model: null,
+            claude_path: null,
+            codex_path: null,
+          },
+        },
+      },
+    });
+
+    completeJob("j-cw", { type: "commit-draft", draft: { subject: "x", body: "" } });
+    await promise;
+  });
+
+  it("includes non-empty PR Draft Instructions (trimmed) in the pull-request-draft request", async () => {
+    draftProvider.set("claude");
+    draftPrInstructions.set("  Include a Testing section.  ");
+    // Commit instructions are set too, but the PR request must NOT carry them.
+    draftCommitInstructions.set("Use Conventional Commits.");
+    projects.set([
+      { id: "p-pr", name: "p", root: "/p", kind: "git-backed" },
+    ]);
+    worktrees.set([
+      { id: "w-pr", project_id: "p-pr", path: "/p", branch: "feat", is_main: false, is_hitch_managed: true },
+    ]);
+    selectedProjectId.set("p-pr");
+    selectedWorktreeId.set("w-pr");
+    invokeMock.mockResolvedValueOnce({ type: "job-started", job_id: "j-pr-draft" });
+
+    const promise = generatePullRequestDraft(null);
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "generate-pull-request-draft",
+          worktree_id: "w-pr",
+          base: null,
+          settings: {
+            provider: "claude",
+            model: null,
+            claude_path: null,
+            codex_path: null,
+            pr_instructions: "Include a Testing section.",
+          },
+        },
+      },
+    });
+
+    completeJob("j-pr-draft", {
+      type: "pull-request-draft",
+      draft: { title: "t", body: "b" },
+    });
+    await promise;
+  });
+
   it("rebuilds a replayed running job so its later completion is applied", () => {
     applyJobProgress("j-reattach", "running", "Pushing…", "push");
 
@@ -1161,6 +1401,261 @@ describe("job store: StartJob -> JobCompleted", () => {
   });
 
 });
+
+describe("composite chains (commit-and-push / create-pr)", () => {
+  function selectWorktree(worktreeId: string) {
+    projects.set([{ id: "p", name: "p", root: "/p", kind: "git-backed" } as any]);
+    worktrees.set([
+      { id: worktreeId, project_id: "p", path: "/p", branch: "feat", is_main: false, is_hitch_managed: true } as any,
+    ]);
+    selectedProjectId.set("p");
+    selectedWorktreeId.set(worktreeId);
+  }
+
+  it("starts commit-and-push routing the COMMIT draft instructions and resolves with the result", async () => {
+    draftProvider.set("claude");
+    draftCommitInstructions.set("  Use Conventional Commits.  ");
+    draftPrInstructions.set("Should not appear on a commit-and-push request.");
+    invokeMock.mockResolvedValue({ type: "job-started", job_id: "j-cap" });
+
+    const promise = startCommitAndPush("w-cap");
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "commit-and-push",
+          worktree_id: "w-cap",
+          settings: {
+            provider: "claude",
+            model: null,
+            claude_path: null,
+            codex_path: null,
+            commit_instructions: "Use Conventional Commits.",
+          },
+        },
+      },
+    });
+    // Optimistic display so the button morphs before the first progress event.
+    expect(get(compositeChains)["w-cap"]).toMatchObject({
+      kind: "commit-and-push",
+      step: "staging",
+      failed: null,
+    });
+
+    completeJob("j-cap", {
+      type: "commit-and-pushed",
+      result: { subject: "feat: x", short_sha: "3f2c1a9", pushed_commits: 1, file_count: 4 },
+    });
+    await expect(promise).resolves.toMatchObject({
+      subject: "feat: x",
+      short_sha: "3f2c1a9",
+      pushed_commits: 1,
+      file_count: 4,
+    });
+    // Success clears the in-flight display (the toast carries the info).
+    expect(get(compositeChains)["w-cap"]).toBeUndefined();
+  });
+
+  it("starts create-pr routing the PR draft instructions and resolves with the url", async () => {
+    draftProvider.set("claude");
+    draftPrInstructions.set("Include a Testing section.");
+    invokeMock.mockResolvedValue({ type: "job-started", job_id: "j-cpr" });
+
+    const promise = startCreatePr("main", "w-cpr");
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "create-pr",
+          worktree_id: "w-cpr",
+          base: "main",
+          settings: {
+            provider: "claude",
+            model: null,
+            claude_path: null,
+            codex_path: null,
+            pr_instructions: "Include a Testing section.",
+          },
+        },
+      },
+    });
+    expect(get(compositeChains)["w-cpr"]).toMatchObject({ kind: "create-pr", step: "pushing" });
+
+    completeJob("j-cpr", { type: "pull-request-created", url: "https://x/pull/9" });
+    await expect(promise).resolves.toBe("https://x/pull/9");
+    expect(get(compositeChains)["w-cpr"]).toBeUndefined();
+  });
+
+  it("advances the chain display from composite-job-progress 'started' events", () => {
+    applyHitchEvent({
+      type: "composite-job-progress",
+      job_id: "j-prog",
+      worktree_id: "w-prog",
+      kind: "commit-and-push",
+      step: "drafting",
+      phase: "started",
+    } as any);
+    expect(get(compositeChains)["w-prog"]).toMatchObject({
+      jobId: "j-prog",
+      kind: "commit-and-push",
+      step: "drafting",
+      failed: null,
+    });
+
+    // A 'finished' phase is ignored for display (the next step's 'started' advances).
+    applyHitchEvent({
+      type: "composite-job-progress",
+      job_id: "j-prog",
+      worktree_id: "w-prog",
+      kind: "commit-and-push",
+      step: "drafting",
+      phase: "finished",
+    } as any);
+    expect(get(compositeChains)["w-prog"].step).toBe("drafting");
+
+    applyHitchEvent({
+      type: "composite-job-progress",
+      job_id: "j-prog",
+      worktree_id: "w-prog",
+      kind: "commit-and-push",
+      step: "pushing",
+      phase: "started",
+    } as any);
+    expect(get(compositeChains)["w-prog"].step).toBe("pushing");
+  });
+
+  it("parks the oxide failure state on a composite-job-failed completion", async () => {
+    invokeMock.mockResolvedValue({ type: "job-started", job_id: "j-fail" });
+    const promise = startCommitAndPush("w-fail");
+    await flush();
+
+    completeJob("j-fail", {
+      type: "composite-job-failed",
+      kind: "commit-and-push",
+      failed_step: "pushing",
+      reason: "remote rejected: updates were rejected — fetch first",
+      result: { commit: { subject: "feat: x", short_sha: "abc1234", pushed_commits: 0, file_count: 2 } },
+    });
+    await expect(promise).rejects.toThrow(/remote rejected/);
+
+    expect(get(compositeChains)["w-fail"]).toMatchObject({
+      kind: "commit-and-push",
+      step: "pushing",
+      failed: { step: "pushing", reason: "remote rejected: updates were rejected — fetch first" },
+    });
+  });
+
+  it("parks a failure when a composite job completes with a plain error response", async () => {
+    invokeMock.mockResolvedValue({ type: "job-started", job_id: "j-err" });
+    const promise = startCommitAndPush("w-err");
+    await flush();
+
+    // A progress event stamps the chain with the live jobId (the optimistic
+    // display starts at jobId:null) and advances the rung.
+    applyHitchEvent({
+      type: "composite-job-progress",
+      job_id: "j-err",
+      worktree_id: "w-err",
+      kind: "commit-and-push",
+      step: "pushing",
+      phase: "started",
+    } as any);
+
+    // The daemon delivers a plain Response::Error (e.g. cancellation / lock
+    // poison / panic), NOT a composite-job-failed. The chain must not freeze:
+    // park it as an oxide failure on the current rung.
+    completeJob("j-err", { type: "error", error: { message: "worker panicked" } });
+    await expect(promise).rejects.toThrow(/worker panicked/);
+
+    expect(get(compositeChains)["w-err"]).toMatchObject({
+      jobId: null,
+      kind: "commit-and-push",
+      step: "pushing",
+      failed: { step: "pushing", reason: "worker panicked" },
+    });
+  });
+
+  it("does not resurrect a chain cleared by cancellation when its error completion arrives", async () => {
+    compositeChains.set({
+      "w-cxl": { jobId: "j-cxl", kind: "create-pr", step: "pushing", failed: null },
+    });
+    invokeMock.mockResolvedValue({ type: "ack" });
+
+    // User cancels: the optimistic clear removes the chain display now.
+    await cancelCompositeChain("w-cxl");
+    expect(get(compositeChains)["w-cxl"]).toBeUndefined();
+
+    // The daemon's "job cancelled" error completion lands afterwards — it must
+    // NOT re-create a parked failure for the now-dismissed chain.
+    completeJob("j-cxl", { type: "error", error: { message: "job cancelled" } });
+    expect(get(compositeChains)["w-cxl"]).toBeUndefined();
+  });
+
+  it("restores an in-flight chain from the active-jobs query and exposes it for the selected worktree", async () => {
+    selectWorktree("w-active");
+    invokeMock.mockResolvedValueOnce({
+      type: "active-jobs",
+      jobs: [
+        { job_id: "j-active", worktree_id: "w-active", kind: "create-pr", step: "drafting" },
+      ],
+    });
+
+    const restored = await refreshActiveJobs("w-active");
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: { type: "active-jobs", worktree_id: "w-active" },
+    });
+    expect(restored).toMatchObject({ jobId: "j-active", kind: "create-pr", step: "drafting" });
+    expect(get(compositeChainForSelectedWorktree)).toMatchObject({
+      kind: "create-pr",
+      step: "drafting",
+    });
+  });
+
+  it("clears a stale in-flight display when active-jobs reports none (but keeps a parked failure)", async () => {
+    compositeChains.set({
+      "w-stale": { jobId: "j-old", kind: "commit-and-push", step: "pushing", failed: null },
+      "w-kept": {
+        jobId: null,
+        kind: "commit-and-push",
+        step: "pushing",
+        failed: { step: "pushing", reason: "boom" },
+      },
+    });
+    invokeMock.mockResolvedValue({ type: "active-jobs", jobs: [] });
+
+    await refreshActiveJobs("w-stale");
+    expect(get(compositeChains)["w-stale"]).toBeUndefined();
+
+    await refreshActiveJobs("w-kept");
+    expect(get(compositeChains)["w-kept"]).toMatchObject({ failed: { step: "pushing" } });
+  });
+
+  it("cancels the in-flight chain by its job id and clears the display", async () => {
+    compositeChains.set({
+      "w-cancel": { jobId: "j-cancel", kind: "commit-and-push", step: "drafting", failed: null },
+    });
+    invokeMock.mockResolvedValue({ type: "ack" });
+
+    await cancelCompositeChain("w-cancel");
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: { type: "cancel-job", job_id: "j-cancel" },
+    });
+    expect(get(compositeChains)["w-cancel"]).toBeUndefined();
+  });
+
+  it("clears a chain display on demand (success ack / dismissed failure)", () => {
+    compositeChains.set({
+      "w-clear": { jobId: null, kind: "create-pr", step: "creating-pr", failed: null },
+    });
+    clearCompositeChain("w-clear");
+    expect(get(compositeChains)["w-clear"]).toBeUndefined();
+  });
+});
+
 describe("Windows project paths", () => {
   const projectRoot = String.raw`C:\Users\Ada Lovelace\Repo With Spaces`;
   const filePath = String.raw`src\folder with spaces\file name.ts`;
@@ -1265,8 +1760,95 @@ describe("Windows project paths", () => {
     await viewDiff(filePath);
 
     expect(requests).toEqual([{ type: "git-diff", worktree_id: worktree.id, path: filePath }]);
-    expect(get(diffPath)).toBe(filePath);
+    expect(get(diffTabs)).toEqual([{ path: filePath, text: "diff --git" }]);
+    expect(get(activeDiffPath)).toBe(filePath);
     expect(get(diffText)).toBe("diff --git");
+  });
+
+  it("requests the clicked file's staged or worktree diff side", async () => {
+    const requests: unknown[] = [];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; staged?: boolean } }) => {
+        requests.push(request);
+        if (request.type === "git-diff") {
+          return {
+            type: "git-diff",
+            diff: { diff: request.staged ? "staged diff" : "worktree diff" },
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await viewDiff(filePath, true, true);
+    expect(get(diffText)).toBe("staged diff");
+
+    await viewDiff(filePath, true, false);
+    expect(get(diffText)).toBe("worktree diff");
+    expect(requests).toEqual([
+      { type: "git-diff", worktree_id: worktree.id, path: filePath, staged: true },
+      { type: "git-diff", worktree_id: worktree.id, path: filePath, staged: false },
+    ]);
+  });
+
+
+  it("opens each clicked file as its own diff tab and re-uses an existing tab", async () => {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          return { type: "git-diff", diff: { diff: `diff for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await viewDiff("src/a.ts");
+    await viewDiff("src/b.ts");
+
+    // Two distinct files → two tabs, the most recent active.
+    expect(get(diffTabs)).toEqual([
+      { path: "src/a.ts", text: "diff for src/a.ts" },
+      { path: "src/b.ts", text: "diff for src/b.ts" },
+    ]);
+    expect(get(activeDiffPath)).toBe("src/b.ts");
+
+    // Re-clicking an open file activates its tab without spawning a duplicate.
+    await viewDiff("src/a.ts");
+    expect(get(diffTabs).map((tab) => tab.path)).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(get(activeDiffPath)).toBe("src/a.ts");
+  });
+
+  it("closes one diff tab and activates the left neighbor, falling back to none", () => {
+    diffTabs.set([
+      { path: "src/a.ts", text: "a" },
+      { path: "src/b.ts", text: "b" },
+      { path: "src/c.ts", text: "c" },
+    ]);
+    activeDiffPath.set("src/b.ts");
+    diffActive.set(true);
+
+    // Closing the active middle tab activates the tab to its left.
+    closeDiff("src/b.ts");
+    expect(get(diffTabs).map((tab) => tab.path)).toEqual(["src/a.ts", "src/c.ts"]);
+    expect(get(activeDiffPath)).toBe("src/a.ts");
+    expect(get(diffActive)).toBe(true);
+
+    // Closing an inactive tab leaves the active selection untouched.
+    closeDiff("src/c.ts");
+    expect(get(diffTabs).map((tab) => tab.path)).toEqual(["src/a.ts"]);
+    expect(get(activeDiffPath)).toBe("src/a.ts");
+
+    // Closing the last tab clears the diff view entirely.
+    closeDiff("src/a.ts");
+    expect(get(diffTabs)).toEqual([]);
+    expect(get(activeDiffPath)).toBeNull();
+    expect(get(diffActive)).toBe(false);
   });
 
   it("creates a Windows managed worktree through a job and reflects the daemon worktree event", async () => {
@@ -1356,8 +1938,8 @@ describe("Windows project paths", () => {
       deletions: 4,
       files: [{ path: filePath, status: "modified", staged: false }],
     });
-    diffPath.set(filePath);
-    diffText.set("diff --git a/file b/file");
+    diffTabs.set([{ path: filePath, text: "diff --git a/file b/file" }]);
+    activeDiffPath.set(filePath);
     diffActive.set(true);
     prByWorktree.set({
       [removed.id]: { number: 7, url: "https://example.test/pr/7", state: "OPEN", draft: false },
@@ -1372,7 +1954,8 @@ describe("Windows project paths", () => {
     expect(get(selectedWorktreeId)).toBeNull();
     expect(get(activeSessionId)).toBeNull();
     expect(get(gitStatus)).toBeNull();
-    expect(get(diffPath)).toBeNull();
+    expect(get(diffTabs)).toEqual([]);
+    expect(get(activeDiffPath)).toBeNull();
     expect(get(diffText)).toBeNull();
     expect(get(diffActive)).toBe(false);
     expect(get(dirtyWorktrees)).toEqual({ [worktree.id]: false });
@@ -1388,6 +1971,772 @@ describe("Windows project paths", () => {
   });
 });
 
+
+describe("all-changes diff tab", () => {
+  const project = { id: "proj-all", name: "repo", kind: "git-backed", root: "/repo" } as const;
+  const worktree = {
+    id: "wt-all",
+    project_id: project.id,
+    path: "/repo/wt",
+    branch: "feature",
+    is_main: false,
+    is_hitch_managed: true,
+  } as const;
+
+  function setStatus(files: ChangedFile[]) {
+    gitStatus.set({
+      worktree_id: worktree.id,
+      branch: "feature",
+      dirty: files.length > 0,
+      ahead: 0,
+      behind: 0,
+      additions: 0,
+      deletions: 0,
+      files,
+    });
+  }
+
+  function mockDiffs() {
+    invokeMock.mockImplementation(
+      async (
+        _command: string,
+        { request }: { request: { type: string; path?: string; staged?: boolean } },
+      ) => {
+        if (request.type === "git-diff") {
+          return { type: "git-diff", diff: { diff: `diff for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+  }
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((res) => {
+      resolve = res;
+    });
+    return { promise, resolve };
+  }
+
+  // Rows are collapsed by default (nothing fetches until expanded), so tests
+  // that exercise the diff fan-out mark their rows expanded up front.
+  function expandRows(...rows: [path: string, staged: boolean][]) {
+    allChangesExpanded.set(new Set(rows.map(([path, staged]) => allChangesRowKey(path, staged))));
+  }
+
+  it("opens the sentinel tab with every row collapsed and fetches nothing", async () => {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false }]);
+    const diffRequests: string[] = [];
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffRequests.push(request.path!);
+          return { type: "git-diff", diff: { diff: `diff for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await viewAllChanges();
+
+    // Collapsed-by-default: the row seeds as null and no diff is fetched.
+    expect(diffRequests).toEqual([]);
+    expect(get(allChangesFiles)).toEqual([{ path: "src/a.ts", staged: false, text: null }]);
+  });
+
+  it("expand-all marks every row expanded and fans out; collapse-all clears the set", async () => {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([
+      { path: "src/b.ts", status: "modified", staged: false },
+      { path: "src/a.ts", status: "modified", staged: true },
+    ]);
+    mockDiffs();
+
+    await viewAllChanges();
+    expect(get(allChangesFiles).every((row) => row.text === null)).toBe(true);
+
+    setAllChangesAllExpanded(true);
+    await flush();
+
+    expect(get(allChangesExpanded)).toEqual(
+      new Set([allChangesRowKey("src/a.ts", true), allChangesRowKey("src/b.ts", false)]),
+    );
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: true, text: "diff for src/a.ts" },
+      { path: "src/b.ts", staged: false, text: "diff for src/b.ts" },
+    ]);
+
+    setAllChangesAllExpanded(false);
+    expect(get(allChangesExpanded)).toEqual(new Set());
+  });
+
+  it("opens the sentinel tab and fans out expanded per-file diffs (staged first)", async () => {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([
+      { path: "src/b.ts", status: "modified", staged: false },
+      { path: "src/a.ts", status: "modified", staged: true },
+    ]);
+    mockDiffs();
+    expandRows(["src/a.ts", true], ["src/b.ts", false]);
+
+    await viewAllChanges();
+
+    // One special tab, activated, diff view up.
+    expect(get(diffTabs)).toEqual([{ path: ALL_CHANGES_TAB, text: null }]);
+    expect(get(activeDiffPath)).toBe(ALL_CHANGES_TAB);
+    expect(get(diffActive)).toBe(true);
+    // Back-compat single-diff text store ignores the sentinel (its text is null).
+    expect(get(diffText)).toBeNull();
+    // Rows ordered staged-then-unstaged, each with its fetched diff.
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: true, text: "diff for src/a.ts" },
+      { path: "src/b.ts", staged: false, text: "diff for src/b.ts" },
+    ]);
+  });
+
+  it("keeps an open diff tab on its own staged side when staging the file", async () => {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false }]);
+
+    const diffRequests: { path?: string; staged?: boolean }[] = [];
+    invokeMock.mockImplementation(
+      async (
+        _command: string,
+        { request }: { request: { type: string; path?: string; staged?: boolean } },
+      ) => {
+        if (request.type === "git-diff") {
+          diffRequests.push({ path: request.path, staged: request.staged });
+          return { type: "git-diff", diff: { diff: `${request.staged ? "staged" : "worktree"} ${request.path}` } };
+        }
+        if (request.type === "stage-files") return { type: "ack" };
+        if (request.type === "git-status") return { type: "git-status", status: get(gitStatus) };
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Open the unstaged-side single-file diff tab the user is looking at.
+    await viewDiff("src/a.ts", true, false);
+    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "worktree src/a.ts", staged: false }]);
+    diffRequests.length = 0;
+
+    // Stage the file. The keep-in-sync refresh must re-fetch the tab on ITS
+    // OWN side (unstaged), not the operation's staged side.
+    await setFileStaged("src/a.ts", true);
+    await flush();
+
+    // The tab stays on the unstaged side it was opened with (no flip to staged).
+    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "worktree src/a.ts", staged: false }]);
+    // And the refresh asked for the unstaged diff, never the staged one.
+    expect(diffRequests).toContainEqual({ path: "src/a.ts", staged: false });
+    expect(diffRequests).not.toContainEqual({ path: "src/a.ts", staged: true });
+  });
+
+  it("re-activates the existing sentinel tab without duplicating it", async () => {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false }]);
+    mockDiffs();
+
+    await viewAllChanges();
+    await viewAllChanges();
+
+    expect(get(diffTabs).filter((tab) => tab.path === ALL_CHANGES_TAB)).toHaveLength(1);
+  });
+
+  it("closing the sentinel tab clears its per-file rows and falls back to a neighbor", async () => {
+    diffTabs.set([
+      { path: "src/x.ts", text: "x" },
+      { path: ALL_CHANGES_TAB, text: null },
+    ]);
+    activeDiffPath.set(ALL_CHANGES_TAB);
+    diffActive.set(true);
+    allChangesFiles.set([{ path: "src/a.ts", staged: false, text: "a" }]);
+
+    closeDiff(ALL_CHANGES_TAB);
+
+    expect(get(diffTabs).map((tab) => tab.path)).toEqual(["src/x.ts"]);
+    expect(get(activeDiffPath)).toBe("src/x.ts");
+    expect(get(allChangesFiles)).toEqual([]);
+  });
+
+
+  it("keeps a slower previous-side single-file diff from overwriting the visible tab", async () => {
+    const pending: {
+      staged: boolean | undefined;
+      resolve: (value: { type: "git-diff"; diff: { diff: string } }) => void;
+    }[] = [];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; staged?: boolean } }) => {
+        if (request.type !== "git-diff") throw new Error(`unexpected request ${request.type}`);
+        const deferredResponse = deferred<{ type: "git-diff"; diff: { diff: string } }>();
+        pending.push({ staged: request.staged, resolve: deferredResponse.resolve });
+        return deferredResponse.promise;
+      },
+    );
+
+    const worktreePromise = viewDiff("src/a.ts", true, false);
+    await flush();
+    const stagedPromise = viewDiff("src/a.ts", true, true);
+    await flush();
+
+    expect(pending.map((request) => request.staged)).toEqual([false, true]);
+
+    pending[1]!.resolve({ type: "git-diff", diff: { diff: "staged diff" } });
+    await stagedPromise;
+    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "staged diff", staged: true }]);
+    expect(get(diffText)).toBe("staged diff");
+
+    pending[0]!.resolve({ type: "git-diff", diff: { diff: "worktree diff" } });
+    await worktreePromise;
+
+    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "staged diff", staged: true }]);
+    expect(get(diffText)).toBe("staged diff");
+  });
+
+  it("keeps stale all-changes responses out of its diff cache", async () => {
+    const pending: {
+      path: string;
+      resolve: (value: { type: "git-diff"; diff: { diff: string } }) => void;
+    }[] = [];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false, additions: 1 }]);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type !== "git-diff" || !request.path) throw new Error(`unexpected request ${request.type}`);
+        const deferredResponse = deferred<{ type: "git-diff"; diff: { diff: string } }>();
+        pending.push({ path: request.path, resolve: deferredResponse.resolve });
+        return deferredResponse.promise;
+      },
+    );
+    expandRows(["src/a.ts", false]);
+
+    const olderPromise = viewAllChanges();
+    await flush();
+    const singlePromise = viewDiff("src/a.ts", true, false);
+    await flush();
+
+    expect(pending.map((request) => request.path)).toEqual(["src/a.ts", "src/a.ts"]);
+
+    pending[1]!.resolve({ type: "git-diff", diff: { diff: "new all diff" } });
+    await singlePromise;
+    await flush();
+    pending[0]!.resolve({ type: "git-diff", diff: { diff: "old all diff" } });
+    await olderPromise;
+
+    await viewAllChanges(false);
+
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "new all diff" },
+    ]);
+    expect(pending).toHaveLength(2);
+  });
+
+  it("does not let an in-flight diff repopulate the cache after invalidation when no newer fetch follows", async () => {
+    // The stale-write race: a row's diff fetch is in flight (it captured the
+    // current write-seq) when the file changes and the cache is invalidated. If
+    // the user then collapses the row, no newer fetch bumps the write-seq, so the
+    // in-flight (stale) response must not be allowed to write back into the cache
+    // — otherwise expanding the row later serves the pre-change diff.
+    const pending: {
+      path: string;
+      resolve: (value: { type: "git-diff"; diff: { diff: string } }) => void;
+    }[] = [];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false, additions: 1 }]);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type !== "git-diff" || !request.path) throw new Error(`unexpected request ${request.type}`);
+        const deferredResponse = deferred<{ type: "git-diff"; diff: { diff: string } }>();
+        pending.push({ path: request.path, resolve: deferredResponse.resolve });
+        return deferredResponse.promise;
+      },
+    );
+
+    // Open all-changes with src/a.ts expanded, so its diff fetch starts (held).
+    expandRows(["src/a.ts", false]);
+    const openPromise = viewAllChanges();
+    await flush();
+    expect(pending.map((request) => request.path)).toEqual(["src/a.ts"]);
+
+    // The file changes on disk: the cache entry for src/a.ts is invalidated. This
+    // is exactly what the gitStatus subscriber does on a worktree-dirty refresh
+    // (deleteDiffCacheForChangedFiles -> invalidateDiffCacheVariants).
+    invalidateDiffCacheVariants(worktree.id, "src/a.ts");
+
+    // The user collapses the row, so the in-flight fetch's seq is the LATEST —
+    // no follow-up fetch bumps the write-seq to neutralize it.
+    allChangesExpanded.set(new Set());
+
+    // The held (now stale) response resolves.
+    pending[0]!.resolve({ type: "git-diff", diff: { diff: "stale a diff" } });
+    await openPromise;
+    await flush();
+
+    // Expanding the row must NOT serve the stale cached diff: it has to re-fetch.
+    pending.length = 0;
+    const expandPromise = fetchAllChangesRow("src/a.ts", false);
+    await flush();
+    expect(pending.map((request) => request.path)).toEqual(["src/a.ts"]);
+    pending[0]!.resolve({ type: "git-diff", diff: { diff: "fresh a diff" } });
+    await expandPromise;
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "fresh a diff" },
+    ]);
+  });
+
+  it("auto-refreshes all-changes when file metadata changes without a path or staged change", async () => {
+    let diffVersion = 0;
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false, additions: 1 }]);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffVersion += 1;
+          return { type: "git-diff", diff: { diff: `diff v${diffVersion} for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+    expandRows(["src/a.ts", false]);
+
+    await viewAllChanges();
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v1 for src/a.ts" },
+    ]);
+
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false, additions: 2 }]);
+    await flush();
+
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v2 for src/a.ts" },
+    ]);
+  });
+
+  it("only re-fetches expanded rows when a status-poll signature drift refreshes", async () => {
+    const diffRequests: string[] = [];
+    let diffVersion = 0;
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([
+      { path: "src/a.ts", status: "modified", staged: false, additions: 1 },
+      { path: "src/b.ts", status: "modified", staged: false, additions: 1 },
+    ]);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffVersion += 1;
+          diffRequests.push(request.path!);
+          return { type: "git-diff", diff: { diff: `diff v${diffVersion} for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Open with both rows expanded, both fetched.
+    expandRows(["src/a.ts", false], ["src/b.ts", false]);
+    await viewAllChanges();
+    expect(diffRequests).toEqual(["src/a.ts", "src/b.ts"]);
+    diffRequests.length = 0;
+
+    // User collapses src/b.ts.
+    allChangesExpanded.set(new Set([allChangesRowKey("src/a.ts", false)]));
+
+    // The 1s status poll picks up a line-count drift (additions 1 -> 2) on BOTH
+    // files — the signature flips and the diff cache is evicted, so the refresh
+    // re-fans. Only the expanded row (src/a.ts) is re-fetched; the collapsed
+    // src/b.ts is skipped and its row text is dropped to null (cache evicted).
+    setStatus([
+      { path: "src/a.ts", status: "modified", staged: false, additions: 2 },
+      { path: "src/b.ts", status: "modified", staged: false, additions: 2 },
+    ]);
+    await flush();
+
+    expect(diffRequests).toEqual(["src/a.ts"]);
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v3 for src/a.ts" },
+      { path: "src/b.ts", staged: false, text: null },
+    ]);
+  });
+
+  it("fetches a collapsed row on demand when it is expanded", async () => {
+    const diffRequests: string[] = [];
+    let diffVersion = 0;
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/b.ts", status: "modified", staged: false, additions: 1 }]);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffVersion += 1;
+          diffRequests.push(request.path!);
+          return { type: "git-diff", diff: { diff: `diff v${diffVersion} for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Open with the row collapsed (the default): it isn't fetched and seeds as
+    // null (the "Loading" state the component renders).
+    await viewAllChanges();
+    expect(diffRequests).toEqual([]);
+    expect(get(allChangesFiles)).toEqual([{ path: "src/b.ts", staged: false, text: null }]);
+
+    // Expanding the section drives the store and kicks an on-demand fetch.
+    expandRows(["src/b.ts", false]);
+    await fetchAllChangesRow("src/b.ts", false);
+
+    expect(diffRequests).toEqual(["src/b.ts"]);
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/b.ts", staged: false, text: "diff v1 for src/b.ts" },
+    ]);
+  });
+
+  it("does not auto-refresh all-changes for identical status metadata", async () => {
+    let diffVersion = 0;
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false, additions: 1, deletions: 1 }]);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffVersion += 1;
+          return { type: "git-diff", diff: { diff: `diff v${diffVersion} for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+    expandRows(["src/a.ts", false]);
+
+    await viewAllChanges();
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v1 for src/a.ts" },
+    ]);
+
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false, additions: 1, deletions: 1 }]);
+    await flush();
+
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v1 for src/a.ts" },
+    ]);
+    expect(diffVersion).toBe(1);
+  });
+
+  it("refreshes all-changes on worktree-dirty even when status metadata is identical", async () => {
+    let diffVersion = 0;
+    const files: ChangedFile[] = [
+      { path: "src/a.ts", status: "modified", staged: false, additions: 1, deletions: 1 },
+    ];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus(files);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffVersion += 1;
+          return { type: "git-diff", diff: { diff: `diff v${diffVersion} for ${request.path}` } };
+        }
+        if (request.type === "git-status") {
+          return {
+            type: "git-status",
+            status: {
+              worktree_id: worktree.id,
+              branch: "feature",
+              dirty: true,
+              ahead: 0,
+              behind: 0,
+              additions: 1,
+              deletions: 1,
+              files,
+            },
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    expandRows(["src/a.ts", false]);
+    await viewAllChanges();
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v1 for src/a.ts" },
+    ]);
+
+    applyHitchEvent({ type: "worktree-dirty", worktree_id: worktree.id, dirty: true });
+    await flush();
+    await flush();
+
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v2 for src/a.ts" },
+    ]);
+  });
+
+  it("refreshes an open single-file tab on worktree-dirty with no all-changes tab", async () => {
+    // Regression: an open single-file diff tab must track external edits the same
+    // way the all-changes tab does. With NO all-changes tab open, a
+    // worktree-dirty -> status update has to evict the stale cache and re-fetch the
+    // tab's diff, updating its text in place — without it the tab showed the
+    // pre-edit diff indefinitely.
+    let diffVersion = 0;
+    const files: ChangedFile[] = [
+      { path: "src/a.ts", status: "modified", staged: false, additions: 1, deletions: 1 },
+    ];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus(files);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffVersion += 1;
+          return { type: "git-diff", diff: { diff: `diff v${diffVersion} for ${request.path}` } };
+        }
+        if (request.type === "git-status") {
+          return {
+            type: "git-status",
+            status: {
+              worktree_id: worktree.id,
+              branch: "feature",
+              dirty: true,
+              ahead: 0,
+              behind: 0,
+              additions: 1,
+              deletions: 1,
+              files,
+            },
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Open the single-file tab the user is looking at. No all-changes tab exists.
+    await viewDiff("src/a.ts", true, false);
+    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "diff v1 for src/a.ts", staged: false }]);
+
+    // An external edit fires worktree-dirty, which reloads status (identical
+    // metadata) and arms the one-shot force flag.
+    applyHitchEvent({ type: "worktree-dirty", worktree_id: worktree.id, dirty: true });
+    await flush();
+    await flush();
+
+    // The tab re-fetched the diff (v2) and its text updated in place, without
+    // stealing the active tab or reordering the strip.
+    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "diff v2 for src/a.ts", staged: false }]);
+    expect(get(activeDiffPath)).toBe("src/a.ts");
+  });
+
+  it("invalidates every option-key variant on worktree-dirty so a toggled-back option re-fetches", async () => {
+    // Each git-diff response encodes the diff version and the current
+    // ignore-whitespace option, so a stale (un-invalidated) cache entry is
+    // detectable by its version/option text.
+    let diffVersion = 0;
+    const files: ChangedFile[] = [
+      { path: "src/a.ts", status: "modified", staged: false, additions: 1, deletions: 1 },
+    ];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus(files);
+    invokeMock.mockImplementation(
+      async (
+        _command: string,
+        { request }: { request: { type: string; path?: string; ignore_whitespace?: boolean } },
+      ) => {
+        if (request.type === "git-diff") {
+          diffVersion += 1;
+          const iw = request.ignore_whitespace ? "iw" : "no-iw";
+          return { type: "git-diff", diff: { diff: `diff v${diffVersion} ${iw} for ${request.path}` } };
+        }
+        if (request.type === "git-status") {
+          return {
+            type: "git-status",
+            status: {
+              worktree_id: worktree.id,
+              branch: "feature",
+              dirty: true,
+              ahead: 0,
+              behind: 0,
+              additions: 1,
+              deletions: 1,
+              files,
+            },
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // (a) Cache the all-changes diff under option-key A (ignore-whitespace ON).
+    expandRows(["src/a.ts", false]);
+    diffIgnoreWhitespace.set(true);
+    await viewAllChanges();
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v1 iw for src/a.ts" },
+    ]);
+
+    // (b) Toggle to option-key B (ignore-whitespace OFF); the subscribe-driven
+    // refreshOpenDiffs re-fans and caches the file under key B too.
+    diffIgnoreWhitespace.set(false);
+    await flush();
+    await flush();
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v2 no-iw for src/a.ts" },
+    ]);
+
+    // (c) The file changes on disk while option B is the current setting. The
+    // dirty-status handler must invalidate BOTH option variants, not just B.
+    applyHitchEvent({ type: "worktree-dirty", worktree_id: worktree.id, dirty: true });
+    await flush();
+    await flush();
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v3 no-iw for src/a.ts" },
+    ]);
+
+    // (d) Toggle back to option-key A. If only the current (B) variant was
+    // invalidated, the stale v1 key-A entry survives and is served without
+    // re-asking the daemon — permanently showing the pre-change diff.
+    diffIgnoreWhitespace.set(true);
+    await flush();
+    await flush();
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: false, text: "diff v4 iw for src/a.ts" },
+    ]);
+  });
+
+  it("bounds all-changes diff fan-out", async () => {
+    const files: ChangedFile[] = Array.from({ length: 20 }, (_value, index) => ({
+      path: `src/${index}.ts`,
+      status: "modified",
+      staged: false,
+    }));
+    const pending: {
+      path: string;
+      resolve: (value: { type: "git-diff"; diff: { diff: string } }) => void;
+    }[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let resolvedCount = 0;
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus(files);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type !== "git-diff" || !request.path) {
+          throw new Error(`unexpected request ${request.type}`);
+        }
+        const response = deferred<{ type: "git-diff"; diff: { diff: string } }>();
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        pending.push({
+          path: request.path,
+          resolve: (value) => {
+            inFlight -= 1;
+            response.resolve(value);
+          },
+        });
+        return response.promise;
+      },
+    );
+    expandRows(...files.map((file): [string, boolean] => [file.path, false]));
+
+    const promise = viewAllChanges();
+    await flush();
+
+    const firstBatchSize = pending.length;
+    expect(firstBatchSize).toBeGreaterThan(0);
+    expect(firstBatchSize).toBeLessThan(files.length);
+    expect(maxInFlight).toBe(firstBatchSize);
+
+    pending[resolvedCount]!.resolve({
+      type: "git-diff",
+      diff: { diff: `diff for ${pending[resolvedCount]!.path}` },
+    });
+    resolvedCount += 1;
+    await flush();
+
+    expect(pending).toHaveLength(firstBatchSize + 1);
+    expect(maxInFlight).toBe(firstBatchSize);
+
+    while (resolvedCount < files.length) {
+      while (resolvedCount < pending.length) {
+        pending[resolvedCount]!.resolve({
+          type: "git-diff",
+          diff: { diff: `diff for ${pending[resolvedCount]!.path}` },
+        });
+        resolvedCount += 1;
+      }
+      await flush();
+    }
+    await promise;
+
+    expect(maxInFlight).toBe(firstBatchSize);
+    expect(get(allChangesFiles)).toHaveLength(files.length);
+    expect(get(allChangesFiles).every((row) => row.text === `diff for ${row.path}`)).toBe(true);
+  });
+
+  it("closing the sentinel tab invalidates in-flight all-changes fan-out rows", async () => {
+    const response = deferred<{ type: "git-diff"; diff: { diff: string } }>();
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false }]);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string } }) => {
+        if (request.type === "git-diff") return response.promise;
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+    expandRows(["src/a.ts", false]);
+
+    const promise = viewAllChanges();
+    await flush();
+    expect(get(allChangesFiles)).toEqual([{ path: "src/a.ts", staged: false, text: null }]);
+
+    closeDiff(ALL_CHANGES_TAB);
+    response.resolve({ type: "git-diff", diff: { diff: "late diff" } });
+    await promise;
+
+    expect(get(diffTabs)).toEqual([]);
+    expect(get(allChangesFiles)).toEqual([]);
+  });
+
+  it("close-all and worktree switch both drop the sentinel tab and its rows", () => {
+    diffTabs.set([{ path: ALL_CHANGES_TAB, text: null }]);
+    activeDiffPath.set(ALL_CHANGES_TAB);
+    diffActive.set(true);
+    allChangesFiles.set([{ path: "src/a.ts", staged: false, text: "a" }]);
+
+    closeDiff();
+
+    expect(get(diffTabs)).toEqual([]);
+    expect(get(activeDiffPath)).toBeNull();
+    expect(get(diffActive)).toBe(false);
+    expect(get(allChangesFiles)).toEqual([]);
+  });
+});
 
 describe("worktree-scoped git actions", () => {
   it("keeps a commit-then-push sequence on the triggering worktree after selection changes", async () => {
@@ -1511,5 +2860,760 @@ describe("PR status freshness across batched and per-worktree lookups", () => {
 
     expect(get(prByWorktree)["wt-1"]).toEqual(freshPr);
     expect(get(prInfo)).toEqual(freshPr);
+  });
+
+  it("sweeps a removed project's worktrees out of the PR-freshness maps", async () => {
+    // The project-removed handler must drop each vanished worktree's
+    // prByWorktreeApplied/prByWorktreeStarted entries (via sweepWorktreeCaches),
+    // not just filter the stores — otherwise those maps leak until disposeDaemon.
+    projects.set([{ id: "proj-1", name: "Repo", root: "/repo", kind: "git-backed" }]);
+    worktrees.set([
+      { id: "wt-1", project_id: "proj-1", path: "/repo", branch: "main", is_main: true, is_hitch_managed: false },
+    ]);
+
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { request: { type: string } } }) => {
+        if (request.request.type === "pr-status") return { type: "job-started", job_id: "j-pr" };
+        throw new Error(`unexpected request ${request.request.type}`);
+      },
+    );
+
+    // A completed lookup stamps both started and applied for wt-1.
+    const lookup = loadPrStatus("wt-1");
+    await flush();
+    completeJob("j-pr", { type: "pr-status", pr: { number: 1, url: "u", state: "OPEN", draft: false } });
+    await lookup;
+    expect(__prFreshnessTracked("wt-1")).toBe(true);
+
+    applyHitchEvent({ type: "project-removed", project_id: "proj-1" });
+
+    expect(__prFreshnessTracked("wt-1")).toBe(false);
+  });
+
+  it("sweeps a directly-removed worktree out of the PR-freshness maps", async () => {
+    projects.set([{ id: "proj-1", name: "Repo", root: "/repo", kind: "git-backed" }]);
+    worktrees.set([
+      { id: "wt-1", project_id: "proj-1", path: "/repo", branch: "main", is_main: true, is_hitch_managed: false },
+    ]);
+
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { request: { type: string } } }) => {
+        if (request.request.type === "pr-status") return { type: "job-started", job_id: "j-pr" };
+        throw new Error(`unexpected request ${request.request.type}`);
+      },
+    );
+
+    const lookup = loadPrStatus("wt-1");
+    await flush();
+    completeJob("j-pr", { type: "pr-status", pr: { number: 1, url: "u", state: "OPEN", draft: false } });
+    await lookup;
+    expect(__prFreshnessTracked("wt-1")).toBe(true);
+
+    // The direct worktree-removed path (removeWorktreeLocal) must clear the same set.
+    applyHitchEvent({ type: "worktree-removed", worktree_id: "wt-1" });
+
+    expect(__prFreshnessTracked("wt-1")).toBe(false);
+  });
+});
+
+describe("ordered tabs (keyboard tab navigation)", () => {
+  // Put two visible sessions under the selected worktree, then open two diff
+  // tabs — the same shape SessionTabs renders: sessions first, diffs after.
+  function seedTwoSessionsTwoDiffs(): void {
+    projects.set([{ id: "p1", name: "Repo", root: "/repo", kind: "git-backed" }]);
+    worktrees.set([
+      { id: "w1", project_id: "p1", path: "/repo", branch: "main", is_main: true, is_hitch_managed: false },
+    ]);
+    selectedProjectId.set("p1");
+    selectedWorktreeId.set("w1");
+    sessions.set([
+      { id: "s1", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+      { id: "s2", name: "codex", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+    ]);
+    diffTabs.set([
+      { path: "src/a.ts", text: null },
+      { path: "src/b.ts", text: null },
+    ]);
+  }
+
+  it("orders sessions before diff tabs, mirroring the tab strip", () => {
+    seedTwoSessionsTwoDiffs();
+    expect(get(orderedTabs)).toEqual([
+      { kind: "session", id: "s1" },
+      { kind: "session", id: "s2" },
+      { kind: "diff", id: "src/a.ts" },
+      { kind: "diff", id: "src/b.ts" },
+    ]);
+  });
+
+  it("reports the active tab index for the active session or active diff", () => {
+    seedTwoSessionsTwoDiffs();
+    activeSessionId.set("s2");
+    diffActive.set(false);
+    expect(activeTabIndex()).toBe(1);
+
+    activeDiffPath.set("src/b.ts");
+    diffActive.set(true);
+    expect(activeTabIndex()).toBe(3);
+  });
+
+  it("returns -1 when nothing maps to a tab", () => {
+    expect(get(orderedTabs)).toEqual([]);
+    expect(activeTabIndex()).toBe(-1);
+  });
+
+  it("activates the Nth tab — session clears the diff view, diff sets the path", () => {
+    seedTwoSessionsTwoDiffs();
+    activateTabIndex(0);
+    expect(get(activeSessionId)).toBe("s1");
+    expect(get(diffActive)).toBe(false);
+
+    activateTabIndex(2);
+    expect(get(diffActive)).toBe(true);
+    expect(get(activeDiffPath)).toBe("src/a.ts");
+  });
+
+  it("ignores an out-of-range index (Cmd+N with fewer than N tabs)", () => {
+    seedTwoSessionsTwoDiffs();
+    activeSessionId.set("s1");
+    diffActive.set(false);
+    activateTabIndex(9);
+    expect(get(activeSessionId)).toBe("s1");
+    expect(get(diffActive)).toBe(false);
+  });
+
+  it("closeActiveTab closes the active diff tab by path", () => {
+    seedTwoSessionsTwoDiffs();
+    activeDiffPath.set("src/a.ts");
+    diffActive.set(true);
+    closeActiveTab();
+    expect(get(diffTabs).map((t) => t.path)).toEqual(["src/b.ts"]);
+    // Closing the active diff re-activates the neighbor (closeDiff's rule).
+    expect(get(activeDiffPath)).toBe("src/b.ts");
+  });
+});
+
+describe("History commit log + Commit Tabs", () => {
+  const project = { id: "p-hist", name: "repo", kind: "git-backed", root: "/repo" } as const;
+  const worktree = {
+    id: "w-hist",
+    project_id: project.id,
+    path: "/repo/wt",
+    branch: "feature",
+    is_main: false,
+    is_hitch_managed: true,
+  } as const;
+
+  function commitInfo(id: string, overrides: Record<string, unknown> = {}) {
+    return {
+      id,
+      summary: `summary ${id}`,
+      body: null,
+      author: "Ada",
+      time: 1_700_000_000,
+      is_merge: false,
+      ahead_of_base: false,
+      additions: 1,
+      deletions: 0,
+      ...overrides,
+    };
+  }
+
+  function selectWorktree() {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+  }
+
+  it("derives the commit tab sentinel path and round-trips the sha", () => {
+    const path = commitTabPath("abc123");
+    expect(path).toBe(`${COMMIT_TAB_PREFIX}abc123`);
+    expect(isCommitTab(path)).toBe(true);
+    expect(commitShaFromTab(path)).toBe("abc123");
+    // A normal file path is not a commit tab.
+    expect(isCommitTab("src/a.ts")).toBe(false);
+    expect(commitShaFromTab("src/a.ts")).toBeNull();
+    expect(isCommitTab(ALL_CHANGES_TAB)).toBe(false);
+  });
+
+  it("loads the first page of the commit log for the selected worktree", async () => {
+    selectWorktree();
+    const requests: { limit?: number; offset?: number }[] = [];
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; limit?: number; offset?: number } }) => {
+        if (request.type === "git-log") {
+          requests.push({ limit: request.limit, offset: request.offset });
+          return { type: "commit-log", commits: [commitInfo("c1"), commitInfo("c2")], has_more: true };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await loadCommitLog();
+
+    expect(requests).toEqual([{ limit: 20, offset: 0 }]);
+    const state = get(commitLog);
+    expect(state.worktreeId).toBe(worktree.id);
+    expect(state.commits.map((c) => c.id)).toEqual(["c1", "c2"]);
+    expect(state.hasMore).toBe(true);
+    expect(state.loading).toBe(false);
+  });
+
+  it("appends the next offset page on loadMore", async () => {
+    selectWorktree();
+    const offsets: number[] = [];
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; offset?: number } }) => {
+        if (request.type === "git-log") {
+          offsets.push(request.offset!);
+          const page = request.offset === 0
+            ? { commits: [commitInfo("c1")], has_more: true }
+            : { commits: [commitInfo("c2")], has_more: false };
+          return { type: "commit-log", ...page };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await loadCommitLog();
+    await loadMoreCommits();
+
+    expect(offsets).toEqual([0, 1]);
+    const state = get(commitLog);
+    expect(state.commits.map((c) => c.id)).toEqual(["c1", "c2"]);
+    expect(state.hasMore).toBe(false);
+  });
+
+  it("does not loadMore past the end", async () => {
+    selectWorktree();
+    let calls = 0;
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string } }) => {
+        if (request.type === "git-log") {
+          calls += 1;
+          return { type: "commit-log", commits: [commitInfo("c1")], has_more: false };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await loadCommitLog();
+    await loadMoreCommits();
+    expect(calls).toBe(1);
+  });
+
+  it("refetches the log when HEAD changes while HISTORY is visible", async () => {
+    selectWorktree();
+    let logVersion = 0;
+    let head = "head-a";
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string } }) => {
+        if (request.type === "git-status") {
+          return {
+            type: "git-status",
+            status: {
+              worktree_id: worktree.id,
+              branch: "feature",
+              dirty: false,
+              ahead: 0,
+              behind: 0,
+              additions: 0,
+              deletions: 0,
+              head_commit_id: head,
+              files: [],
+            },
+          };
+        }
+        if (request.type === "git-log") {
+          logVersion += 1;
+          return { type: "commit-log", commits: [commitInfo(`v${logVersion}`)], has_more: false };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+    // HISTORY is the visible view; seed the log as already pointed at this worktree
+    // so flipping the view doesn't race a lazy load with the status-driven refetch.
+    commitLog.set({ worktreeId: worktree.id, commits: [], hasMore: false, loading: false, prependedCount: 0, tick: 0 });
+    railView.set("history");
+
+    // First status seeds HEAD (null -> head-a) and refetches the log.
+    await loadGitStatus(worktree.id);
+    await flush();
+    expect(get(commitLog).commits.map((c) => c.id)).toEqual(["v1"]);
+
+    // Same HEAD again → no refetch.
+    await loadGitStatus(worktree.id);
+    await flush();
+    expect(logVersion).toBe(1);
+
+    // HEAD moves → refetch from page one.
+    head = "head-b";
+    await loadGitStatus(worktree.id);
+    await flush();
+    expect(get(commitLog).commits.map((c) => c.id)).toEqual(["v2"]);
+  });
+
+  it("PREPENDS new commits on a HEAD change, preserving the loaded depth and row identity", async () => {
+    // Regression for "clicking a late-loaded commit row does nothing / snaps back
+    // to the start" under a churning HEAD (an agent committing in the selected
+    // PTY). The old refresh re-fetched and SWAPPED the whole fixed-size window
+    // every ~1s: new top commits pushed the oldest rows out of the window AND
+    // slid every visible row down with no scroll compensation, so a real pointer's
+    // mousedown and mouseup landed on different rows (no synthesized `click`). The
+    // refresh must instead (a) keep the rows in place — never go empty mid-flight,
+    // (b) PREPEND only the genuinely-new commits above the existing top, reusing
+    // the existing row objects (stable identity → no DOM churn → the keyed each
+    // keeps each node), (c) GROW the array rather than drop the oldest loaded rows,
+    // and (d) signal `prependedCount` so the list can anchor scroll.
+    selectWorktree();
+    let head = "head-a";
+    const requestedLimits: number[] = [];
+    // The commits the daemon currently reports, in HEAD order (newest first).
+    // `topId` is HEAD's number; row i back from HEAD is `c{topId - i}`.
+    let topId = 40;
+    const rowsFor = (limit: number) =>
+      Array.from({ length: limit }, (_v, i) => commitInfo(`c${topId - i}`));
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; limit?: number } }) => {
+        if (request.type === "git-status") {
+          return {
+            type: "git-status",
+            status: {
+              worktree_id: worktree.id,
+              branch: "feature",
+              dirty: false,
+              ahead: 0,
+              behind: 0,
+              additions: 0,
+              deletions: 0,
+              head_commit_id: head,
+              files: [],
+            },
+          };
+        }
+        if (request.type === "git-log") {
+          requestedLimits.push(request.limit!);
+          return { type: "commit-log", commits: rowsFor(request.limit!), has_more: true };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Seed 40 already-paginated rows (c40 … c1) for this worktree, HISTORY visible.
+    const seeded = rowsFor(40);
+    commitLog.set({
+      worktreeId: worktree.id,
+      commits: seeded,
+      hasMore: true,
+      loading: false,
+      prependedCount: 0,
+      tick: 0,
+    });
+    railView.set("history");
+
+    // Observe the store across the refresh: it must never go empty mid-flight.
+    let sawEmpty = false;
+    const unsub = commitLog.subscribe((s) => {
+      if (s.worktreeId === worktree.id && s.commits.length === 0) sawEmpty = true;
+    });
+
+    // Three new commits land on top → HEAD moves.
+    topId = 43;
+    head = "head-b";
+    await loadGitStatus(worktree.id);
+    await flush();
+    unsub();
+
+    const after = get(commitLog);
+    // Refresh fetches ONE page, not the full 40-row loaded depth: the merge keeps
+    // only the new prefix above our top sha and reuses the rest verbatim, so pulling
+    // the whole depth made the daemon recompute a per-commit diff for every loaded
+    // row just to throw all but the prefix away. The ≤ PAGE new commits overlap
+    // within that single page, so no escalation is needed.
+    expect(requestedLimits).toEqual([20]);
+    expect(sawEmpty).toBe(false);
+    // The three new commits are PREPENDED; the loaded depth GROWS 40 → 43 (the
+    // oldest rows c1 … are NOT dropped to a fixed window).
+    expect(after.commits.map((c) => c.id).slice(0, 5)).toEqual(["c43", "c42", "c41", "c40", "c39"]);
+    expect(after.commits).toHaveLength(43);
+    expect(after.commits[after.commits.length - 1].id).toBe("c1");
+    // The prepend is signaled so the list can anchor scroll, and the original row
+    // objects are reused (stable identity keeps each DOM node / avoids drift).
+    expect(after.prependedCount).toBe(3);
+    expect(after.commits[3]).toBe(seeded[0]);
+    expect(after.commits[42]).toBe(seeded[39]);
+  });
+
+  it("escalates to the full depth on a fast-forward burst so scrolled depth survives", async () => {
+    // A burst of MORE than one page of new commits lands on top (an agent committing
+    // rapidly): the old top sha is still in history, just deeper than one page, so the
+    // first one-page refresh finds NO overlap. Rather than collapse the user's scrolled
+    // depth back to one page (the rewrite path), the refresh escalates ONCE at the
+    // previous full depth — the overlap is found there and the whole loaded depth is
+    // preserved while the burst is prepended.
+    selectWorktree();
+    let head = "head-a";
+    const requestedLimits: number[] = [];
+    // 25 new commits land on top of the 40 loaded (c40 … c1). HEAD order is newest
+    // first: c65 … c1. Row i back from HEAD is c{65 - i}.
+    let topId = 40;
+    const rowsFor = (limit: number) =>
+      Array.from({ length: limit }, (_v, i) => commitInfo(`c${topId - i}`));
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; limit?: number } }) => {
+        if (request.type === "git-status") {
+          return {
+            type: "git-status",
+            status: {
+              worktree_id: worktree.id,
+              branch: "feature",
+              dirty: false,
+              ahead: 0,
+              behind: 0,
+              additions: 0,
+              deletions: 0,
+              head_commit_id: head,
+              files: [],
+            },
+          };
+        }
+        if (request.type === "git-log") {
+          requestedLimits.push(request.limit!);
+          return { type: "commit-log", commits: rowsFor(request.limit!), has_more: true };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    const seeded = rowsFor(40);
+    commitLog.set({
+      worktreeId: worktree.id,
+      commits: seeded,
+      hasMore: true,
+      loading: false,
+      prependedCount: 0,
+      tick: 0,
+    });
+    railView.set("history");
+
+    // 25 new commits on top → the old top sha (c40) is now 25 rows down, past one page.
+    topId = 65;
+    head = "head-b";
+    await loadGitStatus(worktree.id);
+    await flush();
+
+    const after = get(commitLog);
+    // First fetch one page (20, no overlap), then escalate once at the old depth (40).
+    expect(requestedLimits).toEqual([20, 40]);
+    // The 25 new commits are PREPENDED and the original 40-row depth is preserved (65),
+    // the seeded objects reused for stable identity.
+    expect(after.commits.map((c) => c.id).slice(0, 3)).toEqual(["c65", "c64", "c63"]);
+    expect(after.commits).toHaveLength(65);
+    expect(after.commits[after.commits.length - 1].id).toBe("c1");
+    expect(after.prependedCount).toBe(25);
+    expect(after.commits[25]).toBe(seeded[0]);
+  });
+
+  it("replaces the window when a HEAD change has no overlap with the loaded rows", async () => {
+    // A big jump, rebase, or force-update where none of the loaded shas are in the
+    // fresh top window: there is nothing to prepend onto, so the refresh must
+    // replace the window (correctness over node reuse) rather than prepend a
+    // disjoint history. prependedCount stays 0 (no scroll anchoring).
+    selectWorktree();
+    let head = "head-a";
+    let generation = 0;
+    const requestedLimits: number[] = [];
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; limit?: number } }) => {
+        if (request.type === "git-status") {
+          return {
+            type: "git-status",
+            status: {
+              worktree_id: worktree.id,
+              branch: "feature",
+              dirty: false,
+              ahead: 0,
+              behind: 0,
+              additions: 0,
+              deletions: 0,
+              head_commit_id: head,
+              files: [],
+            },
+          };
+        }
+        if (request.type === "git-log") {
+          requestedLimits.push(request.limit!);
+          const rows = Array.from({ length: request.limit! }, (_v, i) =>
+            commitInfo(`g${generation}-${i}`),
+          );
+          return { type: "commit-log", commits: rows, has_more: true };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    generation = 1;
+    commitLog.set({
+      worktreeId: worktree.id,
+      commits: Array.from({ length: 40 }, (_v, i) => commitInfo(`g1-${i}`)),
+      hasMore: true,
+      loading: false,
+      prependedCount: 0,
+      tick: 0,
+    });
+    railView.set("history");
+
+    // A force-update rewrites history: the fresh window shares no sha with ours.
+    generation = 2;
+    head = "head-b";
+    await loadGitStatus(worktree.id);
+    await flush();
+
+    const after = get(commitLog);
+    // The one-page refresh finds no overlap, escalates ONCE at the old depth (40),
+    // still finds no overlap, then falls through to the full replace.
+    expect(requestedLimits).toEqual([20, 40]);
+    expect(after.commits[0].id).toBe("g2-0");
+    expect(after.commits.every((c) => c.id.startsWith("g2-"))).toBe(true);
+    expect(after.prependedCount).toBe(0);
+  });
+
+  it("opens a commit tab keyed by sha and re-activates it without duplicating", () => {
+    openCommitTab("sha-1");
+    expect(get(diffTabs).map((t) => t.path)).toEqual([commitTabPath("sha-1")]);
+    expect(get(activeDiffPath)).toBe(commitTabPath("sha-1"));
+    expect(get(diffActive)).toBe(true);
+
+    openCommitTab("sha-2");
+    expect(get(diffTabs).map((t) => t.path)).toEqual([
+      commitTabPath("sha-1"),
+      commitTabPath("sha-2"),
+    ]);
+
+    // Re-opening an existing commit re-activates without a duplicate.
+    openCommitTab("sha-1");
+    expect(get(diffTabs).map((t) => t.path)).toEqual([
+      commitTabPath("sha-1"),
+      commitTabPath("sha-2"),
+    ]);
+    expect(get(activeDiffPath)).toBe(commitTabPath("sha-1"));
+  });
+
+  it("refreshOpenDiffs skips commit tabs but still re-diffs file tabs", async () => {
+    selectWorktree();
+    gitStatus.set({
+      worktree_id: worktree.id,
+      branch: "feature",
+      dirty: true,
+      ahead: 0,
+      behind: 0,
+      additions: 1,
+      deletions: 0,
+      files: [{ path: "src/a.ts", status: "modified", staged: false }],
+    });
+    const diffRequests: string[] = [];
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffRequests.push(request.path ?? "");
+          return { type: "git-diff", diff: { diff: `diff for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Open a regular file tab and a commit tab side by side.
+    await viewDiff("src/a.ts", true, false);
+    openCommitTab("sha-1");
+    expect(get(diffTabs).map((t) => t.path)).toEqual(["src/a.ts", commitTabPath("sha-1")]);
+    diffRequests.length = 0;
+
+    // Re-diffing under new view options must re-fetch the file tab but never
+    // send the commit sentinel as a working-tree pathspec.
+    refreshOpenDiffs();
+    await flush();
+    expect(diffRequests).toEqual(["src/a.ts"]);
+    expect(diffRequests).not.toContain(commitTabPath("sha-1"));
+  });
+
+  it("fetches a commit diff once and serves the immutable cache thereafter", async () => {
+    let calls = 0;
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; commit_id?: string } }) => {
+        if (request.type === "commit-diff") {
+          calls += 1;
+          return {
+            type: "commit-diff",
+            meta: {
+              id: request.commit_id,
+              summary: "feat: x",
+              body: null,
+              author: "Ada",
+              time: 1_700_000_000,
+              is_merge: false,
+              additions: 2,
+              deletions: 1,
+            },
+            files: [{ path: "src/a.ts", status: "modified", diff: "diff" }],
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    const first = await fetchCommitDiff(worktree.id, "sha-x");
+    expect(first?.meta.id).toBe("sha-x");
+    expect(first?.files).toEqual([{ path: "src/a.ts", status: "modified", diff: "diff" }]);
+
+    const second = await fetchCommitDiff(worktree.id, "sha-x");
+    expect(second).toBe(first);
+    expect(calls).toBe(1);
+  });
+
+  it("evicts a worktree's cached commit diff when the worktree is removed", async () => {
+    selectWorktree();
+    let calls = 0;
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; commit_id?: string } }) => {
+        if (request.type === "commit-diff") {
+          calls += 1;
+          return {
+            type: "commit-diff",
+            meta: {
+              id: request.commit_id,
+              summary: "feat: x",
+              body: null,
+              author: "Ada",
+              time: 1_700_000_000,
+              is_merge: false,
+              additions: 2,
+              deletions: 1,
+            },
+            files: [{ path: "src/a.ts", status: "modified", diff: "diff" }],
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Populate the immutable per-sha commit-diff cache.
+    await fetchCommitDiff(worktree.id, "sha-x");
+    expect(calls).toBe(1);
+
+    // Removing the worktree must evict its commit-diff entry (it would otherwise
+    // pin full CommitDiffData until disposeDaemon).
+    applyHitchEvent({ type: "worktree-removed", worktree_id: worktree.id });
+
+    // A re-fetch (e.g. the worktree is re-created with the same id) must hit the
+    // daemon again rather than serve a stale, supposedly-evicted entry.
+    await fetchCommitDiff(worktree.id, "sha-x");
+    expect(calls).toBe(2);
+  });
+
+  it("evicts cached commit diffs for every worktree when the project is removed", async () => {
+    selectWorktree();
+    let calls = 0;
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; commit_id?: string } }) => {
+        if (request.type === "commit-diff") {
+          calls += 1;
+          return {
+            type: "commit-diff",
+            meta: {
+              id: request.commit_id,
+              summary: "feat: x",
+              body: null,
+              author: "Ada",
+              time: 1_700_000_000,
+              is_merge: false,
+              additions: 2,
+              deletions: 1,
+            },
+            files: [{ path: "src/a.ts", status: "modified", diff: "diff" }],
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await fetchCommitDiff(worktree.id, "sha-x");
+    expect(calls).toBe(1);
+
+    // Removing the whole project must sweep every cached diff for each of its
+    // worktrees, not just filter the stores.
+    applyHitchEvent({ type: "project-removed", project_id: project.id });
+
+    await fetchCommitDiff(worktree.id, "sha-x");
+    expect(calls).toBe(2);
+  });
+
+  it("caps the commit-diff cache, evicting the oldest entry and keeping the newest", async () => {
+    selectWorktree();
+    // The cap is 64 (COMMIT_DIFF_CACHE_CAP); overflowing it by one must drop the
+    // single oldest entry while every later entry stays served from the cache.
+    const cap = 64;
+    const callsBySha = new Map<string, number>();
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; commit_id?: string } }) => {
+        if (request.type === "commit-diff") {
+          const sha = request.commit_id ?? "";
+          callsBySha.set(sha, (callsBySha.get(sha) ?? 0) + 1);
+          return {
+            type: "commit-diff",
+            meta: commitInfo(sha),
+            files: [{ path: "src/a.ts", status: "modified", diff: "diff" }],
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Fill the cache to exactly the cap (sha-0 is the oldest), then add one more.
+    for (let i = 0; i < cap; i += 1) await fetchCommitDiff(worktree.id, `sha-${i}`);
+    await fetchCommitDiff(worktree.id, `sha-${cap}`);
+    expect(callsBySha.size).toBe(cap + 1);
+
+    // The newest entry is cached: re-fetching it must not hit the daemon again.
+    await fetchCommitDiff(worktree.id, `sha-${cap}`);
+    expect(callsBySha.get(`sha-${cap}`)).toBe(1);
+
+    // The oldest (sha-0) was evicted to make room, so its re-fetch re-walks.
+    await fetchCommitDiff(worktree.id, "sha-0");
+    expect(callsBySha.get("sha-0")).toBe(2);
+  });
+
+  it("re-inserts a served entry so it survives eviction over an untouched older one", async () => {
+    selectWorktree();
+    const cap = 64;
+    const callsBySha = new Map<string, number>();
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; commit_id?: string } }) => {
+        if (request.type === "commit-diff") {
+          const sha = request.commit_id ?? "";
+          callsBySha.set(sha, (callsBySha.get(sha) ?? 0) + 1);
+          return {
+            type: "commit-diff",
+            meta: commitInfo(sha),
+            files: [{ path: "src/a.ts", status: "modified", diff: "diff" }],
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Fill to the cap; sha-0 is oldest, sha-1 is next-oldest.
+    for (let i = 0; i < cap; i += 1) await fetchCommitDiff(worktree.id, `sha-${i}`);
+
+    // Touch sha-0 (a cache hit), which re-inserts it as the newest — so sha-1 is
+    // now the oldest. Adding a fresh entry must evict sha-1, not the just-read sha-0.
+    await fetchCommitDiff(worktree.id, "sha-0");
+    expect(callsBySha.get("sha-0")).toBe(1);
+    await fetchCommitDiff(worktree.id, `sha-${cap}`);
+
+    // sha-0 is still cached (re-fetch serves it); sha-1 was evicted (re-walks).
+    await fetchCommitDiff(worktree.id, "sha-0");
+    expect(callsBySha.get("sha-0")).toBe(1);
+    await fetchCommitDiff(worktree.id, "sha-1");
+    expect(callsBySha.get("sha-1")).toBe(2);
   });
 });

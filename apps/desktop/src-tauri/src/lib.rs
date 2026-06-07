@@ -45,10 +45,16 @@ use hitch_proto::{
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-#[cfg(feature = "packaged-smoke")]
+use tauri::tray::TrayIconBuilder;
+#[cfg(windows)]
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+// Used by the packaged-smoke `Ready` hook and the macOS `Reopen` re-show handler.
+#[cfg(any(feature = "packaged-smoke", target_os = "macos"))]
 use tauri::RunEvent;
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
+use tauri::window::Color;
+use tauri::{
+    AppHandle, Emitter, Manager, State, Theme, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry,
+};
 
 /// Per-session bound on the bytes we stage before the webview registers that
 /// session's output channel. Mirrors the daemon's `DEFAULT_SCROLLBACK_CAPACITY`
@@ -2005,6 +2011,114 @@ fn daemon_log_path() -> PathBuf {
     hitch_proto::transport::default_data_dir().join("daemon.log")
 }
 
+/// The two canonical Paper Terminal `--paper-0` window-base colors (doc-design/
+/// colors.md), as sRGB hex: light `oklch(97.4% 0.008 80)`, dusk
+/// `oklch(16.5% 0.012 72)`. These are the ONLY two background colors the native
+/// window is ever painted; they match the pre-paint values in `app.html` so the
+/// native frame, the document, and the app CSS all agree before first paint.
+// Kept in sync with app.css --paper-0 + app.html pre-paint hex by
+// apps/desktop/src/lib/paperColors.test.ts.
+const PAPER_0_LIGHT: Color = Color(0xf9, 0xf6, 0xf1, 0xff);
+const PAPER_0_DARK: Color = Color(0x12, 0x0e, 0x09, 0xff);
+
+/// File the frontend mirrors the persisted theme into so the Rust side can read
+/// it synchronously at startup — Rust cannot reliably read WKWebView localStorage
+/// (where `theme.ts` keeps the canonical value). `set_window_theme` writes either
+/// `"dark"` or `"light"`; startup reads it to pick the native window background.
+fn window_theme_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|dir| dir.join("theme"))
+}
+
+/// Read the persisted window theme from the mirror file. Returns `None` when no
+/// preference has been recorded yet (first run / installs predating the mirror),
+/// leaving the caller to resolve a first-run default from the OS appearance —
+/// this function never guesses on its own. Only ever returns one of the two
+/// themes (or `None`).
+fn persisted_window_theme(app: &AppHandle) -> Option<Theme> {
+    let path = window_theme_path(app)?;
+    let contents = std::fs::read_to_string(&path).ok()?;
+    match contents.trim() {
+        "dark" => Some(Theme::Dark),
+        "light" => Some(Theme::Light),
+        _ => None,
+    }
+}
+
+/// Best-effort detection of the OS appearance for first-run, used only when no
+/// theme has been persisted yet. The "main" window doesn't exist at startup
+/// (it's built programmatically below, and there's no static window in the
+/// config), so we can't ask a window for its theme — instead, on macOS, read the
+/// global `AppleInterfaceStyle` user default, which is `"Dark"` exactly when the
+/// system is in dark mode and unset otherwise. A single blocking one-shot at
+/// startup (before the window is built) is acceptable here. Other platforms have
+/// no equivalent one-liner without a window, so they fall back to light; once the
+/// user picks a theme the mirror file takes over on every subsequent launch.
+fn os_appearance() -> Theme {
+    #[cfg(target_os = "macos")]
+    {
+        let dark = std::process::Command::new("defaults")
+            .args(["read", "-g", "AppleInterfaceStyle"])
+            .output()
+            .map(|out| {
+                out.status.success()
+                    && String::from_utf8_lossy(&out.stdout).trim() == "Dark"
+            })
+            .unwrap_or(false);
+        if dark {
+            return Theme::Dark;
+        }
+    }
+    Theme::Light
+}
+
+/// The theme to paint the native window with: the persisted preference if one
+/// exists, otherwise the OS appearance on first run. Always one of the two
+/// themes.
+fn startup_window_theme(app: &AppHandle) -> Theme {
+    persisted_window_theme(app).unwrap_or_else(os_appearance)
+}
+
+fn window_background_color(theme: Theme) -> Color {
+    match theme {
+        Theme::Dark => PAPER_0_DARK,
+        _ => PAPER_0_LIGHT,
+    }
+}
+
+/// Create the main window programmatically so its native background is painted
+/// from the persisted theme BEFORE the webview loads — otherwise dark-theme users
+/// see a light native frame for the pre-paint frames (the static
+/// `backgroundColor` in the config could only ever be one theme). All other
+/// window config that used to live in `tauri.conf.json` / `tauri.windows.conf.json`
+/// is reproduced here, cfg-gated per platform.
+fn build_main_window(app: &AppHandle) -> tauri::Result<()> {
+    let theme = startup_window_theme(app);
+    let mut builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+        .title("Hitch")
+        .inner_size(1100.0, 720.0)
+        .min_inner_size(720.0, 480.0)
+        .background_color(window_background_color(theme))
+        .theme(Some(theme));
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .title_bar_style(tauri::TitleBarStyle::Overlay)
+            .traffic_light_position(tauri::LogicalPosition::new(16.0, 23.0))
+            .hidden_title(true);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Frameless on Windows: the app draws its own caption controls and the
+        // Snap-Layouts bridge re-adds max-button hit-testing (window_chrome).
+        builder = builder.decorations(false).zoom_hotkeys_enabled(false);
+    }
+
+    builder.build()?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EditorLaunchSpec {
     program: OsString,
@@ -2185,8 +2299,9 @@ fn windows_editor_candidates_from_dirs(
         // Unknown editor: the table has no install-dir mapping, so fall back to
         // treating the configured name itself as a bare-name PATH candidate. This
         // routes through the same `resolve_windows_path_candidate` machinery the
-        // known bare-name entries use (which tries `.exe`/`.cmd` and applies the
-        // cmd-shim), so any editor resolvable on PATH works instead of dead-ending.
+        // known bare-name entries use (which tries `.exe`/`.cmd`/`.bat` and
+        // applies the cmd-shim), so any editor resolvable on PATH works instead
+        // of dead-ending.
         // Candidates that carry path components are left out here because
         // `configured_executable` already handles absolute/relative paths, and
         // `resolve_windows_path_candidate` only accepts bare names anyway.
@@ -2252,16 +2367,23 @@ fn windows_candidate_names(candidate: &OsString) -> Vec<OsString> {
     exe.push(".exe");
     let mut cmd = candidate.clone();
     cmd.push(".cmd");
-    vec![exe, cmd]
+    let mut bat = candidate.clone();
+    bat.push(".bat");
+    vec![exe, cmd, bat]
+}
+
+#[cfg(windows)]
+fn windows_editor_program_needs_command_shim(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        })
 }
 
 #[cfg(windows)]
 fn windows_editor_program_from_path(path: PathBuf) -> WindowsEditorProgram {
-    if path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
-    {
+    if windows_editor_program_needs_command_shim(&path) {
         WindowsEditorProgram::command_shim(path.into_os_string())
     } else {
         WindowsEditorProgram::executable(path.into_os_string())
@@ -2311,6 +2433,117 @@ fn first_available_windows_candidate(candidates: &[OsString]) -> Option<WindowsE
                 .filter(|candidate| !Path::new(candidate).is_absolute())
                 .find_map(resolve_windows_path_candidate)
         })
+}
+
+/// Launch spec for the "System default" editor setting (empty editor string):
+/// $VISUAL, then $EDITOR. Env editor values are command lines (`code -w`,
+/// `"/opt/My Editor/bin/edit" --flag`), not app display names, so they bypass
+/// the display-name table / `open -a` resolution entirely. Errors when neither
+/// variable is set — the frontend surfaces this so the user picks an editor in
+/// Settings instead of silently getting nothing.
+fn env_editor_launch_spec(path: &Path) -> Result<EditorLaunchSpec, String> {
+    let command = ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+        .ok_or_else(|| "$VISUAL/$EDITOR are not set; pick an editor in Settings".to_string())?;
+    Ok(env_editor_command_spec(&command, path))
+}
+
+#[cfg(windows)]
+fn split_windows_editor_command(command: &str) -> Vec<OsString> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut in_quotes = false;
+    let mut has_arg = false;
+
+    while let Some(ch) = chars.next() {
+        if ch == ' ' || ch == '\t' {
+            if in_quotes {
+                current.push(ch);
+                has_arg = true;
+            } else if has_arg {
+                args.push(OsString::from(std::mem::take(&mut current)));
+                has_arg = false;
+            }
+            continue;
+        }
+
+        if ch == '\\' {
+            let mut backslashes = 1;
+            while chars.next_if_eq(&'\\').is_some() {
+                backslashes += 1;
+            }
+
+            if chars.peek() == Some(&'"') {
+                current.extend(std::iter::repeat('\\').take(backslashes / 2));
+                if backslashes % 2 == 0 {
+                    chars.next();
+                    in_quotes = !in_quotes;
+                } else {
+                    chars.next();
+                    current.push('"');
+                    has_arg = true;
+                }
+            } else {
+                current.extend(std::iter::repeat('\\').take(backslashes));
+                has_arg = true;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            has_arg = true;
+            continue;
+        }
+
+        current.push(ch);
+        has_arg = true;
+    }
+
+    if has_arg {
+        args.push(OsString::from(current));
+    }
+    args
+}
+
+/// Spec for a non-empty $VISUAL/$EDITOR command line.
+fn env_editor_command_spec(command: &str, path: &Path) -> EditorLaunchSpec {
+    // Unix: run the value through the shell, git-style, so quoting and
+    // arguments behave exactly as they would for git/crontab. The path rides
+    // in as "$@", never interpolated into the script.
+    #[cfg(unix)]
+    {
+        EditorLaunchSpec {
+            program: OsString::from("/bin/sh"),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from(format!("exec {command} \"$@\"")),
+                OsString::from("hitch-editor"),
+                path.as_os_str().to_os_string(),
+            ],
+        }
+    }
+
+    // Windows: no POSIX shell to lean on; parse the command line with Windows
+    // quote/backslash semantics (program + args) and reuse the cmd shim for
+    // `.cmd`/`.bat` launchers so a GUI parent doesn't flash a console window.
+    #[cfg(windows)]
+    {
+        let mut parts = split_windows_editor_command(command).into_iter();
+        let program = parts.next().expect("non-empty after trim");
+        let mut args: Vec<OsString> = parts.collect();
+        args.push(path.as_os_str().to_os_string());
+        let command_processor_shim = windows_editor_program_needs_command_shim(Path::new(&program));
+        EditorLaunchSpec {
+            program: OsString::from(program),
+            args,
+            command_processor_shim,
+        }
+    }
 }
 
 fn build_editor_launch_spec(editor: &str, path: &Path) -> Option<EditorLaunchSpec> {
@@ -2403,6 +2636,12 @@ fn open_path_with_default_viewer(path: &Path) -> Result<(), String> {
 async fn open_in_editor(path: String, editor: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let path = PathBuf::from(path);
+        // An empty editor is the "System default" setting: resolve $VISUAL /
+        // $EDITOR instead of the display-name table, and fail loudly when
+        // neither is set so the user knows to pick an editor in Settings.
+        if trim_configured_editor(&editor).is_empty() {
+            return spawn_editor(env_editor_launch_spec(&path)?);
+        }
         match build_editor_launch_spec(&editor, &path) {
             Some(spec) => spawn_editor(spec),
             None => open_path_with_default_viewer(&path),
@@ -2410,6 +2649,207 @@ async fn open_in_editor(path: String, editor: String) -> Result<(), String> {
     })
     .await
     .map_err(|err| format!("editor launch task failed: {err}"))?
+}
+
+/// Installed monospace font families for the Settings terminal-font picker.
+/// Enumeration loads one face per family to read its fixed-pitch flag, so it
+/// runs off the UI thread like the other blocking commands.
+#[tauri::command]
+async fn list_monospace_fonts() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(list_monospace_font_families)
+        .await
+        .map_err(|err| format!("font listing task failed: {err}"))?
+}
+
+/// One installed font face the frontend should register as a web font.
+/// `index` addresses the face within `select_family_by_name`'s handle list and
+/// is only meaningful for the matching `read_font_face` call.
+#[derive(Clone, Copy, serde::Serialize)]
+struct TerminalFontFace {
+    index: usize,
+    /// CSS font-weight (100–900).
+    weight: u16,
+    italic: bool,
+}
+
+/// The faces of an installed family the terminal needs: best match per
+/// regular / bold / italic / bold-italic slot (deduped — a single-weight
+/// family yields one face and the webview synthesizes the rest).
+///
+/// This exists because WKWebView's sandboxed web processes CANNOT see
+/// user-installed fonts (only system fonts), so naming an installed family in
+/// font-family silently falls through to fallback — Nerd Font icons render as
+/// tofu. Verified on macOS 26 that even WKPreferences'
+/// `_shouldAllowUserInstalledFonts` no longer lifts this. Instead the frontend
+/// fetches the picked family's raw face bytes through these two commands and
+/// registers them as WEB fonts (FontFace), which the sandbox never blocks.
+#[tauri::command]
+async fn list_terminal_font_faces(family: String) -> Result<Vec<TerminalFontFace>, String> {
+    tauri::async_runtime::spawn_blocking(move || terminal_font_faces(&family))
+        .await
+        .map_err(|err| format!("font face listing task failed: {err}"))?
+}
+
+/// Raw bytes of one face from `list_terminal_font_faces`, as a binary IPC
+/// response (an ArrayBuffer on the JS side) — a Nerd Font face is megabytes,
+/// so it skips JSON.
+#[tauri::command]
+async fn read_font_face(family: String, index: usize) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || font_face_bytes(&family, index))
+        .await
+        .map_err(|err| format!("font face read task failed: {err}"))??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn family_face_handles(family: &str) -> Result<Vec<font_kit::handle::Handle>, String> {
+    font_kit::source::SystemSource::new()
+        .select_family_by_name(family)
+        .map(|handle| handle.fonts().to_vec())
+        .map_err(|err| format!("font family {family:?} not found: {err}"))
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn terminal_font_faces(family: &str) -> Result<Vec<TerminalFontFace>, String> {
+    use font_kit::properties::Style;
+
+    struct Face {
+        index: usize,
+        weight: f32,
+        italic: bool,
+        stretch: f32,
+    }
+
+    let faces: Vec<Face> = family_face_handles(family)?
+        .iter()
+        .enumerate()
+        .filter(|(_, handle)| {
+            match handle {
+                // FontFace can't address a face inside a collection (.ttc), so
+                // only faces that are a whole file (or collection-first) are
+                // loadable. SYSTEM-located fonts are skipped entirely: the
+                // webview sandbox already sees those natively (the lockdown
+                // only hides user/admin-installed fonts), and registering a
+                // whole .ttc as a web font would shadow the native family with
+                // its first face regardless of which face was meant.
+                font_kit::handle::Handle::Path { font_index, path } => {
+                    *font_index == 0 && !path.starts_with("/System/")
+                }
+                font_kit::handle::Handle::Memory { font_index, .. } => *font_index == 0,
+            }
+        })
+        .filter_map(|(index, handle)| {
+            let font = handle.load().ok()?;
+            let properties = font.properties();
+            Some(Face {
+                index,
+                weight: properties.weight.0,
+                italic: !matches!(properties.style, Style::Normal),
+                stretch: properties.stretch.0,
+            })
+        })
+        .collect();
+    // Empty is a valid answer (a system family, or nothing loadable): the
+    // frontend registers nothing and native/fallback resolution applies.
+    if faces.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Best face per terminal slot: match the slot's slant, then the closest
+    // weight, then the most normal width (Nerd Font families ship Extended/
+    // Condensed cuts; the terminal wants the regular-width ones).
+    let pick = |target_weight: f32, italic: bool| -> Option<&Face> {
+        let candidates: Vec<&Face> = faces.iter().filter(|f| f.italic == italic).collect();
+        candidates.into_iter().min_by(|a, b| {
+            let cost =
+                |f: &Face| ((f.weight - target_weight).abs(), (f.stretch - 1.0).abs());
+            cost(a).partial_cmp(&cost(b)).unwrap_or(std::cmp::Ordering::Equal)
+        })
+    };
+    let slots = [
+        pick(400.0, false),
+        pick(700.0, false),
+        pick(400.0, true),
+        pick(700.0, true),
+    ];
+
+    let mut picked: Vec<TerminalFontFace> = Vec::new();
+    for face in slots.into_iter().flatten() {
+        if picked.iter().any(|p| p.index == face.index) {
+            continue;
+        }
+        picked.push(TerminalFontFace {
+            index: face.index,
+            weight: (face.weight.clamp(1.0, 1000.0)) as u16,
+            italic: face.italic,
+        });
+    }
+    Ok(picked)
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn font_face_bytes(family: &str, index: usize) -> Result<Vec<u8>, String> {
+    let handles = family_face_handles(family)?;
+    let handle = handles
+        .get(index)
+        .ok_or_else(|| format!("face {index} out of range for family {family:?}"))?;
+    match handle {
+        font_kit::handle::Handle::Path { path, .. } => std::fs::read(path)
+            .map_err(|err| format!("failed to read font file {}: {err}", path.display())),
+        font_kit::handle::Handle::Memory { bytes, .. } => Ok(bytes.as_ref().clone()),
+    }
+}
+
+/// Linux: see list_monospace_font_families.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn terminal_font_faces(_family: &str) -> Result<Vec<TerminalFontFace>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn font_face_bytes(family: &str, _index: usize) -> Result<Vec<u8>, String> {
+    Err(format!("font access not supported on this platform ({family:?})"))
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn list_monospace_font_families() -> Result<Vec<String>, String> {
+    use font_kit::source::SystemSource;
+
+    let source = SystemSource::new();
+    let mut families = source
+        .all_families()
+        .map_err(|err| format!("failed to enumerate font families: {err}"))?;
+    families.sort();
+    families.dedup();
+    let monospace = families
+        .into_iter()
+        // Leading-dot families are hidden system fonts on macOS (".SF NS Mono"
+        // and friends) that CSS font-family cannot select.
+        .filter(|family| !family.starts_with('.'))
+        .filter(|family| {
+            // Patched Nerd Font families are the reason the picker exists, but
+            // their non-"Mono" variants use double-width icon glyphs and are
+            // often NOT flagged fixed-pitch — keep them by name.
+            if family.to_ascii_lowercase().contains("nerd font") {
+                return true;
+            }
+            let Ok(handle) = source.select_family_by_name(family) else {
+                return false;
+            };
+            let Some(font) = handle.fonts().first() else {
+                return false;
+            };
+            font.load().map(|f| f.is_monospace()).unwrap_or(false)
+        })
+        .collect();
+    Ok(monospace)
+}
+
+/// Linux: font-kit would pull freetype + fontconfig into the build, so the
+/// command degrades to "no fonts found" and the Settings picker hides itself.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn list_monospace_font_families() -> Result<Vec<String>, String> {
+    Ok(Vec::new())
 }
 
 #[tauri::command]
@@ -2534,6 +2974,33 @@ fn unregister_session_output(
 #[tauri::command]
 fn set_max_button_rect(left: i32, top: i32, right: i32, bottom: i32) {
     window_chrome::set_max_button_rect(left, top, right, bottom);
+}
+
+/// Mirror the persisted theme into a file the Rust side can read synchronously at
+/// the next launch, so the native window background is painted from the user's
+/// theme before the webview loads (no light flash for dark-theme users). The
+/// frontend's `theme.ts` is the source of truth (localStorage `hitch-theme`),
+/// which Rust cannot read from WKWebView; this command is its small write-through
+/// mirror. Best-effort and called fire-and-forget: any value other than `"dark"`
+/// is normalised to `"light"`.
+#[tauri::command]
+fn set_window_theme(app: AppHandle, theme: String) -> Result<(), String> {
+    let value = if theme == "dark" { "dark" } else { "light" };
+    let path = window_theme_path(&app)
+        .ok_or_else(|| "could not resolve app config dir for theme mirror".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create config dir: {err}"))?;
+    }
+    // Write-then-rename so a concurrent cold-start reader (no single-instance
+    // plugin) or a crash mid-write never sees a torn/empty mirror — the rename
+    // is an atomic swap because the temp file lives on the same filesystem.
+    // The temp name carries our pid: without single-instance two app processes
+    // must not share `theme.tmp`, or the first rename consumes it and the
+    // second loses its write to ENOENT. A leaked tmp on crash is harmless.
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, value).map_err(|err| format!("failed to write theme mirror: {err}"))?;
+    std::fs::rename(&tmp, &path).map_err(|err| format!("failed to swap theme mirror: {err}"))
 }
 
 /// Menu-bar status line mirroring the four-state Daemon Status (ADR 0009). The
@@ -2674,10 +3141,11 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 mod tests {
     use super::{
         build_editor_launch_spec, describe_handshake_failure, encode_control_message,
-        parse_spawned_daemon_pid, read_control_message, read_log_tail, recovery_mode_for_loss,
-        run_probe, should_force_kill_daemon, tray_status_text, ControlMessage, CrashLoopGuard,
-        DaemonStatus, ErrorCode, HitchClient, OutputRouter, ProbeError, ProtocolError,
-        RecoveryMode, Request, Response, CRASH_LOOP_MAX, HEARTBEAT_LOST_REASON,
+        env_editor_command_spec, parse_spawned_daemon_pid, read_control_message, read_log_tail,
+        recovery_mode_for_loss, run_probe, should_force_kill_daemon, tray_status_text,
+        ControlMessage, CrashLoopGuard, DaemonStatus, ErrorCode, HitchClient, OutputRouter,
+        ProbeError, ProtocolError, RecoveryMode, Request, Response, CRASH_LOOP_MAX,
+        HEARTBEAT_LOST_REASON,
     };
     #[cfg(windows)]
     use super::{
@@ -2724,6 +3192,83 @@ mod tests {
 
         std::fs::remove_file(editor).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_editor_command_runs_through_the_shell_with_path_as_positional() {
+        let worktree = std::path::Path::new("/repo with spaces");
+
+        let spec = env_editor_command_spec(r#""/opt/My Editor/bin/edit" -w"#, worktree);
+
+        // The command line lands in the script verbatim (shell semantics, like
+        // git's $EDITOR handling); the path only ever travels as a positional.
+        assert_eq!(spec.program, std::ffi::OsString::from("/bin/sh"));
+        assert_eq!(
+            spec.args,
+            vec![
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from(r#"exec "/opt/My Editor/bin/edit" -w "$@""#),
+                std::ffi::OsString::from("hitch-editor"),
+                worktree.as_os_str().to_os_string(),
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn env_editor_command_splits_args_and_shims_cmd_launchers() {
+        let worktree = std::path::Path::new(r"C:\repo");
+
+        let plain = env_editor_command_spec("notepad", worktree);
+        assert_eq!(plain.program, std::ffi::OsString::from("notepad"));
+        assert_eq!(plain.args, vec![worktree.as_os_str().to_os_string()]);
+        assert!(!plain.command_processor_shim);
+
+        let program_files = env_editor_command_spec(
+            r#""C:\Program Files\Microsoft VS Code\Code.exe" --wait"#,
+            worktree,
+        );
+        assert_eq!(
+            program_files.program,
+            std::ffi::OsString::from(r"C:\Program Files\Microsoft VS Code\Code.exe")
+        );
+        assert_eq!(
+            program_files.args,
+            vec![
+                std::ffi::OsString::from("--wait"),
+                worktree.as_os_str().to_os_string(),
+            ]
+        );
+
+        let quoted_args = env_editor_command_spec(
+            r#"code --goto "C:\repo with spaces\src\main.rs:10" "say \"hi\"""#,
+            worktree,
+        );
+        assert_eq!(quoted_args.program, std::ffi::OsString::from("code"));
+        assert_eq!(
+            quoted_args.args,
+            vec![
+                std::ffi::OsString::from("--goto"),
+                std::ffi::OsString::from(r"C:\repo with spaces\src\main.rs:10"),
+                std::ffi::OsString::from(r#"say "hi""#),
+                worktree.as_os_str().to_os_string(),
+            ]
+        );
+
+        let shimmed = env_editor_command_spec(r"C:\bin\code.CMD --wait", worktree);
+        assert_eq!(
+            shimmed.program,
+            std::ffi::OsString::from(r"C:\bin\code.CMD")
+        );
+        assert_eq!(
+            shimmed.args,
+            vec![
+                std::ffi::OsString::from("--wait"),
+                worktree.as_os_str().to_os_string(),
+            ]
+        );
+        assert!(shimmed.command_processor_shim);
     }
 
     #[cfg(windows)]
@@ -2874,6 +3419,52 @@ mod tests {
 
         std::fs::remove_file(shim).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_fallback_resolves_bat_shim_before_launch() {
+        let dir = std::env::temp_dir().join(format!(
+            "hitch-editor-test-{}-{}",
+            std::process::id(),
+            "path-bat-shim"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("code.bat");
+        std::fs::write(&shim, b"").unwrap();
+
+        assert_eq!(
+            resolve_windows_path_candidate_from_dirs(
+                &std::ffi::OsString::from("code"),
+                &[dir.clone()],
+            ),
+            Some(WindowsEditorProgram::command_shim(
+                shim.as_os_str().to_os_string()
+            ))
+        );
+
+        std::fs::remove_file(shim).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_env_editor_bat_uses_command_processor_shim() {
+        let path = std::path::Path::new(r"C:\work\repo");
+        let spec = env_editor_command_spec(r#""C:\Tools\editor.bat" --wait"#, path);
+
+        assert!(spec.command_processor_shim);
+        assert_eq!(
+            spec.program,
+            std::ffi::OsString::from(r"C:\Tools\editor.bat")
+        );
+        assert_eq!(
+            spec.args,
+            vec![
+                std::ffi::OsString::from("--wait"),
+                path.as_os_str().to_os_string(),
+            ]
+        );
     }
 
     #[test]
@@ -3807,9 +4398,15 @@ pub fn run() {
         .manage(HitchClient::new())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             #[cfg(target_os = "macos")]
             disable_press_and_hold();
+            // Create the main window in Rust (not statically in the config) so its
+            // native background can be painted from the persisted theme before the
+            // webview loads — otherwise dark-theme users get a light native frame
+            // for the pre-paint frames.
+            build_main_window(&app.handle())?;
             // Debug builds run their own isolated daemon (`.hitch-dev`); label the
             // window so it's obvious which build you're looking at when a dev build
             // and an installed release build are open side by side.
@@ -3837,6 +4434,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             open_in_editor,
+            list_monospace_fonts,
+            list_terminal_font_faces,
+            read_font_face,
             connect_daemon,
             hitch_request,
             send_session_input,
@@ -3845,11 +4445,20 @@ pub fn run() {
             get_daemon_status,
             get_daemon_log_tail,
             restart_daemon_command,
-            set_max_button_rect
+            set_max_button_rect,
+            set_window_theme
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(move |_app_handle, _event| {
+            // The close button only hides the window (see `on_window_event`), so
+            // clicking the dock icon or a notification banner just reactivates the
+            // app without restoring it. Reopen fires on that reactivation when no
+            // window is visible — re-show the main window so the app comes back.
+            #[cfg(target_os = "macos")]
+            if let RunEvent::Reopen { .. } = _event {
+                show_main_window(_app_handle);
+            }
             #[cfg(feature = "packaged-smoke")]
             if matches!(_event, RunEvent::Ready) && packaged_smoke_enabled() {
                 let app_handle = _app_handle.clone();

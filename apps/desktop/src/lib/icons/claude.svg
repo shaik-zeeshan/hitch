@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+  <path d="M12 2.2 L13 11 L12 12 L11 11 Z" />
+  <path d="M21.8 12 L13 13 L12 12 L13 11 Z" />
+  <path d="M12 21.8 L11 13 L12 12 L13 13 Z" />
+  <path d="M2.2 12 L11 11 L12 12 L11 13 Z" />
+  <path d="M18.9 5.1 L12.9 11.1 L12 12 L11.95 10.6 Z" />
+  <path d="M18.9 18.9 L13.4 12.9 L12 12 L13.4 11.05 Z" />
+  <path d="M5.1 18.9 L11.1 12.9 L12 12 L12.05 13.4 Z" />
+  <path d="M5.1 5.1 L10.6 11.1 L12 12 L10.6 12.95 Z" />
+</svg>

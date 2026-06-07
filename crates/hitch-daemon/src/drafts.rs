@@ -191,6 +191,11 @@ pub(crate) struct CommitDraftInput {
     pub(crate) worktree_path: PathBuf,
     pub(crate) staged_paths: Vec<PathBuf>,
     pub(crate) staged_patch: String,
+    /// Draft Instructions appended to the built-in commit prompt as an extra
+    /// block placed before the diff; never replaces the prompt or its JSON
+    /// output contract (ADR 0007 amendment 2026-06-07). Empty/whitespace-only →
+    /// no block. The stub provider ignores it.
+    pub(crate) instructions: Option<String>,
 }
 
 pub(crate) struct PullRequestDraftInput {
@@ -200,6 +205,9 @@ pub(crate) struct PullRequestDraftInput {
     pub(crate) commits: Vec<String>,
     pub(crate) changed_paths: Vec<PathBuf>,
     pub(crate) diff: String,
+    /// Draft Instructions appended to the built-in pull-request prompt; same
+    /// append-never-replace contract as [`CommitDraftInput::instructions`].
+    pub(crate) instructions: Option<String>,
 }
 
 pub(crate) fn list_models(
@@ -255,7 +263,11 @@ pub(crate) fn generate_commit_draft(
     match config.kind {
         DraftProviderKind::Stub => Ok(stub_commit_draft(&input.staged_paths, &input.staged_patch)),
         DraftProviderKind::Claude | DraftProviderKind::Codex => {
-            let prompt = commit_prompt(&input.staged_paths, &input.staged_patch);
+            let prompt = commit_prompt(
+                &input.staged_paths,
+                &input.staged_patch,
+                input.instructions.as_deref(),
+            );
             let output = run_headless_provider(config, &input.worktree_path, prompt, cancel)?;
             let mut draft = parse_commit_draft_output(&output)?;
             if draft.body.trim().is_empty() {
@@ -285,6 +297,7 @@ pub(crate) fn generate_pull_request_draft(
                 &input.commits,
                 &input.changed_paths,
                 &input.diff,
+                input.instructions.as_deref(),
             );
             let output = run_headless_provider(config, &input.worktree_path, prompt, cancel)?;
             parse_pull_request_draft_output(&output)
@@ -342,11 +355,16 @@ fn stub_pull_request_draft(
     PullRequestDraft { title, body }
 }
 
-fn commit_prompt(staged_paths: &[PathBuf], staged_patch: &str) -> String {
+fn commit_prompt(
+    staged_paths: &[PathBuf],
+    staged_patch: &str,
+    instructions: Option<&str>,
+) -> String {
     let paths = path_list(staged_paths);
     let patch = truncate_context(staged_patch, MAX_DIFF_CHARS);
+    let instructions = instructions_block(instructions);
     format!(
-        "You are Hitch's headless draft generator. Draft a concise git commit message from ONLY the staged diff below.\n\nReturn ONLY valid JSON with this exact shape, no markdown fences and no commentary:\n{{\"subject\":\"type: imperative summary under 72 chars\",\"body\":\"markdown bullet body with at least one bullet\"}}\n\nRules:\n- Do not mention unstaged or untracked files.\n- Use an imperative, review-ready subject.\n- Body must be non-empty and include at least one bullet summarizing changed files, rationale, or testing notes supported by the diff.\n- Put rationale, notable files, and testing notes in body only if supported by the diff.\n\nStaged files:\n{paths}\n\nStaged diff:\n```diff\n{patch}\n```"
+        "You are Hitch's headless draft generator. Draft a concise git commit message from ONLY the staged diff below.\n\nReturn ONLY valid JSON with this exact shape, no markdown fences and no commentary:\n{{\"subject\":\"type: imperative summary under 72 chars\",\"body\":\"markdown bullet body with at least one bullet\"}}\n\nRules:\n- Do not mention unstaged or untracked files.\n- Use an imperative, review-ready subject.\n- Body must be non-empty and include at least one bullet summarizing changed files, rationale, or testing notes supported by the diff.\n- Put rationale, notable files, and testing notes in body only if supported by the diff.\n\nStaged files:\n{paths}\n{instructions}\nStaged diff:\n```diff\n{patch}\n```"
     )
 }
 
@@ -356,6 +374,7 @@ fn pull_request_prompt(
     commits: &[String],
     changed_paths: &[PathBuf],
     diff: &str,
+    instructions: Option<&str>,
 ) -> String {
     let commits = if commits.is_empty() {
         "- No commits found".to_string()
@@ -368,9 +387,24 @@ fn pull_request_prompt(
     };
     let paths = path_list(changed_paths);
     let diff = truncate_context(diff, MAX_DIFF_CHARS);
+    let instructions = instructions_block(instructions);
     format!(
-        "You are Hitch's headless draft generator. Draft a GitHub pull request title and body from the branch context below.\n\nReturn ONLY valid JSON with this exact shape, no markdown fences and no commentary:\n{{\"title\":\"concise PR title\",\"body\":\"markdown PR description\"}}\n\nRules:\n- The body must include a ## Summary section and a ## Testing section.\n- If testing cannot be inferred, include '- [ ] Not run' under ## Testing.\n- Use only the commits, changed files, and diff below.\n\nCurrent branch: {branch}\nBase branch: {base}\n\nCommits on branch:\n{commits}\n\nChanged files:\n{paths}\n\nDiff from base:\n```diff\n{diff}\n```"
+        "You are Hitch's headless draft generator. Draft a GitHub pull request title and body from the branch context below.\n\nReturn ONLY valid JSON with this exact shape, no markdown fences and no commentary:\n{{\"title\":\"concise PR title\",\"body\":\"markdown PR description\"}}\n\nRules:\n- The body must include a ## Summary section and a ## Testing section.\n- If testing cannot be inferred, include '- [ ] Not run' under ## Testing.\n- Use only the commits, changed files, and diff below.\n\nCurrent branch: {branch}\nBase branch: {base}\n\nCommits on branch:\n{commits}\n\nChanged files:\n{paths}\n{instructions}\nDiff from base:\n```diff\n{diff}\n```"
     )
+}
+
+/// Build the optional "Additional instructions from the user" block injected
+/// into a draft prompt **before the diff**. The built-in prompt and its JSON
+/// output contract are never replaced — this only appends an extra block (ADR
+/// 0007 amendment 2026-06-07). Empty or whitespace-only instructions return an
+/// empty string, so the prompt is byte-for-byte identical to one with no
+/// instructions; a non-empty block carries a leading and trailing blank line so
+/// it slots cleanly between the file list and the diff.
+fn instructions_block(instructions: Option<&str>) -> String {
+    match instructions.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => format!("\nAdditional instructions from the user:\n{text}\n"),
+        None => String::new(),
+    }
 }
 
 fn run_headless_provider(
@@ -1119,6 +1153,165 @@ mod tests {
     }
 
     #[test]
+    fn commit_prompt_injects_instructions_block_before_the_diff() {
+        let paths = [PathBuf::from("src/lib.rs")];
+        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n+new\n";
+        let with = commit_prompt(&paths, patch, Some("Reference JIRA-42 in the subject"));
+        // The block is present, labelled, and carries the user's text...
+        assert!(with.contains("Additional instructions from the user:"));
+        assert!(with.contains("Reference JIRA-42 in the subject"));
+        // ...and sits before the diff, not after it.
+        let block = with.find("Additional instructions from the user:").unwrap();
+        let diff = with.find("Staged diff:").unwrap();
+        assert!(block < diff, "instructions must precede the diff");
+        // The built-in JSON output contract is untouched.
+        assert!(with.contains(r#"{"subject":"type: imperative summary under 72 chars""#));
+    }
+
+    #[test]
+    fn commit_prompt_without_instructions_is_identical_to_empty_and_whitespace() {
+        let paths = [PathBuf::from("src/lib.rs")];
+        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n+new\n";
+        let baseline = commit_prompt(&paths, patch, None);
+        // Empty and whitespace-only instructions produce a byte-identical prompt
+        // and never emit the block.
+        assert_eq!(baseline, commit_prompt(&paths, patch, Some("")));
+        assert_eq!(baseline, commit_prompt(&paths, patch, Some("   \n\t ")));
+        assert!(!baseline.contains("Additional instructions from the user:"));
+    }
+
+    #[test]
+    fn pull_request_prompt_injects_instructions_block_before_the_diff() {
+        let paths = [PathBuf::from("src/lib.rs")];
+        let with = pull_request_prompt(
+            "feature/x",
+            "main",
+            &["add x".to_string()],
+            &paths,
+            "+new\n",
+            Some("Call out the migration risk"),
+        );
+        assert!(with.contains("Additional instructions from the user:"));
+        assert!(with.contains("Call out the migration risk"));
+        let block = with.find("Additional instructions from the user:").unwrap();
+        let diff = with.find("Diff from base:").unwrap();
+        assert!(block < diff, "instructions must precede the diff");
+        // The built-in JSON output contract is untouched.
+        assert!(with.contains(r#"{"title":"concise PR title","body":"markdown PR description"}"#));
+    }
+
+    #[test]
+    fn pull_request_prompt_without_instructions_is_identical_to_empty_and_whitespace() {
+        let paths = [PathBuf::from("src/lib.rs")];
+        let baseline = pull_request_prompt(
+            "feature/x",
+            "main",
+            &["add x".to_string()],
+            &paths,
+            "+new\n",
+            None,
+        );
+        assert_eq!(
+            baseline,
+            pull_request_prompt(
+                "feature/x",
+                "main",
+                &["add x".to_string()],
+                &paths,
+                "+new\n",
+                Some("")
+            )
+        );
+        assert_eq!(
+            baseline,
+            pull_request_prompt(
+                "feature/x",
+                "main",
+                &["add x".to_string()],
+                &paths,
+                "+new\n",
+                Some("  \n  ")
+            )
+        );
+        assert!(!baseline.contains("Additional instructions from the user:"));
+    }
+
+    #[test]
+    fn instructions_block_trims_and_drops_empty() {
+        assert_eq!(instructions_block(None), "");
+        assert_eq!(instructions_block(Some("")), "");
+        assert_eq!(instructions_block(Some("   \t\n ")), "");
+        // Surrounding whitespace is trimmed; interior text is preserved.
+        assert_eq!(
+            instructions_block(Some("  keep me  ")),
+            "\nAdditional instructions from the user:\nkeep me\n"
+        );
+    }
+
+    #[test]
+    fn commit_prompt_still_truncates_the_diff_with_instructions_set() {
+        let paths = [PathBuf::from("src/lib.rs")];
+        // A diff well over MAX_DIFF_CHARS must still be truncated regardless of an
+        // instructions block being present.
+        let huge = "+line\n".repeat(MAX_DIFF_CHARS);
+        let prompt = commit_prompt(&paths, &huge, Some("do the thing"));
+        assert!(prompt.contains("...[truncated by Hitch]..."));
+        assert!(prompt.contains("Additional instructions from the user:"));
+    }
+
+    #[test]
+    fn stub_commit_draft_ignores_instructions() {
+        // The stub provider never reads instructions: its output is purely a
+        // function of staged paths/patch, so generation stays deterministic.
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Stub,
+            claude: PathBuf::from("claude"),
+            codex: PathBuf::from("codex"),
+            timeout: Duration::from_secs(2),
+            model: None,
+        };
+        let make_input = |instructions: Option<String>| CommitDraftInput {
+            worktree_path: PathBuf::from("."),
+            staged_paths: vec![PathBuf::from("src/main.rs")],
+            staged_patch: "diff --git a/src/main.rs b/src/main.rs\n+new\n-old\n".into(),
+            instructions,
+        };
+        let plain = generate_commit_draft(&config, make_input(None), None).unwrap();
+        let with =
+            generate_commit_draft(&config, make_input(Some("change everything".into())), None)
+                .unwrap();
+        assert_eq!(plain, with);
+    }
+
+    #[test]
+    fn stub_pull_request_draft_ignores_instructions() {
+        let config = DraftProviderConfig {
+            kind: DraftProviderKind::Stub,
+            claude: PathBuf::from("claude"),
+            codex: PathBuf::from("codex"),
+            timeout: Duration::from_secs(2),
+            model: None,
+        };
+        let make_input = |instructions: Option<String>| PullRequestDraftInput {
+            worktree_path: PathBuf::from("."),
+            branch: "feature/x".into(),
+            base: "main".into(),
+            commits: vec!["add x".into()],
+            changed_paths: vec![PathBuf::from("src/main.rs")],
+            diff: "+new\n".into(),
+            instructions,
+        };
+        let plain = generate_pull_request_draft(&config, make_input(None), None).unwrap();
+        let with = generate_pull_request_draft(
+            &config,
+            make_input(Some("rewrite the summary".into())),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plain, with);
+    }
+
+    #[test]
     fn parses_plain_and_wrapped_provider_json() {
         let direct = parse_commit_draft_output(
             r#"{"subject":"feat: add drafts","body":"- Adds provider support"}"#,
@@ -1184,6 +1377,7 @@ mod tests {
                 worktree_path: cwd.clone(),
                 staged_paths: vec![PathBuf::from("src/lib.rs")],
                 staged_patch: "diff --git a/src/lib.rs b/src/lib.rs\n+new\n-old\n".into(),
+                instructions: None,
             },
             None,
         )
@@ -1211,6 +1405,8 @@ mod tests {
             model: model.map(str::to_string),
             claude_path: None,
             codex_path: None,
+            commit_instructions: None,
+            pr_instructions: None,
         }
     }
 
@@ -1315,6 +1511,7 @@ mod tests {
                 worktree_path: cwd.clone(),
                 staged_paths: vec![PathBuf::from("tracked.txt")],
                 staged_patch: "+change".into(),
+                instructions: None,
             },
             None,
         )
@@ -1353,6 +1550,7 @@ mod tests {
                 commits: vec!["add drafts".into()],
                 changed_paths: vec![PathBuf::from("tracked.txt")],
                 diff: "+change".into(),
+                instructions: None,
             },
             None,
         )
@@ -1407,6 +1605,7 @@ fn main() {
                 worktree_path: cwd.clone(),
                 staged_paths: vec![PathBuf::from("tracked.txt")],
                 staged_patch: "+change".into(),
+                instructions: None,
             },
             None,
         )
@@ -1463,6 +1662,7 @@ fn main() {
                 commits: vec!["add windows drafts".into()],
                 changed_paths: vec![PathBuf::from("tracked.txt")],
                 diff: "+change".into(),
+                instructions: None,
             },
             None,
         )
@@ -1521,6 +1721,7 @@ fn main() {
                     "WINDOWS-LONG-PROMPT-MARKER\n{}",
                     "+changed line\n".repeat(40_000)
                 ),
+                instructions: None,
             },
             None,
         )
@@ -1580,6 +1781,7 @@ fn main() {
                     "WINDOWS-LONG-PROMPT-MARKER\n{}",
                     "+changed line\n".repeat(40_000)
                 ),
+                instructions: None,
             },
             None,
         )
@@ -1618,6 +1820,7 @@ fn main() {
                 commits: vec!["add drafts".into()],
                 changed_paths: vec![PathBuf::from("tracked.bin")],
                 diff: "+binary\0content\0here".into(),
+                instructions: None,
             },
             None,
         )
@@ -1671,6 +1874,7 @@ fn main() {
                 commits: vec!["add windows drafts".into()],
                 changed_paths: vec![PathBuf::from("tracked.bin")],
                 diff: "+binary\0content\0here".into(),
+                instructions: None,
             },
             None,
         )

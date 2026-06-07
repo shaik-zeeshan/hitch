@@ -1,16 +1,3 @@
 {
-  "$schema": "https://schema.tauri.app/config/2",
-  "app": {
-    "windows": [
-      {
-        "title": "Hitch",
-        "width": 1100,
-        "height": 720,
-        "minWidth": 720,
-        "minHeight": 480,
-        "decorations": false,
-        "zoomHotkeysEnabled": false
-      }
-    ]
-  }
+  "$schema": "https://schema.tauri.app/config/2"
 }

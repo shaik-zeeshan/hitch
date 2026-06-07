@@ -53,12 +53,36 @@ A small `hitch` CLI invoked by an Agent's installed hook; it reports the Agent's
 _Avoid_: Notifier, Bridge.
 
 **Job**:
-A long-running **Daemon** operation dispatched off the per-client request loop onto a worker, so it never blocks other requests. A Job has a status lifecycle (*queued*, *running*, *succeeded*, *failed*, *cancelled*), broadcasts progress/completion as events the GUI observes by job id, and is cancellable. Job kinds today: slow git (*push*, *pull*, *fetch*, *clone*) and the **Draft Generator**; a future kind is a headless **Agent** run (run an Agent non-interactively to completion — not yet built). Fast git reads (*status*, *diff*) stay on the synchronous request/response path and are NOT Jobs. A Job is internal async plumbing surfaced as quiet progress; it is NOT the rejected user-facing "Task" work-item. Jobs are ephemeral — they live in daemon memory only and do NOT survive a daemon restart (unlike Sessions, whose PTYs are re-owned): a Job that was *running* when the daemon stopped is reported *failed* with reason "daemon restarted", and the user re-triggers.
+A long-running **Daemon** operation dispatched off the per-client request loop onto a worker, so it never blocks other requests. A Job has a status lifecycle (*queued*, *running*, *succeeded*, *failed*, *cancelled*), broadcasts progress/completion as events the GUI observes by job id, and is cancellable. Job kinds today: slow git (*push*, *pull*, *fetch*, *clone*) and the **Draft Generator**; planned composite kinds are *commit-and-push* and *create-pr* — daemon-executed chains whose steps (stage, draft, commit, push, create draft PR) are reported as progress events, so the chain survives the GUI navigating away or quitting, and an attaching GUI can query a worktree's active Jobs to restore the **Composer** display (decided 2026-06-07). A future kind is a headless **Agent** run (run an Agent non-interactively to completion — not yet built). Fast git reads (*status*, *diff*) stay on the synchronous request/response path and are NOT Jobs. A Job is internal async plumbing surfaced as quiet progress; it is NOT the rejected user-facing "Task" work-item. Jobs are ephemeral — they live in daemon memory only and do NOT survive a daemon restart (unlike Sessions, whose PTYs are re-owned): a Job that was *running* when the daemon stopped is reported *failed* with reason "daemon restarted", and the user re-triggers.
 _Avoid_: Task (a Job is not a tracked tree work-item — see Session's avoided terms), Background process (that is the Daemon itself).
 
 **Draft Generator**:
-A non-interactive generation run that drafts commit messages, commit bodies, or PR descriptions from git context. It is one kind of **Job** — dispatched off the request loop rather than blocking a synchronous request as it does today. Its provider binaries (claude/codex) are user-configurable paths, needed where they aren't on the service PATH (ADR 0007 amendment 2026-06-04).
+A non-interactive generation run that drafts commit messages, commit bodies, or PR descriptions from git context. It is one kind of **Job** — dispatched off the request loop rather than blocking a synchronous request as it does today. Its provider binaries (claude/codex) are user-configurable paths, needed where they aren't on the service PATH (ADR 0007 amendment 2026-06-04). It accepts optional **Draft Instructions**; its built-in prompt (with the JSON output contract) is never user-replaceable.
 _Avoid_: Agent harness, Agent.
+
+**Draft Instructions**:
+User-written guidance (style, conventions, language) for the **Draft Generator**, kept as two app-global settings — one for commit messages, one for PR descriptions — and sent per request in the draft settings. Instructions are **appended** into the built-in prompt as an "additional instructions" block; they never replace the prompt or its JSON output contract (decided 2026-06-07). The stub provider ignores them (it is deterministic).
+_Avoid_: Custom prompt (implies template replacement, which is rejected), Prompt template.
+
+**Composer**:
+The right rail's inline card for the smart action's generate-and-confirm steps, replacing the former commit/PR modal dialogs (decided 2026-06-07). It renders as an **anchored overlay** — floating over the file list just below the action button, no backdrop, Esc dismisses — so the rail never reflows and the center panes stay visible. Two modes:
+- *commit* — glance-and-confirm: opening it starts a **Draft Generator** run immediately (staged files if any are staged; otherwise it stages all first), the draft fills an editable subject/body, Enter commits. Enter while generation is in flight **queues commit-on-arrival** (commits the draft the moment it lands; Esc cancels the queue; a failed generation cancels the queue, never auto-commits a fallback).
+- *PR pre-flight* — a base-branch select (prefilled with the default base) plus confirm; after confirm the flow is hands-off: push → generate title/body → create the PR **as a GitHub draft** → open it in the browser. Title/body are never reviewed locally; the draft flag on GitHub is the safety net. The card stays as a progress/result display.
+The existing auto-commit-push toggle bypasses the Composer's card entirely; its progress shows as the action button morphing its label in place through the chain's steps (staging → drafting → committing → pushing → subject shown briefly), never opening the body (decided 2026-06-07).
+Both autonomous chains (auto commit & push, PR create) run as daemon-owned **composite Jobs**, not GUI-orchestrated sequences — the chain completes even if the user navigates away, switches worktrees, or quits the app, and a (re)attaching GUI queries the worktree's active Jobs to restore the button/card state (decided 2026-06-07). A generation failure aborts the chain before commit — a fallback message is never auto-committed.
+_Avoid_: Dialog/Modal (it is anchored and non-blocking), Popover (UI-library term, not domain language).
+
+**History**:
+The right rail's second view (decided 2026-06-06): the selected **Worktree**'s full commit log from HEAD, switched via a CHANGES | HISTORY header toggle (one view at a time, `←`/`→` when the git pane is focused). Commits ahead of the base branch carry an iris branch-work marker; rows are two lines (summary, then sha · relative time · author). Freshness rides the existing status backbone: the HEAD commit id travels in `GitStatus`, and a changed id refetches the log (~1s, covers Agent commits made in a PTY). Selecting a commit opens its **Commit Tab**. Merge commits diff against their first parent and carry a *merge* badge.
+_Avoid_: Log view (UI label is HISTORY), Timeline.
+
+**Commit Tab**:
+A center-pane diff tab showing one commit, opened from **History** — one tab **per commit**, keyed by sha (peer of file diff tabs and all-changes). Label is a commit glyph + 7-char short sha; body is a metadata header (full sha, message, author, date, ±totals) above collapsible per-file sections in the all-changes style. Its content is immutable: cached per sha with no invalidation, and the tab survives history rewrites (an amended/rebased-away sha keeps its open tab; the object is still readable).
+_Avoid_: Commit view (it is a tab, not a rail view), Revision tab.
+
+**Desktop Notification**:
+A native OS notification raised by the GUI from **live** **Agent State** transitions — never from state replayed on attach (ADR 0011 replay is for catching up, not re-alerting). Three triggers (decided 2026-06-07): a Session entering *needs-approval*, entering *error*, and a **turn end** (*running* → *waiting*) gated on the turn having run at least a user-configurable minimum (default 30s); the gate's clock starts when the turn enters *running* and survives *needs-approval* pauses, so an approved-then-finished long task still notifies. Copy is agent + state in the title, `project · branch` in the body, with *error* detail appended when present; all three play the default OS sound. Click is the OS default (activate the app — no Session routing; revisit if it stings). Suppression is one user setting with three modes: *off*, *app-in-background* (notify only when the GUI is unfocused), and *background-or-other-session* (**default** — notify unless the GUI is focused AND that Session is the visible one). The GUI fires these (it owns chrome preferences, focus, and the visible Session); the **Daemon** raises none. OS permission is requested at GUI startup whenever the mode is not *off*.
+_Avoid_: Completed notification (a turn ends to *waiting*; nothing "completes"), Notification (bare — collides with the agents' own `Notification` hook event), Alert.
 
 ## Relationships
 
@@ -70,8 +94,12 @@ _Avoid_: Agent harness, Agent.
 - A **Session** running a known **Agent** has an **Agent State**; other Sessions do not. The **Daemon** owns the current value per Session and replays it on attach; a **Worktree**/**Project** row badge is a *derived* rollup of its Sessions' states, prioritised *needs-approval > error > waiting > running*.
 - Hitch enables Agent State by writing the agent's hook config into the Worktree it manages.
 - A **Draft Generator** runs outside Sessions and does not produce **Agent State**.
+- The **Composer** is the only GUI surface that triggers the **Draft Generator**; it observes the run as a **Job** and is the cancel affordance for it.
+- **Draft Instructions** are app-global settings carried per draft request; they shape the **Draft Generator**'s prompt but never own it.
 - A **Job** is owned by the **Daemon**, runs off the request loop, and reports its lifecycle via events; the GUI observes Jobs but never owns them. Fast git reads are not Jobs.
 - **Daemon Status** describes the Daemon process's own liveness; it is broader than, and contains, any single GUI's connection state.
+- A **Desktop Notification** derives from a live **Agent State** transition observed by the GUI; the **Daemon** stores and broadcasts state but never raises notifications. Codex's missing failure hook (known gap) means *error* notifications never fire for Codex.
+- **History** belongs to the right rail and shows exactly one **Worktree**'s log; a **Commit Tab** belongs to the center tab strip. Commit reads (log, commit diff) follow the fast synchronous git-read path, not **Jobs**.
 
 ## Flagged ambiguities
 

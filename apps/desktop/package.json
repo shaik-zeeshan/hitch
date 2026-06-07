@@ -15,10 +15,12 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@fontsource/jetbrains-mono": "^5.2.8",
     "@internationalized/date": "^3.12.1",
     "@pierre/diffs": "^1.2.3",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-notification": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-search": "^0.16.0",
@@ -27,9 +29,11 @@
     "@xterm/xterm": "^6.0.0",
     "@zerodevx/svelte-toast": "^0.9.6",
     "bits-ui": "^2.18.1",
-    "svelte-french-toast": "^1.2.0"
+    "svelte-french-toast": "^1.2.0",
+    "vscode-material-icons": "^0.1.1"
   },
   "devDependencies": {
+    "@iconify-json/lucide": "^1.2.111",
     "@sveltejs/adapter-static": "^3.0.10",
     "@sveltejs/kit": "^2.61.1",
     "@sveltejs/vite-plugin-svelte": "^6.2.4",
@@ -42,6 +46,7 @@
     "svelte-check": "^4.4.8",
     "tailwindcss": "^4.3.0",
     "typescript": "~5.8.3",
+    "unplugin-icons": "^23.0.1",
     "vite": "^7.0.4",
     "vitest": "^3.0.0"
   }

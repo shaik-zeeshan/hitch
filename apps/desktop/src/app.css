@@ -1,107 +1,293 @@
 @import "tailwindcss";
 
+/* JetBrains Mono — bundled (no Google Fonts network requests). The mono stack
+   in --mono prefers it; weights 400/500/600/700 + italic 400 are imported here.
+   See doc-design/colors.md (non-color tokens) and icons.md. */
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
+@import "@fontsource/jetbrains-mono/600.css";
+@import "@fontsource/jetbrains-mono/700.css";
+@import "@fontsource/jetbrains-mono/400-italic.css";
+
 /* ============================================================
-   Hitch design tokens — ported verbatim from hitch-shell-mockup.html
-   Palette: OKLCH, dark, tinted-cool neutrals (hue 265 iris).
-   Accent (iris 265) = selection/focus/primary + the "dirty" dot.
-   State is shown as a WORD (label) in a reserved hue, never a bare
-   symbol, so it survives grayscale + color blindness:
-     running (teal) · needs approval (amber) · waiting (green) · error (red)
+   Hitch design tokens — "Paper Terminal" (doc-design/colors.md).
+   A warm letterpress-paper chrome wrapping a deep cool-ink terminal.
+   OKLCH only; never pure black/white. Light ("paper") is the default
+   theme on :root; dark ("dusk") lives on html[data-theme="dark"].
 
-   Colors and fonts live under Tailwind v4 namespaces (--color-*, --font-*)
-   so they also generate `bg-*`/`text-*`/`border-*`/`font-*` utilities.
-   Radii and transitions stay as raw custom properties (referenced as
-   var(--radius), var(--t), …) exactly as the mockup uses them.
+   Rules (colors.md):
+   - Warm-tinted neutrals (paper/ink hue ~70-82); the terminal follows the
+     theme (paper-light in light, deep ink in dusk) but keeps a cool hue
+     (~262-265) to separate it from the warm chrome.
+   - The iris accent is reserved for selection, the primary action, and
+     state — never decorative.
+   - State is never color alone: it renders as a colored uppercase WORD.
    ============================================================ */
-@theme {
-  /* ---- surfaces ---- */
-  --color-bg-0: oklch(15.5% 0.006 265); /* terminal canvas (deepest) */
-  --color-bg-1: oklch(18% 0.007 265); /* center chrome */
-  --color-bg-2: oklch(20.5% 0.008 265); /* rails / panels */
-  --color-bg-3: oklch(24% 0.009 265); /* hover, wells */
-  --color-bg-4: oklch(28.5% 0.011 265); /* inputs, active */
-  --color-line: oklch(30% 0.011 265);
-  --color-line-soft: oklch(26% 0.009 265);
 
-  /* ---- text ---- */
-  --color-tx-hi: oklch(93% 0.006 265);
-  --color-tx-md: oklch(74% 0.008 265);
-  --color-tx-lo: oklch(61% 0.01 265);
+:root {
+  /* ---- neutrals: paper + ink (light / paper theme) ---- */
+  /* Canonical window-base color; app.html hex + lib.rs PAPER_0_* mirror this,
+     enforced by src/lib/paperColors.test.ts. */
+  --paper-0: oklch(97.4% 0.008 80); /* page behind window; body backdrop base */
+  --paper-1: oklch(96.6% 0.010 78); /* rails (left + right), facepile ring */
+  --paper-2: oklch(98.0% 0.008 82); /* raised cards, inputs, popover, fills */
+  --paper-3: oklch(94.0% 0.012 76); /* sunken wells, tab strip, hover, center */
+  --line: oklch(88.0% 0.014 74); /* hairlines, borders, dividers */
+  --line-soft: oklch(91.5% 0.012 76); /* softer hairlines (tree spine) */
+  --ink-0: oklch(28.0% 0.020 70); /* primary text */
+  --ink-1: oklch(42.0% 0.018 70); /* secondary text, emphasized counts */
+  --ink-2: oklch(56.0% 0.016 72); /* tertiary text, labels, icons */
+  --ink-3: oklch(66.0% 0.014 74); /* faint text, separators, twisties */
 
-  /* ---- accent (iris 265) ---- */
-  --color-ac: oklch(70% 0.13 265);
-  --color-ac-bright: oklch(78% 0.13 265);
-  --color-ac-wash: oklch(34% 0.06 265);
+  /* ---- terminal panel (cool-tinted paper; follows the light theme) ---- */
+  --term-bg: oklch(96.8% 0.006 265); /* terminal base (gradient bottom) */
+  --term-bg2: oklch(98.4% 0.005 265); /* terminal top; active-tab fill; bridge */
+  --term-line: oklch(87.0% 0.014 265); /* terminal/tab hairlines (the seam) */
+  --term-fg: oklch(27.0% 0.020 265); /* terminal foreground text */
+  --term-dim: oklch(54.0% 0.016 265); /* dim terminal text, active-tab close */
 
-  /* ---- reserved state hues ---- */
-  --color-run: oklch(78% 0.1 195); /* teal */
-  --color-warn: oklch(81% 0.13 75); /* amber */
-  --color-ok: oklch(77% 0.12 150); /* green */
-  --color-err: oklch(68% 0.17 25); /* red */
+  /* ---- iris accent (selection + primary action) ---- */
+  --iris: oklch(48.0% 0.150 275); /* accent fill (primary button, checkbox on) */
+  --iris-ink: oklch(40.0% 0.160 275); /* accent text/icon on paper; sel ink; border */
+  --iris-wash: oklch(93.5% 0.030 275); /* selected-row background; ring when sel */
+  --iris-line: oklch(82.0% 0.060 275); /* selected-row inset border; iris seps */
+  --iris-on: oklch(98% 0.01 280); /* text/icon on the iris fill */
+  --iris-on-sc: oklch(92% 0.04 280); /* secondary glyph on iris fill */
+  --iris-on-sc-line: oklch(60% 0.10 280); /* keycap hairline on iris; caret divider */
 
-  /* ---- fonts ---- */
-  --font-ui:
+  /* ---- semantic state palette (word + color; never color alone) ---- */
+  --st-run: oklch(48.0% 0.090 195); /* working / streaming (teal-ink) */
+  --st-need: oklch(47.0% 0.150 32); /* awaiting approval / error (oxide red) */
+  --st-need-wash: oklch(94.0% 0.035 32); /* wash behind rollup pill / awaiting */
+  --st-need-line: oklch(83.0% 0.080 32); /* border on awaiting chrome */
+  --st-stall: oklch(52.0% 0.075 75); /* ochre — only the `M` modified letter */
+  --st-ok: oklch(50.0% 0.095 150); /* positive/ok (green-ink): daemon dot, ↑N, A */
+  --st-ok-glow: oklch(50% 0.095 150 / 0.14); /* soft glow ring on ok dots */
+  --st-ok-wash: oklch(94.0% 0.035 150); /* wash behind the open-PR chip */
+  --st-ok-line: oklch(83.0% 0.080 150); /* border on the open-PR chip */
+
+  /* ---- PR merged (purple — a PR state, not an agent state) ---- */
+  --pr-merged: oklch(48.0% 0.140 300); /* merged-PR ink (chip text/icon) */
+  --pr-merged-wash: oklch(94.0% 0.035 300); /* wash behind the merged-PR chip */
+  --pr-merged-line: oklch(83.0% 0.080 300); /* border on the merged-PR chip */
+
+  /* ---- diff numerals ---- */
+  --diff-add: oklch(46.0% 0.095 150); /* +N additions */
+  --diff-del: oklch(50.0% 0.130 28); /* −N deletions */
+
+  /* ---- harness marks: facepile fills + mark inks ---- */
+  --harness-claude: oklch(58% 0.150 30); /* Claude solid fill (coral) */
+  --harness-codex: oklch(46% 0.040 250); /* Codex solid fill (neutral blue) */
+  --harness-shell: oklch(44% 0.020 80); /* Shell solid fill (warm neutral) */
+  --harness-fg: oklch(98% 0.01 90); /* mark color on a solid harness fill */
+  --mark-claude: oklch(63% 0.165 32); /* Claude sunburst ink on ringed circle */
+  --mark-codex: oklch(40% 0.030 250); /* Codex blossom ink */
+  --mark-shell: oklch(40% 0.018 80); /* Shell terminal-mark ink */
+
+  /* ---- page seat + shadows (mockup chrome; reproduced for completeness) ---- */
+  --page-glow: oklch(98.4% 0.010 82);
+  --light-inset: oklch(100% 0 0 / 0.6);
+  --win-shadow:
+    0 1px 0 oklch(100% 0 0 / 0.6) inset,
+    0 28px 60px -28px oklch(30% 0.03 70 / 0.35),
+    0 6px 18px -10px oklch(30% 0.03 70 / 0.22);
+  /* Popover/menu shadow recipe (components.md "act-menu"): crisp, no blur.
+     Consumed by .menu / .select-content (app.css) and the scoped popovers in
+     TopNav.svelte + Terminal.svelte. */
+  --shadow-pop:
+    0 1px 0 var(--light-inset) inset,
+    0 14px 30px -14px oklch(30% 0.03 70 / 0.35),
+    0 4px 10px -6px oklch(30% 0.03 70 / 0.25);
+
+  /* ---- non-color design tokens ---- */
+  --radius: 6px; /* defined, but the shell is rectangular (see components.md) */
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --ui:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui,
     sans-serif;
-  --font-mono:
-    "Berkeley Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  --r0: 0.75rem; /* 12px */
+  --r1: 0.8125rem; /* 13px */
+  --r2: 0.875rem; /* 14px */
+  --r3: 1rem; /* 16px */
+  --r4: 1.125rem; /* 18px */
 }
 
-/* Radii + transitions: raw custom properties (used as var(--radius) etc.) */
-:root {
-  --radius: 6px;
-  --radius-lg: 10px;
-  --t-fast: 120ms cubic-bezier(0.22, 1, 0.36, 1);
-  --t: 180ms cubic-bezier(0.22, 1, 0.36, 1);
+html[data-theme="dark"] {
+  /* ---- neutrals: paper + ink (dark / dusk theme) ---- */
+  --paper-0: oklch(16.5% 0.012 72);
+  --paper-1: oklch(19.0% 0.013 72);
+  --paper-2: oklch(22.0% 0.014 74);
+  --paper-3: oklch(17.5% 0.012 70);
+  --line: oklch(31.0% 0.016 74);
+  --line-soft: oklch(26.0% 0.014 72);
+  --ink-0: oklch(91.0% 0.014 82);
+  --ink-1: oklch(78.0% 0.014 80);
+  --ink-2: oklch(64.0% 0.014 78);
+  --ink-3: oklch(52.0% 0.013 76);
 
-  /* Short aliases for the @theme tokens above, so component style blocks can
-     port the locked mockup CSS verbatim. The mockup references the short names
-     (--bg-0, --ac, --mono); Tailwind v4 @theme requires the color- and font-
-     prefixed names, so we bridge them here. */
-  --bg-0: var(--color-bg-0);
-  --bg-1: var(--color-bg-1);
-  --bg-2: var(--color-bg-2);
-  --bg-3: var(--color-bg-3);
-  --bg-4: var(--color-bg-4);
-  --line: var(--color-line);
-  --line-soft: var(--color-line-soft);
-  --tx-hi: var(--color-tx-hi);
-  --tx-md: var(--color-tx-md);
-  --tx-lo: var(--color-tx-lo);
-  --ac: var(--color-ac);
-  --ac-bright: var(--color-ac-bright);
-  --ac-wash: var(--color-ac-wash);
-  --run: var(--color-run);
-  --warn: var(--color-warn);
-  --ok: var(--color-ok);
-  --err: var(--color-err);
-  --ui: var(--font-ui);
-  --mono: var(--font-mono);
+  /* ---- terminal panel ---- */
+  --term-bg: oklch(12.0% 0.018 262);
+  --term-bg2: oklch(13.8% 0.018 262);
+  --term-line: oklch(26.0% 0.022 262);
+  --term-fg: oklch(90.0% 0.012 90);
+  --term-dim: oklch(64.0% 0.016 100);
+
+  /* ---- iris accent ---- */
+  --iris: oklch(64.0% 0.150 278);
+  --iris-ink: oklch(80.0% 0.120 280);
+  --iris-wash: oklch(28.0% 0.060 278);
+  --iris-line: oklch(42.0% 0.090 278);
+  --iris-on: oklch(18% 0.03 280);
+  --iris-on-sc: oklch(28% 0.06 280);
+  --iris-on-sc-line: oklch(56% 0.10 280);
+
+  /* ---- semantic state palette ---- */
+  --st-run: oklch(74.0% 0.120 195);
+  --st-need: oklch(72.0% 0.150 32);
+  --st-need-wash: oklch(28.0% 0.060 32);
+  --st-need-line: oklch(42.0% 0.090 32);
+  --st-stall: oklch(78.0% 0.110 78);
+  --st-ok: oklch(74.0% 0.120 152);
+  --st-ok-glow: oklch(74% 0.120 152 / 0.18);
+  --st-ok-wash: oklch(28.0% 0.060 152);
+  --st-ok-line: oklch(42.0% 0.090 152);
+
+  /* ---- PR merged ---- */
+  --pr-merged: oklch(72.0% 0.130 300);
+  --pr-merged-wash: oklch(28.0% 0.060 300);
+  --pr-merged-line: oklch(42.0% 0.090 300);
+
+  /* ---- diff numerals ---- */
+  --diff-add: oklch(76.0% 0.120 152);
+  --diff-del: oklch(74.0% 0.140 28);
+
+  /* ---- harness marks ---- */
+  --harness-claude: oklch(62% 0.150 30);
+  --harness-codex: oklch(60% 0.060 250);
+  --harness-shell: oklch(58% 0.022 80);
+  --harness-fg: oklch(14% 0.012 80);
+  --mark-claude: oklch(72% 0.155 34);
+  --mark-codex: oklch(82% 0.030 250);
+  --mark-shell: oklch(82% 0.018 80);
+
+  /* ---- page seat + shadows ---- */
+  --page-glow: oklch(20.0% 0.016 74);
+  --light-inset: oklch(100% 0 0 / 0.04);
+  --win-shadow:
+    0 0 0 1px oklch(10% 0.01 72 / 0.5),
+    0 24px 60px -32px oklch(4% 0.01 72 / 0.7);
+  --shadow-pop:
+    0 0 0 1px oklch(8% 0.01 72 / 0.5),
+    0 16px 34px -16px oklch(4% 0.01 72 / 0.7);
+}
+
+/* Expose a sensible slice of the palette to Tailwind v4 utilities. Components
+   use scoped CSS with var(), so this is intentionally minimal — it just lets
+   `bg-paper-2`, `text-ink-0`, `border-line`, `text-iris`, `font-mono`, etc.
+   resolve where a utility is handier than scoped CSS. The custom properties
+   above remain the source of truth (and theme-switch live via var()). */
+@theme inline {
+  --color-paper-0: var(--paper-0);
+  --color-paper-1: var(--paper-1);
+  --color-paper-2: var(--paper-2);
+  --color-paper-3: var(--paper-3);
+  --color-line: var(--line);
+  --color-line-soft: var(--line-soft);
+  --color-ink-0: var(--ink-0);
+  --color-ink-1: var(--ink-1);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-term-bg: var(--term-bg);
+  --color-term-bg2: var(--term-bg2);
+  --color-term-line: var(--term-line);
+  --color-term-fg: var(--term-fg);
+  --color-term-dim: var(--term-dim);
+  --color-iris: var(--iris);
+  --color-iris-ink: var(--iris-ink);
+  --color-iris-wash: var(--iris-wash);
+  --color-iris-line: var(--iris-line);
+  --color-st-run: var(--st-run);
+  --color-st-need: var(--st-need);
+  --color-st-ok: var(--st-ok);
+  --color-diff-add: var(--diff-add);
+  --color-diff-del: var(--diff-del);
+  --font-mono: var(--mono);
+  --font-ui: var(--ui);
 }
 
 /* ============================================================
-   Shared primitives (mockup .btn + dialog chrome). Global, not
-   component-scoped, because the buttons recur across surfaces and the
-   bits-ui dialogs render their own elements that a scoped `class` can't
-   reach. Ported verbatim from hitch-shell-mockup.html.
+   Shared keycap recipe (components.md "Keycap (kbd)"). One recipe everywhere:
+   flat rectangle, hairline border, no bevel/shadow, tabular mono in a fixed
+   box, baseline-nudged. The `kbd` element gets it for free; `.kbd` is kept as a
+   compatibility hook for legacy markup that used a class.
+   ============================================================ */
+@layer base {
+  kbd,
+  .kbd {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 15px;
+    min-width: 20px;
+    padding: 0 5px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.02em;
+    line-height: 1;
+    color: var(--ink-2);
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: 0;
+    vertical-align: baseline;
+    translate: 0 1px;
+  }
+  /* Multi-key shortcut: one keycap per key in a tight row — never two glyphs
+     crammed into a single cap (⌘K renders as [⌘][K]). */
+  .keys {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+  /* Variant: a keycap drawn on the iris fill inverts to a light glyph on a
+     translucent hairline (components.md). */
+  .on-iris kbd,
+  .on-iris .kbd {
+    color: var(--iris-on);
+    border-color: var(--iris-on-sc-line);
+  }
+}
+
+/* ============================================================
+   Shared primitives, restyled to the letterpress look (components.md
+   shape/motion policy): border-radius 0 everywhere, hairline 1px borders,
+   paper fills (--paper-2 raised / --paper-3 sunken), crisp shadows (the
+   act-menu recipe for popovers, no blur), iris primary buttons. These remain
+   global (not scoped) because they recur across surfaces and bits-ui dialogs
+   render their own elements a scoped class can't reach. Other agents inherit
+   this styling for .btn / .modal* / .palette* / .menu / .mi / .select-* / .seg
+   / .check / .field / status badges until their components are migrated.
    ============================================================ */
 @layer components {
   .btn {
     padding: 7px 10px;
-    border-radius: var(--radius);
+    border-radius: 0;
     font: inherit;
-    font-size: 11.5px;
-    font-weight: 540;
+    font-size: var(--r1);
+    font-weight: 600;
     cursor: pointer;
-    background: var(--bg-3);
+    background: var(--paper-2);
     border: 1px solid var(--line);
-    color: var(--tx-hi);
+    color: var(--ink-0);
     transition:
-      background var(--t-fast),
-      border-color var(--t-fast);
+      background 0.18s ease-out,
+      border-color 0.18s ease-out,
+      color 0.18s ease-out;
   }
   .btn:hover {
-    background: var(--bg-4);
+    background: var(--paper-3);
+    border-color: var(--ink-3);
   }
   .btn:disabled {
     opacity: 0.5;
@@ -114,22 +300,29 @@
     flex: 1;
   }
   .btn.primary {
-    background: var(--ac);
-    border-color: var(--ac);
-    color: oklch(18% 0.03 265);
+    background: var(--iris);
+    border-color: var(--iris-ink);
+    color: var(--iris-on);
     font-weight: 600;
   }
   .btn.primary:hover {
-    background: var(--ac-bright);
+    background: var(--iris);
+    border-color: var(--iris-ink);
+    filter: brightness(1.06);
   }
   .btn.primary:disabled:hover {
-    background: var(--ac);
+    filter: none;
   }
-  .btn .kbd {
-    font-family: var(--mono);
-    font-size: 10px;
-    opacity: 0.6;
+  .btn :is(kbd, .kbd, .keys) {
     margin-left: 5px;
+    color: var(--ink-2);
+  }
+  .btn .keys :is(kbd, .kbd) {
+    margin-left: 0;
+  }
+  .btn.primary :is(kbd, .kbd) {
+    color: var(--iris-on);
+    border-color: var(--iris-on-sc-line);
   }
   .btn .ar {
     font-family: var(--mono);
@@ -142,8 +335,8 @@
     position: fixed;
     inset: 0;
     z-index: 60;
-    background: oklch(8% 0.012 265 / 0.5);
-    backdrop-filter: blur(3px);
+    background: oklch(30% 0.03 70 / 0.32);
+    backdrop-filter: blur(2px);
   }
   .modal {
     position: fixed;
@@ -153,34 +346,36 @@
     transform: translate(-50%, -50%);
     width: 470px;
     max-width: calc(100vw - 48px);
-    background: var(--bg-2);
-    border: 1px solid oklch(34% 0.012 265);
-    border-radius: var(--radius-lg);
-    box-shadow: 0 30px 70px -20px oklch(4% 0.02 265 / 0.8);
+    background: var(--paper-2);
+    border: 1px solid var(--line);
+    border-radius: 0;
+    box-shadow:
+      0 1px 0 var(--light-inset) inset,
+      0 28px 60px -28px oklch(30% 0.03 70 / 0.35),
+      0 8px 18px -10px oklch(30% 0.03 70 / 0.25);
     overflow: hidden;
   }
   .m-head {
     padding: 15px 18px 12px;
-    border-bottom: 1px solid var(--line-soft);
+    border-bottom: 1px solid var(--line);
   }
-  /* bits-ui Dialog.Title renders a `div[role=heading]`, not an <h3>; cover both
-     so ported dialog titles match the mockup's .m-head h3 styling. */
+  /* bits-ui Dialog.Title renders a `div[role=heading]`, not an <h3>. */
   .m-head h3,
   .m-head [role="heading"] {
-    font-size: 14px;
+    font-size: var(--r2);
     font-weight: 600;
-    color: var(--tx-hi);
+    color: var(--ink-0);
     margin: 0;
   }
   .m-head .sub {
-    font-size: 11.5px;
-    color: var(--tx-lo);
+    font-size: var(--r0);
+    color: var(--ink-2);
     margin-top: 3px;
   }
   .m-head .sub b {
     font-family: var(--mono);
-    color: var(--tx-md);
-    font-weight: 400;
+    color: var(--ink-1);
+    font-weight: 600;
   }
   .m-body {
     padding: 14px 18px 16px;
@@ -192,24 +387,24 @@
     gap: 5px;
   }
   .field > span {
-    font-size: 11px;
-    color: var(--tx-md);
+    font-size: var(--r0);
+    color: var(--ink-2);
   }
   .field input,
   .field textarea {
-    background: var(--bg-0);
+    background: var(--paper-3);
     border: 1px solid var(--line);
-    border-radius: var(--radius);
-    color: var(--tx-hi);
+    border-radius: 0;
+    color: var(--ink-0);
     font: inherit;
-    font-size: 12.5px;
+    font-size: var(--r1);
     padding: 8px 10px;
-    transition: border-color var(--t-fast);
+    transition: border-color 0.18s ease-out;
   }
   .field input:focus,
   .field textarea:focus {
     outline: none;
-    border-color: var(--ac);
+    border-color: var(--iris);
   }
   .field textarea {
     resize: none;
@@ -218,7 +413,6 @@
   .field .base {
     font-family: var(--mono);
   }
-  /* path field + native picker button (mockup .input-row / .browse) */
   .input-row {
     display: flex;
     gap: 7px;
@@ -228,17 +422,21 @@
   }
   .browse {
     padding: 8px 12px;
-    border-radius: var(--radius);
+    border-radius: 0;
     border: 1px solid var(--line);
-    background: var(--bg-3);
-    color: var(--tx-hi);
+    background: var(--paper-2);
+    color: var(--ink-0);
     font: inherit;
-    font-size: 11.5px;
+    font-size: var(--r1);
     cursor: pointer;
     white-space: nowrap;
+    transition:
+      background 0.18s ease-out,
+      border-color 0.18s ease-out;
   }
   .browse:hover {
-    background: var(--bg-4);
+    background: var(--paper-3);
+    border-color: var(--ink-3);
   }
   .field-row {
     display: flex;
@@ -252,15 +450,15 @@
     text-align: left;
   }
   .field-row .lab {
-    font-size: 12px;
-    color: var(--tx-md);
+    font-size: var(--r0);
+    color: var(--ink-1);
   }
   .check {
     width: 15px;
     height: 15px;
-    border-radius: 4px;
+    border-radius: 0;
     border: 1px solid var(--line);
-    background: var(--bg-0);
+    background: var(--paper-2);
     flex: none;
     display: grid;
     place-items: center;
@@ -268,91 +466,94 @@
     font-size: 10px;
   }
   .check.on {
-    background: var(--ac);
-    border-color: var(--ac);
-    color: oklch(18% 0.03 265);
+    background: var(--iris);
+    border-color: var(--iris-ink);
+    color: var(--iris-on);
   }
   .m-foot {
     padding: 13px 18px;
     display: flex;
     justify-content: flex-end;
     gap: 8px;
-    border-top: 1px solid var(--line-soft);
+    border-top: 1px solid var(--line);
   }
   .m-foot .btn {
     padding: 7px 14px;
   }
   .m-error {
-    font-size: 11.5px;
-    color: oklch(80% 0.1 25);
+    font-size: var(--r0);
+    color: var(--st-need);
     line-height: 1.5;
   }
   .m-success {
-    font-size: 12px;
-    color: var(--tx-md);
+    font-size: var(--r0);
+    color: var(--ink-1);
     line-height: 1.6;
   }
   .m-success a {
     font-family: var(--mono);
-    font-size: 11.5px;
-    color: var(--ac-bright);
+    font-size: var(--r0);
+    color: var(--iris-ink);
     word-break: break-all;
   }
 
-  /* ---- segmented control + dialog helpers (mockup) ---- */
+  /* ---- segmented control + dialog helpers ---- */
   .seg {
     display: flex;
     gap: 2px;
     padding: 3px;
-    background: var(--bg-0);
+    background: var(--paper-3);
     border: 1px solid var(--line);
-    border-radius: var(--radius);
+    border-radius: 0;
   }
   .seg button {
     flex: 1;
     padding: 6px 10px;
     border: 0;
     background: transparent;
-    color: var(--tx-md);
+    color: var(--ink-2);
     font: inherit;
-    font-size: 11.5px;
-    border-radius: 4px;
+    font-size: var(--r0);
+    border-radius: 0;
     cursor: pointer;
-    transition: background var(--t-fast), color var(--t-fast);
+    transition:
+      background 0.18s ease-out,
+      color 0.18s ease-out;
   }
   .seg button.on {
-    background: var(--bg-3);
-    color: var(--tx-hi);
+    background: var(--paper-2);
+    color: var(--ink-0);
   }
   .help {
-    font-size: 11px;
-    color: var(--tx-lo);
+    font-size: var(--r0);
+    color: var(--ink-2);
     line-height: 1.5;
   }
   .help .mono {
     font-family: var(--mono);
-    color: var(--tx-md);
+    color: var(--ink-1);
   }
   .field-row.disabled {
     opacity: 0.45;
   }
   .btn.danger-btn {
-    background: oklch(58% 0.14 25 / 0.16);
-    border-color: oklch(58% 0.14 25 / 0.4);
-    color: oklch(85% 0.07 25);
+    background: var(--st-need-wash);
+    border-color: var(--st-need-line);
+    color: var(--st-need);
   }
   .btn.danger-btn:hover {
-    background: oklch(58% 0.14 25 / 0.26);
+    background: var(--st-need-wash);
+    filter: brightness(0.98);
   }
   .warn-box {
     display: flex;
     gap: 10px;
     padding: 11px 12px;
-    border-radius: var(--radius);
-    background: oklch(58% 0.14 25 / 0.1);
-    border: 1px solid oklch(58% 0.14 25 / 0.28);
-    color: oklch(86% 0.06 25);
-    font-size: 11.5px;
+    border-radius: 0;
+    background: var(--st-need-wash);
+    border: 1px solid var(--st-need-line);
+    color: var(--st-need);
+    font-size: var(--r0);
     line-height: 1.5;
   }
   .warn-box svg {
@@ -362,7 +563,8 @@
     margin-top: 1px;
   }
 
-  /* ---- Command palette (mockup #cmdk-modal) ---- */
+  /* ---- Command palette modal (legacy #cmdk-modal). The new top-bar palette
+     trigger ships in Phase 2; this is the open-overlay surface. ---- */
   .palette {
     position: fixed;
     z-index: 61;
@@ -371,10 +573,13 @@
     transform: translateX(-50%);
     width: 568px;
     max-width: calc(100vw - 48px);
-    background: var(--bg-2);
-    border: 1px solid oklch(34% 0.012 265);
-    border-radius: var(--radius-lg);
-    box-shadow: 0 30px 70px -20px oklch(4% 0.02 265 / 0.85);
+    background: var(--paper-2);
+    border: 1px solid var(--line);
+    border-radius: 0;
+    box-shadow:
+      0 1px 0 var(--light-inset) inset,
+      0 28px 60px -28px oklch(30% 0.03 70 / 0.35),
+      0 8px 18px -10px oklch(30% 0.03 70 / 0.25);
     overflow: hidden;
   }
   .p-input {
@@ -382,12 +587,12 @@
     align-items: center;
     gap: 10px;
     padding: 13px 16px;
-    border-bottom: 1px solid var(--line-soft);
+    border-bottom: 1px solid var(--line);
   }
   .p-input svg {
     width: 16px;
     height: 16px;
-    color: var(--tx-lo);
+    color: var(--ink-2);
     flex: none;
   }
   .p-input input {
@@ -395,12 +600,12 @@
     background: transparent;
     border: 0;
     outline: 0;
-    color: var(--tx-hi);
+    color: var(--ink-0);
     font: inherit;
-    font-size: 14px;
+    font-size: var(--r2);
   }
   .p-input input::placeholder {
-    color: var(--tx-lo);
+    color: var(--ink-3);
   }
   .p-list {
     max-height: 348px;
@@ -409,44 +614,44 @@
   }
   .p-group {
     font-size: 10px;
-    font-weight: 600;
+    font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--tx-lo);
+    letter-spacing: 0.1em;
+    color: var(--ink-2);
     padding: 9px 8px 4px;
   }
   .p-empty {
     padding: 20px 10px;
     text-align: center;
-    font-size: 12px;
-    color: var(--tx-lo);
+    font-size: var(--r0);
+    color: var(--ink-2);
   }
   .p-item {
     display: flex;
     align-items: center;
     gap: 10px;
     padding: 8px 10px;
-    border-radius: var(--radius);
-    color: var(--tx-md);
+    border-radius: 0;
+    color: var(--ink-1);
     cursor: pointer;
   }
   .p-item:hover {
-    background: var(--bg-3);
-    color: var(--tx-hi);
+    background: var(--paper-3);
+    color: var(--ink-0);
   }
   .p-item[data-selected] {
-    background: var(--ac-wash);
-    color: var(--tx-hi);
-    box-shadow: inset 0 0 0 1px oklch(62% 0.1 265 / 0.28);
+    background: var(--iris-wash);
+    color: var(--iris-ink);
+    box-shadow: inset 0 0 0 1px var(--iris-line);
   }
   .p-item .pi-ico {
     width: 15px;
     height: 15px;
-    color: var(--tx-lo);
+    color: var(--ink-2);
     flex: none;
   }
   .p-item[data-selected] .pi-ico {
-    color: var(--ac-bright);
+    color: var(--iris-ink);
   }
   .p-item .pi-label {
     flex: 1;
@@ -457,97 +662,99 @@
   }
   .p-item .pi-label .mono {
     font-family: var(--mono);
-    font-size: 11.5px;
+    font-size: var(--r0);
   }
   .p-item .pi-label .ctx {
-    color: var(--tx-lo);
+    color: var(--ink-2);
   }
   .p-foot {
     display: flex;
     gap: 16px;
     padding: 8px 16px;
-    border-top: 1px solid var(--line-soft);
+    border-top: 1px solid var(--line);
     font-size: 10.5px;
-    color: var(--tx-lo);
+    color: var(--ink-2);
   }
   .p-foot .kbd {
-    font-family: var(--mono);
-    color: var(--tx-md);
+    color: var(--ink-1);
   }
   /* Agent-state word, reused by palette jump rows (portaled, so global). */
   .palette .status {
     font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 0.2px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
     flex: none;
     white-space: nowrap;
   }
   .palette .status.run {
-    color: var(--run);
+    color: var(--st-run);
   }
   .palette .status.approval {
-    color: var(--warn);
+    color: var(--st-need);
   }
   .palette .status.wait {
-    color: var(--ok);
+    color: var(--st-ok);
   }
   .palette .status.error {
-    color: var(--err);
+    color: var(--st-need);
   }
 
-  /* ---- context menu (mockup .menu); bits-ui positions, we style ---- */
+  /* ---- context menu (bits-ui positions, we style). Letterpress popover:
+     square, hairline, the act-menu shadow recipe (no blur), dark ring variant
+     via --shadow-pop. ---- */
   .menu {
     z-index: 70;
     min-width: 200px;
-    background: var(--bg-2);
-    border: 1px solid oklch(34% 0.012 265);
-    border-radius: 8px;
-    box-shadow: 0 18px 44px -16px oklch(4% 0.02 265 / 0.85);
+    background: var(--paper-2);
+    border: 1px solid var(--line);
+    border-radius: 0;
+    box-shadow: var(--shadow-pop);
     padding: 5px;
   }
   .mi {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 6px 9px;
-    border-radius: 5px;
-    color: var(--tx-md);
-    font-size: 12px;
+    gap: 9px;
+    padding: 7px 9px;
+    border-radius: 0;
+    color: var(--ink-0);
+    font-family: var(--ui);
+    font-size: var(--r1);
     cursor: pointer;
     outline: none;
   }
   .mi:hover,
   .mi[data-highlighted] {
-    background: var(--bg-3);
-    color: var(--tx-hi);
+    background: var(--paper-3);
+    color: var(--ink-0);
   }
   .mi.danger {
-    color: oklch(78% 0.1 25);
+    color: var(--st-need);
   }
   .mi.danger:hover,
   .mi.danger[data-highlighted] {
-    background: oklch(58% 0.14 25 / 0.16);
-    color: oklch(87% 0.06 25);
+    background: var(--st-need-wash);
+    color: var(--st-need);
   }
   .mi .mi-ico {
-    width: 14px;
-    height: 14px;
-    color: var(--tx-lo);
+    width: 15px;
+    height: 15px;
+    color: var(--ink-2);
     flex: none;
   }
   .mi.danger .mi-ico {
-    color: oklch(70% 0.13 25);
+    color: var(--st-need);
   }
   .mi .mi-k {
     margin-left: auto;
     font-family: var(--mono);
-    font-size: 10px;
-    color: var(--tx-lo);
+    font-size: 0.625rem;
+    color: var(--ink-2);
   }
   .m-sep {
     height: 1px;
-    background: var(--line-soft);
-    margin: 5px 4px;
+    background: var(--line);
+    margin: 5px 7px;
   }
 
   /* ---- bits-ui Select (shared: settings + dialogs) ---- */
@@ -558,30 +765,30 @@
     align-items: center;
     justify-content: space-between;
     gap: 10px;
-    background: var(--bg-0);
+    background: var(--paper-3);
     border: 1px solid var(--line);
-    border-radius: var(--radius);
-    color: var(--tx-hi);
+    border-radius: 0;
+    color: var(--ink-0);
     font: inherit;
-    font-size: 12.5px;
+    font-size: var(--r1);
     padding: 8px 10px;
     text-align: left;
     cursor: pointer;
-    transition: border-color var(--t-fast);
+    transition: border-color 0.18s ease-out;
   }
   .select-trigger:focus-visible {
     outline: none;
-    border-color: var(--ac);
+    border-color: var(--iris);
   }
   .select-trigger:disabled {
     cursor: wait;
-    color: var(--tx-lo);
+    color: var(--ink-2);
   }
   .select-trigger.base {
     font-family: var(--mono);
   }
   .select-chev {
-    color: var(--tx-lo);
+    color: var(--ink-2);
     font-size: 12px;
     flex: none;
   }
@@ -591,8 +798,8 @@
     max-height: 260px;
     overflow-y: auto;
     border: 1px solid var(--line);
-    border-radius: var(--radius-lg);
-    background: var(--bg-2);
+    border-radius: 0;
+    background: var(--paper-2);
     box-shadow: var(--shadow-pop);
     padding: 5px;
   }
@@ -601,20 +808,32 @@
     display: flex;
     align-items: center;
     padding: 6px 8px;
-    border-radius: var(--radius);
-    color: var(--tx-md);
-    font-size: 12px;
+    border-radius: 0;
+    color: var(--ink-1);
+    font-size: var(--r1);
     font-family: var(--mono);
     cursor: pointer;
     outline: none;
   }
   .select-item[data-highlighted] {
-    background: var(--bg-4);
-    color: var(--tx-hi);
+    background: var(--paper-3);
+    color: var(--ink-0);
   }
   .select-item[data-selected] {
-    background: var(--ac-wash);
-    color: var(--tx-hi);
+    background: var(--iris-wash);
+    color: var(--iris-ink);
+  }
+}
+
+/* ============================================================
+   Shared inline-icon contract (icons.md). Iconify's Lucide bodies bake
+   stroke-width="2"; the design wants 1.5px — CSS wins over the presentation
+   attribute. Apply `class="icon"` to any ~icons import.
+   ============================================================ */
+@layer base {
+  .icon,
+  .icon * {
+    stroke-width: 1.5;
   }
 }
 
@@ -626,12 +845,48 @@
 
   body {
     margin: 0;
-    background: var(--color-bg-0);
-    color: var(--color-tx-hi);
-    font-family: var(--font-ui);
-    font-size: 12px;
+    background: var(--paper-0);
+    color: var(--ink-0);
+    font-family: var(--ui);
+    font-size: var(--r0);
     line-height: 1.45;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
+  }
+
+  /* Thin, neutral scrollbars, consistent in both themes (components.md). */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--ink-3) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--ink-3);
+    border: 2px solid transparent;
+    background-clip: padding-box;
+    border-radius: 0;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--ink-2);
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+
+  /* Motion: honor reduced-motion by disabling every transition/animation
+     (components.md). All shell transitions are 150-250ms ease-out. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      transition-duration: 0.001ms !important;
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+    }
   }
 }

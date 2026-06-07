@@ -18,14 +18,26 @@ import {
   parentKey,
   sessionBelongsTo,
   type ActRollup,
+  type ActiveJobInfo,
   type AgentState,
   type BranchSummary,
   type ChangedFile,
+  type CommitAndPushResult,
+  type CompositeJobKind,
+  type CompositeJobResult,
+  type CompositeStep,
+  type StepPhase,
+  type CommitDiffRequest,
   type CommitDraft,
+  type CommitFileDiff,
+  type CommitInfo,
+  type CommitMeta,
   type DaemonStatus,
   type DraftGenerationSettings,
   type FileStatus,
   type GitStatus,
+  type GitDiffRequest,
+  type GitLogRequest,
   type HitchEvent,
   type Id,
   type JobStatus,
@@ -45,12 +57,25 @@ import {
   type Worktree,
 } from "./types";
 import {
+  DEFAULT_DIFF_CONTEXT_LINES,
+  diffContextLines,
+  diffIgnoreWhitespace,
   draftClaudePath,
   draftCodexPath,
+  draftCommitInstructions,
   draftModel,
+  draftPrInstructions,
   draftProvider,
+  railView,
+  terminalFontFamily,
+  terminalFontStack,
   type DraftProvider,
 } from "./settings";
+import {
+  forgetSession as forgetSessionNotifications,
+  noteAgentState,
+  primeNotificationPermission,
+} from "./notifications";
 
 export type Connection = "connecting" | "ready" | "offline";
 
@@ -136,14 +161,96 @@ export const selectedProjectId = writable<Id | null>(null);
 export const selectedWorktreeId = writable<Id | null>(null);
 export const activeSessionId = writable<Id | null>(null);
 
-// Git view state (consumed by the Changes panel + diff tab).
+// Git view state (consumed by the Changes panel + diff tabs).
 export const gitStatus = writable<GitStatus | null>(null);
-export const diffPath = writable<string | null>(null);
-export const diffText = writable<string | null>(null);
-// Whether the diff tab is the active center view. The diff tab persists as a
-// peer of the session tabs (so `diffPath` can be set while a terminal shows);
-// this flag is what the tab bar and center pane switch on.
+
+// One open diff per changed file the user has clicked. Each tab carries its own
+// fetched text (`null` while loading / for the binary/empty cases). Tabs persist
+// as peers of the session tabs in the strip; clicking a file that's already open
+// re-activates its tab rather than spawning a duplicate. Paths are worktree-
+// relative, so the set is cleared wholesale on worktree switch.
+// `staged` records which side a single-file tab was opened with, so a re-diff
+// (e.g. after toggling ignore-whitespace) can re-fetch the same git target it
+// originally showed. The all-changes sentinel tab carries no staged side (its
+// per-file rows track their own); undefined keeps the daemon's legacy selection.
+export type DiffTabEntry = { path: string; text: string | null; staged?: boolean };
+export const diffTabs = writable<DiffTabEntry[]>([]);
+// Sentinel "path" for the single all-changes tab — the unified view that shows
+// every changed file at once, each as its own collapsible section. The NUL byte
+// can never appear in a real worktree-relative path, so this never collides with
+// a file. Its tab carries no `text` (its content is `allChangesFiles`, not a
+// single diff string); the back-compat `diffText`/`parseDiff` path skips it.
+export const ALL_CHANGES_TAB = "\0all";
+
+// Sentinel "path" prefix for a Commit Tab — one diff tab per commit, keyed by
+// sha (`\0commit:<sha>`). Like `ALL_CHANGES_TAB`, the leading NUL byte can never
+// appear in a real worktree-relative path, so a commit tab never collides with a
+// file or with the all-changes sentinel. Its `text` is unused (its content is the
+// per-sha commit diff cache, not a single diff string); the single-file
+// `diffText`/`parseDiff` path skips it like the all-changes tab.
+export const COMMIT_TAB_PREFIX = "\0commit:";
+// The sentinel tab path for a commit sha.
+export function commitTabPath(sha: string): string {
+  return `${COMMIT_TAB_PREFIX}${sha}`;
+}
+// Whether a diff-tab path is a Commit Tab sentinel.
+export function isCommitTab(path: string): boolean {
+  return path.startsWith(COMMIT_TAB_PREFIX);
+}
+// The full sha carried by a Commit Tab sentinel path, or `null` if it isn't one.
+export function commitShaFromTab(path: string): string | null {
+  return isCommitTab(path) ? path.slice(COMMIT_TAB_PREFIX.length) : null;
+}
+
+// Per-file diffs for the all-changes view, in the order RightRail lists them
+// (staged first, then unstaged). `text` is `null` while that file's `git-diff`
+// fetch is in flight. Populated by `viewAllChanges`; the view component renders
+// one @pierre/diffs instance per expanded entry from these.
+export type AllChangesFile = { path: string; staged: boolean; text: string | null };
+export const allChangesFiles = writable<AllChangesFile[]>([]);
+// Which all-changes rows are currently expanded, keyed by `allChangesRowKey`
+// (side + path, since a partially-staged file appears as two rows). DiffAllTab
+// owns the toggling; the daemon reads it so a refresh only fetches diffs for
+// rows the user actually has expanded. A key absent from the set means collapsed
+// — the default — so an initial open (and any row that newly appears in status)
+// starts collapsed and fetches nothing until the user expands it, individually
+// or via the head's expand-all toggle.
+export const allChangesExpanded = writable<Set<string>>(new Set());
+// Row identity for the all-changes view: side + path. A partially-staged file
+// contributes a staged and an unstaged row that diff differently, so the side
+// has to be part of the key. Shared with DiffAllTab (which keys its sections the
+// same way) through this exported helper so the two never drift.
+export function allChangesRowKey(path: string, staged: boolean): string {
+  return `${staged ? "staged" : "unstaged"}\0${path}`;
+}
+const allChangesRowExpanded = (path: string, staged: boolean): boolean =>
+  get(allChangesExpanded).has(allChangesRowKey(path, staged));
+// Keep the daemon/webview responsive for large working trees: All changes may
+// contain hundreds of rows, and untracked directory rows can expand to large
+// diffs. Fetch a small pool instead of starting one git-diff per row at once.
+const ALL_CHANGES_DIFF_CONCURRENCY = 4;
+// The path of the diff tab currently shown when the diff view is active. `null`
+// when no diff tabs are open.
+export const activeDiffPath = writable<string | null>(null);
+// Whether a diff tab is the active center view. Diff tabs persist as peers of
+// the session tabs (so they can be open while a terminal shows); this flag is
+// what the tab bar and center pane switch on.
 export const diffActive = writable<boolean>(false);
+
+// Active-tab projection kept for the diff renderer + Changes-panel highlight,
+// which only ever care about the visible diff. It derives off the tab set so
+// there's a single source of truth (`diffTabs` + `activeDiffPath`).
+// Which side the visible diff tab shows. A partially-staged file appears as two
+// Changes-panel rows (staged + unstaged), so the highlight must compare both
+// axes; `undefined` (legacy/no explicit side) matches either row.
+export const diffStaged = derived(
+  [diffTabs, activeDiffPath],
+  ([$tabs, $path]) => $tabs.find((tab) => tab.path === $path)?.staged,
+);
+export const diffText = derived(
+  [diffTabs, activeDiffPath],
+  ([$tabs, $path]) => $tabs.find((tab) => tab.path === $path)?.text ?? null,
+);
 export const gitBusy = writable<boolean>(false);
 export const prUrl = writable<string | null>(null);
 // The PR (if any) GitHub has for the selected worktree's branch. `null` = none
@@ -192,8 +299,478 @@ function writePrByWorktree(worktreeId: Id, pr: PrInfo | null, seq: number): bool
   return true;
 }
 
+// Test-only inspector: whether either PR-freshness map still holds bookkeeping
+// for a worktree. These maps are otherwise module-private (their monotonic seqs
+// have no public-store effect), so this lets the leak tests assert that a removed
+// worktree's entries are swept rather than retained until disposeDaemon.
+export function __prFreshnessTracked(worktreeId: Id): boolean {
+  return prByWorktreeApplied.has(worktreeId) || prByWorktreeStarted.has(worktreeId);
+}
+
 const diffCache = new Map<string, string>();
-let diffRequestSeq = 0;
+// Diff freshness is scoped by consumer. A single-file tab and the all-changes
+// fan-out may request the same path concurrently; each should only gate its own
+// UI state, while cache writes are guarded by a separate per-path clock below.
+const diffRequestSeq = new Map<string, number>();
+const diffCacheWriteSeq = new Map<string, number>();
+const diffSideKey = (staged: boolean | undefined) =>
+  staged === undefined ? "legacy" : staged ? "staged" : "worktree";
+
+// The two re-diff options change the diff *text* the daemon returns, so they're
+// part of the cache identity: toggling either must not serve a diff fetched
+// under the old options. Read live from the settings stores so every cache key
+// (and every request) reflects the user's current choice. Defaults serialize as
+// the omitted shape, matching what the request builder sends.
+function diffOptionFields(): { ignore_whitespace?: boolean; context_lines?: number } {
+  const fields: { ignore_whitespace?: boolean; context_lines?: number } = {};
+  if (get(diffIgnoreWhitespace)) fields.ignore_whitespace = true;
+  const context = get(diffContextLines);
+  if (context !== DEFAULT_DIFF_CONTEXT_LINES) fields.context_lines = context;
+  return fields;
+}
+// Stable string for the cache key: default options collapse to "" so warm
+// caches from before any toggle still hit at default settings.
+function diffOptionKey(): string {
+  const fields = diffOptionFields();
+  if (fields.ignore_whitespace === undefined && fields.context_lines === undefined) return "";
+  return `iw${fields.ignore_whitespace ? 1 : 0}\0cx${fields.context_lines ?? DEFAULT_DIFF_CONTEXT_LINES}`;
+}
+const diffCacheKey = (worktreeId: Id, path: string, staged?: boolean) =>
+  `${worktreeId}\0${diffSideKey(staged)}\0${diffOptionKey()}\0${path}`;
+const diffFreshnessKey = (worktreeId: Id, consumer: string, path: string, staged?: boolean) =>
+  `${worktreeId}\0${consumer}\0${diffSideKey(staged)}\0${path}`;
+const diffTabFreshnessKey = (worktreeId: Id, path: string) =>
+  diffFreshnessKey(worktreeId, "single", path);
+
+function nextDiffRequestSeq(
+  worktreeId: Id,
+  consumer: string,
+  path: string,
+  staged?: boolean,
+): number {
+  const requestKey = diffFreshnessKey(worktreeId, consumer, path, staged);
+  const requestSeq = (diffRequestSeq.get(requestKey) ?? 0) + 1;
+  diffRequestSeq.set(requestKey, requestSeq);
+  return requestSeq;
+}
+
+function nextDiffCacheWriteSeq(cacheKey: string): number {
+  const writeSeq = (diffCacheWriteSeq.get(cacheKey) ?? 0) + 1;
+  diffCacheWriteSeq.set(cacheKey, writeSeq);
+  return writeSeq;
+}
+
+function writeFreshDiffCache(cacheKey: string, writeSeq: number, text: string): boolean {
+  if (diffCacheWriteSeq.get(cacheKey) !== writeSeq) return false;
+  diffCache.set(cacheKey, text);
+  return true;
+}
+
+// Worktrees whose open diffs (all-changes AND single-file tabs) must refresh on
+// the next git status, even when the status metadata is byte-identical. A
+// worktree-dirty event sets this because an external edit can change the diff
+// text while line counts / file set stay the same (see the gitStatus subscriber).
+const forcedDiffRefreshWorktrees = new Set<Id>();
+
+// Drop every cached diff variant for one worktree/path/side, across ALL re-diff
+// option keys — not just the one active now. The option key sits between the side
+// token and the path in the cache key (`worktree\0side\0optionKey\0path`), so a
+// fixed-key delete would only evict the current-option variant and leave a stale
+// entry under another option key (e.g. ignore-whitespace toggled) that a later
+// toggle-back would serve without re-asking the daemon. The `\0` delimiter bounds
+// every segment, so matching the worktree+side prefix and the `\0path` suffix is
+// unambiguous (no false positives between paths that share a suffix, or between
+// sides whose names share a prefix). `staged === undefined` invalidates all sides.
+//
+// Bumping the per-key write-seq is as load-bearing as the delete: an in-flight
+// `git-diff` captured the current write-seq before this invalidation and would
+// otherwise pass `writeFreshDiffCache`'s seq check and repopulate the just-cleared
+// entry with its now-stale text. That refill is invisible until the cache is read
+// again — and the "All changes" collapse-during-refresh path issues no follow-up
+// fetch to bump the seq, so expanding the row later serves the pre-change diff.
+// Bumping here invalidates any request older than this point. The write-seq map is
+// the superset (every cache write goes through `nextDiffCacheWriteSeq`, plus
+// in-flight keys not yet written), so iterating it covers both the delete and the
+// bump, including requests whose entry was never cached.
+export function invalidateDiffCacheVariants(worktreeId: Id, path: string, staged?: boolean): void {
+  const pathSuffix = `\0${path}`;
+  const prefix =
+    staged === undefined ? `${worktreeId}\0` : `${worktreeId}\0${diffSideKey(staged)}\0`;
+  for (const key of diffCacheWriteSeq.keys()) {
+    if (key.startsWith(prefix) && key.endsWith(pathSuffix)) {
+      diffCache.delete(key);
+      diffCacheWriteSeq.set(key, (diffCacheWriteSeq.get(key) ?? 0) + 1);
+    }
+  }
+}
+
+function deleteDiffCacheForChangedFiles(worktreeId: Id, files: ChangedFile[]): void {
+  for (const file of files) invalidateDiffCacheVariants(worktreeId, file.path, file.staged);
+}
+
+// Arm a one-shot forced refresh for the worktree if it's selected and has any
+// open diff that tracks the working tree — the all-changes tab OR a single-file
+// (non-commit) tab. Commit tabs are immutable per-sha snapshots and never need
+// this. The flag is consumed by the gitStatus subscriber on the next status.
+function requestDiffRefreshOnNextStatus(worktreeId: Id): void {
+  if (get(gitWorktreeId) !== worktreeId) return;
+  const tracksWorkingTree = get(diffTabs).some(
+    (tab) => tab.path === ALL_CHANGES_TAB || !isCommitTab(tab.path),
+  );
+  if (tracksWorkingTree) forcedDiffRefreshWorktrees.add(worktreeId);
+}
+
+// ---- History commit log ---------------------------------------------------
+//
+// The HISTORY rail view's commit log for the selected worktree: paginated, fetched
+// lazily a page at a time. `commits` is the accumulated pages in order (newest
+// first); `hasMore` flags more past the last fetched page; `loading` is true while
+// any page request is in flight. `worktreeId` records which worktree the rows
+// belong to so a stale fetch from a previous worktree can't land into the new one,
+// mirroring the seq guards on `loadGitStatus`/diffs. The store swaps wholesale on
+// worktree switch (the gitWorktreeId subscription resets it and refetches page one).
+export type CommitLogState = {
+  worktreeId: Id | null;
+  commits: CommitInfo[];
+  hasMore: boolean;
+  loading: boolean;
+  // How many commits a HEAD-move refresh just PREPENDED above the existing rows.
+  // The History list reads this to compensate scrollTop by the inserted rows'
+  // height so the viewport stays anchored to the same commit (rather than the new
+  // top commits sliding every visible row down under a churning HEAD). `tick` is a
+  // monotonic stamp so the component re-anchors once per prepend even when two
+  // refreshes prepend the same count back-to-back.
+  prependedCount: number;
+  tick: number;
+};
+const EMPTY_COMMIT_LOG: CommitLogState = {
+  worktreeId: null,
+  commits: [],
+  hasMore: false,
+  loading: false,
+  prependedCount: 0,
+  tick: 0,
+};
+export const commitLog = writable<CommitLogState>(EMPTY_COMMIT_LOG);
+// Page size for each `git-log` fetch (lazy "load more" pulls the next page).
+const COMMIT_LOG_PAGE = 20;
+// Monotonic freshness clock: a slow page response from a previous worktree (or a
+// superseded reset) must not land. Each load stamps a seq; only the freshest
+// applies, mirroring `statusRequestSeq`.
+let commitLogSeq = 0;
+// The HEAD sha the current log was last fetched for, so the status backbone can
+// detect a HEAD change and refetch only when it actually moved.
+let commitLogHeadId: string | null = null;
+
+// How a `loadCommitLogPage` call treats the rows it already holds:
+//   - "reset":   replace from page one, clearing the rows first (worktree switch
+//                / first open) — the array genuinely belongs to a new context.
+//   - "append":  add the next offset page at the bottom (loadMore).
+//   - "refresh": a HEAD moved under the SAME worktree (e.g. an agent committed in
+//                the selected PTY). Fetch the fresh top window, then PREPEND only
+//                the genuinely-new commits above the rows we already hold —
+//                keeping every existing row's object identity (so the sha-keyed
+//                `{#each … (commit.id)}` does zero DOM work for them) and the full
+//                paginated depth (new commits GROW the list rather than pushing
+//                the oldest rows out of a fixed window). The component compensates
+//                scrollTop for the prepended height so the viewport stays anchored
+//                to the same commit instead of drifting down under a churning
+//                HEAD. This is the fix for the "late row click does nothing /
+//                snaps back" bug: the old refresh swapped the WHOLE window every
+//                ~1s while an agent committed, so visible rows slid down by a row
+//                each tick (scrollTop never compensated) — a real pointer's
+//                mousedown and mouseup then landed on DIFFERENT rows and the
+//                browser synthesized NO `click`, and the oldest rows silently fell
+//                out of the window. A prepend-only, scroll-anchored refresh fixes
+//                both. When the new commits don't overlap our top sha within the
+//                fetched window (a big jump, a rebase, or a force-update), we fall
+//                back to replacing the window — correctness over node reuse.
+type CommitLogLoad = "reset" | "append" | "refresh";
+
+// Fetch commit-log rows for the selected worktree under one of the modes above.
+// A no-op if no git worktree is selected.
+async function loadCommitLogPage(mode: CommitLogLoad): Promise<void> {
+  const worktreeId = get(gitWorktreeId);
+  if (!worktreeId) return;
+  const current = get(commitLog);
+  const sameWorktree = current.worktreeId === worktreeId;
+  // A refresh of a worktree we don't actually hold yet is just a first load.
+  const effective: CommitLogLoad = mode === "refresh" && !sameWorktree ? "reset" : mode;
+
+  // Append starts past the rows we hold; reset/refresh start at the top. Refresh
+  // fetches only ONE page from the top, not the full loaded depth: the merge below
+  // keeps just the new prefix above our top sha and reuses the rest of our rows
+  // verbatim, so fetching the whole depth made the daemon recompute a per-commit
+  // tree diff (`commit_line_totals`) for every loaded row just to discard all but
+  // the prefix — O(loaded) wasted work on EVERY HEAD move (an agent committing in
+  // a 200-row History paid ~200 redundant diffs to deliver one prepended row). One
+  // page covers the common case (≤ PAGE new commits since the last refresh); the
+  // overlap is within it. A burst of > PAGE fast-forward commits won't overlap in
+  // one page — that's handled by a bounded one-step escalation in the merge below
+  // (refetch once at the old full depth) so a pure fast-forward keeps the user's
+  // scrolled depth; a genuine rewrite still falls through to the full replace.
+  const offset = effective === "append" && sameWorktree ? current.commits.length : 0;
+  const limit = COMMIT_LOG_PAGE;
+  if (effective === "append" && sameWorktree && !current.hasMore) return;
+  // A refresh whose HEAD didn't actually change nothing-to-do early-out is the
+  // caller's job (it only refreshes on a HEAD move); but if we somehow hold no
+  // rows yet, treat it as a first load so the window is established.
+  const refreshHasRows = effective === "refresh" && current.commits.length > 0;
+
+  const seq = ++commitLogSeq;
+  commitLog.update((state) =>
+    effective === "reset" || state.worktreeId !== worktreeId
+      ? { ...state, worktreeId, commits: [], hasMore: false, loading: true, prependedCount: 0 }
+      : // append + refresh keep the rows in place (the merge below swaps/prepends
+        // only once the fresh page lands, so no node churn while it's in flight).
+        { ...state, loading: true, prependedCount: 0 },
+  );
+
+  // The fetch is still the freshest and its worktree is still selected.
+  const isLatest = () => commitLogSeq === seq && get(gitWorktreeId) === worktreeId;
+
+  const fetchLog = (fetchLimit: number) =>
+    daemonRequest<Response & { commits: CommitInfo[]; has_more: boolean }>({
+      type: "git-log",
+      worktree_id: worktreeId,
+      limit: fetchLimit,
+      offset,
+    } satisfies GitLogRequest);
+
+  try {
+    const response = await fetchLog(limit);
+    if (!isLatest()) return;
+
+    if (effective === "append") {
+      commitLog.update((state) => ({
+        ...state,
+        worktreeId,
+        commits: [...state.commits, ...response.commits],
+        hasMore: response.has_more,
+        loading: false,
+        prependedCount: 0,
+      }));
+      return;
+    }
+
+    if (refreshHasRows) {
+      // The fresh window is newest-first; the commits ABOVE our current top sha are
+      // genuinely new. Prepend only those, reusing the EXISTING objects for the rest
+      // (so the sha-keyed each does zero DOM work for unchanged rows) and GROWING the
+      // list rather than dropping the oldest loaded rows to a fixed window.
+      let merged = mergeRefresh(get(commitLog), response.commits, worktreeId);
+      // No overlap in one page: either a fast-forward burst landed > PAGE commits on
+      // top (the old top sha exists, just deeper than one page) or history was
+      // rewritten (the old sha is gone). Escalate ONCE at the previous full depth so
+      // a pure fast-forward recovers the overlap and keeps the user's scrolled depth.
+      // If the second window still has no overlap it's a real rewrite → full replace.
+      if (merged === NO_OVERLAP && current.commits.length > COMMIT_LOG_PAGE) {
+        const deep = await fetchLog(current.commits.length);
+        if (!isLatest()) return;
+        merged = mergeRefresh(get(commitLog), deep.commits, worktreeId);
+        if (merged === NO_OVERLAP) {
+          // Genuine rewrite: replace the window (the loaded rows may be gone).
+          commitLog.update((state) => ({
+            ...state,
+            worktreeId,
+            commits: deep.commits,
+            hasMore: deep.has_more,
+            loading: false,
+            prependedCount: 0,
+          }));
+          return;
+        }
+      } else if (merged === NO_OVERLAP) {
+        // Only one page was ever loaded and it shares no sha — a rewrite. Replace.
+        commitLog.update((state) => ({
+          ...state,
+          worktreeId,
+          commits: response.commits,
+          hasMore: response.has_more,
+          loading: false,
+          prependedCount: 0,
+        }));
+        return;
+      }
+      commitLog.update(() => merged as CommitLogState);
+      return;
+    }
+
+    // reset (or a refresh with no prior rows): take the fresh window as-is.
+    commitLog.update((state) => ({
+      ...state,
+      worktreeId,
+      commits: response.commits,
+      hasMore: response.has_more,
+      loading: false,
+      prependedCount: 0,
+    }));
+  } catch (err) {
+    error.set(toMessage(err));
+    if (isLatest()) commitLog.update((state) => ({ ...state, loading: false }));
+  }
+}
+
+// Sentinel: the fresh window shares no sha with the loaded rows (caller decides
+// whether to escalate or replace).
+const NO_OVERLAP = Symbol("commit-log-no-overlap");
+
+// Merge a fresh top window into the loaded rows for a refresh: prepend the commits
+// above our current top sha (reusing existing objects for the overlapping tail so
+// the sha-keyed each does no DOM work, and growing the list). Returns the sentinel
+// when the window doesn't reach our top sha so the caller can escalate or replace.
+function mergeRefresh(
+  state: CommitLogState,
+  fresh: CommitInfo[],
+  worktreeId: string,
+): CommitLogState | typeof NO_OVERLAP {
+  const topSha = state.commits[0]?.id;
+  const overlap = topSha ? fresh.findIndex((c) => c.id === topSha) : -1;
+  if (overlap < 0) return NO_OVERLAP;
+  const prepended = fresh.slice(0, overlap);
+  // overlap === 0 means our top commit is still HEAD's first row — nothing new to
+  // prepend; leave the rows (and scroll) exactly as they are.
+  if (prepended.length === 0) {
+    return { ...state, loading: false, prependedCount: 0 };
+  }
+  return {
+    ...state,
+    worktreeId,
+    commits: [...prepended, ...state.commits],
+    hasMore: state.hasMore,
+    loading: false,
+    prependedCount: prepended.length,
+    tick: state.tick + 1,
+  };
+}
+
+// Load (reset to) the first page of the selected worktree's commit log. Used on
+// worktree switch / first open, where clearing the rows is correct.
+export function loadCommitLog(): Promise<void> {
+  return loadCommitLogPage("reset");
+}
+
+// Re-fetch the selected worktree's log in place after its HEAD moved, PREPENDING
+// only the genuinely-new top commits above the rows already loaded. Existing rows
+// keep their object identity (the sha-keyed each does no DOM work for them) and
+// the full paginated depth is preserved; the History list compensates scrollTop
+// for the prepended height so the viewport stays anchored. This keeps a late-row
+// click stable under a churning HEAD (a row never slides out from under the
+// pointer between mousedown and mouseup) — the reported "click does nothing /
+// snaps to start" failure.
+export function refreshCommitLog(): Promise<void> {
+  return loadCommitLogPage("refresh");
+}
+
+// Append the next page of commits (lazy "load more" at the scroll bottom). A
+// no-op while a page is already in flight or when there are no more commits.
+export function loadMoreCommits(): Promise<void> {
+  if (get(commitLog).loading) return Promise.resolve();
+  return loadCommitLogPage("append");
+}
+
+// ---- Commit diff cache (Commit Tab) ---------------------------------------
+//
+// Commit objects are immutable, so a commit's diff never needs invalidation
+// (unlike the working-tree diff cache variants). A Commit Tab opened twice
+// fetches once; every later open serves the cache. Entries are dropped on
+// `disposeDaemon`/`sweepWorktreeCaches`, OR evicted once the cache exceeds
+// `COMMIT_DIFF_CACHE_CAP`. Each entry pins a commit's full multi-file
+// CommitDiffData, so the cap is deliberately small (mirroring the Rust side's
+// LINE_TOTALS_CACHE_CAP): a miss just re-walks via the daemon, the accepted
+// fallback. Eviction is FIFO over Map insertion order (oldest entry dropped);
+// a read re-inserts its entry so it counts as freshly used (LRU-ish).
+export type CommitDiffData = { meta: CommitMeta; files: CommitFileDiff[] };
+const COMMIT_DIFF_CACHE_CAP = 64;
+const commitDiffCache = new Map<string, CommitDiffData>();
+// Coalesce concurrent fetches of the same commit (e.g. a re-click while the first
+// request is still in flight) onto one daemon round-trip.
+const commitDiffInFlight = new Map<string, Promise<CommitDiffData | null>>();
+const commitDiffCacheKey = (worktreeId: Id, sha: string) => `${worktreeId}\0${sha}`;
+
+// Fetch one commit's metadata + per-file diff, serving the immutable per-sha
+// cache after the first fetch. Returns `null` on error (the caller renders an
+// error/empty state). Concurrent calls for the same commit share one request.
+export async function fetchCommitDiff(
+  worktreeId: Id,
+  sha: string,
+): Promise<CommitDiffData | null> {
+  const cacheKey = commitDiffCacheKey(worktreeId, sha);
+  const cached = commitDiffCache.get(cacheKey);
+  if (cached !== undefined) {
+    // Re-insert so a served entry moves to the back (newest) of the eviction
+    // order — keeps actively-viewed commits from being dropped under the cap.
+    commitDiffCache.delete(cacheKey);
+    commitDiffCache.set(cacheKey, cached);
+    return cached;
+  }
+  const inFlight = commitDiffInFlight.get(cacheKey);
+  if (inFlight) return inFlight;
+
+  const promise = (async (): Promise<CommitDiffData | null> => {
+    try {
+      const request: CommitDiffRequest = {
+        type: "commit-diff",
+        worktree_id: worktreeId,
+        commit_id: sha,
+      };
+      const response = await daemonRequest<
+        Response & { meta: CommitMeta; files: CommitFileDiff[] }
+      >(request);
+      const data: CommitDiffData = { meta: response.meta, files: response.files };
+      // Evict the oldest entry (front of Map insertion order) when at cap before
+      // inserting the newest, bounding the memory each large diff would pin.
+      if (commitDiffCache.size >= COMMIT_DIFF_CACHE_CAP && !commitDiffCache.has(cacheKey)) {
+        const oldest = commitDiffCache.keys().next().value;
+        if (oldest !== undefined) commitDiffCache.delete(oldest);
+      }
+      commitDiffCache.set(cacheKey, data);
+      return data;
+    } catch (err) {
+      error.set(toMessage(err));
+      return null;
+    } finally {
+      commitDiffInFlight.delete(cacheKey);
+    }
+  })();
+  commitDiffInFlight.set(cacheKey, promise);
+  return promise;
+}
+
+// Open (or re-activate) the Commit Tab for `sha`: a peer of file diff tabs and
+// the all-changes sentinel in `diffTabs`, keyed by the `\0commit:<sha>` path.
+// Clicking a commit that's already open re-activates its tab rather than spawning
+// a duplicate, mirroring `viewDiff`/`viewAllChanges`. The diff body is fetched
+// (and cached) through `fetchCommitDiff` by the tab component, not here.
+export function openCommitTab(sha: string): void {
+  const path = commitTabPath(sha);
+  diffTabs.update((tabs) =>
+    tabs.some((tab) => tab.path === path) ? tabs : [...tabs, { path, text: null }],
+  );
+  activeDiffPath.set(path);
+  diffActive.set(true);
+}
+
+async function forEachBounded<T>(
+  items: readonly T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) return;
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      for (;;) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= items.length) return;
+        await worker(items[index]!, index);
+      }
+    }),
+  );
+}
+
 let statusRequestSeq = 0;
 let statusPollTimer: ReturnType<typeof setInterval> | null = null;
 let statusPollInFlight = false;
@@ -241,8 +818,38 @@ export const currentDirty = derived(
   ([$id, $dirty]) => ($id ? $dirty[$id] : undefined),
 );
 
-export const defaultBase = derived(projectWorktrees, ($worktrees) =>
-  $worktrees.find((w) => w.is_main)?.branch ?? null,
+// The base branch for PR-base defaults and "from {base}" labels. The DAEMON owns
+// the convention now (GitStatus.base_branch, shared with git_log's ahead-of-base
+// markers) — so when a git status is loaded for the selected worktree, the
+// daemon-provided value WINS: it is the single definition, and only it correctly
+// handles the remote-less-worktree fallback that the client can't see.
+//
+// Two cases keep the worktree-derived value as a fallback rather than regressing:
+//  - Rolling upgrade: an OLD daemon omits the field entirely (`undefined`). We
+//    can't trust its absence as "no base", so we recompute client-side.
+//  - No status yet: `gitStatus` is null before a worktree is selected/loaded, and
+//    consumers like CreateWorktreeDialog run with no selection at all. The
+//    worktree-derived main branch is available as soon as worktrees load, so we
+//    keep it for that window (matching the prior behavior, never null when a main
+//    worktree exists).
+// A new daemon that explicitly resolves to `null` (the main worktree relative to
+// itself — no cross-branch base) is authoritative ONLY when its status is the one
+// for the selected worktree; otherwise the stale/absent status doesn't speak for
+// the selection, so we fall back.
+export const defaultBase = derived(
+  [projectWorktrees, gitStatus, gitWorktreeId],
+  ([$worktrees, $status, $worktreeId]) => {
+    const worktreeDerived = $worktrees.find((w) => w.is_main)?.branch ?? null;
+    // Only let the daemon's base speak when the loaded status is for the
+    // currently-selected worktree (per-worktree, arrives later than worktrees).
+    if ($status && $status.worktree_id === $worktreeId && "base_branch" in $status) {
+      // New daemon: `string` is the resolved base, explicit `null` means "no
+      // cross-branch base" for this worktree — both authoritative.
+      return $status.base_branch ?? null;
+    }
+    // Old daemon (field absent) or no/foreign status loaded yet: recompute.
+    return worktreeDerived;
+  },
 );
 
 export const visibleSessions = derived(
@@ -255,20 +862,61 @@ export const activeSession = derived(
   ([$sessions, $id]) => $sessions.find((s) => s.id === $id) ?? null,
 );
 
+// The visual tab order, exactly as SessionTabs.svelte renders the strip: every
+// visible session first (in `visibleSessions` order), then every open diff tab
+// (in `diffTabs` order, the all-changes sentinel included as a normal entry).
+// A descriptor's `id` is the session id for sessions and the (worktree-relative
+// or sentinel) path for diffs — the same key each command needs to re-activate
+// or close that tab. Keyboard tab commands (Cmd+1–9, next/prev) index into this
+// so their N matches what the user sees, and `activeTabIndex` reports where the
+// current center view sits in it.
+export type TabDescriptor = { kind: "session"; id: Id } | { kind: "diff"; id: string };
+export const orderedTabs = derived(
+  [visibleSessions, diffTabs],
+  ([$sessions, $diffTabs]): TabDescriptor[] => [
+    ...$sessions.map((s): TabDescriptor => ({ kind: "session", id: s.id })),
+    ...$diffTabs.map((t): TabDescriptor => ({ kind: "diff", id: t.path })),
+  ],
+);
+
+// Index of the currently-active tab in `orderedTabs`, or -1 when nothing maps
+// (no sessions and no diffs). Mirrors SessionTabs' active rule: a diff tab is
+// active iff `diffActive` (then it's `activeDiffPath`); otherwise the active
+// session is `activeSessionId`. Pure read off the stores so next/prev can pivot
+// from the current selection.
+export function activeTabIndex(): number {
+  const tabs = get(orderedTabs);
+  if (get(diffActive)) {
+    const path = get(activeDiffPath);
+    return tabs.findIndex((t) => t.kind === "diff" && t.id === path);
+  }
+  const id = get(activeSessionId);
+  return tabs.findIndex((t) => t.kind === "session" && t.id === id);
+}
+
+// Activate the tab at `index` in `orderedTabs` (the visual order). Out-of-range
+// is a no-op (Cmd+N with fewer than N tabs). A session tab clears the diff view
+// and selects the session; a diff tab activates that path — the same state moves
+// SessionTabs.select()/selectDiff() make. Terminal DOM focus is the caller's job
+// (the layout owns the focuser registry); this only moves daemon state.
+export function activateTabIndex(index: number): void {
+  const tabs = get(orderedTabs);
+  const tab = tabs[index];
+  if (!tab) return;
+  if (tab.kind === "session") {
+    diffActive.set(false);
+    activeSessionId.set(tab.id);
+  } else {
+    activeDiffPath.set(tab.id);
+    diffActive.set(true);
+  }
+}
+
 // Per-worktree rollup of the DISPLAY state (act states always; `running` only
 // while its output gate is open; `waiting` is unlabeled and never rolls up).
-// The single running word on the worktree you are actively looking at is
-// suppressed — you can see that agent live in the main pane.
 export const agentStateByWorktree = derived(
-  [worktrees, sessions, displaySessionStates, selectedWorktreeId, activeSessionId, diffActive],
-  ([$worktrees, $sessions, $display, $selectedWorktreeId, $activeSessionId, $diffActive]) => {
-    const activeSession = $sessions.find((session) => session.id === $activeSessionId);
-    const activeRunningWorktree =
-      !$diffActive &&
-      activeSession?.parent.kind === "worktree" &&
-      $display[activeSession.id] === "running"
-        ? activeSession.parent.id
-        : null;
+  [worktrees, sessions, displaySessionStates],
+  ([$worktrees, $sessions, $display]) => {
     const map: Record<Id, AgentState> = {};
     for (const worktree of $worktrees) {
       const agg = aggregateAgentState(
@@ -277,9 +925,6 @@ export const agentStateByWorktree = derived(
           .map((s) => $display[s.id]),
       );
       if (!agg) continue;
-      if (agg === "running" && worktree.id === $selectedWorktreeId && worktree.id === activeRunningWorktree) {
-        continue;
-      }
       map[worktree.id] = agg;
     }
     return map;
@@ -360,6 +1005,7 @@ const cancellableJobKinds = new Set([
   "fetch",
   "pull",
   "create-pr",
+  "commit-and-push",
   "draft-models",
   "commit-draft",
   "pr-draft",
@@ -477,6 +1123,39 @@ export function applyJobProgress(
 
 // Resolve a Job from its `JobCompleted` event: the wrapped response rides inside.
 export function completeJob(jobId: Id, response: Response): void {
+  // Resolve a composite chain's per-worktree DISPLAY state FIRST (before the job
+  // is dropped from the store below, so the worktree lookup still works): clear
+  // on success, park the oxide failure on a mid-chain failure. The worktree id
+  // rides the live Jobs store entry or the chain display whose jobId matches.
+  if (
+    response.type === "composite-job-failed" ||
+    response.type === "commit-and-pushed" ||
+    response.type === "pull-request-created"
+  ) {
+    const worktreeId =
+      get(jobs)[jobId]?.worktreeId ??
+      Object.entries(get(compositeChains)).find(([, c]) => c.jobId === jobId)?.[0] ??
+      null;
+    if (worktreeId) applyCompositeCompletion(worktreeId, response);
+  } else if (isError(response)) {
+    // A composite Job can ALSO terminate as a plain `Response::Error` rather than
+    // a `composite-job-failed`: cancellation, the worktree vanishing at chain
+    // start, a poisoned lock, or a worker panic. None of those reach
+    // applyCompositeCompletion above, so without this the optimistic in-flight
+    // display would freeze (spinner stuck, autoRunning stuck true). Park it as a
+    // failure so the button shows the oxide ✗ + retry instead. The worktree id
+    // rides the live Jobs store entry or the chain display whose jobId matches
+    // (same resolution as the success path). Park ONLY if a chain entry still
+    // exists for it — a user-driven cancel optimistically clears the chain before
+    // its "job cancelled" error arrives, and we must not resurrect it.
+    const worktreeId =
+      get(jobs)[jobId]?.worktreeId ??
+      Object.entries(get(compositeChains)).find(([, c]) => c.jobId === jobId)?.[0] ??
+      null;
+    if (worktreeId && get(compositeChains)[worktreeId]) {
+      applyCompositeErrorCompletion(worktreeId, response.error.message);
+    }
+  }
   const pending = jobPending.get(jobId);
   const local = locallyStartedJobs.has(jobId);
   jobPending.delete(jobId);
@@ -512,6 +1191,9 @@ function failAllJobs(reason: string): void {
   earlyCompletions.clear();
   locallyStartedJobs.clear();
   jobs.set({});
+  // Composite chains are ephemeral too: a daemon drop strands every in-flight
+  // chain display. (A re-attach re-queries `active-jobs` to restore the truth.)
+  compositeChains.set({});
 }
 
 // Ask the daemon to cancel a running Job (signals its worker to kill any child).
@@ -521,6 +1203,269 @@ export async function cancelJob(jobId: Id): Promise<void> {
   } catch (err) {
     error.set(toMessage(err));
   }
+}
+
+// ---- composite chains (ADR 0013 amendment 2026-06-07) ---------------------
+//
+// The two autonomous chains — auto commit & push and PR create — run as ONE
+// daemon-owned Job each. Their per-step progress is broadcast as
+// `composite-job-progress` events and their result rides the normal
+// `job-completed` envelope. The chain is daemon-owned, so its *display* state
+// must NOT live in a component (which unmounts on navigation): it lives here, in
+// a per-worktree store, fed by the progress events AND seeded by the
+// `active-jobs` query a (re)attaching GUI runs. RightRail's auto-mode header
+// morph and the Composer's PR progress both read this one store, so leaving and
+// returning mid-chain restores the exact in-flight step.
+
+// The live state of one worktree's in-flight chain (at most one per worktree —
+// the daemon serializes mutating git ops per worktree). `step` is the current
+// rung; `failed` carries the terminal failure for the oxide retry state.
+export type CompositeChainState = {
+  jobId: Id | null;
+  kind: CompositeJobKind;
+  step: CompositeStep;
+  // A terminal failure: the chain stopped on `failed.step` with `failed.reason`.
+  // The button shows the oxide `✗ <step> failed — retry` state until retried or
+  // dismissed; `step` stays the failed rung for the label.
+  failed: { step: CompositeStep; reason: string } | null;
+};
+// Per worktree id. Absent = no chain in flight (and no unacknowledged failure).
+export const compositeChains = writable<Record<Id, CompositeChainState>>({});
+
+// The chain for the currently-selected worktree (what RightRail / Composer read).
+export const compositeChainForSelectedWorktree = derived(
+  [compositeChains, gitWorktreeId],
+  ([$chains, $worktreeId]) => ($worktreeId ? ($chains[$worktreeId] ?? null) : null),
+);
+
+function setCompositeChain(worktreeId: Id, state: CompositeChainState): void {
+  compositeChains.update((current) => ({ ...current, [worktreeId]: state }));
+}
+
+// Clear a worktree's chain display (success ack, dismissed failure, or a fresh
+// retry replacing the old failed state).
+export function clearCompositeChain(worktreeId: Id): void {
+  compositeChains.update((current) => omitKey(current, worktreeId));
+}
+
+// Apply a `composite-job-progress` event: a step `started` becomes the current
+// rung; we ignore `finished` for display (the next step's `started` advances the
+// label, and the terminal step's result clears the chain on completion). A live
+// progress event also clears any stale failure for that worktree.
+export function applyCompositeJobProgress(
+  jobId: Id,
+  worktreeId: Id,
+  kind: CompositeJobKind,
+  step: CompositeStep,
+  phase: StepPhase,
+): void {
+  if (phase !== "started") return;
+  setCompositeChain(worktreeId, { jobId, kind, step, failed: null });
+}
+
+// Resolve a chain on its `job-completed`. Success clears the chain display
+// (RightRail flashes its calm "committed"/PR state via the completion handlers,
+// then the chip/diffstat refresh takes over); a `composite-job-failed` parks the
+// oxide retry state on the worktree.
+function applyCompositeCompletion(worktreeId: Id, response: Response): void {
+  if (response.type === "composite-job-failed") {
+    const failedStep = response.failed_step as CompositeStep;
+    const reason = (response.reason as string | null) ?? "Chain failed.";
+    const kind = response.kind as CompositeJobKind;
+    setCompositeChain(worktreeId, {
+      jobId: null,
+      kind,
+      step: failedStep,
+      failed: { step: failedStep, reason },
+    });
+    return;
+  }
+  // Success (commit-and-pushed / pull-request-created) — drop the in-flight
+  // display; the calling start fn handles the auto-mode toast / status refresh.
+  clearCompositeChain(worktreeId);
+  // PR chain finale: OPEN the created draft PR in the browser. The daemon never
+  // opens it (ADR 0013 amendment) — the GUI does, here, only because this handler
+  // only runs while attached. Centralized here (not in the confirm path) so a
+  // chain RESTORED after navigating away also opens on completion, and a single
+  // open guard prevents a double-open. If no GUI is attached when it completes,
+  // nothing opens and the rail's PR chip reflects it on next attach.
+  if (response.type === "pull-request-created" && typeof response.url === "string") {
+    openCreatedPrUrl(worktreeId, response.url);
+  }
+}
+
+// Park a chain that terminated as a plain `Response::Error` (cancellation,
+// worktree removed at chain start, poisoned lock, worker panic) — none of which
+// carry a `failed_step`/`kind`, so we keep the chain's current rung (the
+// optimistic or last-progress step) and reuse its kind for the oxide retry
+// label. Mirrors the `composite-job-failed` parking shape so RightRail/Composer
+// render ✗ + retry identically.
+function applyCompositeErrorCompletion(worktreeId: Id, reason: string): void {
+  const held = get(compositeChains)[worktreeId];
+  if (!held) return;
+  setCompositeChain(worktreeId, {
+    jobId: null,
+    kind: held.kind,
+    step: held.step,
+    failed: { step: held.step, reason: reason || "Chain failed." },
+  });
+}
+
+// PR urls already opened, so a duplicate completion (or a confirm path that also
+// tried) can't open the browser twice for the same chain.
+const openedPrUrls = new Set<string>();
+function openCreatedPrUrl(worktreeId: Id, url: string): void {
+  if (openedPrUrls.has(url)) return;
+  openedPrUrls.add(url);
+  void (async () => {
+    try {
+      const { openUrl } = await import("@tauri-apps/plugin-opener");
+      await openUrl(url);
+    } catch {
+      // Best-effort: the rail's PR chip still links to the created PR.
+    }
+  })();
+}
+
+// Start the auto commit-and-push chain for a worktree. Resolves with the
+// `CommitAndPushResult` (subject · short sha · pushed · files) for the toast.
+// Routes the COMMIT draft instructions per slice 5. A failure rejects with the
+// chain's failed-step reason (the oxide retry state is already parked by the
+// completion handler).
+export async function startCommitAndPush(
+  worktreeId: Id | null = get(gitWorktreeId),
+): Promise<CommitAndPushResult> {
+  if (!worktreeId) throw new Error("Select a git worktree first.");
+  // Optimistically show the first step so the button morphs immediately, even
+  // before the daemon's first progress event lands.
+  setCompositeChain(worktreeId, {
+    jobId: null,
+    kind: "commit-and-push",
+    step: "staging",
+    failed: null,
+  });
+  const response = await runJob<Response & { result?: CommitAndPushResult }>(
+    {
+      type: "commit-and-push",
+      worktree_id: worktreeId,
+      settings: draftGenerationSettings({ commit: get(draftCommitInstructions) }),
+    },
+    "commit-and-push",
+  );
+  // A mid-chain failure rides the normal `job-completed` envelope as a
+  // `composite-job-failed` response (not an `error`), so runJob RESOLVES it. The
+  // oxide retry state is already parked by the completion handler; surface the
+  // reason to the caller so the toast goes error.
+  throwIfCompositeFailed(response);
+  // Refresh status + PR chip so the rail reflects the pushed commit.
+  void loadGitStatus(worktreeId).catch(() => {});
+  void loadPrStatus(worktreeId);
+  if (!response.result) throw new Error("Commit-and-push completed without a result.");
+  return response.result;
+}
+
+// Throw the chain's failed-step reason when a composite Job resolved as a
+// `composite-job-failed` (runJob resolves it — only `type: "error"` rejects).
+function throwIfCompositeFailed(response: Response): void {
+  if (response.type === "composite-job-failed") {
+    const step = response.failed_step as string;
+    const reason = (response.reason as string | null) ?? "Chain failed.";
+    throw new Error(`${step} failed — ${reason}`);
+  }
+}
+
+// Start the autonomous PR chain for a worktree (push → draft → create GitHub
+// DRAFT PR). Resolves with the created PR url so the GUI can open the browser —
+// only the daemon never opens it. Routes the PR draft instructions per slice 5.
+export async function startCreatePr(
+  base: string | null,
+  worktreeId: Id | null = get(gitWorktreeId),
+): Promise<string> {
+  if (!worktreeId) throw new Error("Select a git worktree first.");
+  setCompositeChain(worktreeId, {
+    jobId: null,
+    kind: "create-pr",
+    step: "pushing",
+    failed: null,
+  });
+  const response = await runJob<Response & { url?: string }>(
+    {
+      type: "create-pr",
+      worktree_id: worktreeId,
+      base: base?.trim() || null,
+      settings: draftGenerationSettings({ pr: get(draftPrInstructions) }),
+    },
+    "create-pr",
+  );
+  throwIfCompositeFailed(response);
+  void loadGitStatus(worktreeId).catch(() => {});
+  void loadPrStatus(worktreeId);
+  if (!response.url) throw new Error("Create-PR completed without a url.");
+  return response.url;
+}
+
+// Query a worktree's in-flight composite chains and seed the display store, so a
+// (re)attaching GUI restores the exact button/Composer step. Returns the
+// restored entry (or null) for callers that want to also keep following events.
+// Only composite chains are reported; an empty reply clears any stale display
+// that is not a parked failure (a failure is local terminal state, not in-flight,
+// so it must survive a refresh).
+export async function refreshActiveJobs(
+  worktreeId: Id | null = get(gitWorktreeId),
+): Promise<CompositeChainState | null> {
+  if (!worktreeId) return null;
+  let response: Response & { jobs: ActiveJobInfo[] };
+  try {
+    response = await daemonRequest<Response & { jobs: ActiveJobInfo[] }>({
+      type: "active-jobs",
+      worktree_id: worktreeId,
+    });
+  } catch {
+    return null;
+  }
+  const active = response.jobs.find((j) => j.worktree_id === worktreeId) ?? response.jobs[0];
+  if (active) {
+    const state: CompositeChainState = {
+      jobId: active.job_id,
+      kind: active.kind,
+      step: active.step,
+      failed: null,
+    };
+    setCompositeChain(worktreeId, state);
+    return state;
+  }
+  // No chain running. Drop any in-flight display we hold UNLESS it is a parked
+  // failure (terminal local state the daemon doesn't track).
+  const held = get(compositeChains)[worktreeId];
+  if (held && !held.failed) clearCompositeChain(worktreeId);
+  return null;
+}
+
+// Cancel a worktree's in-flight composite chain (the × in the morphed header).
+// Resolves the Job id from the chain display, falling back to the live Jobs
+// store for the window before the first progress event sets the chain's jobId.
+export async function cancelCompositeChain(
+  worktreeId: Id | null = get(gitWorktreeId),
+): Promise<void> {
+  if (!worktreeId) return;
+  const chain = get(compositeChains)[worktreeId];
+  const jobId =
+    chain?.jobId ??
+    Object.values(get(jobs)).find(
+      (job) =>
+        job.worktreeId === worktreeId &&
+        (job.kind === "commit-and-push" || job.kind === "create-pr"),
+    )?.id ??
+    null;
+  if (jobId) await cancelJob(jobId);
+  // Clear the optimistic display NOW — this is the clear that actually settles
+  // the button. The daemon's cancellation arrives as a plain error-typed
+  // `job-completed`, which completeJob's composite-error path would otherwise
+  // PARK as an oxide failure; clearing here first means no chain entry survives
+  // for that path to park (the park is guarded on a still-present entry), so the
+  // button settles instead of flipping to ✗. This also covers the cancel racing
+  // the first progress event.
+  clearCompositeChain(worktreeId);
 }
 
 function upsert<T extends { id: Id }>(items: T[], item: T): T[] {
@@ -534,6 +1479,31 @@ function omitKey<T>(record: Record<Id, T>, id: Id): Record<Id, T> {
   const next = { ...record };
   delete next[id];
   return next;
+}
+
+// Evict every per-worktree cache/bookkeeping entry belonging to a worktree.
+// The diff caches key by `${worktreeId}\0…` (working-tree diff variants use
+// `\0<path>\0<options>`, commit diffs use `\0<sha>`), so a single prefix sweep
+// covers them; the PR-freshness maps key by bare worktree id. Called when a
+// worktree disappears (removed directly, or as part of a removed project) — the
+// entries (especially commit diffs, which hold full multi-file CommitDiffData and
+// otherwise live until disposeDaemon) would leak forever otherwise. `Map.delete`
+// is idempotent, so callers may also delete these directly without double-free.
+function sweepWorktreeCaches(worktreeId: Id): void {
+  const prefix = `${worktreeId}\0`;
+  for (const map of [
+    diffCache,
+    diffRequestSeq,
+    diffCacheWriteSeq,
+    commitDiffCache,
+    commitDiffInFlight,
+  ]) {
+    for (const key of map.keys()) {
+      if (key.startsWith(prefix)) map.delete(key);
+    }
+  }
+  prByWorktreeApplied.delete(worktreeId);
+  prByWorktreeStarted.delete(worktreeId);
 }
 
 function removeWorktreeLocal(worktreeId: Id): void {
@@ -550,13 +1520,10 @@ function removeWorktreeLocal(worktreeId: Id): void {
   worktrees.update((items) => items.filter((worktree) => worktree.id !== worktreeId));
   dirtyWorktrees.update((current) => omitKey(current, worktreeId));
   worktreeLineStats.update((current) => omitKey(current, worktreeId));
+  compositeChains.update((current) => omitKey(current, worktreeId));
   prByWorktree.update((current) => omitKey(current, worktreeId));
-  prByWorktreeApplied.delete(worktreeId);
-  prByWorktreeStarted.delete(worktreeId);
-  const diffCachePrefix = `${worktreeId}\0`;
-  for (const key of diffCache.keys()) {
-    if (key.startsWith(diffCachePrefix)) diffCache.delete(key);
-  }
+  // sweepWorktreeCaches also drops prByWorktreeApplied/prByWorktreeStarted.
+  sweepWorktreeCaches(worktreeId);
 
   if (get(gitStatus)?.worktree_id === worktreeId) gitStatus.set(null);
   if (get(gitWorktreeId) === worktreeId) {
@@ -820,6 +1787,47 @@ function applySessionAgent(sessionId: Id, agent: KnownAgent | null): void {
   }
 }
 
+// The notification body for a session: `project · branch` of its worktree, so
+// an OS notification names *which* run acted without the user opening the app.
+// Resolves session → parent → worktree → branch + owning project; degrades to
+// the project name alone (plain-project sessions have no worktree), then the
+// session name, then null (no body) so the notification still fires unadorned.
+function notificationBodyForSession(sessionId: Id): string | null {
+  const session = get(sessions).find((s) => s.id === sessionId);
+  if (!session) return null;
+  if (session.parent.kind === "worktree") {
+    const worktree = get(worktrees).find((w) => w.id === session.parent.id);
+    if (worktree) {
+      const project = get(projects).find((p) => p.id === worktree.project_id);
+      return project ? `${project.name} · ${worktree.branch}` : worktree.branch;
+    }
+  } else {
+    const project = get(projects).find((p) => p.id === session.parent.id);
+    if (project) return project.name;
+  }
+  return session.name || null;
+}
+
+// Dispatch one agent-state transition to the notification engine, reading the
+// PREVIOUS stored state from `agentStates` (the single source of truth) before
+// it's overwritten. Both the live event and the SessionOpened replay route
+// through here; `replay` tells notifications.ts to set the baseline without
+// notifying (replayed state must never ping — ADR 0011 attach replay).
+function noteAgentStateTransition(
+  sessionId: Id,
+  nextState: AgentState | null,
+  agent: KnownAgent | null,
+  detail: string | null,
+  replay: boolean,
+): void {
+  noteAgentState(sessionId, get(agentStates)[sessionId] ?? null, nextState, detail, {
+    replay,
+    agent,
+    body: notificationBodyForSession(sessionId),
+    activeSessionId: get(activeSessionId),
+  });
+}
+
 export function applyHitchEvent(event: HitchEvent): void {
   if (event.type === "project-updated") {
     projects.update((items) => upsert(items, event.project as Project));
@@ -836,6 +1844,7 @@ export function applyHitchEvent(event: HitchEvent): void {
     dirtyWorktrees.update((current) =>
       current[worktreeId] === dirty ? current : { ...current, [worktreeId]: dirty },
     );
+    requestDiffRefreshOnNextStatus(worktreeId);
     // Refresh the full status so the tree's line stats and, when selected,
     // the Changes panel track filesystem changes live.
     void loadGitStatus(worktreeId).catch(() => {});
@@ -850,7 +1859,18 @@ export function applyHitchEvent(event: HitchEvent): void {
     const sessionId = (event.session_id as Id | null) ?? null;
     const state = (event.state as AgentState | null) ?? null;
     const agent = (event.agent as KnownAgent | null | undefined) ?? null;
+    const detail = (event.detail as string | null | undefined) ?? null;
     if (sessionId) {
+      // Notify BEFORE applying so the engine sees the true previous state. Use
+      // the event's announced identity when present (an identity announce), else
+      // the session's already-known agent (a pure state report carries none).
+      noteAgentStateTransition(
+        sessionId,
+        state,
+        agent ?? get(sessionAgents)[sessionId] ?? null,
+        detail,
+        false,
+      );
       applyAgentState(sessionId, state);
       applySessionAgent(sessionId, agent);
     }
@@ -875,7 +1895,18 @@ export function applyHitchEvent(event: HitchEvent): void {
       (event.kind as string | null) ?? null,
     );
   }
+  if (event.type === "composite-job-progress") {
+    applyCompositeJobProgress(
+      event.job_id as Id,
+      event.worktree_id as Id,
+      event.kind as CompositeJobKind,
+      event.step as CompositeStep,
+      event.phase as StepPhase,
+    );
+  }
   if (event.type === "job-completed") {
+    // `completeJob` also resolves the composite chain's per-worktree display
+    // state (clear on success, park the oxide failure on a mid-chain failure).
     completeJob(event.job_id as Id, event.response as Response);
   }
   if (event.type === "session-opened") {
@@ -885,7 +1916,12 @@ export function applyHitchEvent(event: HitchEvent): void {
     // attach so a late-joining window is immediately correct (ADR 0011).
     const state = (event.agent_state as AgentState | null | undefined) ?? null;
     const agent = (event.agent as KnownAgent | null | undefined) ?? null;
+    const detail = (event.agent_detail as string | null | undefined) ?? null;
     const outputActive = Boolean(event.output_active);
+    // Replayed state primes the notification baseline (and turn-start clock for
+    // an attach mid-turn) WITHOUT notifying — a catching-up window must never
+    // ping for state it merely learned about (ADR 0011 attach replay).
+    noteAgentStateTransition(session.id, state, agent, detail, true);
     applyAgentState(session.id, state);
     applySessionAgent(session.id, agent);
     sessionOutputActive.update((current) =>
@@ -926,7 +1962,9 @@ export function applyHitchEvent(event: HitchEvent): void {
       return next;
     });
     closeSessionOutput(sessionId);
-
+    // Drop the session's notification bookkeeping (turn-start clock) so the
+    // per-session maps don't leak as sessions come and go.
+    forgetSessionNotifications(sessionId);
   }
   if (event.type === "project-removed") {
     // A project was forgotten (possibly by another window). Drop it and
@@ -947,6 +1985,14 @@ export function applyHitchEvent(event: HitchEvent): void {
     }
     projects.update((items) => items.filter((p) => p.id !== projectId));
     worktrees.update((items) => items.filter((w) => w.project_id !== projectId));
+    // Evict every vanished worktree's per-worktree state (working-tree AND commit
+    // diff caches, plus the PR-freshness maps), which are keyed per worktree and
+    // would otherwise leak until disposeDaemon. We sweep directly rather than call
+    // removeWorktreeLocal per worktree: this handler already owns selection reset
+    // above, and the daemon broadcasts session-closed for any killed sessions
+    // (pruned in the session-closed branch) — so sweepWorktreeCaches covers the
+    // remaining per-worktree leaks (the same set removeWorktreeLocal sweeps).
+    for (const id of removedWorktreeIds) sweepWorktreeCaches(id);
   }
 }
 
@@ -995,6 +2041,10 @@ export async function initDaemon(): Promise<void> {
     unlisteners.push(
       await listen("hitch-reconnected", () => {
         void refreshAll().catch((err) => error.set(toMessage(err)));
+        // A reconnect mid-chain must restore the selected worktree's in-flight
+        // composite chain display from the daemon's active Jobs (chains are
+        // ephemeral across a daemon RESTART, but survive a transient socket drop).
+        void refreshActiveJobs();
       }),
     );
 
@@ -1014,6 +2064,14 @@ export async function initDaemon(): Promise<void> {
 
     await invoke("connect_daemon");
     applyDaemonStatus("running", null);
+    // Warm the cached notification-permission decision once on connect (unless
+    // the user has notifications off) so the first fire doesn't pay an IPC
+    // round-trip. This shows no dialog on desktop — the plugin's desktop
+    // permission is an always-granted stub; the macOS prompt (and delivery) only
+    // happens when a notification is actually posted from an installed .app. Not
+    // awaited: it must not hold up the initial snapshot, and every send guards on
+    // the cached decision anyway.
+    void primeNotificationPermission();
     await refreshSnapshotAfterConnect();
   } catch (err) {
     applyDaemonStatus("failed", toMessage(err));
@@ -1050,6 +2108,14 @@ export function disposeDaemon(): void {
     closeSessionOutput(sessionId);
   }
   rings.clear();
+  diffCache.clear();
+  diffRequestSeq.clear();
+  diffCacheWriteSeq.clear();
+  commitDiffCache.clear();
+  commitDiffInFlight.clear();
+  commitLog.set(EMPTY_COMMIT_LOG);
+  commitLogHeadId = null;
+  compositeChains.set({});
   booted = false;
 }
 
@@ -1114,6 +2180,25 @@ export async function loadGitStatus(worktreeId: Id): Promise<GitStatus> {
   // UI state. This matters when agents edit files while the user stages changes.
   if (requestSeq === statusRequestSeq && get(gitWorktreeId) === worktreeId) {
     gitStatus.set(response.status);
+    // History freshness rides the 1s status backbone (no new poller). When the
+    // selected worktree's HEAD sha moves (e.g. an Agent committed in a PTY),
+    // refresh the log IN PLACE — but only when it's worth it: HISTORY is the
+    // visible rail view, or the log store is already showing this worktree (stale
+    // rows the user may switch back to). A non-visible, never-loaded log waits for
+    // its first open. The shape `head_commit_id` is optional for rolling upgrades.
+    //
+    // refreshCommitLog (not loadCommitLog) preserves the paginated row count and,
+    // via the sha-keyed each, every surviving row's DOM node — so a commit landing
+    // mid-click never tears down the row the user is pressing (which would drop the
+    // synthesized `click` and leave late rows un-openable; see refreshCommitLog).
+    const headId = response.status.head_commit_id ?? null;
+    if (headId !== commitLogHeadId) {
+      commitLogHeadId = headId;
+      const logShowsThisWorktree = get(commitLog).worktreeId === worktreeId;
+      if (get(railView) === "history" || logShowsThisWorktree) {
+        void refreshCommitLog();
+      }
+    }
   }
   dirtyWorktrees.update((current) =>
     current[worktreeId] === response.status.dirty
@@ -1301,16 +2386,30 @@ function optimisticallySetFilesStaged(
   gitStatus.update((current) => {
     if (!current || current.worktree_id !== worktreeId) return current;
     let changed = false;
-    const files: ChangedFile[] = current.files.map((file) => {
-      if (!selected.has(file.path)) return file;
-      const next = {
-        ...file,
-        staged,
-        status: staged ? statusAfterStage(file.status) : statusAfterUnstage(file.status),
-      };
-      changed ||= next.staged !== file.staged || next.status !== file.status;
-      return next;
-    });
+    // A partially-staged file has two rows (staged + unstaged). Flipping a side
+    // merges it into the other side's row, so dedupe by (path, staged) — keeping
+    // the first occurrence preserves the flipped row's post-stage/unstage status
+    // (rows arrive staged-side first, matching the daemon's emit order).
+    const seen = new Set<string>();
+    const files: ChangedFile[] = [];
+    for (const file of current.files) {
+      let next = file;
+      if (selected.has(file.path) && file.staged !== staged) {
+        next = {
+          ...file,
+          staged,
+          status: staged ? statusAfterStage(file.status) : statusAfterUnstage(file.status),
+        };
+        changed = true;
+      }
+      const key = `${next.staged}\0${next.path}`;
+      if (seen.has(key)) {
+        changed = true;
+        continue;
+      }
+      seen.add(key);
+      files.push(next);
+    }
     return changed ? { ...current, dirty: files.length > 0, files } : current;
   });
   dirtyWorktrees.update((current) =>
@@ -1442,14 +2541,16 @@ export function recordTerminalSize(cols: number, rows: number): void {
   if (cols > 0 && rows > 0) lastTerminalSize = { cols, rows };
 }
 
-// The xterm config in Terminal.svelte. Kept here so the offscreen measuring
-// span below uses the exact same font as the real terminal.
-const TERM_FONT_FAMILY =
-  '"Berkeley Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace';
-const TERM_FONT_SIZE_PX = 12.5;
-// `.term` padding from Terminal.svelte's stylesheet (`padding: 12px 14px`).
-const TERM_PADDING_X = 14;
-const TERM_PADDING_Y = 12;
+// The xterm config and panel inset in Terminal.svelte. Kept here so the
+// offscreen measuring span uses the same font as the real terminal and subtracts
+// the wrapper padding before dividing the grid. The font stack comes from the
+// shared settings helper (user-picked family + built-in fallback), the same
+// source Terminal.svelte renders with.
+const TERM_FONT_SIZE_PX = 13;
+// `.terminal` padding from Terminal.svelte (`padding: 14px 16px 4px`).
+const TERM_PADDING_X_PX = 16;
+const TERM_PADDING_TOP_PX = 14;
+const TERM_PADDING_BOTTOM_PX = 4;
 // Last-resort grid when nothing on the page is measurable (e.g. opening a
 // session before any view has laid out). A sane terminal-ish default.
 const FALLBACK_COLS = 120;
@@ -1481,7 +2582,7 @@ function estimateInitialSize(): { cols: number; rows: number } {
   probe.style.position = "absolute";
   probe.style.visibility = "hidden";
   probe.style.whiteSpace = "pre";
-  probe.style.fontFamily = TERM_FONT_FAMILY;
+  probe.style.fontFamily = terminalFontStack(get(terminalFontFamily));
   probe.style.fontSize = `${TERM_FONT_SIZE_PX}px`;
   probe.style.lineHeight = "normal";
   probe.textContent = "0".repeat(100);
@@ -1493,9 +2594,9 @@ function estimateInitialSize(): { cols: number; rows: number } {
   if (cellWidth <= 0 || cellHeight <= 0) {
     return { cols: FALLBACK_COLS, rows: FALLBACK_ROWS };
   }
-  // Subtract the `.term` padding the content area loses on both sides.
-  const usableWidth = rect.width - TERM_PADDING_X * 2;
-  const usableHeight = rect.height - TERM_PADDING_Y * 2;
+  // Subtract the `.terminal` wrapper padding before dividing by the cell size.
+  const usableWidth = rect.width - TERM_PADDING_X_PX * 2;
+  const usableHeight = rect.height - TERM_PADDING_TOP_PX - TERM_PADDING_BOTTOM_PX;
   const cols = Math.max(1, Math.floor(usableWidth / cellWidth));
   const rows = Math.max(1, Math.floor(usableHeight / cellHeight));
   return { cols, rows };
@@ -1563,6 +2664,21 @@ export async function closeSession(session: Session): Promise<void> {
   } catch (err) {
     error.set(toMessage(err));
   }
+}
+
+// Close whichever tab is active (Cmd+W), matching how SessionTabs' per-tab ×
+// closes each kind: an active diff tab is dropped by path via `closeDiff`
+// (which re-activates a neighbor); an active session is closed via
+// `closeSession` (kill + drop, no confirm — the same flow the × button and the
+// context menu use). No-op when nothing is active.
+export function closeActiveTab(): void {
+  if (get(diffActive)) {
+    const path = get(activeDiffPath);
+    if (path !== null) closeDiff(path);
+    return;
+  }
+  const session = get(activeSession);
+  if (session) void closeSession(session);
 }
 
 export async function resizeSession(
@@ -1644,48 +2760,267 @@ export function sendInput(sessionId: Id, data: string): void {
   void invoke("send_session_input", { sessionId, data });
 }
 
+// Write a tab's fetched text into the open set, if a tab for `path` still
+// exists. A no-op once the tab has been closed (so a late fetch can't resurrect
+// a dismissed tab).
+function setDiffTabText(path: string, text: string | null): void {
+  diffTabs.update((tabs) =>
+    tabs.some((tab) => tab.path === path)
+      ? tabs.map((tab) => (tab.path === path ? { ...tab, text } : tab))
+      : tabs,
+  );
+}
+
 // `activate` opens the diff as the center view (a user clicking a changed
 // file). The keep-in-sync refresh from staging passes `false` so re-fetching a
-// diff never yanks the view away from a terminal the user is looking at.
-export async function viewDiff(path: string, activate = true): Promise<void> {
+// diff never yanks the view away from a terminal the user is looking at. Opening
+// a file that's already in the strip re-uses its tab (no duplicates) and just
+// refreshes its text; a new file appends a tab.
+export async function viewDiff(path: string, activate = true, staged?: boolean): Promise<void> {
   const worktreeId = get(gitWorktreeId);
   if (!worktreeId) return;
-  const requestSeq = ++diffRequestSeq;
-  const cacheKey = `${worktreeId}\0${path}`;
-  diffPath.set(path);
-  diffText.set(diffCache.get(cacheKey) ?? null);
-  if (activate) diffActive.set(true);
+  const cacheKey = diffCacheKey(worktreeId, path, staged);
+  const requestKey = diffTabFreshnessKey(worktreeId, path);
+  const requestSeq = nextDiffRequestSeq(worktreeId, "single", path);
+  const writeSeq = nextDiffCacheWriteSeq(cacheKey);
+
+  const cached = diffCache.get(cacheKey) ?? null;
+  diffTabs.update((tabs) =>
+    tabs.some((tab) => tab.path === path)
+      ? tabs.map((tab) => (tab.path === path ? { ...tab, text: cached, staged } : tab))
+      : [...tabs, { path, text: cached, staged }],
+  );
+  if (activate) {
+    activeDiffPath.set(path);
+    diffActive.set(true);
+  } else if (get(activeDiffPath) === null) {
+    // First tab opened by a background refresh still needs an active target so
+    // the view has something to show once the user switches to it.
+    activeDiffPath.set(path);
+  }
+
+  // The tab is live (still open) and this is the freshest request for the visible path.
+  const isLatest = () =>
+    diffRequestSeq.get(requestKey) === requestSeq &&
+    get(gitWorktreeId) === worktreeId &&
+    get(diffTabs).some((tab) => tab.path === path);
+
   try {
-    const response = await daemonRequest<Response & { diff: { diff: string } }>({
+    const request: GitDiffRequest = {
       type: "git-diff",
       worktree_id: worktreeId,
       path,
-    });
-    diffCache.set(cacheKey, response.diff.diff);
-    if (
-      requestSeq === diffRequestSeq &&
-      get(gitWorktreeId) === worktreeId &&
-      get(diffPath) === path
-    ) {
-      diffText.set(response.diff.diff);
-    }
+      ...(staged === undefined ? {} : { staged }),
+      ...diffOptionFields(),
+    };
+    const response = await daemonRequest<Response & { diff: { diff: string } }>(request);
+    writeFreshDiffCache(cacheKey, writeSeq, response.diff.diff);
+    if (isLatest()) setDiffTabText(path, response.diff.diff);
   } catch (err) {
     error.set(toMessage(err));
-    if (
-      requestSeq === diffRequestSeq &&
-      get(gitWorktreeId) === worktreeId &&
-      get(diffPath) === path
-    ) {
-      diffText.set(null);
-    }
+    if (isLatest()) setDiffTabText(path, null);
   }
 }
 
-// Close the diff tab and fall back to the active session's terminal.
-export function closeDiff(): void {
-  diffActive.set(false);
-  diffPath.set(null);
-  diffText.set(null);
+// Fetch one file's unified diff for the all-changes fan-out. It has its own
+// freshness key so it cannot cancel a single-file tab request for the same path.
+// Cache writes are separately guarded so an older response cannot replace newer
+// cached text.
+async function fetchFileDiff(
+  worktreeId: Id,
+  path: string,
+  staged: boolean,
+): Promise<string | null> {
+  const cacheKey = diffCacheKey(worktreeId, path, staged);
+  const cached = diffCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const requestSeq = nextDiffRequestSeq(worktreeId, "all", path, staged);
+  const requestKey = diffFreshnessKey(worktreeId, "all", path, staged);
+  const writeSeq = nextDiffCacheWriteSeq(cacheKey);
+  try {
+    const request: GitDiffRequest = {
+      type: "git-diff",
+      worktree_id: worktreeId,
+      path,
+      staged,
+      ...diffOptionFields(),
+    };
+    const response = await daemonRequest<Response & { diff: { diff: string } }>(request);
+    const wrote = writeFreshDiffCache(cacheKey, writeSeq, response.diff.diff);
+    if (diffRequestSeq.get(requestKey) !== requestSeq) return diffCache.get(cacheKey) ?? null;
+    return wrote ? response.diff.diff : diffCache.get(cacheKey) ?? null;
+  } catch (err) {
+    error.set(toMessage(err));
+    return null;
+  }
+}
+
+// Open (or refresh + activate) the single all-changes tab: one unified view of
+// every changed file. The file list is taken from the current git status (staged
+// first, then unstaged, matching RightRail), and each diff is fetched through a
+// bounded pool via `fetchFileDiff` (reusing `diffCache`). A monotonic seq guards
+// older fan-out (e.g. from before a stage/unstage) overwriting a newer one. The
+// tab is represented by the `ALL_CHANGES_TAB` sentinel in `diffTabs` so it lives
+// in the strip as a peer; its content lives in `allChangesFiles`, not its `text`.
+let allChangesSeq = 0;
+export async function viewAllChanges(activate = true): Promise<void> {
+  const worktreeId = get(gitWorktreeId);
+  if (!worktreeId) return;
+  const status = get(gitStatus);
+  const files = status && status.worktree_id === worktreeId ? status.files : [];
+  // Staged before unstaged, preserving each group's existing order.
+  const ordered = [
+    ...files.filter((file) => file.staged),
+    ...files.filter((file) => !file.staged),
+  ];
+  lastAllChangesSig = allChangesStatusSignature(worktreeId, files);
+
+  const seq = ++allChangesSeq;
+  // Seed the rows (text `null` = loading) so the view paints immediately, reusing
+  // any cached diff text up front to avoid a flash of "Loading" for warm files.
+  allChangesFiles.set(
+    ordered.map((file) => ({
+      path: file.path,
+      staged: file.staged,
+      text: diffCache.get(diffCacheKey(worktreeId, file.path, file.staged)) ?? null,
+    })),
+  );
+
+  diffTabs.update((tabs) =>
+    tabs.some((tab) => tab.path === ALL_CHANGES_TAB)
+      ? tabs
+      : [...tabs, { path: ALL_CHANGES_TAB, text: null }],
+  );
+  if (activate) {
+    activeDiffPath.set(ALL_CHANGES_TAB);
+    diffActive.set(true);
+  } else if (get(activeDiffPath) === null) {
+    activeDiffPath.set(ALL_CHANGES_TAB);
+  }
+
+  // This fan-out is still the freshest and its worktree is still selected.
+  const isLatest = () => allChangesSeq === seq && get(gitWorktreeId) === worktreeId;
+
+  // Only fetch diffs for rows the user has expanded. A collapsed section isn't
+  // rendered, so fetching it is wasted work — and the 1s status poll can flip the
+  // signature on pure line-count drift (e.g. typing in an external editor) and
+  // evict the diff cache, which would otherwise re-fan every file. Collapsed rows
+  // fetch lazily when expanded (`fetchAllChangesRow`); their seeded text (cache
+  // hit or `null`) is left in place here. On the initial open every row is
+  // collapsed (the default), so nothing fans out until the user expands rows.
+  const expanded = ordered.filter((file) => allChangesRowExpanded(file.path, file.staged));
+
+  await forEachBounded(expanded, ALL_CHANGES_DIFF_CONCURRENCY, async (file) => {
+    const text = await fetchFileDiff(worktreeId, file.path, file.staged);
+    if (!isLatest()) return;
+    allChangesFiles.update((rows) =>
+      rows.map((row) =>
+        row.path === file.path && row.staged === file.staged
+          ? {
+              ...row,
+              text: text ?? diffCache.get(diffCacheKey(worktreeId, file.path, file.staged)) ?? row.text,
+            }
+          : row,
+      ),
+    );
+  });
+}
+
+// Fetch one all-changes row's diff on demand — used when the user expands a
+// previously-collapsed section. Reuses the diff cache (so an already-warm row
+// renders instantly with no daemon round-trip) and the same freshness guards as
+// the fan-out, so a stage/unstage or worktree switch in flight can't repopulate a
+// stale row. A no-op for the sentinel-less / wrong-worktree state.
+export async function fetchAllChangesRow(path: string, staged: boolean): Promise<void> {
+  const worktreeId = get(gitWorktreeId);
+  if (!worktreeId) return;
+  const seq = allChangesSeq;
+  const text = await fetchFileDiff(worktreeId, path, staged);
+  if (allChangesSeq !== seq || get(gitWorktreeId) !== worktreeId) return;
+  allChangesFiles.update((rows) =>
+    rows.map((row) =>
+      row.path === path && row.staged === staged
+        ? { ...row, text: text ?? diffCache.get(diffCacheKey(worktreeId, path, staged)) ?? row.text }
+        : row,
+    ),
+  );
+}
+
+// Expand or collapse every all-changes row at once — the head's expand-all /
+// collapse-all toggle. Collapsing just clears the expanded set (collapsed rows
+// keep their seeded text; nothing renders them). Expanding marks every current
+// row expanded and re-runs `viewAllChanges` so the diffs fetch through its
+// bounded pool (warm rows seed from the cache instantly) instead of N unbounded
+// per-row on-demand fetches.
+export function setAllChangesAllExpanded(expanded: boolean): void {
+  if (!expanded) {
+    allChangesExpanded.set(new Set());
+    return;
+  }
+  allChangesExpanded.set(
+    new Set(get(allChangesFiles).map((row) => allChangesRowKey(row.path, row.staged))),
+  );
+  void viewAllChanges(false);
+}
+
+// Re-fetch every open diff under the current re-diff options. Called when
+// `diffIgnoreWhitespace` / `diffContextLines` change: those options are part of
+// the cache key, so a fresh fetch under the new key is what surfaces the
+// re-shaped diff (old-option text stays cached but unreferenced). Single-file
+// tabs re-run `viewDiff` with the `staged` side they were opened with, never
+// stealing focus (`activate: false`); the all-changes tab re-fans via
+// `viewAllChanges`. Both reuse the existing freshness guards, so this races
+// safely with concurrent stage/unstage refreshes.
+export function refreshOpenDiffs(): void {
+  if (!get(gitWorktreeId)) return;
+  const tabs = get(diffTabs);
+  for (const tab of tabs) {
+    if (tab.path === ALL_CHANGES_TAB) continue;
+    // Commit tabs are fed by the commit-diff path (`fetchCommitDiff` /
+    // `commitDiffCache`, immutable per-sha snapshots) and rendered client-side
+    // via `diffViewOptions` — never re-diffed here. Sending their sentinel
+    // (`\0commit:<sha>`) to `viewDiff` would emit it verbatim as a git pathspec,
+    // yielding an empty diff that clobbers the tab's text and the diff cache.
+    if (isCommitTab(tab.path)) continue;
+    void viewDiff(tab.path, false, tab.staged);
+  }
+  if (tabs.some((tab) => tab.path === ALL_CHANGES_TAB)) void viewAllChanges(false);
+}
+
+// Close one diff tab (or, with no argument, all of them) and fall back to the
+// active session's terminal when none remain. When the closed tab was the
+// active one, the neighbor to its left becomes active (the right one if it was
+// first), matching normal editor tab behavior.
+export function closeDiff(path?: string): void {
+  if (path === undefined) {
+    allChangesSeq += 1;
+    diffTabs.set([]);
+    activeDiffPath.set(null);
+    diffActive.set(false);
+    allChangesFiles.set([]);
+    allChangesExpanded.set(new Set());
+    return;
+  }
+  const tabs = get(diffTabs);
+  const index = tabs.findIndex((tab) => tab.path === path);
+  if (index === -1) return;
+  // Closing the all-changes tab drops its per-file rows and invalidates any
+  // in-flight fan-out so late rows cannot repopulate a dismissed tab.
+  if (path === ALL_CHANGES_TAB) {
+    allChangesSeq += 1;
+    allChangesFiles.set([]);
+    allChangesExpanded.set(new Set());
+  }
+  const remaining = tabs.filter((tab) => tab.path !== path);
+  diffTabs.set(remaining);
+  if (remaining.length === 0) {
+    activeDiffPath.set(null);
+    diffActive.set(false);
+  } else if (get(activeDiffPath) === path) {
+    // Prefer the left neighbor; fall back to the new first tab.
+    const neighbor = remaining[Math.max(0, index - 1)];
+    activeDiffPath.set(neighbor.path);
+  }
 }
 
 export async function setFilesStaged(
@@ -1709,20 +3044,34 @@ export async function setFilesStaged(
     });
     gitBusy.set(false);
     void loadGitStatus(worktreeId).catch((err) => error.set(toMessage(err)));
-    // Keep an open diff in sync if its file was just (un)staged, without
-    // stealing focus from a terminal the user may be looking at.
-    const open = get(diffPath);
-    if (open && paths.includes(open)) {
-      diffCache.delete(`${worktreeId}\0${open}`);
-      void viewDiff(open, false);
+    // Keep any open diff tabs in sync if their file was just (un)staged, without
+    // stealing focus from a terminal the user may be looking at. Each tab is
+    // re-fetched on its OWN staged side (`tab.staged`), not the operation's
+    // `staged`, so an open unstaged-side tab stays unstaged (mirroring
+    // `refreshOpenDiffs`). Staging a fully-unstaged file leaving its unstaged
+    // diff empty is correct: the tab keeps its side rather than flipping.
+    const openTabs = get(diffTabs);
+    const affected = new Set(paths);
+    for (const path of paths) {
+      invalidateDiffCacheVariants(worktreeId, path);
     }
+    for (const tab of openTabs) {
+      if (tab.path === ALL_CHANGES_TAB) continue;
+      if (!affected.has(tab.path)) continue;
+      void viewDiff(tab.path, false, tab.staged);
+    }
+    const openPaths = new Set(openTabs.map((tab) => tab.path));
+    // The all-changes tab spans every file, so any (un)stage can change its file
+    // set (a row moving group) or counts. Re-fan it without stealing focus; the
+    // cache deletes above force its touched files to re-fetch.
+    if (openPaths.has(ALL_CHANGES_TAB)) void viewAllChanges(false);
   } catch (err) {
     error.set(toMessage(err));
     if (before?.worktree_id === worktreeId && get(gitWorktreeId) === worktreeId) {
       gitStatus.set(before);
     }
     void loadGitStatus(worktreeId).catch((refreshErr) => error.set(toMessage(refreshErr)));
-    // Rethrow so awaiting callers (e.g. CommitDialog's stage-all-and-generate)
+    // Rethrow so awaiting callers (e.g. the Composer's auto-stage-then-generate)
     // can stop their flow instead of proceeding on a failed stage. The error
     // store + optimistic rollback above still surface the failure on their own,
     // so fire-and-forget callers must `.catch()` (see RightRail).
@@ -1748,10 +3097,18 @@ export async function discardFiles(paths: string[]): Promise<void> {
       worktree_id: worktreeId,
       paths,
     });
-    const open = get(diffPath);
-    for (const path of paths) diffCache.delete(`${worktreeId}\0${path}`);
-    if (open && paths.includes(open)) closeDiff();
+    // A discarded file has no diff left to show, so drop its tab.
+    for (const path of paths) {
+      invalidateDiffCacheVariants(worktreeId, path);
+      closeDiff(path);
+    }
     await loadGitStatus(worktreeId);
+    // The all-changes tab spans the whole working tree, so drop the discarded
+    // files from it (or close it if nothing changed remains) once status reloads.
+    if (get(diffTabs).some((tab) => tab.path === ALL_CHANGES_TAB)) {
+      if ((get(gitStatus)?.files.length ?? 0) === 0) closeDiff(ALL_CHANGES_TAB);
+      else void viewAllChanges(false);
+    }
   } catch (err) {
     error.set(toMessage(err));
     void loadGitStatus(worktreeId).catch((refreshErr) => error.set(toMessage(refreshErr)));
@@ -1765,7 +3122,8 @@ export function discardFile(path: string): Promise<void> {
 }
 
 export function discardAllFiles(): Promise<void> {
-  const paths = get(gitStatus)?.files.map((file) => file.path) ?? [];
+  // A partially-staged file appears as two rows; send each path only once.
+  const paths = [...new Set(get(gitStatus)?.files.map((file) => file.path) ?? [])];
   return discardFiles(paths);
 }
 
@@ -1815,7 +3173,7 @@ export async function generateCommitDraft(
     {
       type: "generate-commit-draft",
       worktree_id: worktreeId,
-      settings: draftGenerationSettings(),
+      settings: draftGenerationSettings({ commit: get(draftCommitInstructions) }),
     },
     "commit-draft",
   );
@@ -1830,7 +3188,7 @@ export async function generatePullRequestDraft(base: string | null): Promise<Pul
       type: "generate-pull-request-draft",
       worktree_id: worktreeId,
       base: base?.trim() || null,
-      settings: draftGenerationSettings(),
+      settings: draftGenerationSettings({ pr: get(draftPrInstructions) }),
     },
     "pr-draft",
   );
@@ -1845,27 +3203,48 @@ function draftDiscoverySettings(
   return draftSettingsForProvider(provider, null, paths);
 }
 
-function draftGenerationSettings(): DraftGenerationSettings | null {
+// Draft Instructions to fold into a generation request. Only one kind applies
+// per request (commit drafts carry the commit guidance; PR drafts the PR
+// guidance), so callers pass the relevant raw value; empties are omitted below.
+type DraftInstructions = { commit?: string; pr?: string };
+
+function draftGenerationSettings(
+  instructions: DraftInstructions = {},
+): DraftGenerationSettings | null {
   const provider = get(draftProvider);
   // No explicit desktop choice → omit settings so the daemon keeps its own
   // configured provider/model/path defaults instead of being forced to "stub".
   if (!provider) return null;
-  return draftSettingsForProvider(provider, get(draftModel).trim() || null);
+  return draftSettingsForProvider(
+    provider,
+    get(draftModel).trim() || null,
+    {},
+    instructions,
+  );
 }
 
 function draftSettingsForProvider(
   provider: DraftProvider,
   model: string | null,
   paths: { claudePath?: string; codexPath?: string } = {},
+  instructions: DraftInstructions = {},
 ): DraftGenerationSettings {
   const claudePath = (paths.claudePath ?? get(draftClaudePath)).trim() || null;
   const codexPath = (paths.codexPath ?? get(draftCodexPath)).trim() || null;
-  return {
+  const settings: DraftGenerationSettings = {
     provider,
     model,
     claude_path: claudePath,
     codex_path: codexPath,
   };
+  // Omit instruction fields entirely when blank/whitespace. The daemon treats
+  // whitespace as absent too, but keeping empties off the wire keeps the request
+  // shape identical to the no-instructions case (and to older callers).
+  const commit = instructions.commit?.trim();
+  if (commit) settings.commit_instructions = commit;
+  const pr = instructions.pr?.trim();
+  if (pr) settings.pr_instructions = pr;
+  return settings;
 }
 
 export async function push(worktreeId: Id | null = get(gitWorktreeId)): Promise<void> {
@@ -2017,9 +3396,12 @@ sessions.subscribe(($sessions) => {
   }
 });
 
-// Forget agent state, announced identity, output gate, and running command for
-// sessions that have closed (or were dropped on a reconnect), so stale labels
-// never linger on the tree or tabs.
+// Forget agent state, announced identity, output gate, running command, and
+// notification bookkeeping for sessions that have closed (or were dropped on a
+// reconnect), so stale labels never linger on the tree or tabs and the
+// notifications module's per-session turn clock doesn't leak. The session-closed
+// event path clears these per session; this catches sessions a reconnect snapshot
+// silently dropped (no session-closed event arrives for them).
 sessions.subscribe(($sessions) => {
   const liveIds = new Set($sessions.map((s) => s.id));
   function pruneToLive<T>(current: Record<Id, T>): Record<Id, T> {
@@ -2028,10 +3410,104 @@ sessions.subscribe(($sessions) => {
     ) as Record<Id, T>;
     return Object.keys(next).length === Object.keys(current).length ? current : next;
   }
+  // agentStates is the authoritative per-session set, so any id in it but no
+  // longer live was dropped — clear its notification turn clock too.
+  for (const id of Object.keys(get(agentStates))) {
+    if (!liveIds.has(id)) forgetSessionNotifications(id);
+  }
   agentStates.update(pruneToLive);
   sessionAgents.update(pruneToLive);
   sessionOutputActive.update(pruneToLive);
   sessionCommands.update(pruneToLive);
+});
+
+// Keep the all-changes tab fresh when status metadata changes (file set, side,
+// status, or line counts) without stealing focus. Idle polls can return a new
+// object for identical content every second, so identical metadata does not
+// refetch. A worktree-dirty event sets a one-shot force flag because the diff
+// text can change while this metadata stays identical.
+function allChangesStatusSignature(worktreeId: Id | null | undefined, files: ChangedFile[]): string {
+  return [
+    worktreeId ?? "",
+    ...files.map(
+      (file) =>
+        `${file.staged ? "1" : "0"}\0${file.path}\0${file.status}\0${file.additions ?? 0}\0${file.deletions ?? 0}`,
+    ),
+  ].join("\n");
+}
+
+// Per-(side,path) metadata signature for one changed file. Drives the single-file
+// tab live refresh: an idle status poll re-emits the same object every second, so
+// matching this stored value lets identical metadata skip a refetch (mirrors the
+// all-changes whole-status signature, but scoped per file so unrelated drift on
+// another file never re-diffs an open tab).
+function changedFileSignature(file: ChangedFile): string {
+  return `${file.status}\0${file.additions ?? 0}\0${file.deletions ?? 0}`;
+}
+const fileTabKey = (path: string, staged: boolean | undefined) => `${staged ? "1" : "0"}\0${path}`;
+
+let lastAllChangesSig: string | null = null;
+// Last seen metadata signature per single-file tab key, so an idle poll with
+// byte-identical status doesn't trigger a refresh storm. Cleared lazily below to
+// the set of files currently present.
+const lastSingleFileSigs = new Map<string, string>();
+gitStatus.subscribe(($status) => {
+  const files = $status?.files ?? [];
+  const worktreeId = $status?.worktree_id;
+  // Consume the one-shot force flag exactly once per status emission so both the
+  // all-changes path and the single-file path below see it. A worktree-dirty edit
+  // can change diff text while line counts / file set stay byte-identical, so the
+  // signature gate alone would miss it (mirrors the all-changes design).
+  const forceRefresh = worktreeId
+    ? forcedDiffRefreshWorktrees.delete(worktreeId)
+    : false;
+
+  const hasAllChangesTab = get(diffTabs).some((tab) => tab.path === ALL_CHANGES_TAB);
+  if (hasAllChangesTab) {
+    const sig = allChangesStatusSignature(worktreeId, files);
+    if (sig !== lastAllChangesSig || forceRefresh) {
+      if (worktreeId) deleteDiffCacheForChangedFiles(worktreeId, files);
+      lastAllChangesSig = sig;
+      void viewAllChanges(false);
+    }
+  } else {
+    lastAllChangesSig = null;
+  }
+
+  // Mirror the all-changes live refresh for open single-file diff tabs: when this
+  // worktree's status changes (or a worktree-dirty force flag fires), evict the
+  // stale cache for each open tab whose file appears in the changed set and re-run
+  // viewDiff in the background (activate: false → no focus steal, no tab reorder;
+  // viewDiff updates the tab text in place). Without this, an external edit (e.g. an
+  // agent in the PTY) to a file with an open single-file tab would leave that tab
+  // showing the pre-edit diff indefinitely. Commit tabs are immutable per-sha
+  // snapshots and are never re-diffed here.
+  if (!worktreeId) {
+    lastSingleFileSigs.clear();
+    return;
+  }
+  const fileSigs = new Map(files.map((file) => [fileTabKey(file.path, file.staged), changedFileSignature(file)]));
+  for (const tab of get(diffTabs)) {
+    if (tab.path === ALL_CHANGES_TAB || isCommitTab(tab.path)) continue;
+    // Refresh a tab only when its own file's metadata signature changed OR the
+    // force flag fired, so idle polls (identical signature) and unrelated drift on
+    // other files never re-diff this tab.
+    const tabKey = fileTabKey(tab.path, tab.staged);
+    const sig = fileSigs.get(tabKey);
+    const hadPrior = lastSingleFileSigs.has(tabKey);
+    // First sight of this tab's file is not a change: the tab was just opened via
+    // viewDiff (already fresh), so only a DIFFERING prior signature counts.
+    const changed = sig !== undefined && hadPrior && sig !== lastSingleFileSigs.get(tabKey);
+    if (sig !== undefined) lastSingleFileSigs.set(tabKey, sig);
+    if (!changed && !forceRefresh) continue;
+    invalidateDiffCacheVariants(worktreeId, tab.path, tab.staged);
+    void viewDiff(tab.path, false, tab.staged);
+  }
+  // Forget signatures for files no longer in the status (e.g. reverted), so if the
+  // same path reappears later its first status counts as a change.
+  for (const key of lastSingleFileSigs.keys()) {
+    if (!fileSigs.has(key)) lastSingleFileSigs.delete(key);
+  }
 });
 
 // Reset the per-worktree Git view state and (re)load status whenever the target
@@ -2045,10 +3521,52 @@ gitWorktreeId.subscribe(($id) => {
   closeDiff();
   prUrl.set(null);
   prInfo.set(null);
+  // Swap the History log to the new worktree (per-worktree, refetched on
+  // selection). Reset the HEAD tracker so the next status doesn't mistake the new
+  // worktree's HEAD for an in-place commit on the old one and skip the load.
+  commitLog.set(EMPTY_COMMIT_LOG);
+  commitLogHeadId = null;
+  commitLogSeq += 1;
   stopGitStatusPolling();
   if ($id) {
     void loadGitStatus($id).catch((err) => error.set(toMessage(err)));
     void loadPrStatus($id);
+    // Restore any daemon-owned composite chain in flight for this worktree, so
+    // switching INTO a worktree mid-chain shows the exact step (and keeps
+    // following its events). The query is a fast in-memory read.
+    void refreshActiveJobs($id);
     startGitStatusPolling($id);
+    if (get(railView) === "history") void loadCommitLog();
   }
+});
+
+// The re-diff options change the daemon request, so a change must re-fetch any
+// open diff (the cache key already folds these in, so the refetch hits a fresh
+// key). Skip each store's synchronous initial emission — only user toggles
+// should trigger a refresh, not module load.
+let diffReDiffInit = 2;
+const onReDiffOptionChange = () => {
+  if (diffReDiffInit > 0) {
+    diffReDiffInit -= 1;
+    return;
+  }
+  refreshOpenDiffs();
+};
+diffIgnoreWhitespace.subscribe(onReDiffOptionChange);
+diffContextLines.subscribe(onReDiffOptionChange);
+
+// Load the History log lazily the first time it becomes the visible rail view
+// for the selected worktree (so a user who never opens HISTORY pays no `git-log`
+// cost). Switching back to a worktree whose log is already loaded is a no-op.
+// Skip the synchronous initial emission — startup selection drives the first load
+// via the gitWorktreeId subscription above.
+let railViewInit = true;
+railView.subscribe(($view) => {
+  if (railViewInit) {
+    railViewInit = false;
+    return;
+  }
+  if ($view !== "history") return;
+  const worktreeId = get(gitWorktreeId);
+  if (worktreeId && get(commitLog).worktreeId !== worktreeId) void loadCommitLog();
 });

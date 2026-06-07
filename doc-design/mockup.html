@@ -1,0 +1,1176 @@
+<!DOCTYPE html>
+<!--
+  Direction: PAPER TERMINAL (merged light + dark, single file)
+  Thesis: A supervision surface - warm letterpress-paper chrome around a deep-ink PTY, so the
+          terminal is the unmistakable star and your work reads like a typeset lab notebook.
+          Two themes in ONE file: :root = daylight paper; [data-theme="dark"] = warm dusk twin
+          (AA-derived). A quiet sun/moon instrument in the top bar toggles data-theme on <html>;
+          on load #dark / #light force a theme for screenshots, otherwise default light.
+  Latest iteration (2026-06-05, user feedback - worktree row states):
+    W1. WORD-ONLY rows: the l1 state glyph column (◆/▍/◴/●) is gone; rows start at the
+        git-branch icon and state lives solely in the colored uppercase statetag word on l2.
+        The word is the non-color channel, so "state never by color alone" still holds.
+        l2 re-aligns under the name (padding-left 29px -> 16px).
+    W2. State words appear ONLY when the user must act or be informed: AWAITING · ERROR
+        (act) and WORKING (informs). Idle/clean rows carry no state word - diffstat / PR
+        chip / facepile are their only meta - and with nothing to report the row collapses
+        to a single line (no l2). The rollup pill and tab needdot keep their marks.
+    W3. STALLED is removed from the state vocabulary: a session that is not working is
+        simply idle, not a labelled state (no duration heuristic). The ochre --st-stall
+        token survives only as the M (modified) file-status letter color. Accepted
+        trade-off: "finished and idle" vs "hung mid-task" look the same; awaiting/error
+        cover what needs attention. (State gallery: mockup-worktree-states.html.)
+  Prior iteration (user feedback):
+    R1. Rectangular shape language: border-radius removed from every button, chip/tag, input,
+        popover and keycap (split button, choices, stash, +/add affordances, theme toggle, PR
+        chip, rollup pill, file-status checkboxes, action menu, kbd). Tabs/terminal were already
+        square; this carries that crisp letterpress edge through the whole chrome. Only true
+        circles survive: facepile session marks, daemon dot, traffic lights, the tiny state dots.
+    R2. One refined keycap recipe everywhere (kbd): flat rectangle, 1px hairline border, NO
+        bevel/shadow, tabular mono 10.5px in a fixed 16px box, muted --ink-2 glyph, baseline-
+        nudged to sit with its label. On the iris primary it inverts to a light glyph on a
+        translucent hairline; inside the dark PTY permission choices it uses borderless-ink caps
+        tuned per choice (green / oxide / dim) for AA. Replaces the old beveled keycaps and the
+        bespoke .sc cap on the primary button.
+    R3. Command palette trigger moved to the CENTER of the top bar (absolutely centered to the
+        window width, not the flex remainder): a quiet 300px rectangular search/jump field with a
+        hairline border, a search glyph, the ⌘K keycap right-aligned inside it, and a teaching
+        placeholder "Jump to worktree, session, or action…". Daemon stays right, theme toggle
+        stays, traffic lights left; bar stays draggable and balanced.
+    0. Removed the terminal's top header bar (the `claude-code · ~/Code/hitch · feature/fast-reload`
+       line with the AWAITING INPUT tag): scrollback now starts directly under the tab strip, the
+       active tab's ink bridges straight into the ink with no chrome between. The term-body's 14px
+       top inset keeps the first line's breathing room. The awaiting-input state is still carried by
+       the tab runtag (needdot) and the left rail, which is sufficient. Dropped its markup, its CSS
+       (.term-bar + children, the pulse keyframes), the now-unused --term-barbg var, and its
+       reduced-motion rule.
+    A. Tab strip, final fix: ZERO padding above the tabs - tabs fill the strip's full 38px height
+       starting at its very top edge, so the active tab's ink runs from the strip's top hairline
+       straight down into the terminal with no chrome visible above the tabs. Tabs are square
+       (0 radius); the terminal panel is fully square + flush on every side; the seam is square.
+    B. Three-column header baseline grid: the left rail PROJECTS row, the center tab strip, and the
+       right rail CHANGES title row are all a fixed 38px tall with bottom hairlines meeting the same
+       y, so the three columns read as one aligned system.
+    C. Dynamic git action: the old static "Commit & Push + Stash" pair is replaced by ONE
+       state-derived split button mirroring the real app (apps/desktop/src/lib/components/RightRail.svelte).
+       Primary segment = the next meaningful step (here, with 2 staged + ↑3 + PR #142 open, that is
+       "Commit & Push", ⌘↵); caret opens a crisp letterpress action menu (no blur) listing Commit,
+       Commit & Push, Push ↑3, Pull, Open PR #142, Create PR, and a quiet "auto-generate commit
+       message" toggle. A faint mono hint line ("2 staged · ↑3 · PR #142 open") explains WHY the
+       primary is primary; Stash survives as a quiet text button on that line. The menu is hidden by
+       default and revealed when location.hash includes "actions" (e.g. #dark-actions) for review.
+    Prior: ahead/behind status (↑3) lives in the Changes branch context, tuned like the +18 −4 diffstat.
+  Prior iteration (user feedback):
+    1. Terminal panel now runs EDGE-TO-EDGE in the center column: zero gutter, the ink meets the
+       left/right column dividers and the bottom of the window directly. Only a 2-3px top radius
+       survives where the active tab bridges into the ink. Internal text inset stays comfortable.
+    2. Top bar cleanup: the git ahead/behind status (↑3) is gone from the window bar (it belongs to
+       the Changes panel). The daemon indicator is now a standalone quiet instrument (dot + word),
+       no shared background/border with the ⌘K hint or theme toggle, comfortable gaps between them.
+    3. Real harness marks as inline <svg><symbol> (no external requests): Claude = warm-coral
+       sunburst of tapered rays; Codex = neutral OpenAI blossom/knot; shell = rounded-square
+       terminal-prompt. Used in both the worktree facepiles and the session tabs via <use>.
+    4. Every project row uses the same plain folder icon (git vs plain no longer differ by icon).
+    5. Git concepts get Octicon-style inline SVG: git-branch on worktree/branch rows + the
+       Changes-panel branch line; git-pull-request on PR chips; git-commit on the commit action.
+  Pain points still addressed: unmissable blocked signal (the word AWAITING, never color
+    alone - now the only saturated text in a quiet rail); state words only when acting or
+    informing (AWAITING / ERROR / WORKING), idle rows silent; low review burden via typeset
+    marginalia and tabular +/- numerals; daemon "connected" status retained in the top bar.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hitch · Paper Terminal</title>
+<style>
+  :root{
+    /* warm paper neutrals - oklch, never #fff/#000 */
+    --paper-0:  oklch(97.4% 0.008 80);   /* page behind window */
+    --paper-1:  oklch(96.6% 0.010 78);   /* rails */
+    --paper-2:  oklch(98.0% 0.008 82);   /* raised cards / inputs */
+    --paper-3:  oklch(94.0% 0.012 76);   /* sunken wells, tab strip */
+    --line:     oklch(88.0% 0.014 74);   /* hairlines */
+    --line-soft:oklch(91.5% 0.012 76);
+
+    /* ink */
+    --ink-0:    oklch(28.0% 0.020 70);   /* primary text */
+    --ink-1:    oklch(42.0% 0.018 70);   /* secondary */
+    --ink-2:    oklch(56.0% 0.016 72);   /* tertiary / labels */
+    --ink-3:    oklch(66.0% 0.014 74);   /* faint */
+
+    /* the deep-ink terminal panel */
+    --term-bg:  oklch(22.5% 0.020 265);
+    --term-bg2: oklch(25.5% 0.020 265);
+    --term-line:oklch(34.0% 0.024 265);
+    --term-fg:  oklch(90.0% 0.012 90);
+    --term-dim: oklch(68.0% 0.018 100);
+
+    /* committed accent: deep iris - selection + needs-attention partner */
+    --iris:     oklch(48.0% 0.150 275);
+    --iris-ink: oklch(40.0% 0.160 275);
+    --iris-wash:oklch(93.5% 0.030 275);
+    --iris-line:oklch(82.0% 0.060 275);
+    --iris-on:  oklch(98% 0.01 280);     /* text on iris fill */
+    --iris-on-sc: oklch(92% 0.04 280);
+    --iris-on-sc-line: oklch(60% 0.10 280);
+
+    /* state hues, darkened for light bg, AA on paper */
+    --st-run:   oklch(48.0% 0.090 195);  /* working / streaming (teal-ink) */
+    --st-need:  oklch(47.0% 0.150 32);   /* awaiting approval (oxide red) */
+    --st-need-wash: oklch(94.0% 0.035 32);
+    --st-need-line: oklch(83.0% 0.080 32);
+    --st-stall: oklch(52.0% 0.075 75);   /* ochre - M file-status letter (stalled state removed) */
+    --st-ok:    oklch(50.0% 0.095 150);  /* clean / done (green-ink) */
+    --st-ok-glow: oklch(50% 0.095 150 / .14);
+
+    --diff-add: oklch(46.0% 0.095 150);
+    --diff-del: oklch(50.0% 0.130 28);
+
+    /* harness facepile marks */
+    --harness-claude: oklch(58% 0.150 30);
+    --harness-codex:  oklch(46% 0.040 250);
+    --harness-shell:  oklch(44% 0.020 80);
+    --harness-fg:     oklch(98% 0.01 90);
+    /* harness mark inks tuned for AA on the ringed circle fills */
+    --mark-claude: oklch(63% 0.165 32);  /* warm coral/terracotta sunburst */
+    --mark-codex:  oklch(40% 0.030 250); /* neutral ink blossom */
+    --mark-shell:  oklch(40% 0.018 80);  /* neutral ink terminal */
+
+    /* page backdrop + window seat */
+    --page-glow: oklch(98.4% 0.010 82);
+    --win-shadow:
+      0 1px 0 oklch(100% 0 0 / .6) inset,
+      0 28px 60px -28px oklch(30% 0.03 70 / .35),
+      0 6px 18px -10px oklch(30% 0.03 70 / .22);
+    --light-inset: oklch(100% 0 0 / .6);
+
+    --radius: 6px;
+    --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+
+    --r0:.75rem; --r1:.8125rem; --r2:.875rem; --r3:1rem; --r4:1.125rem;
+  }
+
+  /* ---------- DARK TWIN ---------- */
+  html[data-theme="dark"]{
+    /* warm dusk neutrals - chrome ~16-22% L, warm hue family carried over */
+    --paper-0:  oklch(16.5% 0.012 72);
+    --paper-1:  oklch(19.0% 0.013 72);
+    --paper-2:  oklch(22.0% 0.014 74);
+    --paper-3:  oklch(17.5% 0.012 70);
+    --line:     oklch(31.0% 0.016 74);
+    --line-soft:oklch(26.0% 0.014 72);
+
+    --ink-0:    oklch(91.0% 0.014 82);
+    --ink-1:    oklch(78.0% 0.014 80);
+    --ink-2:    oklch(64.0% 0.014 78);
+    --ink-3:    oklch(52.0% 0.013 76);
+
+    --term-bg:  oklch(12.0% 0.018 262);
+    --term-bg2: oklch(13.8% 0.018 262);
+    --term-line:oklch(26.0% 0.022 262);
+    --term-fg:  oklch(90.0% 0.012 90);
+    --term-dim: oklch(64.0% 0.016 100);
+
+    --iris:     oklch(64.0% 0.150 278);
+    --iris-ink: oklch(80.0% 0.120 280);
+    --iris-wash:oklch(28.0% 0.060 278);
+    --iris-line:oklch(42.0% 0.090 278);
+    --iris-on:  oklch(18% 0.03 280);
+    --iris-on-sc: oklch(28% 0.06 280);
+    --iris-on-sc-line: oklch(56% 0.10 280);
+
+    --st-run:   oklch(74.0% 0.120 195);
+    --st-need:  oklch(72.0% 0.150 32);
+    --st-need-wash: oklch(28.0% 0.060 32);
+    --st-need-line: oklch(42.0% 0.090 32);
+    --st-stall: oklch(78.0% 0.110 78);
+    --st-ok:    oklch(74.0% 0.120 152);
+    --st-ok-glow: oklch(74% 0.120 152 / .18);
+
+    --diff-add: oklch(76.0% 0.120 152);
+    --diff-del: oklch(74.0% 0.140 28);
+
+    --harness-claude: oklch(62% 0.150 30);
+    --harness-codex:  oklch(60% 0.060 250);
+    --harness-shell:  oklch(58% 0.022 80);
+    --harness-fg:     oklch(14% 0.012 80);
+    --mark-claude: oklch(72% 0.155 34);  /* warm coral, lifted for dusk circle */
+    --mark-codex:  oklch(82% 0.030 250); /* neutral light ink on dark circle */
+    --mark-shell:  oklch(82% 0.018 80);  /* neutral light ink on dark circle */
+
+    --page-glow: oklch(20.0% 0.016 74);
+    --win-shadow:
+      0 0 0 1px oklch(10% 0.01 72 / .5),
+      0 24px 60px -32px oklch(4% 0.01 72 / .7);
+    --light-inset: oklch(100% 0 0 / .04);
+  }
+
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{height:100%;}
+  body{
+    font-family:var(--ui);
+    background:
+      radial-gradient(120% 90% at 50% -10%, var(--page-glow), transparent 60%),
+      var(--paper-0);
+    color:var(--ink-0);
+    -webkit-font-smoothing:antialiased;
+    display:grid; place-items:center;
+    min-height:100vh; padding:28px;
+  }
+
+  /* ---------- macOS window ---------- */
+  .window{
+    width:1440px; max-width:100%; height:900px;
+    background:var(--paper-1);
+    border:1px solid var(--line);
+    border-radius:11px;
+    box-shadow:var(--win-shadow);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  /* ---------- single top bar: traffic lights + instruments, draggable ---------- */
+  .topbar{
+    height:42px; flex:0 0 42px;
+    display:flex; align-items:center; gap:18px;
+    padding:0 16px; position:relative;
+    background:linear-gradient(var(--paper-2), var(--paper-1));
+    border-bottom:1px solid var(--line);
+    -webkit-app-region:drag; /* the quiet, mostly-empty drag region */
+  }
+  .lights{display:flex; gap:8px; align-items:center; -webkit-app-region:no-drag;}
+  .lights i{width:12px; height:12px; border-radius:50%; display:block;
+    box-shadow:0 0 0 .5px oklch(0% 0 0 / .12) inset;}
+  html[data-theme="dark"] .lights i{ box-shadow:0 0 0 .5px oklch(0% 0 0 / .35) inset; }
+  .lights .r{background:oklch(63% 0.17 25);}
+  .lights .y{background:oklch(78% 0.14 85);}
+  .lights .g{background:oklch(72% 0.15 145);}
+  .topbar .grow{flex:1;}
+  .topbar .palette, .topbar .daemon, .topbar .theme-toggle{ -webkit-app-region:no-drag; }
+
+  /* ---------- command palette visual: absolutely centered in the window ----------
+     a quiet rectangular search/jump field (Linear/Arc style), pinned dead-center
+     of the whole bar width regardless of the flex content on either side. */
+  .palette{
+    position:absolute; left:50%; top:50%; translate:-50% -50%;
+    display:inline-flex; align-items:center; gap:8px;
+    width:300px; max-width:42vw; height:26px; padding:0 8px 0 9px;
+    background:var(--paper-2); border:1px solid var(--line); border-radius:0;
+    color:var(--ink-3); cursor:default;
+  }
+  .palette .seek{ width:13px; height:13px; flex:0 0 13px; color:var(--ink-3); }
+  .palette .ph{
+    flex:1; min-width:0; font-size:var(--r0); color:var(--ink-3);
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .palette .keys{ flex:0 0 auto; }
+  .palette kbd{ translate:0 0; }
+  /* ---------- one refined letterpress keycap, used everywhere ----------
+     flat rectangle, hairline border, NO bevel/shadow, tabular mono at a
+     fixed 10.5px / 15px box (wider than tall) so every keycap shares a
+     baseline with its label. Muted ink so it never competes with the word
+     beside it. Multi-key shortcuts are one keycap per key in a .keys row,
+     never two glyphs in one cap. */
+  kbd{
+    display:inline-flex; align-items:center; justify-content:center;
+    height:15px; min-width:20px; padding:0 5px;
+    font-family:var(--mono); font-size:10.5px; font-weight:600;
+    font-variant-numeric:tabular-nums; letter-spacing:.02em; line-height:1;
+    color:var(--ink-2); background:transparent;
+    border:1px solid var(--line); border-radius:0;
+    vertical-align:baseline; translate:0 1px;
+  }
+  .keys{ display:inline-flex; align-items:center; gap:3px; }
+  /* daemon: a standalone quiet instrument - no border/background grouping it with neighbours */
+  .daemon{
+    display:inline-flex; align-items:center; gap:7px;
+    font-family:var(--mono); font-size:var(--r0); color:var(--ink-2);
+    padding:0; margin-left:4px;
+  }
+  .daemon .dot{width:7px; height:7px; border-radius:50%; background:var(--st-ok);
+    box-shadow:0 0 0 3px var(--st-ok-glow);}
+  .daemon .t{ color:var(--ink-1); font-weight:600; }
+
+  /* quiet sun/moon theme instrument - styled like the other bar instruments */
+  .theme-toggle{
+    width:28px; height:28px; display:grid; place-items:center;
+    border:1px solid var(--line); border-radius:0;
+    background:var(--paper-2); color:var(--ink-2);
+    cursor:default; line-height:0;
+    transition:color .18s ease-out, border-color .18s ease-out, background .18s ease-out;
+  }
+  .theme-toggle:hover{ color:var(--ink-1); border-color:var(--ink-3); }
+  .theme-toggle svg{ width:15px; height:15px; display:block; }
+  .theme-toggle .moon{ display:none; }
+  .theme-toggle .sun{ display:block; }
+  html[data-theme="dark"] .theme-toggle .moon{ display:block; }
+  html[data-theme="dark"] .theme-toggle .sun{ display:none; }
+
+  /* ---------- body grid (left rail widened to ~290px to fit branch names) ---------- */
+  .body{flex:1; display:grid; grid-template-columns:295px 1fr 330px; min-height:0;}
+
+  /* ---------- left rail ---------- */
+  .rail-l{
+    background:var(--paper-1);
+    border-right:1px solid var(--line);
+    display:flex; flex-direction:column; min-height:0;
+  }
+  /* the three column headers share one baseline grid: each is a fixed 38px row
+     with a bottom hairline that meets the same y as the tab strip's bottom edge,
+     so the left rail (PROJECTS), center (tab strip) and right rail (CHANGES)
+     read as one aligned system. */
+  .rail-head{
+    flex:0 0 38px; height:38px;
+    display:flex; align-items:center; justify-content:space-between;
+    padding:0 16px; border-bottom:1px solid var(--line);
+  }
+  .rail-head h2{
+    font-size:.6875rem; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--ink-2); font-weight:700;
+  }
+  .rail-head .add{
+    font-family:var(--mono); font-size:var(--r2); color:var(--ink-2);
+    width:20px; height:20px; display:grid; place-items:center; border-radius:0;
+    border:1px solid var(--line); background:var(--paper-2);
+  }
+  .tree{flex:1; overflow:auto; padding:2px 4px 8px;}
+
+  /* shared inline-icon helper: quiet ink, 1.5px-stroke marks at small size */
+  .svgi{ display:inline-block; vertical-align:-0.18em; color:var(--ink-2); flex:0 0 auto; }
+  .svgi svg{ width:100%; height:100%; display:block; }
+
+  .proj{margin-bottom:3px;}
+  .proj > .row{
+    display:flex; align-items:center; gap:7px;
+    padding:6px 8px; border-radius:0; cursor:default;
+    font-family:var(--mono); font-size:var(--r1); font-weight:600;
+    color:var(--ink-0);
+  }
+  .proj > .row .tw{ font-size:.625rem; width:9px; color:var(--ink-3); }
+  .proj > .row .pkind{
+    margin-left:auto; font-family:var(--mono); font-size:.625rem;
+    color:var(--ink-3); letter-spacing:.04em;
+  }
+  /* every project row gets the same plain folder icon */
+  .proj > .row .folder{ width:15px; height:15px; color:var(--ink-2); }
+  .rollup{
+    margin-left:auto; display:inline-flex; align-items:center; gap:5px;
+    font-family:var(--mono); font-size:.625rem; font-weight:600;
+    color:var(--st-need); background:var(--st-need-wash);
+    border:1px solid var(--st-need-line); border-radius:0; padding:1px 7px 1px 6px;
+  }
+  .rollup .g{font-size:.7rem; line-height:1;}
+
+  .wt{ list-style:none; margin:1px 0 4px; padding-left:0; }
+  .wt li{ position:relative; }
+  /* hairline tree spine - a hairline, not an accent stripe */
+  .wt{ margin-left:8px; border-left:1px solid var(--line-soft); }
+
+  /* worktree entry: name over faint meta (word-only state, no glyph column);
+     facepile spans both rows; a row with nothing to report has no l2 at all */
+  .wt .wrow{
+    display:grid;
+    grid-template-columns:1fr auto;
+    grid-template-areas:
+      "name pile"
+      "meta pile";
+    align-items:center; column-gap:4px;
+    min-width:0; padding:5px 6px 5px 7px; margin:1px 0; border-radius:0;
+    font-family:var(--mono); cursor:default;
+  }
+  .wt .wrow .l1{
+    grid-area:name; display:flex; align-items:center; gap:5px; min-width:0;
+  }
+  /* git-branch icon marking the worktree's branch identity */
+  .wt .wrow .branchic{ width:12px; height:12px; color:var(--ink-3); flex:0 0 12px; margin-right:-1px; }
+  .wt .wrow.sel .branchic{ color:var(--iris-ink); }
+  .wt .wrow .name{
+    font-size:var(--r1); font-weight:600; color:var(--ink-0);
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;
+  }
+  .wt .wrow .l2{
+    grid-area:meta; display:flex; align-items:center; gap:4px;
+    margin-top:2px; padding-left:16px; /* aligns under the name (no glyph column) */
+    font-size:.625rem; color:var(--ink-2); font-variant-numeric:tabular-nums;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .wt .wrow .l2 .sep{ color:var(--ink-3); }
+  .wt .wrow .l2 .diffn .a{ color:var(--diff-add); font-weight:600; }
+  .wt .wrow .l2 .diffn .d{ color:var(--diff-del); font-weight:600; }
+  .wt .wrow .l2 .prchip{ color:var(--ink-1); display:inline-flex; align-items:center; gap:3px; }
+  .wt .wrow .l2 .prchip .svgi{ width:12px; height:12px; color:var(--ink-2); }
+  .wt .wrow.sel .l2 .prchip .svgi{ color:var(--iris-ink); }
+  .wt .wrow .l2 .statetag{
+    font-weight:700; letter-spacing:.04em; text-transform:uppercase; font-size:.5625rem;
+  }
+
+  /* harness facepile - overlapping ringed marks, vertically centered */
+  .pile{
+    grid-area:pile; display:flex; align-items:center; flex:0 0 auto;
+    padding-left:0;
+  }
+  .pile.empty{ width:4px; }
+  .pile .h{
+    width:17px; height:17px; border-radius:50%;
+    display:grid; place-items:center;
+    line-height:1;
+    box-shadow:0 0 0 1.75px var(--pile-ring, var(--paper-1));
+    margin-left:-8px;
+    /* circle fills sit a touch lighter so the mark reads; mark color via --mark-* */
+    background:var(--paper-2);
+  }
+  .pile .h:first-child{ margin-left:0; }
+  .pile .h svg{ width:12px; height:12px; display:block; }
+  .pile .h.claude{ color:var(--mark-claude); }
+  .pile .h.codex { color:var(--mark-codex); }
+  .pile .h.codex svg{ width:13px; height:13px; }
+  .pile .h.shell { color:var(--mark-shell); }
+  .pile .h.shell svg{ width:13px; height:13px; }
+  /* selected row paints rings in the wash so overlaps still read cleanly */
+  .wt .wrow.sel .pile{ --pile-ring:var(--iris-wash); }
+
+  /* selected worktree - iris wash + iris ink, AA */
+  .wt .wrow.sel{
+    background:var(--iris-wash);
+    box-shadow:inset 0 0 0 1px var(--iris-line);
+  }
+  .wt .wrow.sel .name{ color:var(--iris-ink); }
+  .wt .wrow.sel .l2{ color:var(--iris-ink); }
+  .wt .wrow.sel .l2 .sep{ color:var(--iris-line); }
+
+  /* state words: shown only when the user must act or be informed */
+  .statetag.need{ color:var(--st-need); }
+  .statetag.run { color:var(--st-run); }
+
+  .rail-foot{
+    border-top:1px solid var(--line);
+    padding:10px 16px;
+    font-family:var(--mono); font-size:.625rem; color:var(--ink-2);
+    line-height:1.6;
+    background:linear-gradient(var(--paper-1), var(--paper-3));
+  }
+  .rail-foot .k{ color:var(--ink-1); font-weight:600; }
+
+  /* ---------- center: terminal docked as the app's workbench ---------- */
+  .center{ display:flex; flex-direction:column; min-height:0; background:var(--paper-3); }
+  /* tab strip runs FLUSH on every side AND its tabs fill its FULL height: zero
+     strip-level padding (left/right AND top), so the first tab starts hard at the
+     left divider and every tab's top edge IS the strip's top edge. The active
+     tab's ink surface therefore runs from the strip's top hairline straight down
+     into the terminal - no chrome is visible above the tabs inside the strip.
+     Tabs are square (0 radius); the seam into the terminal is fully square. The
+     strip is a fixed 38px tall to share the header baseline grid with the left
+     rail's PROJECTS row and the right rail's CHANGES row. */
+  .tabs{
+    flex:0 0 38px; height:38px; display:flex; align-items:stretch; gap:0;
+    padding:0; background:var(--paper-3);
+    border-bottom:1px solid var(--term-line);
+    position:relative; z-index:2;
+  }
+  .tab{
+    display:inline-flex; align-items:center; gap:8px;
+    font-family:var(--mono); font-size:var(--r1); color:var(--ink-2);
+    padding:0 14px; border:1px solid transparent; border-bottom:none;
+    border-radius:0;
+    position:relative; cursor:default;
+  }
+  /* first tab hugs the column's left divider; its own inner padding is the only inset */
+  .tab:first-child{ margin-left:0; }
+  .tab .gly{ font-size:.75rem; }
+  /* harness/diff marks inside tabs */
+  .tab .tabmark{ width:14px; height:14px; display:block; flex:0 0 14px; }
+  .tab .tabmark.claude{ color:var(--mark-claude); }
+  .tab .tabmark.shell{ color:var(--ink-2); }
+  .tab.active .tabmark.shell{ color:var(--term-dim); }
+  .tab .tabmark.diff{ color:var(--ink-2); }
+  /* active tab IS the terminal surface - same ink bg from the strip's top edge,
+     side hairlines, and a bridge that covers the strip's bottom hairline so the
+     ink runs unbroken into the terminal panel. */
+  .tab.active{
+    background:linear-gradient(var(--term-bg2), var(--term-bg2));
+    color:var(--term-fg); font-weight:600;
+    border-color:var(--term-line); border-top-color:transparent;
+  }
+  .tab.active::after{ /* bridge the active tab down over the strip's bottom hairline */
+    content:""; position:absolute; left:0; right:0; bottom:-1px; height:2px;
+    background:var(--term-bg2); z-index:3;
+  }
+  .tab:not(.active){ color:var(--ink-2); }
+  .tab.diff:not(.active){ color:var(--ink-1); }
+  .tab.diff .gly{ color:var(--ink-2); }
+  .tab .closer{ color:var(--ink-3); font-size:.7rem; margin-left:2px; }
+  .tab.active .closer{ color:var(--term-dim); }
+  .tab .needdot{ width:6px; height:6px; border-radius:50%; background:var(--st-need);
+    box-shadow:0 0 0 3px var(--term-bg2); }
+  .tab .newtab{ color:var(--ink-3); padding:7px 6px 8px; font-family:var(--mono); }
+
+  /* panel runs EDGE-TO-EDGE: zero gutter, meets the column dividers + window bottom directly */
+  .pane-wrap{ flex:1; min-height:0; padding:0; display:flex; }
+
+  .terminal{
+    flex:1; min-height:0; display:flex; flex-direction:column;
+    background:linear-gradient(var(--term-bg2), var(--term-bg));
+    /* the tab strip owns the top hairline; the panel runs fully flush + square on
+       every side into the surrounding chrome and the window bottom */
+    border:none; border-radius:0;
+    overflow:hidden;
+  }
+  .term-body{
+    flex:1; min-height:0; overflow:auto; padding:14px 16px 4px;
+    font-family:var(--mono); font-size:var(--r1); line-height:1.65;
+    color:var(--term-fg);
+  }
+  .term-body .l{ white-space:pre-wrap; }
+  .t-dim{ color:var(--term-dim); }
+  .t-grn{ color:oklch(82% 0.13 150); }
+  .t-red{ color:oklch(78% 0.13 28); }
+  .t-cy { color:oklch(82% 0.10 195); }
+  .t-yl { color:oklch(86% 0.12 92); }
+  .t-iris{ color:oklch(80% 0.10 280); }
+  .t-b{ font-weight:600; color:oklch(96% 0.01 90); }
+
+  /* permission prompt block, rendered as a boxed listing inside the PTY */
+  .perm{
+    margin:10px 0 6px; border:1px solid oklch(43% 0.095 32);
+    border-radius:0; overflow:hidden;
+    background:oklch(22% 0.030 32);
+  }
+  html[data-theme="dark"] .perm{ border-color:oklch(40% 0.09 32); background:oklch(18% 0.030 32); }
+  .perm .ph{
+    padding:7px 12px; font-family:var(--mono); font-size:.6875rem;
+    color:oklch(84% 0.11 32); letter-spacing:.08em; font-weight:700;
+    border-bottom:1px solid oklch(37% 0.075 32);
+    display:flex; align-items:center; gap:8px;
+  }
+  .perm .pb{ padding:11px 14px; font-family:var(--mono); font-size:var(--r1); color:var(--term-fg); line-height:1.7; }
+  .perm .cmd{ color:oklch(86% 0.12 92); font-weight:600; }
+  .perm .why{ color:var(--term-dim); }
+  .perm .choices{
+    display:flex; gap:10px; margin-top:9px; padding-top:10px;
+    border-top:1px dashed oklch(40% 0.055 32);
+  }
+  .choice{
+    display:inline-flex; align-items:center; gap:8px;
+    font-family:var(--mono); font-size:.8125rem; padding:5px 11px; border-radius:0;
+  }
+  .choice.yes{ background:oklch(39% 0.10 150); color:oklch(94% 0.055 150); }
+  .choice.no { background:oklch(31% 0.04 32); color:oklch(85% 0.03 40); border:1px solid oklch(43% 0.06 32); }
+  /* keycaps inside the dark PTY choices: hairline on the deep ink, AA-light glyph */
+  .choice kbd{ background:transparent; border-color:oklch(50% 0.04 264); color:oklch(90% 0.02 90); }
+  .choice.yes kbd{ border-color:oklch(72% 0.06 150); color:oklch(95% 0.05 150); }
+  .choice.no kbd{ border-color:oklch(54% 0.05 32); color:oklch(88% 0.03 40); }
+  .cursor{ display:inline-block; width:8px; height:1.05em; vertical-align:-2px;
+    background:oklch(82% 0.10 92); animation:blink 1.1s steps(1) infinite; }
+  @keyframes blink{ 0%,50%{opacity:1;} 51%,100%{opacity:0;} }
+
+  /* ---------- right rail: Changes ---------- */
+  .rail-r{
+    background:var(--paper-1); border-left:1px solid var(--line);
+    display:flex; flex-direction:column; min-height:0;
+  }
+  /* CHANGES title row: the 38px header that shares the baseline grid with the
+     PROJECTS row and the tab strip; branch/PR context sits in its own block below. */
+  .changes-head{ flex:0 0 38px; height:38px; padding:0 16px; border-bottom:1px solid var(--line); }
+  .changes-head .title{
+    height:100%; display:flex; align-items:center; justify-content:space-between;
+  }
+  .changes-head h2{ font-size:.6875rem; letter-spacing:.14em; text-transform:uppercase; color:var(--ink-2); font-weight:700; }
+  /* branch + PR context block, directly under the aligned title row */
+  .changes-ctx{ padding:11px 16px 12px; border-bottom:1px solid var(--line); }
+  .changes-head .net{
+    font-family:var(--mono); font-size:var(--r0); font-variant-numeric:tabular-nums;
+  }
+  .changes-head .net .a{ color:var(--diff-add); font-weight:600; }
+  .changes-head .net .d{ color:var(--diff-del); font-weight:600; }
+
+  .branchline{
+    display:flex; align-items:center; gap:7px;
+    font-family:var(--mono); font-size:var(--r1); color:var(--ink-0);
+  }
+  .branchline .b{ font-weight:600; }
+  .branchline .from{ color:var(--ink-2); }
+  .branchline .ic{ width:14px; height:14px; color:var(--ink-2); }
+  /* git ahead/behind instrument - lives on the branch row, tuned like the +18 −4 diffstat */
+  .branchline .ahead{
+    margin-left:auto; display:inline-flex; align-items:center; gap:2px;
+    font-family:var(--mono); font-size:var(--r0); font-weight:600;
+    font-variant-numeric:tabular-nums; color:var(--st-ok);
+    cursor:default;
+  }
+  .branchline .ahead .arr{ font-size:.8rem; line-height:1; }
+
+  .pr{
+    display:inline-flex; align-items:center; gap:7px; margin-top:9px;
+    font-family:var(--mono); font-size:var(--r0); color:var(--ink-1);
+    background:var(--paper-2); border:1px solid var(--line); border-radius:0;
+    padding:3px 10px 3px 8px;
+  }
+  .pr .open{ color:var(--st-ok); display:inline-flex; align-items:center; gap:5px; font-weight:600; }
+  .pr .open .dot{ width:6px; height:6px; border-radius:50%; background:var(--st-ok); }
+  .pr .num{ color:var(--ink-0); font-weight:600; }
+  .pr .pric{ width:13px; height:13px; color:var(--ink-2); }
+
+  /* ---- dynamic git action: ONE state-derived split button ---------------- */
+  .actions{ padding:12px 16px; border-bottom:1px solid var(--line); position:relative; }
+
+  /* split = primary segment (the next meaningful step, here Commit & Push) +
+     caret segment that opens the full action menu. Square-ish, letterpress. */
+  .splitbtn{
+    display:flex; align-items:stretch; width:100%;
+    border-radius:0; overflow:hidden;
+    box-shadow:0 1px 0 oklch(100% 0 0 / .14) inset;
+  }
+  .split-main{
+    flex:1; min-width:0; justify-content:center;
+    font-family:var(--ui); font-size:var(--r1); font-weight:600;
+    display:inline-flex; align-items:center; gap:8px;
+    padding:8px 12px; cursor:default;
+    background:var(--iris); color:var(--iris-on);
+    border:1px solid var(--iris-ink); border-right:none;
+  }
+  .split-main .btnic{ width:14px; height:14px; flex:0 0 14px; color:var(--iris-on); }
+  /* keycap on the iris fill: invert to a light-ink glyph on a translucent
+     hairline so it reads AA against the primary without a second fill. */
+  .split-main kbd{
+    color:var(--iris-on); border-color:var(--iris-on-sc-line);
+  }
+  .split-main .keys{ margin-left:2px; }
+  .split-caret{
+    flex:0 0 30px; display:grid; place-items:center;
+    background:var(--iris); color:var(--iris-on);
+    border:1px solid var(--iris-ink);
+    box-shadow:inset 1px 0 0 var(--iris-on-sc-line);
+    cursor:default;
+  }
+  .split-caret svg{ width:13px; height:13px; display:block; }
+
+  /* quiet "why this action is primary" hint, faint mono, under the split */
+  .why-primary{
+    margin-top:8px;
+    font-family:var(--mono); font-size:.625rem; color:var(--ink-3);
+    font-variant-numeric:tabular-nums; letter-spacing:.01em;
+    display:flex; align-items:center; gap:6px;
+  }
+  .why-primary .arr{ font-size:.7rem; }
+  .why-primary .stash{
+    margin-left:auto; display:inline-flex; align-items:center; gap:5px;
+    color:var(--ink-2); font-weight:600; cursor:default;
+  }
+  .why-primary .stash:hover{ color:var(--ink-1); }
+
+  /* ---- action menu: crisp letterpress popover, NO blur, square-ish -------- */
+  .act-menu{
+    display:none;
+    position:absolute; right:16px; top:calc(100% - 6px); z-index:20;
+    min-width:230px; padding:5px;
+    background:var(--paper-2); border:1px solid var(--line);
+    border-radius:0;
+    box-shadow:
+      0 1px 0 var(--light-inset) inset,
+      0 14px 30px -14px oklch(30% 0.03 70 / .35),
+      0 4px 10px -6px oklch(30% 0.03 70 / .25);
+  }
+  html[data-theme="dark"] .act-menu{
+    box-shadow:
+      0 0 0 1px oklch(8% 0.01 72 / .5),
+      0 16px 34px -16px oklch(4% 0.01 72 / .7);
+  }
+  /* reveal the menu for review when the hash includes "actions" (#actions / #dark-actions) */
+  html.show-actions .act-menu{ display:block; }
+  .mi{
+    width:100%; border:0; background:transparent;
+    display:flex; align-items:center; gap:9px;
+    padding:7px 9px; border-radius:0; cursor:pointer;
+    font:inherit; font-family:var(--ui); font-size:var(--r1); color:var(--ink-0);
+    text-align:left;
+  }
+  .mi:hover, .mi:focus-visible{ background:var(--paper-3); }
+  .mi:focus-visible{ outline:1px solid var(--iris-line); outline-offset:-1px; }
+  .mi .mi-ico{ width:15px; height:15px; flex:0 0 15px; color:var(--ink-2); }
+  .mi .mi-k{
+    margin-left:auto; font-family:var(--mono); font-size:.625rem;
+    color:var(--ink-2); font-variant-numeric:tabular-nums;
+  }
+  .mi.is-primary{ color:var(--iris-ink); font-weight:600; }
+  .mi.is-primary .mi-ico{ color:var(--iris-ink); }
+  .mi.disabled, .mi:disabled{ opacity:.42; cursor:default; }
+  .mi.disabled .mi-k, .mi:disabled .mi-k{ color:var(--ink-3); }
+  .m-sep{ height:1px; background:var(--line); margin:5px 7px; }
+  /* quiet toggle row: auto-generate commit message */
+  .mi.toggle{ color:var(--ink-1); }
+  .mi.toggle .check{
+    width:15px; height:15px; flex:0 0 15px; display:grid; place-items:center;
+    border:1px solid var(--line); border-radius:0; font-size:.6rem;
+    color:var(--iris-on); background:var(--paper-2);
+  }
+  .mi.toggle .check.on{ background:var(--iris); border-color:var(--iris-ink); }
+  .mi.toggle .check:not(.on){ color:transparent; }
+
+  .files{ flex:1; overflow:auto; padding:6px 10px 12px; }
+  .fgroup{ margin-top:8px; }
+  .fgroup h3{
+    display:flex; align-items:center; gap:8px;
+    font-family:var(--mono); font-size:.625rem; letter-spacing:.1em; text-transform:uppercase;
+    color:var(--ink-2); font-weight:700; padding:6px 8px 5px;
+  }
+  .fgroup h3 .ct{ color:var(--ink-3); font-weight:600; }
+  .fgroup h3 .all{ margin-left:auto; font-size:.625rem; color:var(--iris-ink); font-weight:600; letter-spacing:.02em; text-transform:none; }
+  .fgroup h3 .hr{ flex:1; height:1px; background:var(--line); }
+
+  .frow{
+    display:flex; align-items:center; gap:9px;
+    padding:5px 8px; border-radius:0; cursor:default;
+    font-family:var(--mono); font-size:var(--r1);
+  }
+  .frow:hover{ background:var(--paper-3); }
+  .frow.active{ background:var(--paper-3); box-shadow:inset 0 0 0 1px var(--line); }
+  .frow .chk{
+    width:14px; height:14px; border-radius:0; flex:0 0 14px;
+    border:1px solid var(--line); display:grid; place-items:center;
+    font-size:.6rem; color:var(--paper-2);
+  }
+  .frow .chk.on{ background:var(--iris); border-color:var(--iris-ink); color:var(--iris-on); }
+  .frow .st{ width:13px; text-align:center; font-weight:700; font-size:.75rem; flex:0 0 13px; }
+  .frow .st.m{ color:var(--st-stall); }
+  .frow .st.u{ color:var(--ink-3); }
+  .frow .path{ color:var(--ink-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .frow .path b{ color:var(--ink-0); font-weight:500; }
+  .frow .fdiff{ margin-left:auto; font-size:.625rem; font-variant-numeric:tabular-nums; flex:0 0 auto; }
+  .frow .fdiff .a{ color:var(--diff-add); } .frow .fdiff .d{ color:var(--diff-del); }
+
+  .rail-r-foot{
+    border-top:1px solid var(--line); padding:8px 16px;
+    font-family:var(--mono); font-size:.625rem; color:var(--ink-2);
+    display:flex; align-items:center; gap:10px;
+  }
+  .rail-r-foot span{ display:inline-flex; align-items:center; gap:5px; }
+
+  @media (prefers-reduced-motion: reduce){
+    .cursor{ animation:none; }
+    .theme-toggle{ transition:none; }
+  }
+</style>
+</head>
+<body>
+  <!-- inline icon library: defined once, referenced with <use>; no external requests -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <defs>
+      <!-- Claude: Anthropic sunburst - tapered rays radiating from center -->
+      <symbol id="mk-claude" viewBox="0 0 24 24">
+        <g fill="currentColor" stroke="none">
+          <path d="M12 2.2 L13 11 L12 12 L11 11 Z"/>
+          <path d="M21.8 12 L13 13 L12 12 L13 11 Z"/>
+          <path d="M12 21.8 L11 13 L12 12 L13 13 Z"/>
+          <path d="M2.2 12 L11 11 L12 12 L11 13 Z"/>
+          <path d="M18.9 5.1 L12.9 11.1 L12 12 L11.95 10.6 Z"/>
+          <path d="M18.9 18.9 L13.4 12.9 L12 12 L13.4 11.05 Z"/>
+          <path d="M5.1 18.9 L11.1 12.9 L12 12 L12.05 13.4 Z"/>
+          <path d="M5.1 5.1 L10.6 11.1 L12 12 L10.6 12.95 Z"/>
+        </g>
+      </symbol>
+      <!-- Codex: OpenAI blossom/knot - 6 rotated petal strokes -->
+      <symbol id="mk-codex" viewBox="0 0 24 24">
+        <g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 5.2 a5.6 5.6 0 0 1 5.6 5.6" transform="rotate(0 12 12)"/>
+          <path d="M12 5.2 a5.6 5.6 0 0 1 5.6 5.6" transform="rotate(60 12 12)"/>
+          <path d="M12 5.2 a5.6 5.6 0 0 1 5.6 5.6" transform="rotate(120 12 12)"/>
+          <path d="M12 5.2 a5.6 5.6 0 0 1 5.6 5.6" transform="rotate(180 12 12)"/>
+          <path d="M12 5.2 a5.6 5.6 0 0 1 5.6 5.6" transform="rotate(240 12 12)"/>
+          <path d="M12 5.2 a5.6 5.6 0 0 1 5.6 5.6" transform="rotate(300 12 12)"/>
+        </g>
+      </symbol>
+      <!-- Shell: rounded-square outline with a prompt chevron -->
+      <symbol id="mk-shell" viewBox="0 0 24 24">
+        <g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3.2" y="3.2" width="17.6" height="17.6" rx="4.4"/>
+          <path d="M8 9 l3 3 l-3 3"/>
+          <path d="M13 15 h3.2"/>
+        </g>
+      </symbol>
+      <!-- folder: plain outline folder -->
+      <symbol id="ic-folder" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+          d="M3 6.6 a1.8 1.8 0 0 1 1.8-1.8 h4.2 l1.8 2.2 h7.4 a1.8 1.8 0 0 1 1.8 1.8 v8.6 a1.8 1.8 0 0 1-1.8 1.8 H4.8 A1.8 1.8 0 0 1 3 17.4 Z"/>
+      </symbol>
+      <!-- git-branch: two-circle fork (Octicon-style) -->
+      <symbol id="ic-branch" viewBox="0 0 24 24">
+        <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="6.5" cy="5" r="2.2"/>
+          <circle cx="6.5" cy="19" r="2.2"/>
+          <circle cx="17.5" cy="7" r="2.2"/>
+          <path d="M6.5 7.2 v9.6"/>
+          <path d="M17.5 9.2 v1.3 a4.5 4.5 0 0 1-4.5 4.5 H10"/>
+        </g>
+      </symbol>
+      <!-- git-pull-request: circle + arrow-line-circle -->
+      <symbol id="ic-pr" viewBox="0 0 24 24">
+        <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="6.5" cy="6" r="2.2"/>
+          <circle cx="6.5" cy="18.5" r="2.2"/>
+          <circle cx="17.5" cy="18.5" r="2.2"/>
+          <path d="M6.5 8.2 v8.1"/>
+          <path d="M17.5 16.3 V9.4 l-2.6 2.6 M17.5 9.4 l2.6 2.6" transform="translate(0 -0.2)"/>
+        </g>
+      </symbol>
+      <!-- git-commit: circle centred on a horizontal line -->
+      <symbol id="ic-commit" viewBox="0 0 24 24">
+        <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3.4"/>
+          <path d="M3 12 h5.6 M15.4 12 H21"/>
+        </g>
+      </symbol>
+      <!-- commit-amp-push: a commit node feeding into an up-arrow -->
+      <symbol id="ic-commitpush" viewBox="0 0 24 24">
+        <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="7" cy="12" r="3"/>
+          <path d="M10.2 12 H15"/>
+          <path d="M18 18 V7 M14.6 10.4 18 7 21.4 10.4"/>
+        </g>
+      </symbol>
+      <!-- push: up arrow -->
+      <symbol id="ic-push" viewBox="0 0 24 24">
+        <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 19 V6 M6.5 11.5 12 6 17.5 11.5"/>
+        </g>
+      </symbol>
+      <!-- pull: down arrow -->
+      <symbol id="ic-pull" viewBox="0 0 24 24">
+        <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 5 V18 M6.5 12.5 12 18 17.5 12.5"/>
+        </g>
+      </symbol>
+    </defs>
+  </svg>
+
+  <div class="window" role="application" aria-label="Hitch desktop window">
+
+    <!-- single top bar: traffic lights inline + instruments; quiet draggable region -->
+    <div class="topbar">
+      <div class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></div>
+
+      <!-- command palette visual: absolutely centered in the window (Linear/Arc style) -->
+      <div class="palette" title="Jump to worktree, session, or action">
+        <svg class="seek" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="10.5" cy="10.5" r="6.2"/><path d="M15.2 15.2 20 20"/>
+        </svg>
+        <span class="ph">Jump to worktree, session, or action…</span>
+        <span class="keys"><kbd>⌘</kbd><kbd>K</kbd></span>
+      </div>
+
+      <div class="grow"></div>
+      <button class="theme-toggle" id="themeToggle" type="button" aria-label="Toggle light or dark theme" title="Toggle theme">
+        <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="4.2"/>
+          <path d="M12 2.4v2.6M12 19v2.6M4.4 4.4l1.9 1.9M17.7 17.7l1.9 1.9M2.4 12h2.6M19 12h2.6M4.4 19.6l1.9-1.9M17.7 6.3l1.9-1.9"/>
+        </svg>
+        <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M20 14.2A8 8 0 0 1 9.8 4 8 8 0 1 0 20 14.2z"/>
+        </svg>
+      </button>
+      <div class="daemon" title="Daemon connected">
+        <span class="dot"></span><span>daemon</span><span class="t">connected</span>
+      </div>
+    </div>
+
+    <!-- body -->
+    <div class="body">
+
+      <!-- LEFT RAIL -->
+      <aside class="rail-l">
+        <div class="rail-head">
+          <h2>Projects</h2>
+          <span class="add">+</span>
+        </div>
+
+        <div class="tree">
+
+          <!-- hitch (expanded, git) -->
+          <div class="proj">
+            <div class="row">
+              <span class="tw">▾</span>
+              <svg class="folder" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-folder"/></svg>
+              <span>hitch</span>
+              <span class="pkind">git</span>
+            </div>
+            <ul class="wt">
+              <!-- idle + clean: no state word, nothing to report -> single-line row -->
+              <li><div class="wrow">
+                <span class="l1">
+                  <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+                  <span class="name">main</span>
+                </span>
+                <span class="pile empty" aria-hidden="true"></span>
+              </div></li>
+
+              <li><div class="wrow sel">
+                <span class="l1">
+                  <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+                  <span class="name">feature/fast-reload</span>
+                </span>
+                <span class="l2">
+                  <span class="statetag need">awaiting</span>
+                  <span class="sep">·</span>
+                  <span class="diffn"><span class="a">+18</span> <span class="d">−4</span></span>
+                  <span class="sep">·</span>
+                  <span class="prchip"><span class="svgi"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-pr"/></svg></span>#142</span>
+                </span>
+                <span class="pile" aria-label="3 sessions">
+                  <span class="h codex"  title="Codex session"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-codex"/></svg></span>
+                  <span class="h claude" title="Claude Code session"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+                  <span class="h claude" title="Claude Code session"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+                </span>
+              </div></li>
+
+              <li><div class="wrow">
+                <span class="l1">
+                  <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+                  <span class="name">ai/draft-pr-gen</span>
+                </span>
+                <span class="l2">
+                  <span class="statetag run">working</span>
+                  <span class="sep">·</span>
+                  <span class="diffn"><span class="a">+231</span> <span class="d">−58</span></span>
+                </span>
+                <span class="pile" aria-label="2 sessions">
+                  <span class="h codex" title="Codex session"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-codex"/></svg></span>
+                  <span class="h shell" title="Shell session"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-shell"/></svg></span>
+                </span>
+              </div></li>
+
+              <!-- idle with a session open: no state word; diffstat is the only meta -->
+              <li><div class="wrow">
+                <span class="l1">
+                  <svg class="branchic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg>
+                  <span class="name">fix/session-state</span>
+                </span>
+                <span class="l2">
+                  <span class="diffn"><span class="a">+12</span> <span class="d">−1</span></span>
+                </span>
+                <span class="pile" aria-label="1 session">
+                  <span class="h claude" title="Claude Code session"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg></span>
+                </span>
+              </div></li>
+            </ul>
+          </div>
+
+          <!-- my-app (collapsed, rolled up) -->
+          <div class="proj">
+            <div class="row">
+              <span class="tw">▸</span>
+              <svg class="folder" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-folder"/></svg>
+              <span>my-app</span>
+              <span class="rollup"><span class="g">◆</span>1 awaiting input</span>
+            </div>
+          </div>
+
+          <!-- utils (plain folder, no git) -->
+          <div class="proj">
+            <div class="row">
+              <span class="tw">▸</span>
+              <svg class="folder" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-folder"/></svg>
+              <span style="font-weight:500;color:var(--ink-1)">utils</span>
+              <span class="pkind">folder</span>
+            </div>
+          </div>
+
+        </div>
+
+        <div class="rail-foot">
+          <div><span class="k">4</span> sessions · <span class="k">3</span> worktrees active</div>
+        </div>
+      </aside>
+
+      <!-- CENTER -->
+      <main class="center">
+        <div class="tabs">
+          <div class="tab active">
+            <svg class="tabmark claude" viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-claude"/></svg><span>claude</span>
+            <span class="needdot" title="awaiting input"></span>
+            <span class="closer">✕</span>
+          </div>
+          <div class="tab">
+            <svg class="tabmark shell" viewBox="0 0 24 24" aria-hidden="true"><use href="#mk-shell"/></svg><span>shell</span>
+            <span class="closer">✕</span>
+          </div>
+          <div class="tab diff">
+            <span class="gly">±</span><span>Terminal.svelte</span>
+            <span class="closer">✕</span>
+          </div>
+          <div class="tab"><span class="newtab">+</span></div>
+        </div>
+
+        <div class="pane-wrap">
+          <div class="terminal">
+            <div class="term-body">
+<div class="l t-dim">● Reading <span class="t-cy">src/lib/components/Terminal.svelte</span> (412 lines)</div>
+<div class="l t-dim">● Edited 2 hunks · adding incremental HMR reload guard</div>
+<div class="l">&nbsp;</div>
+<div class="l"><span class="t-b">›</span> I added the fast-reload guard. Let me verify the suite still passes</div>
+<div class="l">&nbsp;&nbsp; before we commit.</div>
+
+<div class="perm">
+  <div class="ph"><span>◆</span><span>PERMISSION REQUIRED</span></div>
+  <div class="pb">
+<span class="t-b">Claude wants to run a command:</span>
+
+  <span class="cmd">$ pnpm test</span>  <span class="why"># vitest run · ~38 tests</span>
+
+<span class="t-dim">cwd </span>~/Code/hitch  <span class="t-dim">· worktree </span>feature/fast-reload
+    <div class="choices">
+      <span class="choice yes"><kbd>y</kbd> approve &amp; run</span>
+      <span class="choice no"><kbd>n</kbd> deny</span>
+      <span class="choice no" style="background:transparent;border-color:oklch(40% 0.03 265);color:var(--term-dim)"><kbd>a</kbd> always allow <span class="t-dim">pnpm test</span></span>
+    </div>
+  </div>
+</div>
+
+<div class="l">&nbsp;</div>
+<div class="l t-dim">❯ <span class="cursor"></span></div>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <!-- RIGHT RAIL: Changes -->
+      <aside class="rail-r">
+        <div class="changes-head">
+          <div class="title">
+            <h2>Changes</h2>
+            <span class="net"><span class="a">+18</span> <span class="d">−4</span></span>
+          </div>
+        </div>
+        <div class="changes-ctx">
+          <div class="branchline">
+            <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-branch"/></svg><span class="b">feature/fast-reload</span>
+            <span class="from">from main</span>
+            <span class="ahead" title="3 commits ahead of origin"><span class="arr">↑</span>3</span>
+          </div>
+          <div class="pr">
+            <svg class="pric" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-pr"/></svg>
+            <span class="open"><span class="dot"></span>open</span>
+            <span>PR</span><span class="num">#142</span>
+            <span style="color:var(--ink-3)">· fast-reload guard</span>
+          </div>
+        </div>
+
+        <!-- dynamic git action: ONE split button whose primary is derived from
+             repo state. Here: 2 staged + branch ahead 3 + PR #142 open -> the
+             next meaningful step is Commit & Push. The caret opens the full
+             action menu (rendered below, shown when the hash includes "actions"). -->
+        <div class="actions">
+          <div class="splitbtn">
+            <button class="split-main" type="button">
+              <svg class="btnic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-commitpush"/></svg>
+              Commit &amp; Push <span class="keys"><kbd>⌘</kbd><kbd>↵</kbd></span>
+            </button>
+            <button class="split-caret" type="button" aria-label="More git actions" title="More git actions">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9 l6 6 l6-6"/></svg>
+            </button>
+          </div>
+
+          <!-- quiet hint: WHY this action is primary; Stash kept as a quiet text button -->
+          <div class="why-primary">
+            <span>2 staged</span><span class="sep">·</span>
+            <span><span class="arr">↑</span>3</span><span class="sep">·</span>
+            <span>PR #142 open</span>
+            <span class="stash" title="Stash changes">Stash <span class="keys"><kbd>⌘</kbd><kbd>S</kbd></span></span>
+          </div>
+
+          <!-- full action menu: crisp letterpress popover, no blur. The current
+               primary (Commit & Push) is marked; steps that don't apply are quiet. -->
+          <div class="act-menu" role="menu" aria-label="Git actions">
+            <button class="mi" type="button" role="menuitem">
+              <svg class="mi-ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-commit"/></svg>
+              Commit…
+            </button>
+            <button class="mi is-primary" type="button" role="menuitem">
+              <svg class="mi-ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-commitpush"/></svg>
+              Commit &amp; Push <span class="mi-k">⌘↵</span>
+            </button>
+            <div class="m-sep"></div>
+            <button class="mi" type="button" role="menuitem">
+              <svg class="mi-ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-push"/></svg>
+              Push <span class="mi-k">↑3</span>
+            </button>
+            <button class="mi disabled" type="button" role="menuitem" disabled aria-disabled="true" title="Up to date with remote">
+              <svg class="mi-ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-pull"/></svg>
+              Pull <span class="mi-k">↓0</span>
+            </button>
+            <div class="m-sep"></div>
+            <button class="mi" type="button" role="menuitem">
+              <svg class="mi-ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-pr"/></svg>
+              Open PR #142 <span class="mi-k">↗</span>
+            </button>
+            <button class="mi disabled" type="button" role="menuitem" disabled aria-disabled="true" title="A pull request already exists">
+              <svg class="mi-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M12 6 V18 M6 12 H18"/></svg>
+              Create PR…
+            </button>
+            <div class="m-sep"></div>
+            <button class="mi toggle" type="button" role="menuitemcheckbox" aria-checked="true">
+              <span class="check on" aria-hidden="true">✓</span>
+              auto-generate commit message
+            </button>
+          </div>
+        </div>
+
+        <div class="files">
+          <div class="fgroup">
+            <h3><span>Staged</span><span class="ct">2</span><span class="hr"></span><span class="all">unstage all</span></h3>
+            <div class="frow active">
+              <span class="chk on">✓</span>
+              <span class="st m">M</span>
+              <span class="path">src/lib/components/<b>Terminal.svelte</b></span>
+              <span class="fdiff"><span class="a">+14</span> <span class="d">−3</span></span>
+            </div>
+            <div class="frow">
+              <span class="chk on">✓</span>
+              <span class="st m">M</span>
+              <span class="path">apps/desktop/src/<b>app.css</b></span>
+              <span class="fdiff"><span class="a">+3</span> <span class="d">−1</span></span>
+            </div>
+          </div>
+
+          <div class="fgroup">
+            <h3><span>Changes</span><span class="ct">2</span><span class="hr"></span><span class="all">stage all</span></h3>
+            <div class="frow">
+              <span class="chk"></span>
+              <span class="st m">M</span>
+              <span class="path">src/lib/<b>daemon.ts</b></span>
+              <span class="fdiff"><span class="a">+1</span> <span class="d">−0</span></span>
+            </div>
+            <div class="frow">
+              <span class="chk"></span>
+              <span class="st u">U</span>
+              <span class="path"><b>README.md</b></span>
+              <span class="fdiff"><span class="a">new</span></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="rail-r-foot">
+          <span><kbd>␣</kbd> stage</span>
+          <span><kbd>↵</kbd> open diff</span>
+          <span><span class="keys"><kbd>⌘</kbd><kbd>↵</kbd></span> commit</span>
+        </div>
+      </aside>
+
+    </div>
+  </div>
+
+  <script>
+    (function(){
+      var root = document.documentElement;
+      function apply(t){ if(t === "dark"){ root.setAttribute("data-theme","dark"); } else { root.removeAttribute("data-theme"); } }
+      // on load: hash seeds theme (#dark / #light, with optional -actions suffix);
+      // any hash containing "actions" reveals the git action menu for review.
+      var hash = (location.hash || "").toLowerCase();
+      apply(hash.indexOf("dark") !== -1 ? "dark" : "light");
+      root.classList.toggle("show-actions", hash.indexOf("actions") !== -1);
+      var btn = document.getElementById("themeToggle");
+      if(btn){ btn.addEventListener("click", function(){
+        apply(root.getAttribute("data-theme") === "dark" ? "light" : "dark");
+      }); }
+    })();
+  </script>
+</body>
+</html>

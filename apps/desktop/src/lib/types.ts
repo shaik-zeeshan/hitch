@@ -62,6 +62,11 @@ export type ChangedFile = {
   path: string;
   status: FileStatus;
   staged: boolean;
+  // Added/deleted line counts for the side this row represents (staged counts
+  // when staged, worktree counts otherwise). Optional for rolling upgrades —
+  // an older daemon omits them; the UI treats absent as 0.
+  additions?: number;
+  deletions?: number;
 };
 
 export type GitStatus = {
@@ -72,12 +77,49 @@ export type GitStatus = {
   behind: number;
   additions: number;
   deletions: number;
+  // Full SHA of the current HEAD commit, or `null` on an unborn HEAD. The
+  // History view refetches its log when this changes. Optional for rolling
+  // upgrades — an older daemon omits it (serde `default`).
+  head_commit_id?: string | null;
+  // The daemon-resolved base branch (the project's main-worktree branch, falling
+  // back to the repo's default). The single definition of the base convention,
+  // consumed by `defaultBase`. Optional for rolling upgrades — an older daemon
+  // omits it (serde `default`); `null` also means "no cross-branch base" (the
+  // main worktree relative to itself).
+  base_branch?: string | null;
   files: ChangedFile[];
 };
 
 export type FileDiff = {
   worktree_id: Id;
   path: string;
+  diff: string;
+};
+
+// One commit row in a History `CommitLog` page. Mirrors hitch-proto's
+// `CommitInfo` (struct fields are snake_case in the wire JSON). `time` is unix
+// seconds; `summary`/`body`/`author` are null when absent.
+export type CommitInfo = {
+  id: string;
+  summary: string | null;
+  body: string | null;
+  author: string | null;
+  time: number;
+  is_merge: boolean;
+  ahead_of_base: boolean;
+  additions: number;
+  deletions: number;
+};
+
+// The metadata header of a Commit Tab. Mirrors hitch-proto's `CommitMeta`,
+// which is `CommitInfo` minus `ahead_of_base`.
+export type CommitMeta = Omit<CommitInfo, "ahead_of_base">;
+
+// One file's diff within a Commit Tab. Mirrors the working-tree per-file diff
+// shape (path + status + patch text) so the frontend reuses its diff renderer.
+export type CommitFileDiff = {
+  path: string;
+  status: FileStatus;
   diff: string;
 };
 
@@ -116,7 +158,88 @@ export type BranchSummary = {
   is_remote: boolean;
 };
 
+// ---- composite Jobs (ADR 0013 amendment 2026-06-07) -----------------------
+//
+// The two daemon-owned autonomous chains. Wire tags mirror hitch-proto's
+// `CompositeJobKind` / `CompositeStep` / `StepPhase` (kebab-case).
+
+// Which chain a progress event / active-Job entry belongs to. Same strings the
+// UI-facing job kind carries, so `Job.kind` and these line up.
+export type CompositeJobKind = "commit-and-push" | "create-pr";
+
+// One rung of a chain. `commit-and-push` runs staging → drafting → committing →
+// pushing; `create-pr` runs pushing → drafting → creating-pr.
+export type CompositeStep =
+  | "staging"
+  | "drafting"
+  | "committing"
+  | "pushing"
+  | "creating-pr";
+
+// Whether a step is starting or has finished (a step is the "current" rung
+// between its started and finished phases).
+export type StepPhase = "started" | "finished";
+
+// Terminal payload of a successful `commit-and-push` chain (rides inside the
+// `job-completed` envelope as `commit-and-pushed`). The auto-mode toast reads all
+// four fields: subject · short sha · pushed count · file count.
+export type CommitAndPushResult = {
+  subject: string;
+  short_sha: string;
+  pushed_commits: number;
+  file_count: number;
+};
+
+// Whatever a chain completed before failing (e.g. the commit that landed before
+// a push failure). Absent when it aborted before producing anything (a
+// draft-generation failure aborts before any commit).
+export type CompositeJobResult = {
+  commit?: CommitAndPushResult | null;
+};
+
+// One in-flight chain for a worktree, returned by the `active-jobs` query so a
+// re-attaching GUI restores the exact button/Composer step.
+export type ActiveJobInfo = {
+  job_id: Id;
+  worktree_id: Id;
+  kind: CompositeJobKind;
+  step: CompositeStep;
+};
+
 export type Request = { type: string; [key: string]: unknown };
+export type GitDiffRequest = {
+  type: "git-diff";
+  worktree_id: Id;
+  path: string;
+  // Optional for protocol compatibility. Omitted requests keep daemon legacy
+  // worktree-first, staged-fallback selection.
+  staged?: boolean;
+  // Diff-shaping options, serialized snake_case like the rest of the request.
+  // Both are serde skip-if-none on the daemon, so the frontend omits them at
+  // their defaults (no whitespace flag, 3 context lines) to keep older daemons
+  // happy. `ignore_whitespace` true asks git to ignore whitespace-only changes;
+  // `context_lines` overrides git's default of 3 lines of surrounding context.
+  ignore_whitespace?: boolean;
+  context_lines?: number;
+};
+
+// Read a page of the worktree's enriched HEAD commit log (History view). A fast
+// synchronous git read, not a Job. Replies with a `commit-log` response.
+export type GitLogRequest = {
+  type: "git-log";
+  worktree_id: Id;
+  limit: number;
+  offset: number;
+};
+
+// Read one commit's metadata plus per-file first-parent diff in one round-trip
+// (Commit Tab). A fast synchronous git read; replies with `commit-diff`.
+export type CommitDiffRequest = {
+  type: "commit-diff";
+  worktree_id: Id;
+  commit_id: string;
+};
+
 
 // Force a fresh full repaint of a session's PTY child after its size has
 // settled (daemon replies with an Ack). Modeled on the inline `resize-session`
@@ -130,6 +253,12 @@ export type DraftGenerationSettings = {
   model: string | null;
   claude_path: string | null;
   codex_path: string | null;
+  // Draft Instructions appended to the built-in draft prompts as an extra
+  // block; never replace the prompt or its JSON output contract (ADR 0007
+  // amendment 2026-06-07). Optional on the wire (`#[serde(default)]` daemon
+  // side), so existing call sites that omit them still compile.
+  commit_instructions?: string | null;
+  pr_instructions?: string | null;
 };
 
 // Shared allowlist accepted inside `start-job`. Keep this in lockstep with
@@ -176,6 +305,21 @@ export type JobRequest =
       body: string | null;
       base: string | null;
       draft: boolean;
+    }
+  // The two daemon-owned composite chains (ADR 0013 amendment 2026-06-07). Each
+  // runs as ONE Job whose steps are reported as `composite-job-progress` events;
+  // completion rides the existing `job-completed` envelope. `commit-and-push`
+  // carries the COMMIT draft instructions; `create-pr` carries the PR ones.
+  | {
+      type: "commit-and-push";
+      worktree_id: Id;
+      settings: DraftGenerationSettings | null;
+    }
+  | {
+      type: "create-pr";
+      worktree_id: Id;
+      base: string | null;
+      settings: DraftGenerationSettings | null;
     };
 
 export type StartJobRequest = { type: "start-job"; request: JobRequest };
