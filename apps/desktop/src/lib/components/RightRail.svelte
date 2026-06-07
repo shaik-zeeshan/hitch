@@ -48,6 +48,7 @@
   import { autoErrorMessage, autoToastContent } from "../composerToast";
   import { worktreeToast } from "../appToast";
   import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
+  import { cssEscape } from "../cssEscape";
   import { focusWithoutScroll } from "../focusWithoutScroll";
   import { fileIconUrl } from "../file-icons";
   import { focusedPane, matchBinding } from "../keymap";
@@ -331,12 +332,8 @@
     void tick().then(() => focusRailRows());
   }
 
-  // Minimal CSS.escape fallback — file paths can contain characters that break a
-  // raw attribute selector (quotes, brackets). CSS.escape exists in the webview;
-  // guard for the test/SSR environment just in case.
-  function cssEscape(value: string): string {
-    return typeof CSS !== "undefined" && CSS.escape ? CSS.escape(value) : value;
-  }
+  // CSS.escape fallback for the file/sha attribute selectors lives in ../cssEscape
+  // (shared with HistoryList).
 
   // Row clicks on the scrollable file list use the shared focusWithoutScroll
   // pointerdown helper — see ../focusWithoutScroll for why a clipped row's native
@@ -491,12 +488,6 @@
     ].filter(Boolean),
   );
 
-  function shortError(err: unknown): string {
-    const msg = err instanceof Error ? err.message : String(err);
-    const first = msg.split("\n")[0].trim();
-    return first.length > 80 ? first.slice(0, 77) + "…" : first;
-  }
-
   // Split a path into a dimmed directory part and an emphasized filename.
   function splitPath(path: string): { dir: string; name: string } {
     const idx = path.lastIndexOf("/");
@@ -541,7 +532,7 @@
       void loadPrStatus(worktreeId);
       t.success(`Pushed ↑${count}`, { id });
     } catch (err) {
-      t.error(shortError(err), { id });
+      t.error(autoErrorMessage(err), { id });
     }
   }
 
@@ -556,7 +547,7 @@
       void loadGitStatus(worktreeId).catch(() => {});
       t.success(`Pulled ↓${count}`, { id });
     } catch (err) {
-      t.error(shortError(err), { id });
+      t.error(autoErrorMessage(err), { id });
     }
   }
 
@@ -571,7 +562,7 @@
       void loadPrStatus(worktreeId);
       t.success("Fetched", { id });
     } catch (err) {
-      t.error(shortError(err), { id });
+      t.error(autoErrorMessage(err), { id });
     }
   }
 

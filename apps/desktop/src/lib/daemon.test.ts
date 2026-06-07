@@ -19,6 +19,21 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => () => {}),
 }));
 
+// Wrap `./notifications` so its real behavior is preserved but `forgetSession`
+// (the per-session turn-clock cleanup) is observable: the reconnect-prune test
+// asserts daemon.ts forgets sessions that a reconnect snapshot silently dropped.
+const forgetSessionSpy = vi.fn();
+vi.mock("./notifications", async (importActual) => {
+  const actual = await importActual<typeof import("./notifications")>();
+  return {
+    ...actual,
+    forgetSession: (sessionId: string) => {
+      forgetSessionSpy(sessionId);
+      return actual.forgetSession(sessionId);
+    },
+  };
+});
+
 import {
   addProject,
   activeSessionId,
@@ -82,6 +97,7 @@ import {
   loadGitStatus,
   loadPrStatus,
   loadProjectPrStatuses,
+  __prFreshnessTracked,
   prByWorktree,
   prInfo,
   prUrl,
@@ -125,6 +141,7 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 beforeEach(() => {
   disposeDaemon();
   invokeMock.mockReset();
+  forgetSessionSpy.mockReset();
   jobs.set({});
   error.set(null);
   daemonReason.set(null);
@@ -445,6 +462,30 @@ describe("agent state propagation", () => {
     expect(get(sessionAgents)).toEqual({});
     expect(get(sessionOutputActive)).toEqual({});
     expect(get(agentStateByWorktree)).toEqual({});
+  });
+
+  it("forgets notification turn state for a session a reconnect silently dropped", () => {
+    // A reconnect snapshot can replace `sessions` wholesale without a
+    // session-closed event for the vanished session. The prune subscription must
+    // still clear that session's per-session notification bookkeeping (the
+    // notifications module's turn-start clock), not just the store-backed maps —
+    // otherwise turnStartAt leaks across the app's lifetime.
+    sessions.set([
+      { id: "s-gone", name: "claude", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+      { id: "s-live", name: "shell", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+    ]);
+    agentStates.set({ "s-gone": "running", "s-live": "running" });
+    forgetSessionSpy.mockClear();
+
+    // Reconnect drops s-gone, keeps s-live.
+    sessions.set([
+      { id: "s-live", name: "shell", parent: { kind: "worktree", id: "w1" }, cwd: "/repo" },
+    ]);
+
+    expect(forgetSessionSpy).toHaveBeenCalledWith("s-gone");
+    expect(forgetSessionSpy).not.toHaveBeenCalledWith("s-live");
+    // The store-backed maps are pruned to the live set too.
+    expect(get(agentStates)).toEqual({ "s-live": "running" });
   });
 });
 
@@ -1506,6 +1547,52 @@ describe("composite chains (commit-and-push / create-pr)", () => {
       step: "pushing",
       failed: { step: "pushing", reason: "remote rejected: updates were rejected — fetch first" },
     });
+  });
+
+  it("parks a failure when a composite job completes with a plain error response", async () => {
+    invokeMock.mockResolvedValue({ type: "job-started", job_id: "j-err" });
+    const promise = startCommitAndPush("w-err");
+    await flush();
+
+    // A progress event stamps the chain with the live jobId (the optimistic
+    // display starts at jobId:null) and advances the rung.
+    applyHitchEvent({
+      type: "composite-job-progress",
+      job_id: "j-err",
+      worktree_id: "w-err",
+      kind: "commit-and-push",
+      step: "pushing",
+      phase: "started",
+    } as any);
+
+    // The daemon delivers a plain Response::Error (e.g. cancellation / lock
+    // poison / panic), NOT a composite-job-failed. The chain must not freeze:
+    // park it as an oxide failure on the current rung.
+    completeJob("j-err", { type: "error", error: { message: "worker panicked" } });
+    await expect(promise).rejects.toThrow(/worker panicked/);
+
+    expect(get(compositeChains)["w-err"]).toMatchObject({
+      jobId: null,
+      kind: "commit-and-push",
+      step: "pushing",
+      failed: { step: "pushing", reason: "worker panicked" },
+    });
+  });
+
+  it("does not resurrect a chain cleared by cancellation when its error completion arrives", async () => {
+    compositeChains.set({
+      "w-cxl": { jobId: "j-cxl", kind: "create-pr", step: "pushing", failed: null },
+    });
+    invokeMock.mockResolvedValue({ type: "ack" });
+
+    // User cancels: the optimistic clear removes the chain display now.
+    await cancelCompositeChain("w-cxl");
+    expect(get(compositeChains)["w-cxl"]).toBeUndefined();
+
+    // The daemon's "job cancelled" error completion lands afterwards — it must
+    // NOT re-create a parked failure for the now-dismissed chain.
+    completeJob("j-cxl", { type: "error", error: { message: "job cancelled" } });
+    expect(get(compositeChains)["w-cxl"]).toBeUndefined();
   });
 
   it("restores an in-flight chain from the active-jobs query and exposes it for the selected worktree", async () => {
@@ -2774,6 +2861,59 @@ describe("PR status freshness across batched and per-worktree lookups", () => {
     expect(get(prByWorktree)["wt-1"]).toEqual(freshPr);
     expect(get(prInfo)).toEqual(freshPr);
   });
+
+  it("sweeps a removed project's worktrees out of the PR-freshness maps", async () => {
+    // The project-removed handler must drop each vanished worktree's
+    // prByWorktreeApplied/prByWorktreeStarted entries (via sweepWorktreeCaches),
+    // not just filter the stores — otherwise those maps leak until disposeDaemon.
+    projects.set([{ id: "proj-1", name: "Repo", root: "/repo", kind: "git-backed" }]);
+    worktrees.set([
+      { id: "wt-1", project_id: "proj-1", path: "/repo", branch: "main", is_main: true, is_hitch_managed: false },
+    ]);
+
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { request: { type: string } } }) => {
+        if (request.request.type === "pr-status") return { type: "job-started", job_id: "j-pr" };
+        throw new Error(`unexpected request ${request.request.type}`);
+      },
+    );
+
+    // A completed lookup stamps both started and applied for wt-1.
+    const lookup = loadPrStatus("wt-1");
+    await flush();
+    completeJob("j-pr", { type: "pr-status", pr: { number: 1, url: "u", state: "OPEN", draft: false } });
+    await lookup;
+    expect(__prFreshnessTracked("wt-1")).toBe(true);
+
+    applyHitchEvent({ type: "project-removed", project_id: "proj-1" });
+
+    expect(__prFreshnessTracked("wt-1")).toBe(false);
+  });
+
+  it("sweeps a directly-removed worktree out of the PR-freshness maps", async () => {
+    projects.set([{ id: "proj-1", name: "Repo", root: "/repo", kind: "git-backed" }]);
+    worktrees.set([
+      { id: "wt-1", project_id: "proj-1", path: "/repo", branch: "main", is_main: true, is_hitch_managed: false },
+    ]);
+
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { request: { type: string } } }) => {
+        if (request.request.type === "pr-status") return { type: "job-started", job_id: "j-pr" };
+        throw new Error(`unexpected request ${request.request.type}`);
+      },
+    );
+
+    const lookup = loadPrStatus("wt-1");
+    await flush();
+    completeJob("j-pr", { type: "pr-status", pr: { number: 1, url: "u", state: "OPEN", draft: false } });
+    await lookup;
+    expect(__prFreshnessTracked("wt-1")).toBe(true);
+
+    // The direct worktree-removed path (removeWorktreeLocal) must clear the same set.
+    applyHitchEvent({ type: "worktree-removed", worktree_id: "wt-1" });
+
+    expect(__prFreshnessTracked("wt-1")).toBe(false);
+  });
 });
 
 describe("ordered tabs (keyboard tab navigation)", () => {
@@ -3405,5 +3545,75 @@ describe("History commit log + Commit Tabs", () => {
 
     await fetchCommitDiff(worktree.id, "sha-x");
     expect(calls).toBe(2);
+  });
+
+  it("caps the commit-diff cache, evicting the oldest entry and keeping the newest", async () => {
+    selectWorktree();
+    // The cap is 64 (COMMIT_DIFF_CACHE_CAP); overflowing it by one must drop the
+    // single oldest entry while every later entry stays served from the cache.
+    const cap = 64;
+    const callsBySha = new Map<string, number>();
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; commit_id?: string } }) => {
+        if (request.type === "commit-diff") {
+          const sha = request.commit_id ?? "";
+          callsBySha.set(sha, (callsBySha.get(sha) ?? 0) + 1);
+          return {
+            type: "commit-diff",
+            meta: commitInfo(sha),
+            files: [{ path: "src/a.ts", status: "modified", diff: "diff" }],
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Fill the cache to exactly the cap (sha-0 is the oldest), then add one more.
+    for (let i = 0; i < cap; i += 1) await fetchCommitDiff(worktree.id, `sha-${i}`);
+    await fetchCommitDiff(worktree.id, `sha-${cap}`);
+    expect(callsBySha.size).toBe(cap + 1);
+
+    // The newest entry is cached: re-fetching it must not hit the daemon again.
+    await fetchCommitDiff(worktree.id, `sha-${cap}`);
+    expect(callsBySha.get(`sha-${cap}`)).toBe(1);
+
+    // The oldest (sha-0) was evicted to make room, so its re-fetch re-walks.
+    await fetchCommitDiff(worktree.id, "sha-0");
+    expect(callsBySha.get("sha-0")).toBe(2);
+  });
+
+  it("re-inserts a served entry so it survives eviction over an untouched older one", async () => {
+    selectWorktree();
+    const cap = 64;
+    const callsBySha = new Map<string, number>();
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; commit_id?: string } }) => {
+        if (request.type === "commit-diff") {
+          const sha = request.commit_id ?? "";
+          callsBySha.set(sha, (callsBySha.get(sha) ?? 0) + 1);
+          return {
+            type: "commit-diff",
+            meta: commitInfo(sha),
+            files: [{ path: "src/a.ts", status: "modified", diff: "diff" }],
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Fill to the cap; sha-0 is oldest, sha-1 is next-oldest.
+    for (let i = 0; i < cap; i += 1) await fetchCommitDiff(worktree.id, `sha-${i}`);
+
+    // Touch sha-0 (a cache hit), which re-inserts it as the newest — so sha-1 is
+    // now the oldest. Adding a fresh entry must evict sha-1, not the just-read sha-0.
+    await fetchCommitDiff(worktree.id, "sha-0");
+    expect(callsBySha.get("sha-0")).toBe(1);
+    await fetchCommitDiff(worktree.id, `sha-${cap}`);
+
+    // sha-0 is still cached (re-fetch serves it); sha-1 was evicted (re-walks).
+    await fetchCommitDiff(worktree.id, "sha-0");
+    expect(callsBySha.get("sha-0")).toBe(1);
+    await fetchCommitDiff(worktree.id, "sha-1");
+    expect(callsBySha.get("sha-1")).toBe(2);
   });
 });

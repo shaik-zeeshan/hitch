@@ -299,6 +299,14 @@ function writePrByWorktree(worktreeId: Id, pr: PrInfo | null, seq: number): bool
   return true;
 }
 
+// Test-only inspector: whether either PR-freshness map still holds bookkeeping
+// for a worktree. These maps are otherwise module-private (their monotonic seqs
+// have no public-store effect), so this lets the leak tests assert that a removed
+// worktree's entries are swept rather than retained until disposeDaemon.
+export function __prFreshnessTracked(worktreeId: Id): boolean {
+  return prByWorktreeApplied.has(worktreeId) || prByWorktreeStarted.has(worktreeId);
+}
+
 const diffCache = new Map<string, string>();
 // Diff freshness is scoped by consumer. A single-file tab and the all-changes
 // fan-out may request the same path concurrently; each should only gate its own
@@ -663,11 +671,17 @@ export function loadMoreCommits(): Promise<void> {
 
 // ---- Commit diff cache (Commit Tab) ---------------------------------------
 //
-// Commit objects are immutable, so a commit's diff is cached per `worktree+sha`
-// FOREVER — there is no invalidation path (unlike the working-tree diff cache
-// variants). A Commit Tab opened twice fetches once; every later open serves the
-// cache. Entries are only ever dropped on `disposeDaemon`.
+// Commit objects are immutable, so a commit's diff never needs invalidation
+// (unlike the working-tree diff cache variants). A Commit Tab opened twice
+// fetches once; every later open serves the cache. Entries are dropped on
+// `disposeDaemon`/`sweepWorktreeCaches`, OR evicted once the cache exceeds
+// `COMMIT_DIFF_CACHE_CAP`. Each entry pins a commit's full multi-file
+// CommitDiffData, so the cap is deliberately small (mirroring the Rust side's
+// LINE_TOTALS_CACHE_CAP): a miss just re-walks via the daemon, the accepted
+// fallback. Eviction is FIFO over Map insertion order (oldest entry dropped);
+// a read re-inserts its entry so it counts as freshly used (LRU-ish).
 export type CommitDiffData = { meta: CommitMeta; files: CommitFileDiff[] };
+const COMMIT_DIFF_CACHE_CAP = 64;
 const commitDiffCache = new Map<string, CommitDiffData>();
 // Coalesce concurrent fetches of the same commit (e.g. a re-click while the first
 // request is still in flight) onto one daemon round-trip.
@@ -683,7 +697,13 @@ export async function fetchCommitDiff(
 ): Promise<CommitDiffData | null> {
   const cacheKey = commitDiffCacheKey(worktreeId, sha);
   const cached = commitDiffCache.get(cacheKey);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) {
+    // Re-insert so a served entry moves to the back (newest) of the eviction
+    // order — keeps actively-viewed commits from being dropped under the cap.
+    commitDiffCache.delete(cacheKey);
+    commitDiffCache.set(cacheKey, cached);
+    return cached;
+  }
   const inFlight = commitDiffInFlight.get(cacheKey);
   if (inFlight) return inFlight;
 
@@ -698,6 +718,12 @@ export async function fetchCommitDiff(
         Response & { meta: CommitMeta; files: CommitFileDiff[] }
       >(request);
       const data: CommitDiffData = { meta: response.meta, files: response.files };
+      // Evict the oldest entry (front of Map insertion order) when at cap before
+      // inserting the newest, bounding the memory each large diff would pin.
+      if (commitDiffCache.size >= COMMIT_DIFF_CACHE_CAP && !commitDiffCache.has(cacheKey)) {
+        const oldest = commitDiffCache.keys().next().value;
+        if (oldest !== undefined) commitDiffCache.delete(oldest);
+      }
       commitDiffCache.set(cacheKey, data);
       return data;
     } catch (err) {
@@ -1111,6 +1137,24 @@ export function completeJob(jobId: Id, response: Response): void {
       Object.entries(get(compositeChains)).find(([, c]) => c.jobId === jobId)?.[0] ??
       null;
     if (worktreeId) applyCompositeCompletion(worktreeId, response);
+  } else if (isError(response)) {
+    // A composite Job can ALSO terminate as a plain `Response::Error` rather than
+    // a `composite-job-failed`: cancellation, the worktree vanishing at chain
+    // start, a poisoned lock, or a worker panic. None of those reach
+    // applyCompositeCompletion above, so without this the optimistic in-flight
+    // display would freeze (spinner stuck, autoRunning stuck true). Park it as a
+    // failure so the button shows the oxide ✗ + retry instead. The worktree id
+    // rides the live Jobs store entry or the chain display whose jobId matches
+    // (same resolution as the success path). Park ONLY if a chain entry still
+    // exists for it — a user-driven cancel optimistically clears the chain before
+    // its "job cancelled" error arrives, and we must not resurrect it.
+    const worktreeId =
+      get(jobs)[jobId]?.worktreeId ??
+      Object.entries(get(compositeChains)).find(([, c]) => c.jobId === jobId)?.[0] ??
+      null;
+    if (worktreeId && get(compositeChains)[worktreeId]) {
+      applyCompositeErrorCompletion(worktreeId, response.error.message);
+    }
   }
   const pending = jobPending.get(jobId);
   const local = locallyStartedJobs.has(jobId);
@@ -1248,6 +1292,23 @@ function applyCompositeCompletion(worktreeId: Id, response: Response): void {
   if (response.type === "pull-request-created" && typeof response.url === "string") {
     openCreatedPrUrl(worktreeId, response.url);
   }
+}
+
+// Park a chain that terminated as a plain `Response::Error` (cancellation,
+// worktree removed at chain start, poisoned lock, worker panic) — none of which
+// carry a `failed_step`/`kind`, so we keep the chain's current rung (the
+// optimistic or last-progress step) and reuse its kind for the oxide retry
+// label. Mirrors the `composite-job-failed` parking shape so RightRail/Composer
+// render ✗ + retry identically.
+function applyCompositeErrorCompletion(worktreeId: Id, reason: string): void {
+  const held = get(compositeChains)[worktreeId];
+  if (!held) return;
+  setCompositeChain(worktreeId, {
+    jobId: null,
+    kind: held.kind,
+    step: held.step,
+    failed: { step: held.step, reason: reason || "Chain failed." },
+  });
 }
 
 // PR urls already opened, so a duplicate completion (or a confirm path that also
@@ -1397,10 +1458,13 @@ export async function cancelCompositeChain(
     )?.id ??
     null;
   if (jobId) await cancelJob(jobId);
-  // The daemon's cancellation maps to a Cancelled job status → job-completed
-  // with an error/cancelled response, which clears the chain display via the
-  // completion handler. Clear the optimistic display now so the button settles
-  // immediately even if the cancel raced the first progress event.
+  // Clear the optimistic display NOW — this is the clear that actually settles
+  // the button. The daemon's cancellation arrives as a plain error-typed
+  // `job-completed`, which completeJob's composite-error path would otherwise
+  // PARK as an oxide failure; clearing here first means no chain entry survives
+  // for that path to park (the park is guarded on a still-present entry), so the
+  // button settles instead of flipping to ✗. This also covers the cancel racing
+  // the first progress event.
   clearCompositeChain(worktreeId);
 }
 
@@ -1417,12 +1481,14 @@ function omitKey<T>(record: Record<Id, T>, id: Id): Record<Id, T> {
   return next;
 }
 
-// Evict every diff-cache entry belonging to a worktree. All these Maps key by
-// `${worktreeId}\0…` (working-tree diff variants use `\0<path>\0<options>`,
-// commit diffs use `\0<sha>`), so a single prefix sweep covers them. Called when
-// a worktree disappears (removed directly, or as part of a removed project) — the
+// Evict every per-worktree cache/bookkeeping entry belonging to a worktree.
+// The diff caches key by `${worktreeId}\0…` (working-tree diff variants use
+// `\0<path>\0<options>`, commit diffs use `\0<sha>`), so a single prefix sweep
+// covers them; the PR-freshness maps key by bare worktree id. Called when a
+// worktree disappears (removed directly, or as part of a removed project) — the
 // entries (especially commit diffs, which hold full multi-file CommitDiffData and
-// otherwise live until disposeDaemon) would leak forever otherwise.
+// otherwise live until disposeDaemon) would leak forever otherwise. `Map.delete`
+// is idempotent, so callers may also delete these directly without double-free.
 function sweepWorktreeCaches(worktreeId: Id): void {
   const prefix = `${worktreeId}\0`;
   for (const map of [
@@ -1436,6 +1502,8 @@ function sweepWorktreeCaches(worktreeId: Id): void {
       if (key.startsWith(prefix)) map.delete(key);
     }
   }
+  prByWorktreeApplied.delete(worktreeId);
+  prByWorktreeStarted.delete(worktreeId);
 }
 
 function removeWorktreeLocal(worktreeId: Id): void {
@@ -1454,8 +1522,7 @@ function removeWorktreeLocal(worktreeId: Id): void {
   worktreeLineStats.update((current) => omitKey(current, worktreeId));
   compositeChains.update((current) => omitKey(current, worktreeId));
   prByWorktree.update((current) => omitKey(current, worktreeId));
-  prByWorktreeApplied.delete(worktreeId);
-  prByWorktreeStarted.delete(worktreeId);
+  // sweepWorktreeCaches also drops prByWorktreeApplied/prByWorktreeStarted.
   sweepWorktreeCaches(worktreeId);
 
   if (get(gitStatus)?.worktree_id === worktreeId) gitStatus.set(null);
@@ -1918,12 +1985,13 @@ export function applyHitchEvent(event: HitchEvent): void {
     }
     projects.update((items) => items.filter((p) => p.id !== projectId));
     worktrees.update((items) => items.filter((w) => w.project_id !== projectId));
-    // Evict every vanished worktree's diff caches (working-tree AND commit), which
-    // are keyed per worktree and would otherwise leak until disposeDaemon. We sweep
-    // caches directly rather than call removeWorktreeLocal per worktree: this handler
-    // already owns selection reset above, and the daemon broadcasts session-closed
-    // for any killed sessions (pruned in the session-closed branch) — so the only
-    // unhandled leak is the cache, which is exactly what sweepWorktreeCaches covers.
+    // Evict every vanished worktree's per-worktree state (working-tree AND commit
+    // diff caches, plus the PR-freshness maps), which are keyed per worktree and
+    // would otherwise leak until disposeDaemon. We sweep directly rather than call
+    // removeWorktreeLocal per worktree: this handler already owns selection reset
+    // above, and the daemon broadcasts session-closed for any killed sessions
+    // (pruned in the session-closed branch) — so sweepWorktreeCaches covers the
+    // remaining per-worktree leaks (the same set removeWorktreeLocal sweeps).
     for (const id of removedWorktreeIds) sweepWorktreeCaches(id);
   }
 }
@@ -3328,9 +3396,12 @@ sessions.subscribe(($sessions) => {
   }
 });
 
-// Forget agent state, announced identity, output gate, and running command for
-// sessions that have closed (or were dropped on a reconnect), so stale labels
-// never linger on the tree or tabs.
+// Forget agent state, announced identity, output gate, running command, and
+// notification bookkeeping for sessions that have closed (or were dropped on a
+// reconnect), so stale labels never linger on the tree or tabs and the
+// notifications module's per-session turn clock doesn't leak. The session-closed
+// event path clears these per session; this catches sessions a reconnect snapshot
+// silently dropped (no session-closed event arrives for them).
 sessions.subscribe(($sessions) => {
   const liveIds = new Set($sessions.map((s) => s.id));
   function pruneToLive<T>(current: Record<Id, T>): Record<Id, T> {
@@ -3338,6 +3409,11 @@ sessions.subscribe(($sessions) => {
       Object.entries(current).filter(([id]) => liveIds.has(id)),
     ) as Record<Id, T>;
     return Object.keys(next).length === Object.keys(current).length ? current : next;
+  }
+  // agentStates is the authoritative per-session set, so any id in it but no
+  // longer live was dropped — clear its notification turn clock too.
+  for (const id of Object.keys(get(agentStates))) {
+    if (!liveIds.has(id)) forgetSessionNotifications(id);
   }
   agentStates.update(pruneToLive);
   sessionAgents.update(pruneToLive);

@@ -884,18 +884,14 @@ pub struct CommitAndPushResult {
 
 /// Whatever a composite Job completed before failing, so a failure can report
 /// prior steps' results intact (ADR 0013 amendment): the commit that landed
-/// before a push failure, or the PR URL if a later step failed. All `None` when
-/// the chain aborted before producing anything (e.g. a draft-generation failure
-/// that aborts before any commit).
+/// before a push failure. `None` when the chain aborted before producing
+/// anything (e.g. a draft-generation failure that aborts before any commit).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CompositeJobResult {
     /// The commit produced by a `commit-and-push` chain before a later step
     /// failed (the commit stays — only the push failed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<CommitAndPushResult>,
-    /// The PR URL produced before a later step failed, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pr_url: Option<String>,
 }
 
 /// One in-flight composite Job for a worktree (entry in [`Response::ActiveJobs`]).
@@ -1848,15 +1844,12 @@ mod tests {
                     pushed_commits: 0,
                     file_count: 2,
                 }),
-                pr_url: None,
             },
         };
         let value: serde_json::Value = serde_json::to_value(&failed).unwrap();
         assert_eq!(value["type"], "composite-job-failed");
         assert_eq!(value["failed_step"], "pushing");
         assert_eq!(value["result"]["commit"]["short_sha"], "abc1234");
-        // An empty prior-step result omits the optional fields entirely.
-        assert!(value["result"].get("pr_url").is_none());
         let back: Response = serde_json::from_value(value).unwrap();
         assert_eq!(failed, back);
 
@@ -2284,7 +2277,6 @@ mod tests {
                         pushed_commits: 0,
                         file_count: 2,
                     }),
-                    pr_url: None,
                 },
             },
             Response::ActiveJobs {

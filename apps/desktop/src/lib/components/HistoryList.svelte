@@ -19,6 +19,7 @@
     commitTabPath,
   } from "../daemon";
   import type { CommitInfo } from "../types";
+  import { cssEscape } from "../cssEscape";
   import { focusWithoutScroll } from "../focusWithoutScroll";
 
   // The roving (keyboard-focused) commit is owned by RightRail — git pane focus
@@ -165,11 +166,8 @@
     });
   }
 
-  // Minimal CSS.escape fallback for the sha attribute selector (a full git id is
-  // hex + safe, but guard the same way RightRail does for the test/SSR env).
-  function cssEscape(value: string): string {
-    return typeof CSS !== "undefined" && CSS.escape ? CSS.escape(value) : value;
-  }
+  // CSS.escape fallback for the sha attribute selector lives in ../cssEscape
+  // (shared with RightRail).
 </script>
 
 <div class="history" bind:this={listEl}>

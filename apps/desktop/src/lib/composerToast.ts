@@ -37,9 +37,10 @@ export function autoToastContent(result: CommitAndPushResult): {
   };
 }
 
-// Short error line for a failed chain toast (mirrors RightRail.shortError: first
-// line, capped). The full reason also sits under the oxide button via the chain
-// store, so the toast only needs the gist.
+// Short error line for a failed chain toast: first line, capped. The single source
+// for the rail's error-toast wording — RightRail (commit/push/pull/fetch) and
+// ProjectTree (open-in-editor) call this directly. The full reason also sits under
+// the oxide button via the chain store, so the toast only needs the gist.
 export function autoErrorMessage(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
   const first = msg.split("\n")[0].trim();

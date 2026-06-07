@@ -115,6 +115,8 @@ silently blank an unseen failure. `error` holds until the user re-prompts
 (`UserPromptSubmit` → `running`) or the agent exits to `None`. This is a
 transition-precedence rule on the daemon-owned value, not inference.
 
+**The rollup shows on every worktree row, including the selected/actively-watched one.** The prior shell suppressed the `running` word on the worktree you were live-viewing (rationale: "you can see that agent live in the main pane"). The shell redesign (commit 139d349) removed that guard so the rollup is a **pure derivation of session states**, with no dependence on selection or focus — the row reads the same whether or not it is the one you are watching. This keeps the rollup window-agnostic and matches the daemon-owned, replay-on-attach model: display follows state, not the GUI's current view.
+
 **`SessionStart` is wired after all — but as identity, not state.** The "not
 wired" rule above was about *state*, and stands: a fresh agent still has no
 Agent State. What the shell additionally needs is the **Session mark** (whose

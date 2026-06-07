@@ -2995,7 +2995,10 @@ fn set_window_theme(app: AppHandle, theme: String) -> Result<(), String> {
     // Write-then-rename so a concurrent cold-start reader (no single-instance
     // plugin) or a crash mid-write never sees a torn/empty mirror — the rename
     // is an atomic swap because the temp file lives on the same filesystem.
-    let tmp = path.with_extension("tmp");
+    // The temp name carries our pid: without single-instance two app processes
+    // must not share `theme.tmp`, or the first rename consumes it and the
+    // second loses its write to ENOENT. A leaked tmp on crash is harmless.
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&tmp, value).map_err(|err| format!("failed to write theme mirror: {err}"))?;
     std::fs::rename(&tmp, &path).map_err(|err| format!("failed to swap theme mirror: {err}"))
 }

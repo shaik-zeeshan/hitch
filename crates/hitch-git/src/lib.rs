@@ -1493,7 +1493,12 @@ pub fn log_enriched(
 
     // Skip the offset, take one extra to detect whether more remain past the
     // page, then enrich exactly the page.
-    let mut commits = Vec::with_capacity(limit);
+    //
+    // `limit` is client-controlled, so clamp the pre-allocation: a huge value
+    // (e.g. `u32::MAX`) must not drive an unbounded up-front allocation. The Vec
+    // still grows normally past the cap if the limit is genuinely larger.
+    const PREALLOC_CAP: usize = 1024;
+    let mut commits = Vec::with_capacity(limit.min(PREALLOC_CAP));
     let mut has_more = false;
     for oid in revwalk.skip(offset) {
         let oid = oid?;

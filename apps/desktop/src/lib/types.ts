@@ -191,11 +191,10 @@ export type CommitAndPushResult = {
 };
 
 // Whatever a chain completed before failing (e.g. the commit that landed before
-// a push failure, or a PR url). All-absent when it aborted before producing
-// anything (a draft-generation failure aborts before any commit).
+// a push failure). Absent when it aborted before producing anything (a
+// draft-generation failure aborts before any commit).
 export type CompositeJobResult = {
   commit?: CommitAndPushResult | null;
-  pr_url?: string | null;
 };
 
 // One in-flight chain for a worktree, returned by the `active-jobs` query so a

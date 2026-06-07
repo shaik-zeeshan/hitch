@@ -161,6 +161,14 @@
 
   function regenerate() {
     if (phase === "committing") return;
+    // Guard a one-click discard of an edited message — mirrors the old
+    // CommitDialog.confirmReplace: only confirm when there's text to lose.
+    if (
+      (subject.trim() || body.trim()) &&
+      !window.confirm("Replace the current commit text with a generated draft?")
+    ) {
+      return;
+    }
     subject = "";
     body = "";
     void startGeneration();

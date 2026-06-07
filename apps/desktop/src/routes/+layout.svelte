@@ -246,15 +246,10 @@
     },
     // ---- tabs (slice 2) ---------------------------------------------------
     // Cmd+1…9 jump to the Nth tab in the visual order (1-based → 0-based).
-    "tab.jump.1": () => activateTab(0),
-    "tab.jump.2": () => activateTab(1),
-    "tab.jump.3": () => activateTab(2),
-    "tab.jump.4": () => activateTab(3),
-    "tab.jump.5": () => activateTab(4),
-    "tab.jump.6": () => activateTab(5),
-    "tab.jump.7": () => activateTab(6),
-    "tab.jump.8": () => activateTab(7),
-    "tab.jump.9": () => activateTab(8),
+    // Generated to mirror the `tab.jump.${n}` ids keymap.ts emits for 1…9.
+    ...Object.fromEntries(
+      Array.from({ length: 9 }, (_, i) => [`tab.jump.${i + 1}`, () => activateTab(i)]),
+    ),
     // Both next/prev pairs (Cmd+Shift+]/[ and Ctrl+Tab/Ctrl+Shift+Tab) cycle.
     "tab.next": () => cycleTab(1),
     "tab.prev": () => cycleTab(-1),
