@@ -5,23 +5,31 @@ A native desktop app for managing multiple software projects and their git workt
 ## Language
 
 **Project**:
-A workspace rooted at a single local directory that the user has added to Hitch. A Project is either *git-backed* (rooted at a git repository) or a *plain folder*. Git-backed Projects support worktrees and git operations; plain folders support only terminals.
-_Avoid_: Repo (a Project may not be a repo), Workspace.
+A workspace rooted at a directory on the machine where its owning **Daemon** runs. A Project is either *git-backed* (rooted at a git repository) or a *plain folder*. Git-backed Projects support worktrees and git operations; plain folders support only terminals. Whether the GUI reaches that Daemon locally or through an **SSH Host** is an attachment detail, not a different Project kind.
+_Avoid_: Repo (a Project may not be a repo), Workspace, Remote Host Project (use **Remote Project** only when the GUI reaches the owning Daemon through SSH).
+
+**SSH Host**:
+A GUI-local saved OpenSSH target string through which the GUI can reach a Hitch **Daemon** running on that host; SSH auth remains non-interactive and owned by the user's OpenSSH config, ssh-agent, and known_hosts.
+_Avoid_: Server (reserved as an avoided synonym for **Daemon**), Machine, Box.
+
+**Remote Project**:
+A Project owned by a **Daemon** that the GUI reaches through an **SSH Host**.
+_Avoid_: Remote Host Project, SSH Project.
 
 **Worktree**:
 A git working tree belonging to a git-backed Project, checked out on exactly one branch. The original directory the user added is the *main worktree* (flagged primary); all others are *created worktrees* that Hitch places under a managed global directory (`~/.hitch/worktrees/<project>/<branch>/`). Git enforces that a branch is checked out in at most one worktree.
 _Avoid_: Branch (a worktree is a checkout of a branch, not the branch itself), Checkout.
 
 **Session**:
-A single PTY (pseudo-terminal) process running in a fixed working directory — a created **Worktree** or main worktree for git-backed Projects, or the Project root for plain folders. The unit of work in Hitch. A user runs anything in it: shell commands, build tools, or an agent CLI. Sessions are owned by the **Daemon** (not the GUI), organized in the tree under their worktree/project, are nameable, and there may be several per worktree.
-_Avoid_: Task (there is no separate tracked-task entity), Tab (the tab is the UI view of a Session).
+A single PTY (pseudo-terminal) process running in a fixed working directory on the machine where its owning **Daemon** runs — a created **Worktree** or main worktree for git-backed Projects, or the Project root for plain folders. The unit of work in Hitch. A user runs anything in it: shell commands, build tools, or an agent CLI. Sessions are owned by the **Daemon** (not the GUI), organized in the tree under their worktree/project, are nameable, and there may be several per worktree/project.
+_Avoid_: Task (there is no separate tracked-task entity), Tab (the tab is the UI view of a Session), SSH Session (SSH changes how the GUI reaches the owning Daemon, not the entity).
 
 **Daemon**:
 The long-lived Hitch background process that owns every **Session**'s PTY, buffers its scrollback, and receives **Agent State** hook notifications. It is also the sole owner of git operations (status, diff, commit, push, pull, PR, worktree create/remove) and the **Worktree**/**Project** registry: a Worktree is a registry row plus its live Sessions plus a git checkout, so worktree lifecycle is one transaction the daemon must own end-to-end (e.g. removing a worktree kills its Sessions *and* runs `git worktree remove` together), and a single daemon-side poller broadcasts dirty/branch state identically to every attached GUI window. It is spawned detached by the GUI and outlives window-close and Cmd-Q (signalled by a menu-bar item), so Sessions survive app quit/reopen. It does not survive a machine reboot — across a reboot Hitch falls back to reopening the saved session layout as fresh terminals. The GUI is a thin client that connects over a local socket and *reattaches* on launch.
 _Avoid_: Server, Backend.
 
 **Daemon Status**:
-The liveness/health of the **Daemon** process itself, distinct from any one GUI's socket attachment. Values: *starting* (spawn issued, socket not yet up), *running* (a healthy daemon is listening and this GUI is attached), *unreachable* (no socket and no live daemon process found — it died or never ran), *failed* (spawn or startup errored, carrying a captured reason). "Is this GUI attached to the running daemon" is a sub-state of *running*, surfaced as the connection indicator. A *failed* status always carries a human-readable reason sourced from the daemon's own log.
+The liveness/health of one **Daemon** process as observed by the GUI, distinct from any one request/response. Values: *starting* (spawn/connect issued, endpoint not yet up), *running* (a healthy daemon is listening and this GUI is attached), *unreachable* (local endpoint or SSH Host cannot currently reach a live daemon), *failed* (spawn/connect/startup errored, carrying a captured reason). Remote Daemon Status auto-reconnects with backoff for enabled SSH Hosts; the remote tree may be stale while unreachable, then replayed on attach. A *failed* status always carries a human-readable reason sourced from the daemon/proxy path.
 _Avoid_: Connection (that is the per-GUI socket link, a narrower thing), Health (too generic).
 
 **Agent**:
@@ -86,23 +94,28 @@ _Avoid_: Completed notification (a turn ends to *waiting*; nothing "completes"),
 
 ## Relationships
 
-- A **Project** is either git-backed or a plain folder (its *kind*).
+- A GUI window may attach to multiple **Daemons** at once: the local Daemon plus zero or more remote Daemons reached through **SSH Hosts**.
+- An **SSH Host** is saved by the GUI as attachment configuration; it is not owned by the local Daemon or by any remote Daemon.
+- A **Project** is owned by exactly one **Daemon**.
+- A **Remote Project** is a Project whose owning **Daemon** is reached through an **SSH Host**.
+- A **Project** is either git-backed or a plain folder (its *kind*), independent of whether its owning Daemon is local or remote.
 - A git-backed **Project** owns one or more **Worktrees**; exactly one is the main worktree.
 - A plain-folder **Project** owns no worktrees and exposes no git operations.
-- A **Worktree** is checked out on exactly one branch; a branch maps to at most one **Worktree**.
-- A **Session** runs in exactly one Worktree (git-backed) or one plain-folder Project root.
-- A **Session** running a known **Agent** has an **Agent State**; other Sessions do not. The **Daemon** owns the current value per Session and replays it on attach; a **Worktree**/**Project** row badge is a *derived* rollup of its Sessions' states, prioritised *needs-approval > error > waiting > running*.
-- Hitch enables Agent State by writing the agent's hook config into the Worktree it manages.
+- A **Worktree** is checked out on exactly one branch; a branch maps to at most one **Worktree** within its owning Daemon.
+- A **Session** runs in exactly one Worktree (git-backed) or one plain-folder Project root, on the owning Daemon's machine.
+- A **Session** running a known **Agent** has an **Agent State**; other Sessions do not. The **Daemon** owns the current value per Session and replays it on attach; a **Worktree**/**Project** row badge is a *derived* rollup of its Sessions' states, prioritised *needs-approval > error > waiting > running*. Global attention surfaces include Agent State from every connected Daemon, scoped with the local/SSH Host name.
+- Hitch enables Agent State by writing the agent's hook config into the Worktree it manages; for a Remote Project, the remote Daemon writes the hook config and receives hook reports on the remote host.
 - A **Draft Generator** runs outside Sessions and does not produce **Agent State**.
 - The **Composer** is the only GUI surface that triggers the **Draft Generator**; it observes the run as a **Job** and is the cancel affordance for it.
 - **Draft Instructions** are app-global settings carried per draft request; they shape the **Draft Generator**'s prompt but never own it.
 - A **Job** is owned by the **Daemon**, runs off the request loop, and reports its lifecycle via events; the GUI observes Jobs but never owns them. Fast git reads are not Jobs.
-- **Daemon Status** describes the Daemon process's own liveness; it is broader than, and contains, any single GUI's connection state.
+- **Daemon Status** describes one Daemon process's liveness; it is broader than, and contains, any single GUI's connection state. In the multi-daemon tree each top-level local/SSH Host scope has its own Daemon Status.
 - A **Desktop Notification** derives from a live **Agent State** transition observed by the GUI; the **Daemon** stores and broadcasts state but never raises notifications. Codex's missing failure hook (known gap) means *error* notifications never fire for Codex.
 - **History** belongs to the right rail and shows exactly one **Worktree**'s log; a **Commit Tab** belongs to the center tab strip. Commit reads (log, commit diff) follow the fast synchronous git-read path, not **Jobs**.
 
 ## Flagged ambiguities
 
+- "SSH support" — resolved as connecting the GUI to a **Daemon** running on an **SSH Host** through an SSH stdio proxy (ADR 0014). Sessions, git operations, Worktrees, Jobs, and Agent State remain Daemon-owned and run on that host; SSH is the transport to the remote Daemon, not a local-Daemon remote-shell feature.
 - "Tracked task" — there is no Task entity. A Session running an Agent is the closest thing; its "tracking" is just its Agent State, surfaced in the tree/tab. Typing `claude` in any Session reports state because the hook lives in the worktree config, not in how the Session was launched.
 - "Agent harness" — resolved as **Draft Generator** for this feature; **Agent** remains reserved for known CLIs running in Sessions.
 - "completed" / "done" — removed (ADR 0011). An interactive Agent does not terminate into a state: a finished turn is *waiting*, an exited Agent is `None`.
