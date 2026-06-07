@@ -36,9 +36,10 @@ import {
   connection,
   ALL_CHANGES_TAB,
   COMMIT_TAB_PREFIX,
-  allChangesCollapsed,
+  allChangesExpanded,
   allChangesFiles,
   allChangesRowKey,
+  setAllChangesAllExpanded,
   commitLog,
   commitShaFromTab,
   commitTabPath,
@@ -133,7 +134,7 @@ beforeEach(() => {
   diffTabs.set([]);
   activeDiffPath.set(null);
   allChangesFiles.set([]);
-  allChangesCollapsed.set(new Set());
+  allChangesExpanded.set(new Set());
   prByWorktree.set({});
   prInfo.set(null);
   prUrl.set(null);
@@ -1605,7 +1606,36 @@ describe("all-changes diff tab", () => {
     return { promise, resolve };
   }
 
-  it("opens the sentinel tab and fans out per-file diffs (staged first)", async () => {
+  // Rows are collapsed by default (nothing fetches until expanded), so tests
+  // that exercise the diff fan-out mark their rows expanded up front.
+  function expandRows(...rows: [path: string, staged: boolean][]) {
+    allChangesExpanded.set(new Set(rows.map(([path, staged]) => allChangesRowKey(path, staged))));
+  }
+
+  it("opens the sentinel tab with every row collapsed and fetches nothing", async () => {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([{ path: "src/a.ts", status: "modified", staged: false }]);
+    const diffRequests: string[] = [];
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffRequests.push(request.path!);
+          return { type: "git-diff", diff: { diff: `diff for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await viewAllChanges();
+
+    // Collapsed-by-default: the row seeds as null and no diff is fetched.
+    expect(diffRequests).toEqual([]);
+    expect(get(allChangesFiles)).toEqual([{ path: "src/a.ts", staged: false, text: null }]);
+  });
+
+  it("expand-all marks every row expanded and fans out; collapse-all clears the set", async () => {
     projects.set([project]);
     worktrees.set([worktree]);
     selectedWorktreeId.set(worktree.id);
@@ -1614,6 +1644,35 @@ describe("all-changes diff tab", () => {
       { path: "src/a.ts", status: "modified", staged: true },
     ]);
     mockDiffs();
+
+    await viewAllChanges();
+    expect(get(allChangesFiles).every((row) => row.text === null)).toBe(true);
+
+    setAllChangesAllExpanded(true);
+    await flush();
+
+    expect(get(allChangesExpanded)).toEqual(
+      new Set([allChangesRowKey("src/a.ts", true), allChangesRowKey("src/b.ts", false)]),
+    );
+    expect(get(allChangesFiles)).toEqual([
+      { path: "src/a.ts", staged: true, text: "diff for src/a.ts" },
+      { path: "src/b.ts", staged: false, text: "diff for src/b.ts" },
+    ]);
+
+    setAllChangesAllExpanded(false);
+    expect(get(allChangesExpanded)).toEqual(new Set());
+  });
+
+  it("opens the sentinel tab and fans out expanded per-file diffs (staged first)", async () => {
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus([
+      { path: "src/b.ts", status: "modified", staged: false },
+      { path: "src/a.ts", status: "modified", staged: true },
+    ]);
+    mockDiffs();
+    expandRows(["src/a.ts", true], ["src/b.ts", false]);
 
     await viewAllChanges();
 
@@ -1752,6 +1811,7 @@ describe("all-changes diff tab", () => {
         return deferredResponse.promise;
       },
     );
+    expandRows(["src/a.ts", false]);
 
     const olderPromise = viewAllChanges();
     await flush();
@@ -1797,7 +1857,8 @@ describe("all-changes diff tab", () => {
       },
     );
 
-    // Open all-changes: src/a.ts is expanded, so its diff fetch starts (held).
+    // Open all-changes with src/a.ts expanded, so its diff fetch starts (held).
+    expandRows(["src/a.ts", false]);
     const openPromise = viewAllChanges();
     await flush();
     expect(pending.map((request) => request.path)).toEqual(["src/a.ts"]);
@@ -1809,7 +1870,7 @@ describe("all-changes diff tab", () => {
 
     // The user collapses the row, so the in-flight fetch's seq is the LATEST —
     // no follow-up fetch bumps the write-seq to neutralize it.
-    allChangesCollapsed.set(new Set([allChangesRowKey("src/a.ts", false)]));
+    allChangesExpanded.set(new Set());
 
     // The held (now stale) response resolves.
     pending[0]!.resolve({ type: "git-diff", diff: { diff: "stale a diff" } });
@@ -1843,6 +1904,7 @@ describe("all-changes diff tab", () => {
         throw new Error(`unexpected request ${request.type}`);
       },
     );
+    expandRows(["src/a.ts", false]);
 
     await viewAllChanges();
     expect(get(allChangesFiles)).toEqual([
@@ -1878,13 +1940,14 @@ describe("all-changes diff tab", () => {
       },
     );
 
-    // Open: both rows expanded by default, both fetched.
+    // Open with both rows expanded, both fetched.
+    expandRows(["src/a.ts", false], ["src/b.ts", false]);
     await viewAllChanges();
     expect(diffRequests).toEqual(["src/a.ts", "src/b.ts"]);
     diffRequests.length = 0;
 
     // User collapses src/b.ts.
-    allChangesCollapsed.set(new Set([allChangesRowKey("src/b.ts", false)]));
+    allChangesExpanded.set(new Set([allChangesRowKey("src/a.ts", false)]));
 
     // The 1s status poll picks up a line-count drift (additions 1 -> 2) on BOTH
     // files — the signature flips and the diff cache is evicted, so the refresh
@@ -1921,15 +1984,14 @@ describe("all-changes diff tab", () => {
       },
     );
 
-    // Collapse the row before opening, then open: the collapsed row isn't fetched
-    // and seeds as null (the "Loading" state the component renders).
-    allChangesCollapsed.set(new Set([allChangesRowKey("src/b.ts", false)]));
+    // Open with the row collapsed (the default): it isn't fetched and seeds as
+    // null (the "Loading" state the component renders).
     await viewAllChanges();
     expect(diffRequests).toEqual([]);
     expect(get(allChangesFiles)).toEqual([{ path: "src/b.ts", staged: false, text: null }]);
 
     // Expanding the section drives the store and kicks an on-demand fetch.
-    allChangesCollapsed.set(new Set());
+    expandRows(["src/b.ts", false]);
     await fetchAllChangesRow("src/b.ts", false);
 
     expect(diffRequests).toEqual(["src/b.ts"]);
@@ -1953,6 +2015,7 @@ describe("all-changes diff tab", () => {
         throw new Error(`unexpected request ${request.type}`);
       },
     );
+    expandRows(["src/a.ts", false]);
 
     await viewAllChanges();
     expect(get(allChangesFiles)).toEqual([
@@ -2002,6 +2065,7 @@ describe("all-changes diff tab", () => {
       },
     );
 
+    expandRows(["src/a.ts", false]);
     await viewAllChanges();
     expect(get(allChangesFiles)).toEqual([
       { path: "src/a.ts", staged: false, text: "diff v1 for src/a.ts" },
@@ -2113,6 +2177,7 @@ describe("all-changes diff tab", () => {
     );
 
     // (a) Cache the all-changes diff under option-key A (ignore-whitespace ON).
+    expandRows(["src/a.ts", false]);
     diffIgnoreWhitespace.set(true);
     await viewAllChanges();
     expect(get(allChangesFiles)).toEqual([
@@ -2183,6 +2248,7 @@ describe("all-changes diff tab", () => {
         return response.promise;
       },
     );
+    expandRows(...files.map((file): [string, boolean] => [file.path, false]));
 
     const promise = viewAllChanges();
     await flush();
@@ -2231,6 +2297,7 @@ describe("all-changes diff tab", () => {
         throw new Error(`unexpected request ${request.type}`);
       },
     );
+    expandRows(["src/a.ts", false]);
 
     const promise = viewAllChanges();
     await flush();

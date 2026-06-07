@@ -200,14 +200,14 @@ export function commitShaFromTab(path: string): string | null {
 // one @pierre/diffs instance per expanded entry from these.
 export type AllChangesFile = { path: string; staged: boolean; text: string | null };
 export const allChangesFiles = writable<AllChangesFile[]>([]);
-// Which all-changes rows are currently collapsed, keyed by `allChangesRowKey`
+// Which all-changes rows are currently expanded, keyed by `allChangesRowKey`
 // (side + path, since a partially-staged file appears as two rows). DiffAllTab
-// owns the toggling; the daemon reads it so a refresh only re-fetches diffs for
-// rows the user actually has expanded. A key absent from the set means expanded
-// — the default — so an initial open with nothing collapsed fans out every file
-// exactly as before, and the wasted re-fetches only disappear for sections the
-// user has explicitly collapsed.
-export const allChangesCollapsed = writable<Set<string>>(new Set());
+// owns the toggling; the daemon reads it so a refresh only fetches diffs for
+// rows the user actually has expanded. A key absent from the set means collapsed
+// — the default — so an initial open (and any row that newly appears in status)
+// starts collapsed and fetches nothing until the user expands it, individually
+// or via the head's expand-all toggle.
+export const allChangesExpanded = writable<Set<string>>(new Set());
 // Row identity for the all-changes view: side + path. A partially-staged file
 // contributes a staged and an unstaged row that diff differently, so the side
 // has to be part of the key. Shared with DiffAllTab (which keys its sections the
@@ -216,7 +216,7 @@ export function allChangesRowKey(path: string, staged: boolean): string {
   return `${staged ? "staged" : "unstaged"}\0${path}`;
 }
 const allChangesRowExpanded = (path: string, staged: boolean): boolean =>
-  !get(allChangesCollapsed).has(allChangesRowKey(path, staged));
+  get(allChangesExpanded).has(allChangesRowKey(path, staged));
 // Keep the daemon/webview responsive for large working trees: All changes may
 // contain hundreds of rows, and untracked directory rows can expand to large
 // diffs. Fetch a small pool instead of starting one git-diff per row at once.
@@ -2551,8 +2551,8 @@ export async function viewAllChanges(activate = true): Promise<void> {
   // signature on pure line-count drift (e.g. typing in an external editor) and
   // evict the diff cache, which would otherwise re-fan every file. Collapsed rows
   // fetch lazily when expanded (`fetchAllChangesRow`); their seeded text (cache
-  // hit or `null`) is left in place here. On the initial open nothing is
-  // collapsed, so this still fans out every file exactly as before.
+  // hit or `null`) is left in place here. On the initial open every row is
+  // collapsed (the default), so nothing fans out until the user expands rows.
   const expanded = ordered.filter((file) => allChangesRowExpanded(file.path, file.staged));
 
   await forEachBounded(expanded, ALL_CHANGES_DIFF_CONCURRENCY, async (file) => {
@@ -2591,6 +2591,23 @@ export async function fetchAllChangesRow(path: string, staged: boolean): Promise
   );
 }
 
+// Expand or collapse every all-changes row at once — the head's expand-all /
+// collapse-all toggle. Collapsing just clears the expanded set (collapsed rows
+// keep their seeded text; nothing renders them). Expanding marks every current
+// row expanded and re-runs `viewAllChanges` so the diffs fetch through its
+// bounded pool (warm rows seed from the cache instantly) instead of N unbounded
+// per-row on-demand fetches.
+export function setAllChangesAllExpanded(expanded: boolean): void {
+  if (!expanded) {
+    allChangesExpanded.set(new Set());
+    return;
+  }
+  allChangesExpanded.set(
+    new Set(get(allChangesFiles).map((row) => allChangesRowKey(row.path, row.staged))),
+  );
+  void viewAllChanges(false);
+}
+
 // Re-fetch every open diff under the current re-diff options. Called when
 // `diffIgnoreWhitespace` / `diffContextLines` change: those options are part of
 // the cache key, so a fresh fetch under the new key is what surfaces the
@@ -2626,7 +2643,7 @@ export function closeDiff(path?: string): void {
     activeDiffPath.set(null);
     diffActive.set(false);
     allChangesFiles.set([]);
-    allChangesCollapsed.set(new Set());
+    allChangesExpanded.set(new Set());
     return;
   }
   const tabs = get(diffTabs);
@@ -2637,7 +2654,7 @@ export function closeDiff(path?: string): void {
   if (path === ALL_CHANGES_TAB) {
     allChangesSeq += 1;
     allChangesFiles.set([]);
-    allChangesCollapsed.set(new Set());
+    allChangesExpanded.set(new Set());
   }
   const remaining = tabs.filter((tab) => tab.path !== path);
   diffTabs.set(remaining);

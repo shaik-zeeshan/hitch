@@ -2,9 +2,10 @@
   // All-changes view (the special ALL_CHANGES_TAB diff tab): every changed file
   // in one scroll, each as a collapsible section. Mirrors DiffTab's @pierre/diffs
   // rendering, but one FileDiff instance per *expanded* file section (the library
-  // supports many instances). Sections are expanded by default; collapsing a
-  // section unmounts its <diffs-container> so we only process diffs the user is
-  // looking at. Per-row diff text comes from `allChangesFiles` (fanned out by
+  // supports many instances). Sections start collapsed (the default — the head's
+  // expand-all toggle or a per-section click opens them); a collapsed section's
+  // <diffs-container> is unmounted so we only process diffs the user is looking
+  // at. Per-row diff text comes from `allChangesFiles` (fanned out by
   // viewAllChanges in daemon.ts), not a single diff string — so this reuses the
   // --diffs-* token bridge from DiffTab but its own data path.
   //
@@ -16,21 +17,23 @@
   // would greedily fold the later files' hunks into the first, corrupting the view.
   import { processPatch, type FileDiffMetadata } from "@pierre/diffs";
   import {
-    allChangesCollapsed,
+    allChangesExpanded,
     allChangesFiles,
     allChangesRowKey,
     fetchAllChangesRow,
+    setAllChangesAllExpanded,
   } from "../daemon";
   import { parseDiff } from "../diff";
   import { diffViewOptions } from "../diffView";
   import { theme } from "../theme";
   import DiffFileSection from "./DiffFileSection.svelte";
   import DiffViewOptions from "./DiffViewOptions.svelte";
+  import ExpandAllToggle from "./ExpandAllToggle.svelte";
   import { diffStyle, diffWrap } from "../settings";
 
-  // Collapsed sections live in the daemon store (`allChangesCollapsed`, keyed by
-  // row identity) so a refresh can skip fetching diffs for rows the user has
-  // collapsed. Absent from the set = expanded (the default). All-changes can
+  // Expanded sections live in the daemon store (`allChangesExpanded`, keyed by
+  // row identity) so a refresh only fetches diffs for rows the user has
+  // expanded. Absent from the set = collapsed (the default). All-changes can
   // contain the same path twice (staged + unstaged), so the key includes
   // stagedness instead of using file.path alone.
 
@@ -80,8 +83,8 @@
   // resolves instantly, a cold one fills in from `null` (the "Loading" state).
   function toggle(file: { path: string; staged: boolean }) {
     const rowKey = allChangesRowKey(file.path, file.staged);
-    const willExpand = $allChangesCollapsed.has(rowKey);
-    allChangesCollapsed.update((set) => {
+    const willExpand = !$allChangesExpanded.has(rowKey);
+    allChangesExpanded.update((set) => {
       const next = new Set(set);
       if (next.has(rowKey)) next.delete(rowKey);
       else next.add(rowKey);
@@ -93,6 +96,12 @@
   // A partially-staged file contributes two rows (staged + unstaged); the
   // header counts distinct files, not sections.
   const fileCount = $derived(new Set($allChangesFiles.map((f) => f.path)).size);
+
+  // The head's expand/collapse-all toggle: any expanded section flips the action
+  // to "collapse all". The daemon helper owns the effect (set + bounded fan-out).
+  const anyExpanded = $derived(
+    $allChangesFiles.some((f) => $allChangesExpanded.has(allChangesRowKey(f.path, f.staged))),
+  );
 
   // A single FileDiff per mounted (expanded, renderable) section. The shared
   // fileDiffView action (lib/diffView.ts) owns each instance: it renders on mount
@@ -109,6 +118,9 @@
     <span class="path">All changes</span>
     <span class="head-right">
       <span class="meta">{fileCount} file{fileCount === 1 ? "" : "s"}</span>
+      {#if $allChangesFiles.length > 0}
+        <ExpandAllToggle {anyExpanded} onToggle={() => setAllChangesAllExpanded(!anyExpanded)} />
+      {/if}
       <DiffViewOptions />
     </span>
   </div>
@@ -119,7 +131,7 @@
 
   {#each $allChangesFiles as file (allChangesRowKey(file.path, file.staged))}
     {@const rowKey = allChangesRowKey(file.path, file.staged)}
-    {@const isCollapsed = $allChangesCollapsed.has(rowKey)}
+    {@const isCollapsed = !$allChangesExpanded.has(rowKey)}
     <!-- The parse + section caches stay here (keyed by row + diff text, so a live
          status refetch re-parses), and the per-file collapsible markup lives in
          the shared DiffFileSection. The `staged` tag is passed as the trailing

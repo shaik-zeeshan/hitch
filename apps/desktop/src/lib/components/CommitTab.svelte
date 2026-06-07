@@ -25,6 +25,7 @@
   import { STATUS_GLYPH, statusGlyphClass } from "../types";
   import DiffFileSection from "./DiffFileSection.svelte";
   import DiffViewOptions from "./DiffViewOptions.svelte";
+  import ExpandAllToggle from "./ExpandAllToggle.svelte";
   import { diffStyle, diffWrap } from "../settings";
 
   let { sha }: { sha: string } = $props();
@@ -65,17 +66,27 @@
   // DiffTab/DiffAllTab (split/wrap/theme only re-lay-out an already-fetched diff).
   const options = $derived(diffViewOptions($diffStyle, $diffWrap, $theme));
 
-  // Per-file collapse set, keyed by path. Local to this tab instance (no daemon
+  // Per-file expanded set, keyed by path. Local to this tab instance (no daemon
   // store: commit diffs are immutable and fully delivered up front, so there is
-  // nothing to lazily refetch — collapsing is purely a render concern). Absent =
-  // expanded (the default), mirroring all-changes.
-  let collapsed = $state(new Set<string>());
+  // nothing to lazily refetch — expanding is purely a render concern). Absent =
+  // collapsed (the default), mirroring all-changes; the head's expand-all toggle
+  // or a per-section click opens sections.
+  let expanded = $state(new Set<string>());
 
   function toggle(path: string) {
-    const next = new Set(collapsed);
+    const next = new Set(expanded);
     if (next.has(path)) next.delete(path);
     else next.add(path);
-    collapsed = next;
+    expanded = next;
+  }
+
+  // The head's expand/collapse-all toggle: any expanded section flips the action
+  // to "collapse all". Expand-all is render-only (every file's diff text is
+  // already here), so it just fills the set with the commit's paths.
+  const anyExpanded = $derived(expanded.size > 0);
+
+  function toggleAll() {
+    expanded = anyExpanded ? new Set() : new Set((data?.files ?? []).map((file) => file.path));
   }
 
   // Parsed-diff + pierre-section caches keyed by path (the commit's file list is
@@ -149,6 +160,9 @@
             <span class="del">−{data.meta.deletions}</span>
           </span>
         {/if}
+        {#if data && data.files.length > 0}
+          <ExpandAllToggle {anyExpanded} onToggle={toggleAll} />
+        {/if}
         <!-- Commit diffs are immutable per-sha snapshots with no re-fetch path
              (no ws/ctx on CommitDiffRequest, skipped by refreshOpenDiffs), so we
              show only the render-only controls (style/wrap). -->
@@ -180,7 +194,7 @@
     <div class="diff-empty"><p>No file changes in this commit.</p></div>
   {:else}
     {#each data.files as file (file.path)}
-      {@const isCollapsed = collapsed.has(file.path)}
+      {@const isCollapsed = !expanded.has(file.path)}
       <!-- The parse + section caches stay here (keyed by path — a commit is
            immutable, so they never invalidate), and the per-file collapsible
            markup lives in the shared DiffFileSection. The per-file status glyph is
