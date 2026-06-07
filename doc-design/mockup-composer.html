@@ -578,7 +578,10 @@
   .cmp-subject:hover { border-color: var(--line); }
   .cmp-subject:focus { border-color: var(--iris); background: var(--paper-3); }
 
-  /* body: quiet auto-growing textarea; borderless at rest like the subject. */
+  /* body: quiet auto-growing textarea; borderless at rest like the subject.
+     auto-grows to its content up to ~10 text lines (line-height 1.55 × var(--r1))
+     plus the 8px vertical padding, then clamps and scrolls inside the card so a
+     long draft can't push the overlay past the file list. */
   .cmp-bodytext {
     width: 100%;
     display: block;
@@ -591,17 +594,24 @@
     border-radius: 0;
     padding: 4px 5px;
     margin: 4px -5px 0;
+    max-height: calc(10 * 1.55 * var(--r1) + 8px);
     resize: none;
     outline: none;
-    overflow: hidden;
+    overflow-x: hidden;
+    overflow-y: auto;
+    /* thin neutral scrollbar, matching the app's global convention. */
+    scrollbar-width: thin;
+    scrollbar-color: var(--ink-3) transparent;
   }
   .cmp-bodytext::placeholder { color: var(--ink-3); }
   .cmp-bodytext:hover { border-color: var(--line); }
   .cmp-bodytext:focus { border-color: var(--iris); background: var(--paper-3); }
 
-  /* the single muted footer line: scope on the left, esc hint on the right. */
+  /* the single muted footer line: scope on the left, esc hint on the right.
+     it must never wrap — the scope truncates while the controls stay intact. */
   .cmp-foot {
     display: flex;
+    flex-wrap: nowrap;
     align-items: center;
     gap: 8px;
     margin-top: 7px;
@@ -611,17 +621,21 @@
     font-size: 0.625rem;
     color: var(--ink-3);
   }
-  .cmp-foot .scope { color: var(--ink-2); }
+  /* the scope is the one thing that gives way: it shrinks and ellipsises. */
+  .cmp-foot .scope { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); }
   .cmp-foot .scope b { color: var(--ink-1); font-weight: 600; }
   .cmp-foot .spacer { flex: 1; }
+  /* the right-side controls never shrink or wrap — they stay fully visible. */
   .cmp-foot .act {
+    flex: none;
+    white-space: nowrap;
     color: var(--iris-ink);
     cursor: pointer;
     display: inline-flex;
     align-items: center;
     gap: 4px;
   }
-  .cmp-foot .esc { color: var(--ink-3); display: inline-flex; align-items: center; gap: 4px; }
+  .cmp-foot .esc { flex: none; white-space: nowrap; color: var(--ink-3); display: inline-flex; align-items: center; gap: 4px; }
   .cmp-foot .esc kbd { translate: 0 0; }
 
   /* error line inside the body */

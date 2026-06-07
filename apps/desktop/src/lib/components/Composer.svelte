@@ -97,9 +97,10 @@
     }
   }
 
-  // Auto-grow the body textarea to its content (borderless, no scrollbar — matches
-  // the mockup's quiet auto-growing body). Runs on input and whenever the draft
-  // value changes programmatically.
+  // Auto-grow the body textarea to its content (borderless — matches the mockup's
+  // quiet auto-growing body). The CSS max-height clamps it at ~10 lines; past that
+  // the height stays pinned at the cap and the textarea scrolls internally. Runs on
+  // input and whenever the draft value changes programmatically.
   function autoGrow() {
     const el = bodyEl;
     if (!el) return;
@@ -513,9 +514,9 @@
 
       <div class="cmp-foot">
         {#if phase === "queued"}
-          <span class="scope">will commit on ready · <b>{scopeLabel}</b></span>
+          <span class="scope" title="will commit on ready · {scopeLabel}">will commit on ready · <b>{scopeLabel}</b></span>
         {:else}
-          <span class="scope">committing <b>{scopeLabel}</b></span>
+          <span class="scope" title="committing {scopeLabel}">committing <b>{scopeLabel}</b></span>
         {/if}
         <span class="spacer"></span>
         {#if phase === "ready"}
@@ -850,7 +851,10 @@
     background: var(--paper-3);
   }
 
-  /* body: quiet auto-growing textarea; borderless at rest like the subject. */
+  /* body: quiet auto-growing textarea; borderless at rest like the subject.
+     auto-grows via autoGrow() up to ~10 text lines (line-height 1.55 × var(--r1))
+     plus the 8px vertical padding, then clamps and scrolls inside the card so a
+     long draft can't push the overlay past the file list. */
   .cmp-bodytext {
     width: 100%;
     display: block;
@@ -863,9 +867,14 @@
     border-radius: 0;
     padding: 4px 5px;
     margin: 4px -5px 0;
+    max-height: calc(10 * 1.55 * var(--r1) + 8px);
     resize: none;
     outline: none;
-    overflow: hidden;
+    overflow-x: hidden;
+    overflow-y: auto;
+    /* thin neutral scrollbar, matching the global convention in app.css. */
+    scrollbar-width: thin;
+    scrollbar-color: var(--ink-3) transparent;
   }
   .cmp-bodytext::placeholder {
     color: var(--ink-3);
@@ -878,9 +887,11 @@
     background: var(--paper-3);
   }
 
-  /* the single muted footer line: scope on the left, regenerate/esc on the right. */
+  /* the single muted footer line: scope on the left, regenerate/esc on the right.
+     it must never wrap — the scope truncates while the controls stay intact. */
   .cmp-foot {
     display: flex;
+    flex-wrap: nowrap;
     align-items: center;
     gap: 8px;
     margin-top: 7px;
@@ -890,7 +901,13 @@
     font-size: 0.625rem;
     color: var(--ink-3);
   }
+  /* the scope is the one thing that gives way: it shrinks and ellipsises. */
   .cmp-foot .scope {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     color: var(--ink-2);
   }
   .cmp-foot .scope b {
@@ -900,7 +917,10 @@
   .cmp-foot .spacer {
     flex: 1;
   }
+  /* the right-side controls never shrink or wrap — they stay fully visible. */
   .cmp-foot .act {
+    flex: none;
+    white-space: nowrap;
     color: var(--iris-ink);
     cursor: pointer;
     display: inline-flex;
@@ -920,6 +940,8 @@
     cursor: default;
   }
   .cmp-foot .esc {
+    flex: none;
+    white-space: nowrap;
     color: var(--ink-3);
     display: inline-flex;
     align-items: center;
