@@ -2016,6 +2016,61 @@ describe("all-changes diff tab", () => {
     ]);
   });
 
+  it("refreshes an open single-file tab on worktree-dirty with no all-changes tab", async () => {
+    // Regression: an open single-file diff tab must track external edits the same
+    // way the all-changes tab does. With NO all-changes tab open, a
+    // worktree-dirty -> status update has to evict the stale cache and re-fetch the
+    // tab's diff, updating its text in place — without it the tab showed the
+    // pre-edit diff indefinitely.
+    let diffVersion = 0;
+    const files: ChangedFile[] = [
+      { path: "src/a.ts", status: "modified", staged: false, additions: 1, deletions: 1 },
+    ];
+    projects.set([project]);
+    worktrees.set([worktree]);
+    selectedWorktreeId.set(worktree.id);
+    setStatus(files);
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffVersion += 1;
+          return { type: "git-diff", diff: { diff: `diff v${diffVersion} for ${request.path}` } };
+        }
+        if (request.type === "git-status") {
+          return {
+            type: "git-status",
+            status: {
+              worktree_id: worktree.id,
+              branch: "feature",
+              dirty: true,
+              ahead: 0,
+              behind: 0,
+              additions: 1,
+              deletions: 1,
+              files,
+            },
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Open the single-file tab the user is looking at. No all-changes tab exists.
+    await viewDiff("src/a.ts", true, false);
+    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "diff v1 for src/a.ts", staged: false }]);
+
+    // An external edit fires worktree-dirty, which reloads status (identical
+    // metadata) and arms the one-shot force flag.
+    applyHitchEvent({ type: "worktree-dirty", worktree_id: worktree.id, dirty: true });
+    await flush();
+    await flush();
+
+    // The tab re-fetched the diff (v2) and its text updated in place, without
+    // stealing the active tab or reordering the strip.
+    expect(get(diffTabs)).toEqual([{ path: "src/a.ts", text: "diff v2 for src/a.ts", staged: false }]);
+    expect(get(activeDiffPath)).toBe("src/a.ts");
+  });
+
   it("invalidates every option-key variant on worktree-dirty so a toggled-back option re-fetches", async () => {
     // Each git-diff response encodes the diff version and the current
     // ignore-whitespace option, so a stale (un-invalidated) cache entry is
@@ -2638,8 +2693,12 @@ describe("History commit log + Commit Tabs", () => {
     unsub();
 
     const after = get(commitLog);
-    // Re-requested with a limit covering the 40 loaded rows (not the 20 page size).
-    expect(requestedLimits).toEqual([40]);
+    // Refresh fetches ONE page, not the full 40-row loaded depth: the merge keeps
+    // only the new prefix above our top sha and reuses the rest verbatim, so pulling
+    // the whole depth made the daemon recompute a per-commit diff for every loaded
+    // row just to throw all but the prefix away. The ≤ PAGE new commits overlap
+    // within that single page, so no escalation is needed.
+    expect(requestedLimits).toEqual([20]);
     expect(sawEmpty).toBe(false);
     // The three new commits are PREPENDED; the loaded depth GROWS 40 → 43 (the
     // oldest rows c1 … are NOT dropped to a fixed window).
@@ -2653,14 +2712,21 @@ describe("History commit log + Commit Tabs", () => {
     expect(after.commits[42]).toBe(seeded[39]);
   });
 
-  it("replaces the window when a HEAD change has no overlap with the loaded rows", async () => {
-    // A big jump, rebase, or force-update where none of the loaded shas are in the
-    // fresh top window: there is nothing to prepend onto, so the refresh must
-    // replace the window (correctness over node reuse) rather than prepend a
-    // disjoint history. prependedCount stays 0 (no scroll anchoring).
+  it("escalates to the full depth on a fast-forward burst so scrolled depth survives", async () => {
+    // A burst of MORE than one page of new commits lands on top (an agent committing
+    // rapidly): the old top sha is still in history, just deeper than one page, so the
+    // first one-page refresh finds NO overlap. Rather than collapse the user's scrolled
+    // depth back to one page (the rewrite path), the refresh escalates ONCE at the
+    // previous full depth — the overlap is found there and the whole loaded depth is
+    // preserved while the burst is prepended.
     selectWorktree();
     let head = "head-a";
-    let generation = 0;
+    const requestedLimits: number[] = [];
+    // 25 new commits land on top of the 40 loaded (c40 … c1). HEAD order is newest
+    // first: c65 … c1. Row i back from HEAD is c{65 - i}.
+    let topId = 40;
+    const rowsFor = (limit: number) =>
+      Array.from({ length: limit }, (_v, i) => commitInfo(`c${topId - i}`));
     invokeMock.mockImplementation(
       async (_command: string, { request }: { request: { type: string; limit?: number } }) => {
         if (request.type === "git-status") {
@@ -2680,6 +2746,71 @@ describe("History commit log + Commit Tabs", () => {
           };
         }
         if (request.type === "git-log") {
+          requestedLimits.push(request.limit!);
+          return { type: "commit-log", commits: rowsFor(request.limit!), has_more: true };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    const seeded = rowsFor(40);
+    commitLog.set({
+      worktreeId: worktree.id,
+      commits: seeded,
+      hasMore: true,
+      loading: false,
+      prependedCount: 0,
+      tick: 0,
+    });
+    railView.set("history");
+
+    // 25 new commits on top → the old top sha (c40) is now 25 rows down, past one page.
+    topId = 65;
+    head = "head-b";
+    await loadGitStatus(worktree.id);
+    await flush();
+
+    const after = get(commitLog);
+    // First fetch one page (20, no overlap), then escalate once at the old depth (40).
+    expect(requestedLimits).toEqual([20, 40]);
+    // The 25 new commits are PREPENDED and the original 40-row depth is preserved (65),
+    // the seeded objects reused for stable identity.
+    expect(after.commits.map((c) => c.id).slice(0, 3)).toEqual(["c65", "c64", "c63"]);
+    expect(after.commits).toHaveLength(65);
+    expect(after.commits[after.commits.length - 1].id).toBe("c1");
+    expect(after.prependedCount).toBe(25);
+    expect(after.commits[25]).toBe(seeded[0]);
+  });
+
+  it("replaces the window when a HEAD change has no overlap with the loaded rows", async () => {
+    // A big jump, rebase, or force-update where none of the loaded shas are in the
+    // fresh top window: there is nothing to prepend onto, so the refresh must
+    // replace the window (correctness over node reuse) rather than prepend a
+    // disjoint history. prependedCount stays 0 (no scroll anchoring).
+    selectWorktree();
+    let head = "head-a";
+    let generation = 0;
+    const requestedLimits: number[] = [];
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; limit?: number } }) => {
+        if (request.type === "git-status") {
+          return {
+            type: "git-status",
+            status: {
+              worktree_id: worktree.id,
+              branch: "feature",
+              dirty: false,
+              ahead: 0,
+              behind: 0,
+              additions: 0,
+              deletions: 0,
+              head_commit_id: head,
+              files: [],
+            },
+          };
+        }
+        if (request.type === "git-log") {
+          requestedLimits.push(request.limit!);
           const rows = Array.from({ length: request.limit! }, (_v, i) =>
             commitInfo(`g${generation}-${i}`),
           );
@@ -2707,6 +2838,9 @@ describe("History commit log + Commit Tabs", () => {
     await flush();
 
     const after = get(commitLog);
+    // The one-page refresh finds no overlap, escalates ONCE at the old depth (40),
+    // still finds no overlap, then falls through to the full replace.
+    expect(requestedLimits).toEqual([20, 40]);
     expect(after.commits[0].id).toBe("g2-0");
     expect(after.commits.every((c) => c.id.startsWith("g2-"))).toBe(true);
     expect(after.prependedCount).toBe(0);

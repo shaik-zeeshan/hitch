@@ -350,7 +350,11 @@ function writeFreshDiffCache(cacheKey: string, writeSeq: number, text: string): 
   return true;
 }
 
-const forcedAllChangesRefreshWorktrees = new Set<Id>();
+// Worktrees whose open diffs (all-changes AND single-file tabs) must refresh on
+// the next git status, even when the status metadata is byte-identical. A
+// worktree-dirty event sets this because an external edit can change the diff
+// text while line counts / file set stay the same (see the gitStatus subscriber).
+const forcedDiffRefreshWorktrees = new Set<Id>();
 
 // Drop every cached diff variant for one worktree/path/side, across ALL re-diff
 // option keys — not just the one active now. The option key sits between the side
@@ -388,13 +392,16 @@ function deleteDiffCacheForChangedFiles(worktreeId: Id, files: ChangedFile[]): v
   for (const file of files) invalidateDiffCacheVariants(worktreeId, file.path, file.staged);
 }
 
-function requestAllChangesRefreshOnNextStatus(worktreeId: Id): void {
-  if (
-    get(gitWorktreeId) === worktreeId &&
-    get(diffTabs).some((tab) => tab.path === ALL_CHANGES_TAB)
-  ) {
-    forcedAllChangesRefreshWorktrees.add(worktreeId);
-  }
+// Arm a one-shot forced refresh for the worktree if it's selected and has any
+// open diff that tracks the working tree — the all-changes tab OR a single-file
+// (non-commit) tab. Commit tabs are immutable per-sha snapshots and never need
+// this. The flag is consumed by the gitStatus subscriber on the next status.
+function requestDiffRefreshOnNextStatus(worktreeId: Id): void {
+  if (get(gitWorktreeId) !== worktreeId) return;
+  const tracksWorkingTree = get(diffTabs).some(
+    (tab) => tab.path === ALL_CHANGES_TAB || !isCommitTab(tab.path),
+  );
+  if (tracksWorkingTree) forcedDiffRefreshWorktrees.add(worktreeId);
 }
 
 // ---- History commit log ---------------------------------------------------
@@ -475,12 +482,19 @@ async function loadCommitLogPage(mode: CommitLogLoad): Promise<void> {
   const effective: CommitLogLoad = mode === "refresh" && !sameWorktree ? "reset" : mode;
 
   // Append starts past the rows we hold; reset/refresh start at the top. Refresh
-  // pulls enough to cover everything already paginated in (clamped to one page
-  // minimum) so the fresh top window definitely overlaps the row we already hold
-  // at the top — the new commits are the prefix above that overlap.
+  // fetches only ONE page from the top, not the full loaded depth: the merge below
+  // keeps just the new prefix above our top sha and reuses the rest of our rows
+  // verbatim, so fetching the whole depth made the daemon recompute a per-commit
+  // tree diff (`commit_line_totals`) for every loaded row just to discard all but
+  // the prefix — O(loaded) wasted work on EVERY HEAD move (an agent committing in
+  // a 200-row History paid ~200 redundant diffs to deliver one prepended row). One
+  // page covers the common case (≤ PAGE new commits since the last refresh); the
+  // overlap is within it. A burst of > PAGE fast-forward commits won't overlap in
+  // one page — that's handled by a bounded one-step escalation in the merge below
+  // (refetch once at the old full depth) so a pure fast-forward keeps the user's
+  // scrolled depth; a genuine rewrite still falls through to the full replace.
   const offset = effective === "append" && sameWorktree ? current.commits.length : 0;
-  const limit =
-    effective === "refresh" ? Math.max(COMMIT_LOG_PAGE, current.commits.length) : COMMIT_LOG_PAGE;
+  const limit = COMMIT_LOG_PAGE;
   if (effective === "append" && sameWorktree && !current.hasMore) return;
   // A refresh whose HEAD didn't actually change nothing-to-do early-out is the
   // caller's job (it only refreshes on a HEAD move); but if we somehow hold no
@@ -499,79 +513,119 @@ async function loadCommitLogPage(mode: CommitLogLoad): Promise<void> {
   // The fetch is still the freshest and its worktree is still selected.
   const isLatest = () => commitLogSeq === seq && get(gitWorktreeId) === worktreeId;
 
-  try {
-    const request: GitLogRequest = {
+  const fetchLog = (fetchLimit: number) =>
+    daemonRequest<Response & { commits: CommitInfo[]; has_more: boolean }>({
       type: "git-log",
       worktree_id: worktreeId,
-      limit,
+      limit: fetchLimit,
       offset,
-    };
-    const response = await daemonRequest<
-      Response & { commits: CommitInfo[]; has_more: boolean }
-    >(request);
+    } satisfies GitLogRequest);
+
+  try {
+    const response = await fetchLog(limit);
     if (!isLatest()) return;
-    commitLog.update((state) => {
-      if (effective === "append") {
-        return {
-          ...state,
-          worktreeId,
-          commits: [...state.commits, ...response.commits],
-          hasMore: response.has_more,
-          loading: false,
-          prependedCount: 0,
-        };
-      }
-      if (refreshHasRows) {
-        // Prepend only the genuinely-new commits above the rows we already hold.
-        // The fresh window is newest-first and overlaps our current top sha; the
-        // commits before that overlap are new. Reuse the EXISTING objects for the
-        // overlapping tail so the sha-keyed each does zero DOM work for unchanged
-        // rows, and GROW the list (don't drop the oldest loaded rows to a fixed
-        // window). If the overlap isn't in the fetched window (a big jump / rebase
-        // / force-update), replace the window — correctness over node reuse.
-        const topSha = state.commits[0]?.id;
-        const overlap = topSha ? response.commits.findIndex((c) => c.id === topSha) : -1;
-        if (overlap >= 0) {
-          const prepended = response.commits.slice(0, overlap);
-          // overlap === 0 means our top commit is still HEAD's first row — nothing
-          // new to prepend; leave the rows (and scroll) exactly as they are.
-          if (prepended.length === 0) {
-            return { ...state, loading: false, prependedCount: 0 };
-          }
-          return {
+
+    if (effective === "append") {
+      commitLog.update((state) => ({
+        ...state,
+        worktreeId,
+        commits: [...state.commits, ...response.commits],
+        hasMore: response.has_more,
+        loading: false,
+        prependedCount: 0,
+      }));
+      return;
+    }
+
+    if (refreshHasRows) {
+      // The fresh window is newest-first; the commits ABOVE our current top sha are
+      // genuinely new. Prepend only those, reusing the EXISTING objects for the rest
+      // (so the sha-keyed each does zero DOM work for unchanged rows) and GROWING the
+      // list rather than dropping the oldest loaded rows to a fixed window.
+      let merged = mergeRefresh(get(commitLog), response.commits, worktreeId);
+      // No overlap in one page: either a fast-forward burst landed > PAGE commits on
+      // top (the old top sha exists, just deeper than one page) or history was
+      // rewritten (the old sha is gone). Escalate ONCE at the previous full depth so
+      // a pure fast-forward recovers the overlap and keeps the user's scrolled depth.
+      // If the second window still has no overlap it's a real rewrite → full replace.
+      if (merged === NO_OVERLAP && current.commits.length > COMMIT_LOG_PAGE) {
+        const deep = await fetchLog(current.commits.length);
+        if (!isLatest()) return;
+        merged = mergeRefresh(get(commitLog), deep.commits, worktreeId);
+        if (merged === NO_OVERLAP) {
+          // Genuine rewrite: replace the window (the loaded rows may be gone).
+          commitLog.update((state) => ({
             ...state,
             worktreeId,
-            commits: [...prepended, ...state.commits],
-            hasMore: state.hasMore,
+            commits: deep.commits,
+            hasMore: deep.has_more,
             loading: false,
-            prependedCount: prepended.length,
-            tick: state.tick + 1,
-          };
+            prependedCount: 0,
+          }));
+          return;
         }
-        // No overlap: replace the window (rows the user had may genuinely be gone).
-        return {
+      } else if (merged === NO_OVERLAP) {
+        // Only one page was ever loaded and it shares no sha — a rewrite. Replace.
+        commitLog.update((state) => ({
           ...state,
           worktreeId,
           commits: response.commits,
           hasMore: response.has_more,
           loading: false,
           prependedCount: 0,
-        };
+        }));
+        return;
       }
-      // reset (or a refresh with no prior rows): take the fresh window as-is.
-      return {
-        ...state,
-        worktreeId,
-        commits: response.commits,
-        hasMore: response.has_more,
-        loading: false,
-        prependedCount: 0,
-      };
-    });
+      commitLog.update(() => merged as CommitLogState);
+      return;
+    }
+
+    // reset (or a refresh with no prior rows): take the fresh window as-is.
+    commitLog.update((state) => ({
+      ...state,
+      worktreeId,
+      commits: response.commits,
+      hasMore: response.has_more,
+      loading: false,
+      prependedCount: 0,
+    }));
   } catch (err) {
     error.set(toMessage(err));
     if (isLatest()) commitLog.update((state) => ({ ...state, loading: false }));
   }
+}
+
+// Sentinel: the fresh window shares no sha with the loaded rows (caller decides
+// whether to escalate or replace).
+const NO_OVERLAP = Symbol("commit-log-no-overlap");
+
+// Merge a fresh top window into the loaded rows for a refresh: prepend the commits
+// above our current top sha (reusing existing objects for the overlapping tail so
+// the sha-keyed each does no DOM work, and growing the list). Returns the sentinel
+// when the window doesn't reach our top sha so the caller can escalate or replace.
+function mergeRefresh(
+  state: CommitLogState,
+  fresh: CommitInfo[],
+  worktreeId: string,
+): CommitLogState | typeof NO_OVERLAP {
+  const topSha = state.commits[0]?.id;
+  const overlap = topSha ? fresh.findIndex((c) => c.id === topSha) : -1;
+  if (overlap < 0) return NO_OVERLAP;
+  const prepended = fresh.slice(0, overlap);
+  // overlap === 0 means our top commit is still HEAD's first row — nothing new to
+  // prepend; leave the rows (and scroll) exactly as they are.
+  if (prepended.length === 0) {
+    return { ...state, loading: false, prependedCount: 0 };
+  }
+  return {
+    ...state,
+    worktreeId,
+    commits: [...prepended, ...state.commits],
+    hasMore: state.hasMore,
+    loading: false,
+    prependedCount: prepended.length,
+    tick: state.tick + 1,
+  };
 }
 
 // Load (reset to) the first page of the selected worktree's commit log. Used on
@@ -1452,7 +1506,7 @@ export function applyHitchEvent(event: HitchEvent): void {
     dirtyWorktrees.update((current) =>
       current[worktreeId] === dirty ? current : { ...current, [worktreeId]: dirty },
     );
-    requestAllChangesRefreshOnNextStatus(worktreeId);
+    requestDiffRefreshOnNextStatus(worktreeId);
     // Refresh the full status so the tree's line stats and, when selected,
     // the Changes panel track filesystem changes live.
     void loadGitStatus(worktreeId).catch(() => {});
@@ -2372,8 +2426,7 @@ export async function viewDiff(path: string, activate = true, staged?: boolean):
   if (!worktreeId) return;
   const cacheKey = diffCacheKey(worktreeId, path, staged);
   const requestKey = diffTabFreshnessKey(worktreeId, path);
-  const requestSeq = (diffRequestSeq.get(requestKey) ?? 0) + 1;
-  diffRequestSeq.set(requestKey, requestSeq);
+  const requestSeq = nextDiffRequestSeq(worktreeId, "single", path);
   const writeSeq = nextDiffCacheWriteSeq(cacheKey);
 
   const cached = diffCache.get(cacheKey) ?? null;
@@ -2982,26 +3035,78 @@ function allChangesStatusSignature(worktreeId: Id | null | undefined, files: Cha
   ].join("\n");
 }
 
+// Per-(side,path) metadata signature for one changed file. Drives the single-file
+// tab live refresh: an idle status poll re-emits the same object every second, so
+// matching this stored value lets identical metadata skip a refetch (mirrors the
+// all-changes whole-status signature, but scoped per file so unrelated drift on
+// another file never re-diffs an open tab).
+function changedFileSignature(file: ChangedFile): string {
+  return `${file.status}\0${file.additions ?? 0}\0${file.deletions ?? 0}`;
+}
+const fileTabKey = (path: string, staged: boolean | undefined) => `${staged ? "1" : "0"}\0${path}`;
+
 let lastAllChangesSig: string | null = null;
+// Last seen metadata signature per single-file tab key, so an idle poll with
+// byte-identical status doesn't trigger a refresh storm. Cleared lazily below to
+// the set of files currently present.
+const lastSingleFileSigs = new Map<string, string>();
 gitStatus.subscribe(($status) => {
-  const hasAllChangesTab = get(diffTabs).some((tab) => tab.path === ALL_CHANGES_TAB);
-  if (!hasAllChangesTab) {
-    lastAllChangesSig = null;
-    forcedAllChangesRefreshWorktrees.clear();
-    return;
-  }
   const files = $status?.files ?? [];
   const worktreeId = $status?.worktree_id;
-  const sig = allChangesStatusSignature(worktreeId, files);
+  // Consume the one-shot force flag exactly once per status emission so both the
+  // all-changes path and the single-file path below see it. A worktree-dirty edit
+  // can change diff text while line counts / file set stay byte-identical, so the
+  // signature gate alone would miss it (mirrors the all-changes design).
   const forceRefresh = worktreeId
-    ? forcedAllChangesRefreshWorktrees.delete(worktreeId)
+    ? forcedDiffRefreshWorktrees.delete(worktreeId)
     : false;
-  if (sig === lastAllChangesSig && !forceRefresh) return;
-  if (worktreeId) {
-    deleteDiffCacheForChangedFiles(worktreeId, files);
+
+  const hasAllChangesTab = get(diffTabs).some((tab) => tab.path === ALL_CHANGES_TAB);
+  if (hasAllChangesTab) {
+    const sig = allChangesStatusSignature(worktreeId, files);
+    if (sig !== lastAllChangesSig || forceRefresh) {
+      if (worktreeId) deleteDiffCacheForChangedFiles(worktreeId, files);
+      lastAllChangesSig = sig;
+      void viewAllChanges(false);
+    }
+  } else {
+    lastAllChangesSig = null;
   }
-  lastAllChangesSig = sig;
-  void viewAllChanges(false);
+
+  // Mirror the all-changes live refresh for open single-file diff tabs: when this
+  // worktree's status changes (or a worktree-dirty force flag fires), evict the
+  // stale cache for each open tab whose file appears in the changed set and re-run
+  // viewDiff in the background (activate: false → no focus steal, no tab reorder;
+  // viewDiff updates the tab text in place). Without this, an external edit (e.g. an
+  // agent in the PTY) to a file with an open single-file tab would leave that tab
+  // showing the pre-edit diff indefinitely. Commit tabs are immutable per-sha
+  // snapshots and are never re-diffed here.
+  if (!worktreeId) {
+    lastSingleFileSigs.clear();
+    return;
+  }
+  const fileSigs = new Map(files.map((file) => [fileTabKey(file.path, file.staged), changedFileSignature(file)]));
+  for (const tab of get(diffTabs)) {
+    if (tab.path === ALL_CHANGES_TAB || isCommitTab(tab.path)) continue;
+    // Refresh a tab only when its own file's metadata signature changed OR the
+    // force flag fired, so idle polls (identical signature) and unrelated drift on
+    // other files never re-diff this tab.
+    const tabKey = fileTabKey(tab.path, tab.staged);
+    const sig = fileSigs.get(tabKey);
+    const hadPrior = lastSingleFileSigs.has(tabKey);
+    // First sight of this tab's file is not a change: the tab was just opened via
+    // viewDiff (already fresh), so only a DIFFERING prior signature counts.
+    const changed = sig !== undefined && hadPrior && sig !== lastSingleFileSigs.get(tabKey);
+    if (sig !== undefined) lastSingleFileSigs.set(tabKey, sig);
+    if (!changed && !forceRefresh) continue;
+    invalidateDiffCacheVariants(worktreeId, tab.path, tab.staged);
+    void viewDiff(tab.path, false, tab.staged);
+  }
+  // Forget signatures for files no longer in the status (e.g. reverted), so if the
+  // same path reappears later its first status counts as a change.
+  for (const key of lastSingleFileSigs.keys()) {
+    if (!fileSigs.has(key)) lastSingleFileSigs.delete(key);
+  }
 });
 
 // Reset the per-worktree Git view state and (re)load status whenever the target
