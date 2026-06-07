@@ -15,7 +15,9 @@
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { writable } from "svelte/store";
-import { sendInput } from "./daemon";
+import toast from "svelte-french-toast";
+import { scopeForSession, sendInput } from "./daemon";
+import { LOCAL_SCOPE_ID } from "./types";
 import type { Id } from "./types";
 
 // The terminal currently under a file drag (or null). Terminal.svelte subscribes
@@ -91,9 +93,30 @@ export async function initFileDrop(): Promise<UnlistenFn> {
         const sessionId = sessionAtPosition(payload.position);
         // Dropped outside any terminal (rail/diff/empty), or an empty drag.
         if (!sessionId || payload.paths.length === 0) return;
-        sendInput(sessionId, formatDroppedPaths(payload.paths));
+        handleDrop(sessionId, payload.paths);
         break;
       }
     }
   });
+}
+
+// Insert dropped paths at a session's prompt, GUARDING remote sessions: a remote
+// session lives on another machine, so inserting LOCAL absolute paths would be
+// bogus there. Upload-on-drop to remote sessions is issue #31; until then a drop
+// on a remote session is a no-op with an honest toast rather than pasting paths
+// that don't exist remotely. Factored out of the listener so it is unit-testable
+// without synthesizing a Tauri drag event.
+function handleDrop(sessionId: Id, paths: string[]): void {
+  if (scopeForSession(sessionId) !== LOCAL_SCOPE_ID) {
+    toast.error("File drop to remote sessions isn't supported yet");
+    return;
+  }
+  sendInput(sessionId, formatDroppedPaths(paths));
+}
+
+// Test seam for the remote/local drop guard (issue #29). Exercised by
+// remoteSessions.test.ts; not part of the runtime drop path (the listener calls
+// `handleDrop` directly after hit-testing the cursor).
+export function handleDropForTest(sessionId: Id, paths: string[]): void {
+  handleDrop(sessionId, paths);
 }

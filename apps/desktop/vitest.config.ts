@@ -19,12 +19,37 @@ const stubVirtualIcons = (): Plugin => ({
   },
 });
 
+// `svelte-french-toast` ships only browser/svelte export conditions, so vite's
+// node resolver can't find an entry for the bare specifier under the node-based
+// test config (it throws "No known conditions for '.'"). The toast UI is never
+// asserted in the pure-logic unit tests (modules that import it — appToast,
+// fileDrop — are exercised for their data path, and tests that care about a
+// toast firing `vi.mock` it themselves). Stub the package to an inert toast
+// object so importing those modules is cheap and hermetic, mirroring the
+// `~icons/*` stub above.
+const stubToast = (): Plugin => ({
+  name: "stub-svelte-french-toast",
+  enforce: "pre",
+  resolveId(id) {
+    return id === "svelte-french-toast" ? "\0virtual-toast" : null;
+  },
+  load(id) {
+    if (id !== "\0virtual-toast") return null;
+    return [
+      "const noop = () => '';",
+      "const toast = Object.assign(noop, { loading: noop, success: noop, error: noop });",
+      "export default toast;",
+      "export const Toaster = () => null;",
+    ].join("\n");
+  },
+});
+
 // Standalone vitest config: the SvelteKit plugin in vite.config.ts pulls in the
 // full app build pipeline, which the pure-module unit tests (byteRing) don't
 // need. Keep this minimal and node-based so `vitest run` stays fast and
 // hermetic. Scope it to *.test.ts so it never tries to drive Svelte components.
 export default defineConfig({
-  plugins: [stubVirtualIcons()],
+  plugins: [stubVirtualIcons(), stubToast()],
   test: {
     environment: "node",
     include: ["src/**/*.test.ts"],

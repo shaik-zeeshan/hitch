@@ -247,6 +247,18 @@ export function scopeForWorktree(worktreeId: Id | null | undefined): DaemonScope
   return scopeForProject(worktree?.project_id);
 }
 
+// The owning daemon scope of a Session parent (worktree or plain project). A
+// fresh session-open routes its `OpenSession` to this scope so the remote daemon
+// spawns the PTY on the machine that owns the worktree/project (ADR 0014). A
+// worktree parent resolves through its project; a plain-project parent resolves
+// directly. Defaults to Local.
+export function scopeForParent(parent: SessionParent | null | undefined): DaemonScopeId {
+  if (!parent) return LOCAL_SCOPE_ID;
+  return parent.kind === "worktree"
+    ? scopeForWorktree(parent.id)
+    : scopeForProject(parent.id);
+}
+
 // Tag a set of Projects as owned by a scope at ingestion. Replaces the scope map
 // wholesale for a full snapshot (so a project that vanished loses its tag);
 // `mergeProjectScopes` keeps existing tags for incremental upserts.
@@ -2099,25 +2111,50 @@ function applySessionAgent(sessionId: Id, agent: KnownAgent | null): void {
   }
 }
 
+// The SSH Host label to PREFIX a remote session's attention copy with, so a
+// remote approval/finish is attributable to its host (ADR 0014: "labels and
+// navigation include the local/SSH Host scope"). `null` for the Local scope —
+// local copy stays clean with no "Local ·" prefix (palette metadata format is
+// `host · project · branch`, local is `project · branch`).
+function hostLabelForSession(sessionId: Id): string | null {
+  const scopeId = scopeForSession(sessionId);
+  if (scopeId === LOCAL_SCOPE_ID) return null;
+  return get(daemonScopes).find((s) => s.id === scopeId)?.label ?? null;
+}
+
+// Prepend the owning SSH Host label to a remote session's body so the OS
+// notification reads `host · project · branch`; a local body is returned
+// untouched (`project · branch`). A null body (no worktree/project resolved)
+// still carries the host alone for a remote session, so the host attribution is
+// never lost.
+function withHostLabel(sessionId: Id, body: string | null): string | null {
+  const host = hostLabelForSession(sessionId);
+  if (!host) return body;
+  return body ? `${host} · ${body}` : host;
+}
+
 // The notification body for a session: `project · branch` of its worktree, so
 // an OS notification names *which* run acted without the user opening the app.
 // Resolves session → parent → worktree → branch + owning project; degrades to
 // the project name alone (plain-project sessions have no worktree), then the
 // session name, then null (no body) so the notification still fires unadorned.
+// A remote session's body is host-prefixed (`host · project · branch`) so the
+// notification names the SSH Host the run acted on (ADR 0014).
 function notificationBodyForSession(sessionId: Id): string | null {
   const session = get(sessions).find((s) => s.id === sessionId);
   if (!session) return null;
+  let base: string | null = session.name || null;
   if (session.parent.kind === "worktree") {
     const worktree = get(worktrees).find((w) => w.id === session.parent.id);
     if (worktree) {
       const project = get(projects).find((p) => p.id === worktree.project_id);
-      return project ? `${project.name} · ${worktree.branch}` : worktree.branch;
+      base = project ? `${project.name} · ${worktree.branch}` : worktree.branch;
     }
   } else {
     const project = get(projects).find((p) => p.id === session.parent.id);
-    if (project) return project.name;
+    if (project) base = project.name;
   }
-  return session.name || null;
+  return withHostLabel(sessionId, base);
 }
 
 // Dispatch one agent-state transition to the notification engine, reading the
@@ -3083,14 +3120,25 @@ export async function openSession(
   try {
     error.set(null);
     const { cols, rows } = lastTerminalSize ?? estimateInitialSize();
-    const response = await daemonRequest<Response & { session: Session }>({
-      type: "open-session",
-      parent,
-      name: name.trim() || "shell",
-      command,
-      cols,
-      rows,
-    });
+    // Route the open to the parent's owning daemon: a worktree/project under an
+    // SSH Host scope spawns its PTY on that remote machine (ADR 0014). Local
+    // omits the scope for the exact back-compat path.
+    const scopeId = scopeForParent(parent);
+    const response = await daemonRequest<Response & { session: Session }>(
+      {
+        type: "open-session",
+        parent,
+        name: name.trim() || "shell",
+        command,
+        cols,
+        rows,
+      },
+      scopeId,
+    );
+    // Tag the new session's scope BEFORE anything subscribes to its output, so the
+    // channel registration routes to the owning daemon even if the scope-tagged
+    // `session-opened` event has not ingested yet (it will re-tag idempotently).
+    tagSessionScope(response.session.id, scopeId);
     activeSessionId.set(response.session.id);
     if (command?.[0]) {
       sessionCommands.update((current) => ({ ...current, [response.session.id]: command[0] }));
@@ -3107,11 +3155,14 @@ export async function renameSession(session: Session, name: string): Promise<voi
   if (!next || next === session.name) return;
   try {
     error.set(null);
-    await daemonRequest({
-      type: "rename-session",
-      session_id: session.id,
-      name: next,
-    });
+    await daemonRequest(
+      {
+        type: "rename-session",
+        session_id: session.id,
+        name: next,
+      },
+      scopeForSession(session.id),
+    );
     sessions.update((items) =>
       items.map((item) => (item.id === session.id ? { ...item, name: next } : item)),
     );
@@ -3123,11 +3174,14 @@ export async function renameSession(session: Session, name: string): Promise<voi
 export async function closeSession(session: Session): Promise<void> {
   try {
     error.set(null);
-    await daemonRequest({
-      type: "close-session",
-      session_id: session.id,
-      kill_process: true,
-    });
+    await daemonRequest(
+      {
+        type: "close-session",
+        session_id: session.id,
+        kill_process: true,
+      },
+      scopeForSession(session.id),
+    );
     sessions.update((items) => items.filter((item) => item.id !== session.id));
     closeSessionOutput(session.id);
   } catch (err) {
@@ -3156,7 +3210,12 @@ export async function resizeSession(
   rows: number,
 ): Promise<void> {
   try {
-    await daemonRequest({ type: "resize-session", session_id: sessionId, cols, rows });
+    // Resize routes to the session's owning daemon so a remote PTY gets its
+    // SIGWINCH over the SSH connection (issue #29); Local omits the scope.
+    await daemonRequest(
+      { type: "resize-session", session_id: sessionId, cols, rows },
+      scopeForSession(sessionId),
+    );
   } catch (err) {
     // Resize is best-effort: NEVER throw, so keystrokes keep flowing even if
     // the PTY exited mid-resize. But a dropped final size is a real bug (the
@@ -3177,7 +3236,9 @@ export async function repaintSession(sessionId: Id): Promise<void> {
       type: "repaint-session",
       session_id: sessionId,
     };
-    await daemonRequest(request);
+    // Route the daemon-forced repaint to the session's owning daemon (ADR 0010)
+    // so a remote TUI redraws over the SSH connection; Local omits the scope.
+    await daemonRequest(request, scopeForSession(sessionId));
   } catch {
     // Repaint is best-effort; a missing/dead PTY must not break the UI.
   }
