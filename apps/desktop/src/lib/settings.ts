@@ -1,7 +1,7 @@
 // Desktop-local user preferences, persisted in localStorage. The daemon owns
 // no chrome preferences (like editor app), while daemon actions receive the
 // relevant user-selected settings explicitly in their IPC requests.
-import { writable, type Writable } from "svelte/store";
+import { get, writable, type Writable } from "svelte/store";
 
 const EDITOR_KEY = "hitch.editorApp";
 const DRAFT_PROVIDER_KEY = "hitch.draftProvider";
@@ -109,15 +109,18 @@ function persistedBool(key: string, initial: boolean): Writable<boolean> {
 
 // Numeric preference, persisted as a string. Reads that don't parse (or fall
 // outside [min, max]) fall back to the default, mirroring `persisted`'s
-// best-effort localStorage handling. Writes clamp into range so a stored value
-// can never drift out of bounds.
+// best-effort localStorage handling. The store clamps on EVERY write (set and
+// update), not just on persistence, so the in-memory value consumers read via
+// `get(...)` can never drift out of bounds — a settings input typing/pasting an
+// out-of-range value lands clamped both in memory and in localStorage.
 function persistedNumber(
   key: string,
   initial: number,
   min: number,
   max: number,
 ): Writable<number> {
-  const clamp = (value: number) => Math.min(max, Math.max(min, Math.round(value)));
+  const clamp = (value: number) =>
+    Number.isFinite(value) ? Math.min(max, Math.max(min, Math.round(value))) : initial;
   let start = initial;
   try {
     const stored = localStorage.getItem(key);
@@ -131,10 +134,22 @@ function persistedNumber(
   const store = writable(start);
   store.subscribe((value) => {
     try {
-      localStorage.setItem(key, String(clamp(value)));
+      // Value is already clamped by `set` below, so persist it as-is.
+      localStorage.setItem(key, String(value));
     } catch {}
   });
-  return store;
+  // Wrap `set` to clamp before storing. A bound `<input>` may write the clamped
+  // value straight back (e.g. typing 9999 clamps to 600, which Svelte echoes
+  // into the input); skip that no-op write so we don't churn subscribers.
+  const set = (value: number) => {
+    const clamped = clamp(value);
+    if (clamped !== get(store)) store.set(clamped);
+  };
+  return {
+    subscribe: store.subscribe,
+    set,
+    update: (fn) => set(fn(get(store))),
+  };
 }
 
 export type DiffStyle = "unified" | "split";
