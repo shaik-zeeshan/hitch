@@ -8,6 +8,12 @@
   //   - Context lines stepper (re-diff — re-fetches), cycling 3 → 5 → 10 → 25
   // The stores themselves drive the diff renderer + daemon re-fetch (wired in
   // DiffTab / DiffAllTab / daemon.ts); this component only flips them.
+  //
+  // `rediff` gates the two re-diff controls (ws + ctx). Surfaces that show an
+  // immutable, already-fetched diff with no re-fetch path — the Commit Tab, whose
+  // per-sha snapshot carries no ws/ctx and is skipped by refreshOpenDiffs — pass
+  // `rediff={false}` so those buttons are omitted (not disabled: a disabled
+  // control still implies it applies). The render-only controls always show.
   import {
     DEFAULT_DIFF_CONTEXT_LINES,
     diffContextLines,
@@ -15,6 +21,8 @@
     diffStyle,
     diffWrap,
   } from "../settings";
+
+  let { rediff = true }: { rediff?: boolean } = $props();
 
   // The context-lines values the stepper cycles through. The default (3) is in
   // the set so the control always lands on a known rung.
@@ -49,22 +57,26 @@
     title={$diffWrap ? "Disable line wrap" : "Wrap long lines"}
     onclick={() => diffWrap.update((v) => !v)}
   >wrap</button>
-  <button
-    type="button"
-    class="dv-btn"
-    class:on={$diffIgnoreWhitespace}
-    aria-pressed={$diffIgnoreWhitespace}
-    title={$diffIgnoreWhitespace ? "Show whitespace changes" : "Ignore whitespace changes"}
-    onclick={() => diffIgnoreWhitespace.update((v) => !v)}
-  >ws</button>
-  <button
-    type="button"
-    class="dv-btn dv-ctx"
-    class:on={$diffContextLines !== DEFAULT_DIFF_CONTEXT_LINES}
-    title="Context lines: {$diffContextLines} (click to cycle)"
-    aria-label="Context lines, currently {$diffContextLines}"
-    onclick={cycleContext}
-  >ctx&nbsp;{$diffContextLines}</button>
+  <!-- ws + ctx re-fetch the diff text, so they only render where a re-fetch path
+       exists (gap-based layout means omitting them leaves no dangling divider). -->
+  {#if rediff}
+    <button
+      type="button"
+      class="dv-btn"
+      class:on={$diffIgnoreWhitespace}
+      aria-pressed={$diffIgnoreWhitespace}
+      title={$diffIgnoreWhitespace ? "Show whitespace changes" : "Ignore whitespace changes"}
+      onclick={() => diffIgnoreWhitespace.update((v) => !v)}
+    >ws</button>
+    <button
+      type="button"
+      class="dv-btn dv-ctx"
+      class:on={$diffContextLines !== DEFAULT_DIFF_CONTEXT_LINES}
+      title="Context lines: {$diffContextLines} (click to cycle)"
+      aria-label="Context lines, currently {$diffContextLines}"
+      onclick={cycleContext}
+    >ctx&nbsp;{$diffContextLines}</button>
+  {/if}
 </div>
 
 <style>

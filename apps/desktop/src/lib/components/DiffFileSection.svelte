@@ -127,8 +127,16 @@
   }
   /* Collapsible section header: chevron + (optional status mark) + file icon +
      path + (optional badge) + counts. Sticks just under the surrounding head
-     (the all-changes / commit metadata bar, both 38px tall) so the current
-     file's name stays visible while scrolling its body. */
+     (the all-changes / commit metadata bar) so the current file's name stays
+     visible while scrolling its body.
+
+     The sticky offset is a variable because the surrounding head's height is
+     call-site-dependent: DiffAllTab's single-line bar is a fixed 38px (the
+     fallback), but CommitTab's metadata bar is a multi-line column whose height
+     grows with the commit message, so it measures its own header and sets
+     `--section-sticky-top` on the scroll container. Without this the file head
+     would pin at 38px inside a taller commit header and paint behind it
+     (z-index 1 vs the head's 2), occluding the current file's name. */
   .file-head {
     display: flex;
     align-items: center;
@@ -141,7 +149,7 @@
     cursor: pointer;
     text-align: left;
     position: sticky;
-    top: 38px;
+    top: var(--section-sticky-top, 38px);
     z-index: 1;
     transition: color 0.15s ease-out;
   }

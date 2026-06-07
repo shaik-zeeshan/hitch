@@ -29,6 +29,14 @@
 
   let { sha }: { sha: string } = $props();
 
+  // The sticky commit header's measured height. Unlike DiffAllTab's fixed 38px
+  // bar, this header is a multi-line column (sha + summary + body + byline) whose
+  // height depends on the commit message, so we feed the live height to the
+  // per-file sections' sticky offset (--section-sticky-top) — otherwise each file
+  // head would pin at the 38px default, inside this taller header's footprint,
+  // and paint behind it.
+  let headHeight = $state(0);
+
   // The commit's worktree is the one selected when the tab is opened/mounted.
   // The per-sha cache keys on worktree+sha, so capturing it once on mount is
   // correct: this tab instance is keyed by sha in Center, so a different commit
@@ -120,8 +128,8 @@
   }
 </script>
 
-<div class="commit">
-  <div class="commit-head">
+<div class="commit" style:--section-sticky-top="{headHeight}px">
+  <div class="commit-head" bind:clientHeight={headHeight}>
     <div class="head-top">
       <span class="glyph" aria-hidden="true">±</span>
       <button class="sha" type="button" title="Copy full SHA" onclick={() => void copySha()}>
@@ -141,7 +149,10 @@
             <span class="del">−{data.meta.deletions}</span>
           </span>
         {/if}
-        <DiffViewOptions />
+        <!-- Commit diffs are immutable per-sha snapshots with no re-fetch path
+             (no ws/ctx on CommitDiffRequest, skipped by refreshOpenDiffs), so we
+             show only the render-only controls (style/wrap). -->
+        <DiffViewOptions rediff={false} />
       </span>
     </div>
 
