@@ -12,7 +12,6 @@
   // and the same header-morph recipe.
   import { tick } from "svelte";
   import { Select } from "bits-ui";
-  import toast from "svelte-french-toast";
   import GitCommitHorizontal from "~icons/lucide/git-commit-horizontal";
   import GitPullRequest from "~icons/lucide/git-pull-request";
   import ArrowUp from "~icons/lucide/arrow-up";
@@ -34,7 +33,8 @@
     startCreatePr,
   } from "../daemon";
   import type { BranchSummary, CompositeStep } from "../types";
-  import { autoToastMessage, autoErrorMessage } from "../composerToast";
+  import { autoToastContent, autoErrorMessage } from "../composerToast";
+  import { worktreeToast } from "../appToast";
   import { commitOpen, createPrOpen } from "../overlays";
   import { currentDesktopPlatform, isShortcutModifier, shortcutKeys } from "../desktopPlatform";
 
@@ -432,12 +432,14 @@
     const worktreeId = $gitWorktreeId;
     if (!worktreeId) return;
     clearCompositeChain(worktreeId);
-    const id = toast.loading("Staging files…");
+    // Branch-label the toast against this worktree before the chain starts.
+    const t = worktreeToast(worktreeId);
+    const id = t.loading("Staging files…");
     try {
       const result = await startCommitAndPush(worktreeId);
-      toast.success(autoToastMessage(result), { id });
+      t.success(autoToastContent(result), { id });
     } catch (err) {
-      toast.error(autoErrorMessage(err), { id });
+      t.error(autoErrorMessage(err), { id });
     }
   }
 </script>

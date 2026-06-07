@@ -45,7 +45,8 @@
     viewAllChanges,
     viewDiff,
   } from "../daemon";
-  import { autoErrorMessage, autoToastMessage } from "../composerToast";
+  import { autoErrorMessage, autoToastContent } from "../composerToast";
+  import { worktreeToast } from "../appToast";
   import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
   import { focusWithoutScroll } from "../focusWithoutScroll";
   import { fileIconUrl } from "../file-icons";
@@ -55,7 +56,6 @@
   import { STATUS_GLYPH, statusGlyphClass } from "../types";
   import Composer from "./Composer.svelte";
   import HistoryList from "./HistoryList.svelte";
-  import toast from "svelte-french-toast";
 
   // The Paper Terminal header drops the hide/collapse toggle (the rail is part
   // of the fixed 3-pane grid); rail visibility is driven from the layout via the
@@ -507,20 +507,25 @@
   // Job (ADR 0013 amendment): one chain (stage → draft → commit → push) that
   // survives navigation/quit. Progress shows as the action button morphing in
   // place (the Composer's auto mode reads the same chain store); this handler
-  // only kicks it off and raises the completion toast. A daemon-side draft
-  // failure aborts the chain before any commit. The chain store drives the oxide
-  // failed-button state + retry, so we don't park failure here.
+  // only kicks it off and raises the completion toast — branch-labeled via
+  // worktreeToast() so it's clear which worktree finished when several chains run
+  // at once. A daemon-side draft failure aborts the chain before any commit. The
+  // chain store drives the oxide failed-button state + retry, so we don't park
+  // failure here.
   async function handleAutoCommitPush() {
     const worktreeId = $gitWorktreeId;
     if (busy || !worktreeId) return;
     // Clear any parked failure from a previous run before re-triggering.
     clearCompositeChain(worktreeId);
-    const id = toast.loading("Staging files…");
+    // Bind the toast to this worktree's identity now, before the chain starts —
+    // the branch is stamped on the loading toast and carries through to success.
+    const t = worktreeToast(worktreeId);
+    const id = t.loading("Staging files…");
     try {
       const result = await startCommitAndPush(worktreeId);
-      toast.success(autoToastMessage(result), { id });
+      t.success(autoToastContent(result), { id });
     } catch (err) {
-      toast.error(autoErrorMessage(err), { id });
+      t.error(autoErrorMessage(err), { id });
     }
   }
 
@@ -528,14 +533,15 @@
     const worktreeId = $gitWorktreeId;
     if (!worktreeId) return;
     const count = ahead;
-    const id = toast.loading("Pushing…");
+    const t = worktreeToast(worktreeId);
+    const id = t.loading("Pushing…");
     try {
       await push(worktreeId);
       void loadGitStatus(worktreeId).catch(() => {});
       void loadPrStatus(worktreeId);
-      toast.success(`Pushed ↑${count}`, { id });
+      t.success(`Pushed ↑${count}`, { id });
     } catch (err) {
-      toast.error(shortError(err), { id });
+      t.error(shortError(err), { id });
     }
   }
 
@@ -543,27 +549,29 @@
     const worktreeId = $gitWorktreeId;
     if (!worktreeId) return;
     const count = behind;
-    const id = toast.loading("Pulling…");
+    const t = worktreeToast(worktreeId);
+    const id = t.loading("Pulling…");
     try {
       await pull(worktreeId);
       void loadGitStatus(worktreeId).catch(() => {});
-      toast.success(`Pulled ↓${count}`, { id });
+      t.success(`Pulled ↓${count}`, { id });
     } catch (err) {
-      toast.error(shortError(err), { id });
+      t.error(shortError(err), { id });
     }
   }
 
   async function handleRefresh() {
     if ($gitBusy || !$gitWorktreeId) return;
     const worktreeId = $gitWorktreeId;
-    const id = toast.loading("Fetching…");
+    const t = worktreeToast(worktreeId);
+    const id = t.loading("Fetching…");
     try {
       await fetchRemote(worktreeId);
       await loadGitStatus(worktreeId);
       void loadPrStatus(worktreeId);
-      toast.success("Fetched", { id });
+      t.success("Fetched", { id });
     } catch (err) {
-      toast.error(shortError(err), { id });
+      t.error(shortError(err), { id });
     }
   }
 
