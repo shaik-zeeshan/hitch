@@ -236,8 +236,10 @@ describe("remote clone targets the chosen daemon scope", () => {
     });
 
     // Resolve the Job so the awaiting clone settles (its refreshAll uses the
-    // scoped snapshot mocked above).
-    completeJob("j-clone", { type: "ack" });
+    // scoped snapshot mocked above). The completion is tagged with the SAME scope
+    // the Job was started on — a JobId is interpreted within its daemon (ADR 0014),
+    // so the pending resolver is keyed by the scope-composite key (issue #30).
+    completeJob("j-clone", { type: "ack" }, SCOPE);
     await done;
   });
 

@@ -39,12 +39,14 @@
     prInfo,
     pull,
     push,
+    scopeAttributionForWorktree,
     setFileStaged,
     setFilesStaged,
     startCommitAndPush,
     viewAllChanges,
     viewDiff,
   } from "../daemon";
+  import { discardAllConfirm, discardFileConfirm } from "../scopeCopy";
   import { autoErrorMessage, autoToastContent } from "../composerToast";
   import { worktreeToast } from "../appToast";
   import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
@@ -571,14 +573,18 @@
     // A partially-staged file appears as two rows (staged + unstaged); count
     // distinct paths so the prompt matches what discard actually touches.
     const count = new Set(files.map((f) => f.path)).size;
-    if (window.confirm(`Discard all ${count} changed file${count === 1 ? "" : "s"}?`)) {
+    // Discard is destructive; a remote worktree's prompt names its SSH Host so it
+    // is never mistaken for a same-path local discard (issue #30, ADR 0014).
+    const attribution = scopeAttributionForWorktree($gitWorktreeId);
+    if (window.confirm(discardAllConfirm(count, attribution))) {
       void discardAllFiles();
     }
   }
 
   function confirmDiscardFile(path: string) {
     if ($gitBusy) return;
-    if (window.confirm(`Discard changes to ${path}?`)) {
+    const attribution = scopeAttributionForWorktree($gitWorktreeId);
+    if (window.confirm(discardFileConfirm(path, attribution))) {
       void discardFile(path);
     }
   }
@@ -715,7 +721,7 @@
         <button
           class="cancel"
           title="Cancel the running operation"
-          onclick={() => void cancelJob(cancellableJob.id)}
+          onclick={() => void cancelJob(cancellableJob.id, cancellableJob.scopeId)}
         >
           Cancel
         </button>

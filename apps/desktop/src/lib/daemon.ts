@@ -81,6 +81,7 @@ import {
   primeNotificationPermission,
 } from "./notifications";
 import { sshHosts, sshHostScopes } from "./sshHosts";
+import { isRemoteScopeId, type ScopeAttribution } from "./scopeCopy";
 import type { SshHost } from "./types";
 
 export type Connection = "connecting" | "ready" | "offline";
@@ -112,8 +113,25 @@ export type Job = {
   message: string | null;
   kind: string | null;
   worktreeId: Id | null;
+  // The owning daemon scope (ADR 0014): a JobId is interpreted within its daemon,
+  // never as globally unique across attached daemons, so two daemons can mint the
+  // same JobId without colliding here. `cancelJob` routes its cancel to this scope.
+  scopeId: DaemonScopeId;
 };
-export const jobs = writable<Record<Id, Job>>({});
+// Live Jobs keyed by a SCOPE-COMPOSITE key (`jobKey`), so the same JobId from two
+// daemons tracks as two entries (ADR 0014). The Local scope keys by the bare
+// JobId (back-compat with every existing consumer and the local-only test suite);
+// a remote scope namespaces with `<scope>:<jobId>`. Job lifecycle events arrive
+// scope-tagged (`hitch-scope-event`), so ingestion always knows the owning scope.
+export const jobs = writable<Record<string, Job>>({});
+
+// The store key for a Job within its owning scope. Local stays the bare JobId so
+// the local path (and its tests) are unchanged; a remote scope prefixes its id so
+// a colliding JobId from another daemon lands in a distinct entry. Mirrors the
+// `scopeArg` convention (Local is the no-prefix back-compat case).
+function jobKey(scopeId: DaemonScopeId, jobId: Id): string {
+  return scopeId === LOCAL_SCOPE_ID ? jobId : `${scopeId}:${jobId}`;
+}
 
 export const projects = writable<Project[]>([]);
 export const worktrees = writable<Worktree[]>([]);
@@ -257,6 +275,43 @@ export function scopeForParent(parent: SessionParent | null | undefined): Daemon
   return parent.kind === "worktree"
     ? scopeForWorktree(parent.id)
     : scopeForProject(parent.id);
+}
+
+// The display label of a daemon scope (the tree's mono caption: `LOCAL`, or an
+// SSH target like `prod`). Falls back to the raw scope id if the scope row isn't
+// in the tree yet. Used by host-attributed destructive copy (issue #30).
+export function scopeLabel(scopeId: DaemonScopeId): string {
+  return get(daemonScopes).find((s) => s.id === scopeId)?.label ?? scopeId;
+}
+
+// Resolve a Worktree's owning-scope attribution for destructive-confirmation copy
+// (issue #30): scope id, SSH Host label, and whether it is remote. A Local
+// worktree carries `isRemote: false` so the copy stays unchanged. The label is the
+// SSH target string (e.g. `prod`) for a remote worktree.
+export function scopeAttributionForWorktree(
+  worktreeId: Id | null | undefined,
+): ScopeAttribution {
+  const scopeId = scopeForWorktree(worktreeId);
+  return { scopeId, label: scopeLabel(scopeId), isRemote: isRemoteScopeId(scopeId) };
+}
+
+// Resolve a Project's owning-scope attribution for destructive-confirmation copy.
+export function scopeAttributionForProject(
+  projectId: Id | null | undefined,
+): ScopeAttribution {
+  const scopeId = scopeForProject(projectId);
+  return { scopeId, label: scopeLabel(scopeId), isRemote: isRemoteScopeId(scopeId) };
+}
+
+// Whether a worktree id is already ingested AND owned by a scope OTHER than the
+// one a scope-tagged event arrived on — i.e. the event is from a foreign daemon
+// whose same-id worktree must not bleed into this one (ADR 0014). Returns false
+// for an unknown worktree (it may simply not be snapshotted yet), so the cheap
+// guard only rejects a provable cross-scope id collision, never a racing event.
+function isWorktreeKnownInOtherScope(worktreeId: Id, eventScope: DaemonScopeId): boolean {
+  const worktree = get(worktrees).find((w) => w.id === worktreeId);
+  if (!worktree) return false;
+  return scopeForProject(worktree.project_id) !== eventScope;
 }
 
 // Tag a set of Projects as owned by a scope at ingestion. Replaces the scope map
@@ -727,12 +782,16 @@ async function loadCommitLogPage(mode: CommitLogLoad): Promise<void> {
   const isLatest = () => commitLogSeq === seq && get(gitWorktreeId) === worktreeId;
 
   const fetchLog = (fetchLimit: number) =>
-    daemonRequest<Response & { commits: CommitInfo[]; has_more: boolean }>({
-      type: "git-log",
-      worktree_id: worktreeId,
-      limit: fetchLimit,
-      offset,
-    } satisfies GitLogRequest);
+    daemonRequest<Response & { commits: CommitInfo[]; has_more: boolean }>(
+      {
+        type: "git-log",
+        worktree_id: worktreeId,
+        limit: fetchLimit,
+        offset,
+      } satisfies GitLogRequest,
+      // History reads route to the worktree's owning daemon (issue #30).
+      scopeForWorktree(worktreeId),
+    );
 
   try {
     const response = await fetchLog(limit);
@@ -913,7 +972,7 @@ export async function fetchCommitDiff(
       };
       const response = await daemonRequest<
         Response & { meta: CommitMeta; files: CommitFileDiff[] }
-      >(request);
+      >(request, scopeForWorktree(worktreeId));
       const data: CommitDiffData = { meta: response.meta, files: response.files };
       // Evict the oldest entry (front of Map insertion order) when at cap before
       // inserting the newest, bounding the memory each large diff would pin.
@@ -1240,19 +1299,22 @@ function toMessage(err: unknown): string {
 // ---- Job dispatch (ADR 0008) ----------------------------------------------
 //
 // `runJob` wraps a job-capable request in `StartJob`, registers a pending
-// resolver keyed by the returned job id, and resolves/rejects it when the
-// matching `JobCompleted` event arrives (handled in the hitch-event listener).
-// Callers (push/pull/draft fns) keep an ordinary Promise API.
+// resolver keyed by the SCOPE-COMPOSITE job key (`jobKey`), and resolves/rejects
+// it when the matching `JobCompleted` event arrives (handled in the hitch-event
+// listener). Keying by the composite key means a same JobId from two daemons gets
+// two independent resolvers (ADR 0014). Callers keep an ordinary Promise API.
 type JobPending = {
   resolve: (response: Response) => void;
   reject: (error: Error) => void;
 };
-const jobPending = new Map<Id, JobPending>();
+// All three maps below key by the composite `jobKey(scope, jobId)`, not the bare
+// JobId, so cross-daemon JobId collisions never cross-resolve.
+const jobPending = new Map<string, JobPending>();
 const EARLY_COMPLETION_TTL_MS = 30_000;
 const EARLY_COMPLETION_MAX = 64;
 type EarlyCompletion = { response: Response; receivedAt: number };
-const earlyCompletions = new Map<Id, EarlyCompletion>();
-const locallyStartedJobs = new Set<Id>();
+const earlyCompletions = new Map<string, EarlyCompletion>();
+const locallyStartedJobs = new Set<string>();
 let startingJobRequests = 0;
 const cancellableJobKinds = new Set([
   "clone",
@@ -1291,9 +1353,9 @@ export const cancellableJobForSelectedWorktree = derived(
 );
 
 function pruneEarlyCompletions(now = Date.now()): void {
-  for (const [jobId, completion] of earlyCompletions) {
+  for (const [key, completion] of earlyCompletions) {
     if (now - completion.receivedAt > EARLY_COMPLETION_TTL_MS) {
-      earlyCompletions.delete(jobId);
+      earlyCompletions.delete(key);
     }
   }
   while (earlyCompletions.size > EARLY_COMPLETION_MAX) {
@@ -1303,16 +1365,17 @@ function pruneEarlyCompletions(now = Date.now()): void {
   }
 }
 
-function rememberEarlyCompletion(jobId: Id, response: Response): void {
-  earlyCompletions.set(jobId, { response, receivedAt: Date.now() });
+// `key` is the composite `jobKey(scope, jobId)` (callers already resolved it).
+function rememberEarlyCompletion(key: string, response: Response): void {
+  earlyCompletions.set(key, { response, receivedAt: Date.now() });
   pruneEarlyCompletions();
 }
 
-function takeEarlyCompletion(jobId: Id): Response | null {
+function takeEarlyCompletion(key: string): Response | null {
   pruneEarlyCompletions();
-  const early = earlyCompletions.get(jobId);
+  const early = earlyCompletions.get(key);
   if (!early) return null;
-  earlyCompletions.delete(jobId);
+  earlyCompletions.delete(key);
   return early.response;
 }
 
@@ -1335,18 +1398,28 @@ export async function runJob<T extends Response>(
     startingJobRequests = Math.max(0, startingJobRequests - 1);
   }
   const jobId = started.job_id;
-  locallyStartedJobs.add(jobId);
+  // Every job-identity map keys by the SCOPE-COMPOSITE key so a colliding JobId
+  // from another daemon can't resolve THIS promise or overwrite THIS store entry.
+  const key = jobKey(scopeId, jobId);
+  locallyStartedJobs.add(key);
   jobs.update((current) => ({
     ...current,
-    [jobId]: { id: jobId, status: "running", message: null, kind, worktreeId: jobWorktreeId(request) },
+    [key]: {
+      id: jobId,
+      status: "running",
+      message: null,
+      kind,
+      worktreeId: jobWorktreeId(request),
+      scopeId,
+    },
   }));
   return new Promise<T>((resolve, reject) => {
-    const early = takeEarlyCompletion(jobId);
+    const early = takeEarlyCompletion(key);
     if (early) {
-      locallyStartedJobs.delete(jobId);
+      locallyStartedJobs.delete(key);
       jobs.update((current) => {
         const next = { ...current };
-        delete next[jobId];
+        delete next[key];
         return next;
       });
       if (isError(early)) {
@@ -1356,7 +1429,7 @@ export async function runJob<T extends Response>(
       }
       return;
     }
-    jobPending.set(jobId, {
+    jobPending.set(key, {
       resolve: (response) => resolve(response as T),
       reject,
     });
@@ -1364,27 +1437,36 @@ export async function runJob<T extends Response>(
 }
 
 // Update the live Jobs store from a `JobProgress` event. Exported as the seam
-// the event listener and the unit tests both drive.
+// the event listener and the unit tests both drive. `scopeId` is the owning
+// daemon (the scope the `job-progress` event arrived tagged with); it defaults to
+// Local for the untagged local event path and the local-only tests.
 export function applyJobProgress(
   jobId: Id,
   status: JobStatus,
   message: string | null,
   kind: string | null = null,
+  scopeId: DaemonScopeId = LOCAL_SCOPE_ID,
 ): void {
+  const key = jobKey(scopeId, jobId);
   jobs.update((current) => ({
     ...current,
-    [jobId]: {
+    [key]: {
       id: jobId,
       status,
       message,
-      kind: kind ?? current[jobId]?.kind ?? null,
-      worktreeId: current[jobId]?.worktreeId ?? null,
+      kind: kind ?? current[key]?.kind ?? null,
+      worktreeId: current[key]?.worktreeId ?? null,
+      scopeId,
     },
   }));
 }
 
 // Resolve a Job from its `JobCompleted` event: the wrapped response rides inside.
-export function completeJob(jobId: Id, response: Response): void {
+// `scopeId` is the owning daemon (the scope the `job-completed` event arrived
+// tagged with), so the pending resolver + store entry matched here are the ones
+// for THIS daemon's JobId, never a same-id job on another daemon (ADR 0014).
+export function completeJob(jobId: Id, response: Response, scopeId: DaemonScopeId = LOCAL_SCOPE_ID): void {
+  const key = jobKey(scopeId, jobId);
   // Resolve a composite chain's per-worktree DISPLAY state FIRST (before the job
   // is dropped from the store below, so the worktree lookup still works): clear
   // on success, park the oxide failure on a mid-chain failure. The worktree id
@@ -1395,7 +1477,7 @@ export function completeJob(jobId: Id, response: Response): void {
     response.type === "pull-request-created"
   ) {
     const worktreeId =
-      get(jobs)[jobId]?.worktreeId ??
+      get(jobs)[key]?.worktreeId ??
       Object.entries(get(compositeChains)).find(([, c]) => c.jobId === jobId)?.[0] ??
       null;
     if (worktreeId) applyCompositeCompletion(worktreeId, response);
@@ -1411,29 +1493,29 @@ export function completeJob(jobId: Id, response: Response): void {
     // exists for it — a user-driven cancel optimistically clears the chain before
     // its "job cancelled" error arrives, and we must not resurrect it.
     const worktreeId =
-      get(jobs)[jobId]?.worktreeId ??
+      get(jobs)[key]?.worktreeId ??
       Object.entries(get(compositeChains)).find(([, c]) => c.jobId === jobId)?.[0] ??
       null;
     if (worktreeId && get(compositeChains)[worktreeId]) {
       applyCompositeErrorCompletion(worktreeId, response.error.message);
     }
   }
-  const pending = jobPending.get(jobId);
-  const local = locallyStartedJobs.has(jobId);
-  jobPending.delete(jobId);
+  const pending = jobPending.get(key);
+  const local = locallyStartedJobs.has(key);
+  jobPending.delete(key);
   jobs.update((current) => {
-    if (!(jobId in current)) return current;
+    if (!(key in current)) return current;
     const next = { ...current };
-    delete next[jobId];
+    delete next[key];
     return next;
   });
   if (!pending) {
     if (local || startingJobRequests > 0) {
-      rememberEarlyCompletion(jobId, response);
+      rememberEarlyCompletion(key, response);
     }
     return;
   }
-  locallyStartedJobs.delete(jobId);
+  locallyStartedJobs.delete(key);
   if (isError(response)) {
     pending.reject(new Error(response.error.message));
   } else {
@@ -1459,9 +1541,12 @@ function failAllJobs(reason: string): void {
 }
 
 // Ask the daemon to cancel a running Job (signals its worker to kill any child).
-export async function cancelJob(jobId: Id): Promise<void> {
+// `scopeId` routes the cancel to the owning daemon so a remote Job is cancelled on
+// the host that runs it (a JobId is interpreted within its daemon, ADR 0014).
+// Defaults to Local for the back-compat path.
+export async function cancelJob(jobId: Id, scopeId: DaemonScopeId = LOCAL_SCOPE_ID): Promise<void> {
   try {
-    await daemonRequest({ type: "cancel-job", job_id: jobId });
+    await daemonRequest({ type: "cancel-job", job_id: jobId }, scopeId);
   } catch (err) {
     error.set(toMessage(err));
   }
@@ -1613,6 +1698,7 @@ export async function startCommitAndPush(
       settings: draftGenerationSettings({ commit: get(draftCommitInstructions) }),
     },
     "commit-and-push",
+    scopeForWorktree(worktreeId),
   );
   // A mid-chain failure rides the normal `job-completed` envelope as a
   // `composite-job-failed` response (not an `error`), so runJob RESOLVES it. The
@@ -1658,6 +1744,7 @@ export async function startCreatePr(
       settings: draftGenerationSettings({ pr: get(draftPrInstructions) }),
     },
     "create-pr",
+    scopeForWorktree(worktreeId),
   );
   throwIfCompositeFailed(response);
   void loadGitStatus(worktreeId).catch(() => {});
@@ -1678,10 +1765,13 @@ export async function refreshActiveJobs(
   if (!worktreeId) return null;
   let response: Response & { jobs: ActiveJobInfo[] };
   try {
-    response = await daemonRequest<Response & { jobs: ActiveJobInfo[] }>({
-      type: "active-jobs",
-      worktree_id: worktreeId,
-    });
+    // Route the active-Jobs query to the worktree's owning daemon so a remote
+    // worktree restores ITS in-flight composite chain (the daemon that runs the
+    // chain owns the query; ADR 0014).
+    response = await daemonRequest<Response & { jobs: ActiveJobInfo[] }>(
+      { type: "active-jobs", worktree_id: worktreeId },
+      scopeForWorktree(worktreeId),
+    );
   } catch {
     return null;
   }
@@ -1711,6 +1801,9 @@ export async function cancelCompositeChain(
 ): Promise<void> {
   if (!worktreeId) return;
   const chain = get(compositeChains)[worktreeId];
+  // Resolve the owning daemon scope from the worktree so the cancel routes to the
+  // host that runs the chain (a remote chain is cancelled on its own daemon).
+  const scopeId = scopeForWorktree(worktreeId);
   const jobId =
     chain?.jobId ??
     Object.values(get(jobs)).find(
@@ -1719,7 +1812,7 @@ export async function cancelCompositeChain(
         (job.kind === "commit-and-push" || job.kind === "create-pr"),
     )?.id ??
     null;
-  if (jobId) await cancelJob(jobId);
+  if (jobId) await cancelJob(jobId, scopeId);
   // Clear the optimistic display NOW — this is the clear that actually settles
   // the button. The daemon's cancellation arrives as a plain error-typed
   // `job-completed`, which completeJob's composite-error path would otherwise
@@ -1852,13 +1945,14 @@ export async function refreshAll(
 
   // Populate every worktree's PR chip in the background — one batched lookup per
   // project, throttled internally. Not awaited: a slow `gh` must not hold up the
-  // rest of the snapshot (sessions, dirty state). PR lookups stay on the local
-  // path for now; remote PR routing is issue #30.
-  if (isLocal) {
-    for (const project of scopeProjects) {
-      if (project.kind === "git-backed") {
-        void loadProjectPrStatuses(project.id);
-      }
+  // rest of the snapshot (sessions, dirty state). PR statuses run `gh` on the
+  // OWNING daemon's machine (it owns gh), so a remote scope's chips now load via
+  // its own daemon too (issue #30) — `loadProjectPrStatuses` resolves the scope
+  // from the project. A remote daemon without gh fails the lookup quietly, exactly
+  // like a local daemon without gh (the per-worktree map just stays unset).
+  for (const project of scopeProjects) {
+    if (project.kind === "git-backed") {
+      void loadProjectPrStatuses(project.id);
     }
   }
 
@@ -2195,6 +2289,12 @@ export function applyHitchEvent(event: HitchEvent, scopeId: DaemonScopeId = LOCA
   if (event.type === "worktree-dirty") {
     const worktreeId = event.worktree_id as Id;
     const dirty = event.dirty as boolean;
+    // Scope guard (ADR 0014): worktree ids are unique only per daemon, so a dirty
+    // event must not bleed across scopes. When the worktree is already ingested
+    // and owned by a DIFFERENT scope than this event arrived on, drop it (a foreign
+    // daemon's same-id worktree). An unknown worktree is left through — it may
+    // simply not be snapshotted yet, and `loadGitStatus` resolves its own scope.
+    if (isWorktreeKnownInOtherScope(worktreeId, scopeId)) return;
     dirtyWorktrees.update((current) =>
       current[worktreeId] === dirty ? current : { ...current, [worktreeId]: dirty },
     );
@@ -2247,6 +2347,7 @@ export function applyHitchEvent(event: HitchEvent, scopeId: DaemonScopeId = LOCA
       event.status as JobStatus,
       (event.message as string | null) ?? null,
       (event.kind as string | null) ?? null,
+      scopeId,
     );
   }
   if (event.type === "composite-job-progress") {
@@ -2260,8 +2361,10 @@ export function applyHitchEvent(event: HitchEvent, scopeId: DaemonScopeId = LOCA
   }
   if (event.type === "job-completed") {
     // `completeJob` also resolves the composite chain's per-worktree display
-    // state (clear on success, park the oxide failure on a mid-chain failure).
-    completeJob(event.job_id as Id, event.response as Response);
+    // state (clear on success, park the oxide failure on a mid-chain failure). The
+    // scope it arrived tagged with keys the matched resolver/store entry so a
+    // same JobId on another daemon can't cross-resolve (ADR 0014).
+    completeJob(event.job_id as Id, event.response as Response, scopeId);
   }
   if (event.type === "session-opened") {
     const session = event.session as Session;
@@ -2707,6 +2810,9 @@ export async function loadPrStatus(worktreeId: Id): Promise<void> {
     const response = await runJob<Response & { pr: PrInfo | null }>(
       { type: "pr-status", worktree_id: worktreeId },
       "pr-status",
+      // PR status runs `gh` on the worktree's owning daemon (it owns gh), so a
+      // remote worktree's PR is looked up on its host (issue #30).
+      scopeForWorktree(worktreeId),
     );
     // The result is authoritative for `worktreeId` regardless of which worktree
     // is selected now, so always feed the per-worktree map; the selected
@@ -2765,7 +2871,13 @@ export async function loadProjectPrStatuses(
   try {
     const response = await runJob<
       Response & { statuses: { worktree_id: Id; pr: PrInfo | null }[] }
-    >({ type: "project-pr-statuses", project_id: projectId }, "pr-status");
+    >(
+      { type: "project-pr-statuses", project_id: projectId },
+      "pr-status",
+      // Batched PR lookup runs `gh` on the project's owning daemon (issue #30):
+      // a remote project's chips are populated by its host's gh.
+      scopeForProject(projectId),
+    );
     const selectedId = get(gitWorktreeId);
     for (const status of response.statuses) {
       const applied = writePrByWorktree(status.worktree_id, status.pr ?? null, freshnessSeq);
@@ -2972,23 +3084,35 @@ export async function cloneProject(
 }
 
 export async function removeProject(projectId: Id, force: boolean): Promise<void> {
-  await daemonRequest({
-    type: "remove-project",
-    project_id: projectId,
-    force,
-  });
+  // Route the removal to the project's owning daemon so a remote project is
+  // forgotten on its host (issue #30). The scope is resolved BEFORE the request
+  // (refreshAll below replaces that scope's snapshot, which would drop the tag).
+  const scopeId = scopeForProject(projectId);
+  await daemonRequest(
+    {
+      type: "remove-project",
+      project_id: projectId,
+      force,
+    },
+    scopeId,
+  );
   if (get(selectedProjectId) === projectId) {
     selectedProjectId.set(null);
     selectedWorktreeId.set(null);
   }
-  await refreshAll();
+  await refreshAll({ scope: scopeId });
 }
 
 export async function listBranches(projectId: Id): Promise<BranchSummary[]> {
-  const response = await daemonRequest<Response & { branches: BranchSummary[] }>({
-    type: "list-branches",
-    project_id: projectId,
-  });
+  const response = await daemonRequest<Response & { branches: BranchSummary[] }>(
+    {
+      type: "list-branches",
+      project_id: projectId,
+    },
+    // CreateWorktreeDialog's branch list comes from the project's owning daemon
+    // (issue #30), so a remote project lists ITS branches over SSH.
+    scopeForProject(projectId),
+  );
   return response.branches;
 }
 
@@ -3000,6 +3124,10 @@ export async function createWorktree(
 ): Promise<Worktree | null> {
   const trimmed = branch.trim();
   if (!trimmed) return null;
+  // Route the create-worktree Job to the project's owning daemon so a remote
+  // project's worktree is created on its host and lands under the remote project
+  // (issue #30). Tag the created worktree's project scope inheritance is implicit
+  // (it inherits the project's scope via `scopeForWorktree`).
   const response = await runJob<Response & { worktrees: Worktree[] }>(
     {
       type: "create-worktree",
@@ -3009,6 +3137,7 @@ export async function createWorktree(
       mode,
     },
     "create-worktree",
+    scopeForProject(projectId),
   );
   const created = response.worktrees[0] ?? null;
   if (created) {
@@ -3027,12 +3156,20 @@ export async function removeWorktree(
   deleteBranch: boolean,
   force: boolean,
 ): Promise<void> {
-  await daemonRequest({
-    type: "remove-worktree",
-    worktree_id: worktreeId,
-    delete_branch: deleteBranch,
-    force,
-  });
+  // Route the removal to the worktree's owning daemon so a remote worktree is
+  // removed on its host (the daemon runs `git worktree remove` and kills its
+  // Sessions in one transaction; issue #30). Resolve the scope BEFORE the local
+  // prune below drops the worktree (which would lose its scope lookup).
+  const scopeId = scopeForWorktree(worktreeId);
+  await daemonRequest(
+    {
+      type: "remove-worktree",
+      worktree_id: worktreeId,
+      delete_branch: deleteBranch,
+      force,
+    },
+    scopeId,
+  );
   removeWorktreeLocal(worktreeId);
 }
 
@@ -3346,7 +3483,10 @@ export async function viewDiff(path: string, activate = true, staged?: boolean):
       ...(staged === undefined ? {} : { staged }),
       ...diffOptionFields(),
     };
-    const response = await daemonRequest<Response & { diff: { diff: string } }>(request);
+    const response = await daemonRequest<Response & { diff: { diff: string } }>(
+      request,
+      scopeForWorktree(worktreeId),
+    );
     writeFreshDiffCache(cacheKey, writeSeq, response.diff.diff);
     if (isLatest()) setDiffTabText(path, response.diff.diff);
   } catch (err) {
@@ -3378,7 +3518,10 @@ async function fetchFileDiff(
       staged,
       ...diffOptionFields(),
     };
-    const response = await daemonRequest<Response & { diff: { diff: string } }>(request);
+    const response = await daemonRequest<Response & { diff: { diff: string } }>(
+      request,
+      scopeForWorktree(worktreeId),
+    );
     const wrote = writeFreshDiffCache(cacheKey, writeSeq, response.diff.diff);
     if (diffRequestSeq.get(requestKey) !== requestSeq) return diffCache.get(cacheKey) ?? null;
     return wrote ? response.diff.diff : diffCache.get(cacheKey) ?? null;
@@ -3570,11 +3713,14 @@ export async function setFilesStaged(
   gitBusy.set(true);
   try {
     error.set(null);
-    await daemonRequest({
-      type: staged ? "stage-files" : "unstage-files",
-      worktree_id: worktreeId,
-      paths,
-    });
+    await daemonRequest(
+      {
+        type: staged ? "stage-files" : "unstage-files",
+        worktree_id: worktreeId,
+        paths,
+      },
+      scopeForWorktree(worktreeId),
+    );
     gitBusy.set(false);
     void loadGitStatus(worktreeId).catch((err) => error.set(toMessage(err)));
     // Keep any open diff tabs in sync if their file was just (un)staged, without
@@ -3625,11 +3771,14 @@ export async function discardFiles(paths: string[]): Promise<void> {
   gitBusy.set(true);
   try {
     error.set(null);
-    await daemonRequest({
-      type: "discard-files",
-      worktree_id: worktreeId,
-      paths,
-    });
+    await daemonRequest(
+      {
+        type: "discard-files",
+        worktree_id: worktreeId,
+        paths,
+      },
+      scopeForWorktree(worktreeId),
+    );
     // A discarded file has no diff left to show, so drop its tab.
     for (const path of paths) {
       invalidateDiffCacheVariants(worktreeId, path);
@@ -3671,12 +3820,15 @@ export async function commit(
   gitBusy.set(true);
   try {
     error.set(null);
-    await daemonRequest({
-      type: "commit",
-      worktree_id: worktreeId,
-      subject: trimmedSubject,
-      body: trimmedBody,
-    });
+    await daemonRequest(
+      {
+        type: "commit",
+        worktree_id: worktreeId,
+        subject: trimmedSubject,
+        body: trimmedBody,
+      },
+      scopeForWorktree(worktreeId),
+    );
     closeDiff();
     await loadGitStatus(worktreeId);
   } catch (err) {
@@ -3709,6 +3861,7 @@ export async function generateCommitDraft(
       settings: draftGenerationSettings({ commit: get(draftCommitInstructions) }),
     },
     "commit-draft",
+    scopeForWorktree(worktreeId),
   );
   return response.draft;
 }
@@ -3724,6 +3877,7 @@ export async function generatePullRequestDraft(base: string | null): Promise<Pul
       settings: draftGenerationSettings({ pr: get(draftPrInstructions) }),
     },
     "pr-draft",
+    scopeForWorktree(worktreeId),
   );
   return response.draft;
 }
@@ -3785,7 +3939,7 @@ export async function push(worktreeId: Id | null = get(gitWorktreeId)): Promise<
   gitBusy.set(true);
   try {
     error.set(null);
-    await runJob({ type: "push", worktree_id: worktreeId }, "push");
+    await runJob({ type: "push", worktree_id: worktreeId }, "push", scopeForWorktree(worktreeId));
   } catch (err) {
     error.set(toMessage(err));
     throw err;
@@ -3799,7 +3953,7 @@ export async function fetchRemote(worktreeId: Id | null = get(gitWorktreeId)): P
   gitBusy.set(true);
   try {
     error.set(null);
-    await runJob({ type: "fetch", worktree_id: worktreeId }, "fetch");
+    await runJob({ type: "fetch", worktree_id: worktreeId }, "fetch", scopeForWorktree(worktreeId));
   } catch (err) {
     error.set(toMessage(err));
     throw err;
@@ -3813,7 +3967,7 @@ export async function pull(worktreeId: Id | null = get(gitWorktreeId)): Promise<
   gitBusy.set(true);
   try {
     error.set(null);
-    await runJob({ type: "pull", worktree_id: worktreeId }, "pull");
+    await runJob({ type: "pull", worktree_id: worktreeId }, "pull", scopeForWorktree(worktreeId));
   } catch (err) {
     error.set(toMessage(err));
     throw err;
@@ -3839,6 +3993,7 @@ export async function createPr(fields: PrFields): Promise<void> {
         draft: fields.draft,
       },
       "create-pr",
+      scopeForWorktree(worktreeId),
     );
     prUrl.set(response.url);
     // Refresh so the action menu flips from "Create PR" to "Open PR".

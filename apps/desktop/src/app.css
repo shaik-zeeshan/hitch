@@ -377,6 +377,14 @@ html[data-theme="dark"] {
     color: var(--ink-1);
     font-weight: 600;
   }
+  /* Remote destructive attribution (issue #30): the SSH Host + remote path under a
+     remote remove dialog's title, so a path that also exists locally can't be
+     mistaken for local state (ADR 0014). Muted mono, one quiet line. */
+  .m-head .sub.remote-attr {
+    font-family: var(--mono);
+    color: var(--ink-2);
+    word-break: break-all;
+  }
   .m-body {
     padding: 14px 18px 16px;
     display: grid;

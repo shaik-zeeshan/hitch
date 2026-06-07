@@ -6,11 +6,20 @@
   // is gated to merged branches (ADR 0001); the frozen contract exposes no
   // merge status, so it stays disabled and delete_branch is always false.
   import { Dialog } from "bits-ui";
-  import { dirtyWorktrees, removeWorktree, sessions } from "../daemon";
+  import { dirtyWorktrees, removeWorktree, scopeAttributionForWorktree, sessions } from "../daemon";
   import { removeWorktreeTarget } from "../overlays";
+  import { removeWorktreeTitle, remotePathAttribution } from "../scopeCopy";
 
   const target = $derived($removeWorktreeTarget);
   const dirty = $derived(target ? !!$dirtyWorktrees[target.id] : false);
+  // Remote attribution (issue #30, ADR 0014): a remote worktree's confirmation
+  // titles `Remove worktree on <host>?` and shows the SSH Host + remote path so a
+  // path that also exists locally can't be mistaken for local state. Local copy is
+  // unchanged. `$worktrees` (read inside scopeAttributionForWorktree) keeps this
+  // reactive to scope tagging.
+  const attribution = $derived(scopeAttributionForWorktree(target?.id));
+  const title = $derived(removeWorktreeTitle(attribution));
+  const remoteLine = $derived(target ? remotePathAttribution(attribution, target.path) : null);
   const liveSessions = $derived(
     target
       ? $sessions.filter((s) => s.parent.kind === "worktree" && s.parent.id === target.id).length
@@ -66,8 +75,11 @@
     <Dialog.Overlay class="modal-back" />
     <Dialog.Content class="modal" aria-describedby={undefined}>
       <div class="m-head">
-        <Dialog.Title>Remove worktree</Dialog.Title>
+        <Dialog.Title>{title}</Dialog.Title>
         <div class="sub"><b>{target?.branch ?? ""}</b></div>
+        {#if remoteLine}
+          <div class="sub mono remote-attr">{remoteLine}</div>
+        {/if}
       </div>
       <div class="m-body">
         {#if warning}
