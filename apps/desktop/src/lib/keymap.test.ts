@@ -131,6 +131,14 @@ describe("matchBinding — bare-key pane gating", () => {
     expect(id("macos", { key: "r" }, "terminal")).toBeNull();
   });
 
+  it("git.refresh accepts Caps-Lock R but not Shift+R (combo forbids Shift)", () => {
+    // RightRail routes refresh through matchBinding, so the bare `r` combo's
+    // exact-shift rule governs: an uppercase key WITHOUT shiftKey (Caps Lock)
+    // still resolves to git.refresh, but Shift+R (shiftKey true) does not.
+    expect(id("macos", { key: "R" }, "git")).toBe("git.refresh");
+    expect(id("macos", { key: "R", shiftKey: true }, "git")).toBeNull();
+  });
+
   it("a modifier combo is pane-independent (fires from any focus)", () => {
     expect(id("macos", { key: "k", metaKey: true }, "tree")).toBe("palette.open");
     expect(id("macos", { key: "k", metaKey: true }, "git")).toBe("palette.open");

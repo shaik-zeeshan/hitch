@@ -32,3 +32,12 @@ export const commitOpen = writable(false);
 
 // Create-PR dialog (also openable from its button in the Changes panel).
 export const createPrOpen = writable(false);
+
+// Rail-toggle requests. The left/right rail visibility lives in +layout.svelte
+// ($state, so a /settings round-trip doesn't reset it), and the Cmd+B / Cmd+⌥B
+// chords flip it directly there. The command palette has no other path to that
+// layout-local state, so it bumps these counters; +layout watches them and
+// flips the matching rail. A monotonic counter (not a boolean) means every
+// invocation is a distinct toggle event even when the value would repeat.
+export const toggleLeftRailRequest = writable(0);
+export const toggleRightRailRequest = writable(0);

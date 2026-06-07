@@ -47,6 +47,8 @@
     removeWorktreeTarget,
     commitOpen,
     createPrOpen,
+    toggleLeftRailRequest,
+    toggleRightRailRequest,
   } from "$lib/overlays";
   import { currentDesktopPlatform } from "$lib/desktopPlatform";
   import {
@@ -79,6 +81,26 @@
   // xterm grids.
   let showLeft = $state(true);
   let showRight = $state(true);
+
+  // The command palette can't reach this layout-local rail state, so its
+  // "Toggle left/right rail" commands bump request counters in overlays.ts;
+  // here we flip the matching rail when a counter advances. We read the count
+  // (not just subscribe for its side effect) and gate on a remembered baseline
+  // so the initial run doesn't fire a spurious toggle on mount.
+  let seenToggleLeft = $state(get(toggleLeftRailRequest));
+  let seenToggleRight = $state(get(toggleRightRailRequest));
+  $effect(() => {
+    if ($toggleLeftRailRequest !== seenToggleLeft) {
+      seenToggleLeft = $toggleLeftRailRequest;
+      showLeft = !showLeft;
+    }
+  });
+  $effect(() => {
+    if ($toggleRightRailRequest !== seenToggleRight) {
+      seenToggleRight = $toggleRightRailRequest;
+      showRight = !showRight;
+    }
+  });
 
   // Routes that fully replace the shell (the settings page renders on top of
   // the layout while the shell is hidden). Keep this allowlist tight — any
@@ -203,8 +225,17 @@
     "focus.tree": () => focusPane("tree"),
     "focus.terminal": () => focusPane("terminal"),
     "focus.git": () => focusPane("git"),
-    "toggle.left": () => (showLeft = !showLeft),
-    "toggle.right": () => (showRight = !showRight),
+    // Statement bodies (not expression bodies) so these return undefined, not
+    // the boolean assignment value: an expression-body arrow returns `!showLeft`,
+    // which is `false` whenever the rail is being HIDDEN — the dispatcher's
+    // "returns false === declined" contract (see below) would then skip
+    // preventDefault on every hide, letting Cmd+B leak to the terminal/panes.
+    "toggle.left": () => {
+      showLeft = !showLeft;
+    },
+    "toggle.right": () => {
+      showRight = !showRight;
+    },
     "palette.open": openPalette,
     "settings.toggle": toggleSettings,
     "focus.terminal.escape": () => {
@@ -364,16 +395,12 @@
      place. The moment the user navigates back, the shell becomes visible
      again at exactly the size it had on the way out. -->
 <div class="window" class:no-left={!showLeft} class:no-right={!showRight} class:shell-hidden={shellHidden} aria-hidden={shellHidden}>
-  <TopNav
-    rightCollapsed={!showRight}
-    onToggleLeft={() => (showLeft = !showLeft)}
-    onToggleRight={() => (showRight = !showRight)}
-  />
+  <TopNav />
 
   <div class="body">
     <LeftRail collapsed={!showLeft} />
     <Center />
-    <RightRail collapsed={!showRight} onToggleRight={() => (showRight = !showRight)} />
+    <RightRail collapsed={!showRight} />
   </div>
 </div>
 

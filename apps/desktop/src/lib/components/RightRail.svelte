@@ -47,7 +47,7 @@
   import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
   import { focusWithoutScroll } from "../focusWithoutScroll";
   import { fileIconUrl } from "../file-icons";
-  import { focusedPane } from "../keymap";
+  import { focusedPane, matchBinding } from "../keymap";
   import { autoCommitPush, railView } from "../settings";
   import { commitOpen, createPrOpen } from "../overlays";
   import { STATUS_GLYPH, statusGlyphClass } from "../types";
@@ -56,16 +56,14 @@
   import HistoryList from "./HistoryList.svelte";
   import toast from "svelte-french-toast";
 
-  // `onToggleRight` is kept in the prop contract so the layout wiring stays
-  // intact, but the Paper Terminal header drops the hide/collapse toggle (the
-  // rail is part of the fixed 3-pane grid). `collapsed` likewise still drives
-  // the opacity fade if the layout ever requests it.
+  // The Paper Terminal header drops the hide/collapse toggle (the rail is part
+  // of the fixed 3-pane grid); rail visibility is driven from the layout via the
+  // keymap chords and the command palette. `collapsed` still drives the opacity
+  // fade when the layout hides the rail.
   let {
     collapsed = false,
-    onToggleRight: _onToggleRight,
   }: {
     collapsed?: boolean;
-    onToggleRight: () => void;
   } = $props();
 
   // Commit-shortcut hints. The handler (CommitDialog) is platform-aware via
@@ -178,13 +176,24 @@
   // on the git pane and suppresses it while the commit dialog is open.
   function onRailKeydown(event: KeyboardEvent) {
     // Never hijack keys typed into an editable element (none today, but the
-    // checkbox/discard spans are role="button" — keep the guard for safety).
+    // checkbox/discard spans are role="button" — keep the guard for safety). This
+    // is a DOM-target gate, so it stays here rather than in matchBinding (which is
+    // DOM-free — see keymap.ts).
     if (event.target instanceof HTMLElement) {
       const tag = event.target.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || event.target.isContentEditable) {
         return;
       }
     }
+    // Resolve the binding id via the SAME matchBinding the layout dispatcher uses,
+    // so the keymap table stays the single source of truth. We pass pane "git" so
+    // the bare git keys (arrows/Space/Enter/Backspace/R) match; matchBinding
+    // requires modifiers to match EXACTLY, so e.g. Cmd+Enter resolves to
+    // git.commit (no case here → falls through to the dispatcher) and Cmd+R / any
+    // modifier+arrow resolves to nothing. R is git.refresh's case-insensitive key,
+    // but its combo forbids Shift, so Shift+R no longer refreshes (Caps-Lock R,
+    // which carries no shiftKey, still does).
+    const binding = matchBinding(event, platform, "git");
     // ←/→ switch the rail view in BOTH views (git pane focus is shared). Handled
     // before the per-view branch so it works identically from Changes or History.
     // Switching the view UNMOUNTS the focused row (the other list renders), so
@@ -192,8 +201,7 @@
     // restore focus into the rail after the flip (tick() lets the new list mount)
     // so arrows keep round-tripping; on an empty target list focusRailRows falls
     // back to the aside itself, which still carries this handler.
-    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
-      if (event.metaKey || event.ctrlKey || event.altKey) return;
+    if (binding?.id === "git.viewPrev" || binding?.id === "git.viewNext") {
       if (!$gitWorktreeId) return;
       event.preventDefault();
       toggleRailView();
@@ -207,29 +215,26 @@
       // errors. R still refreshes (handled in the shared branch below) — but for
       // History the log rides the status backbone, so it's a no-op-friendly
       // refetch of status; we leave the existing handleRefresh as-is.
-      switch (event.key) {
-        case "ArrowDown":
+      switch (binding?.id) {
+        case "git.down":
           event.preventDefault();
           moveActiveCommit(1);
           return;
-        case "ArrowUp":
+        case "git.up":
           event.preventDefault();
           moveActiveCommit(-1);
           return;
-        case "Enter":
-          if (event.metaKey || event.ctrlKey) return;
+        case "git.openDiff":
           event.preventDefault();
           openActiveCommit();
           return;
-        case " ":
-        case "Backspace":
+        case "git.stage":
+        case "git.discard":
           // Inert in HISTORY (no stage/discard target). Swallow so the page
           // doesn't scroll / navigate, but do nothing else.
           event.preventDefault();
           return;
-        case "r":
-        case "R":
-          if (event.metaKey || event.ctrlKey || event.altKey) return;
+        case "git.refresh":
           event.preventDefault();
           void handleRefresh();
           return;
@@ -237,33 +242,31 @@
       return;
     }
 
-    switch (event.key) {
-      case "ArrowDown":
+    switch (binding?.id) {
+      case "git.down":
         event.preventDefault();
         moveActive(1);
         break;
-      case "ArrowUp":
+      case "git.up":
         event.preventDefault();
         moveActive(-1);
         break;
-      case " ":
+      case "git.stage":
         // preventDefault stops the space from scrolling the file list / page.
         event.preventDefault();
         toggleActiveStaged();
         break;
-      case "Enter":
-        // Plain Enter only — Cmd+Enter (commit) is the layout dispatcher's.
-        if (event.metaKey || event.ctrlKey) return;
+      case "git.openDiff":
+        // Plain Enter only — Cmd+Enter (commit) is the layout dispatcher's
+        // (it resolves to git.commit, which has no case here).
         event.preventDefault();
         openActiveDiff();
         break;
-      case "Backspace":
+      case "git.discard":
         event.preventDefault();
         discardActive();
         break;
-      case "r":
-      case "R":
-        if (event.metaKey || event.ctrlKey || event.altKey) return;
+      case "git.refresh":
         event.preventDefault();
         void handleRefresh();
         break;

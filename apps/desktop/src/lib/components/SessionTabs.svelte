@@ -12,8 +12,6 @@
   import X from "~icons/lucide/x";
   import Files from "~icons/lucide/files";
   import GitCommitHorizontal from "~icons/lucide/git-commit-horizontal";
-  import Claude from "~icons/hitch/claude";
-  import Codex from "~icons/hitch/codex";
   import Shell from "~icons/hitch/shell";
   import {
     activeSession,
@@ -34,7 +32,7 @@
   import { focusedPane, focusTerminal } from "../keymap";
   import { fileIconUrl } from "../file-icons";
   import { needsAction, type Session, type SessionParent } from "../types";
-  import { sessionTabKind, sessionTabTitle } from "../sessionDisplay";
+  import { LAUNCHABLE_AGENTS, TAB_MARK, sessionTabKind, sessionTabTitle } from "../sessionDisplay";
   let { parent }: { parent: SessionParent } = $props();
 
   function basename(path: string): string {
@@ -84,6 +82,7 @@
     {@const command = $sessionCommands[session.id]}
     {@const title = sessionTabTitle(agent, session.name, command)}
     {@const kind = sessionTabKind(agent)}
+    {@const Mark = TAB_MARK[kind]}
     {@const active = !$diffActive && session.id === $activeSession?.id}
     <ContextMenu.Root>
       <ContextMenu.Trigger>
@@ -97,13 +96,7 @@
             {title}
             onclick={() => select(session)}
           >
-            {#if kind === "claude"}
-              <Claude class="icon tabmark claude" />
-            {:else if kind === "codex"}
-              <Codex class="icon tabmark codex" />
-            {:else}
-              <Shell class="icon tabmark shell" />
-            {/if}
+            <Mark class="icon tabmark {kind}" />
 
             <span class="name">{title}</span>
 
@@ -202,14 +195,13 @@
     </DropdownMenu.Trigger>
     <DropdownMenu.Portal>
       <DropdownMenu.Content class="menu" align="start" sideOffset={6}>
-        <DropdownMenu.Item class="mi" onSelect={() => void openSession(parent, "claude", ["claude"])}>
-          <Claude class="mi-ico claude" />
-          Claude
-        </DropdownMenu.Item>
-        <DropdownMenu.Item class="mi" onSelect={() => void openSession(parent, "codex", ["codex"])}>
-          <Codex class="mi-ico" />
-          Codex
-        </DropdownMenu.Item>
+        {#each LAUNCHABLE_AGENTS as a (a.kind)}
+          {@const Mark = a.icon}
+          <DropdownMenu.Item class="mi" onSelect={() => void openSession(parent, a.kind, a.launchArgv)}>
+            <Mark class="mi-ico {a.kind}" />
+            {a.title}
+          </DropdownMenu.Item>
+        {/each}
         <DropdownMenu.Separator class="m-sep" />
         <DropdownMenu.Item class="mi" onSelect={() => void openSession(parent, "shell", null)}>
           <Shell class="mi-ico" />

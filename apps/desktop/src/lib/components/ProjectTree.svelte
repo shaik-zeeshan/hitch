@@ -19,8 +19,6 @@
   import SquarePen from "~icons/lucide/square-pen";
   import Copy from "~icons/lucide/copy";
   import Trash2 from "~icons/lucide/trash-2";
-  import ClaudeMark from "~icons/hitch/claude";
-  import CodexMark from "~icons/hitch/codex";
   import toast from "svelte-french-toast";
   import { editorApp } from "../settings";
   import {
@@ -36,8 +34,9 @@
     worktreeLineStats,
     worktrees,
   } from "../daemon";
+  import { LAUNCHABLE_AGENTS, TAB_MARK, sessionTabKind } from "../sessionDisplay";
   import { createWorktreeFor, removeProjectTarget, removeWorktreeTarget } from "../overlays";
-  import { focusedPane } from "../keymap";
+  import { focusedPane, matchBinding } from "../keymap";
   import {
     currentDesktopPlatform,
     revealItemLabel,
@@ -308,28 +307,33 @@
   // Component-local keydown for the bare tree keys. The global dispatcher matches
   // these same combos but registers NO handler for them, so it never
   // preventDefaults — handling here is the sole route (see keymap.ts / +layout).
-  // Modifier combos (e.g. Cmd+N) are left to the global dispatcher.
+  // We resolve the binding id via the SAME matchBinding the dispatcher uses, so
+  // the keymap table stays the single source of truth (a future rebinding/Settings
+  // panel changes both at once). matchBinding pane-gates bare keys to "tree" and
+  // requires modifiers to match EXACTLY, so Cmd+ArrowDown / Cmd+N never resolve to
+  // a bare tree id here — the modifier-combo ids (e.g. tree.newWorktree) have no
+  // case below and fall through (no preventDefault) to the global dispatcher.
   function onRowKey(event: KeyboardEvent, row: Row) {
-    if (event.metaKey || event.ctrlKey || event.altKey) return;
-    switch (event.key) {
-      case "ArrowDown":
+    const binding = matchBinding(event, desktopPlatform, "tree");
+    switch (binding?.id) {
+      case "tree.down":
         event.preventDefault();
         moveRoving(1);
         break;
-      case "ArrowUp":
+      case "tree.up":
         event.preventDefault();
         moveRoving(-1);
         break;
-      case "ArrowRight":
+      case "tree.expand":
         event.preventDefault();
         rowRight(row);
         break;
-      case "ArrowLeft":
+      case "tree.collapse":
         event.preventDefault();
         rowLeft(row);
         break;
-      case "Enter":
-      case " ":
+      case "tree.select":
+      case "tree.select.space":
         event.preventDefault();
         selectRow(row);
         break;
@@ -508,12 +512,10 @@
 
                       <div class="pile" class:empty={agents.length === 0}>
                         {#each agents as a (a.id)}
-                          <span class="h {a.agent === 'codex' ? 'codex' : 'claude'}">
-                            {#if a.agent === "codex"}
-                              <CodexMark class="icon" />
-                            {:else}
-                              <ClaudeMark class="icon" />
-                            {/if}
+                          {@const kind = sessionTabKind(a.agent)}
+                          {@const Mark = TAB_MARK[kind]}
+                          <span class="h {kind}">
+                            <Mark class="icon" />
                           </span>
                         {/each}
                       </div>
@@ -526,10 +528,13 @@
                       <TerminalIcon class="mi-ico icon" />
                       Open shell session<span class="mi-k">{shellShortcutLabel}</span>
                     </ContextMenu.Item>
-                    <ContextMenu.Item class="mi" onSelect={() => launch(worktree, ["claude"], "claude")}>
-                      <ClaudeMark class="mi-ico icon" />
-                      Launch Claude
-                    </ContextMenu.Item>
+                    {#each LAUNCHABLE_AGENTS as a (a.kind)}
+                      {@const Mark = a.icon}
+                      <ContextMenu.Item class="mi" onSelect={() => launch(worktree, a.launchArgv, a.kind)}>
+                        <Mark class="mi-ico icon" />
+                        Launch {a.title}
+                      </ContextMenu.Item>
+                    {/each}
                     <ContextMenu.Separator class="m-sep" />
                     <ContextMenu.Item class="mi" onSelect={() => void revealInFileManager(worktree.path)}>
                       <FolderOpen class="mi-ico icon" />

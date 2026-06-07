@@ -8,9 +8,9 @@
   //
   // There is NO app name, breadcrumb, or git ahead/behind status here — git
   // sync moved to the right rail. The left/right rail toggle buttons were also
-  // removed (the design's bar has three zones only); the collapse props/
-  // callbacks are kept so the layout's machinery still compiles and the buttons
-  // can return elsewhere later.
+  // removed (the design's bar has three zones only); rail collapse is driven by
+  // the keymap chords (Cmd+B / Cmd+⌥B) and the command palette's toggle
+  // commands, so this bar takes no rail props.
   import { goto } from "$app/navigation";
   import {
     daemonReason,
@@ -30,21 +30,6 @@
   // the native Overlay traffic lights on the left; Windows is frameless and
   // draws its own caption controls on the right.
   const platform = currentDesktopPlatform();
-
-  // Collapse props are retained (the layout drives rail collapse through them)
-  // even though this bar no longer renders the toggle buttons.
-  // The rail-collapse props are accepted (the layout passes them) but no longer
-  // consumed here — the bar dropped its toggle buttons. Kept on the prop type so
-  // the layout's call site stays unchanged and the buttons can return later.
-  let {
-    rightCollapsed: _rightCollapsed = false,
-    onToggleLeft: _onToggleLeft,
-    onToggleRight: _onToggleRight,
-  }: {
-    rightCollapsed?: boolean;
-    onToggleLeft: () => void;
-    onToggleRight: () => void;
-  } = $props();
 
   const commandPaletteKeys = shortcutKeys(platform, "K");
   const settingsShortcut = shortcutLabel(platform, ",");

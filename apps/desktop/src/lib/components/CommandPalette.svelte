@@ -24,13 +24,33 @@
     sessions,
     worktrees,
   } from "../daemon";
-  import { addProjectOpen, cloneProjectOpen, commandOpen, createPrOpen, createWorktreeFor } from "../overlays";
+  import {
+    addProjectOpen,
+    cloneProjectOpen,
+    commandOpen,
+    createPrOpen,
+    createWorktreeFor,
+    toggleLeftRailRequest,
+    toggleRightRailRequest,
+  } from "../overlays";
   import { diffIgnoreWhitespace, diffStyle, diffWrap } from "../settings";
   import { AGENT_LABEL, type Session, type Worktree } from "../types";
+  import { LAUNCHABLE_AGENTS } from "../sessionDisplay";
+  import { bindings, comboKeys } from "../keymap";
+  import { currentDesktopPlatform } from "../desktopPlatform";
   import Search from "~icons/lucide/search";
-  import Claude from "~icons/hitch/claude";
 
   const projectName = (id: string) => $projects.find((p) => p.id === id)?.name ?? "";
+
+  // Chord hints for the rail-toggle rows, formatted from the keymap so the
+  // palette can't drift from the actual bindings (same source the Settings
+  // reference panel reads). The keymap also owns the row labels (toggle.left /
+  // toggle.right "Toggle left/right rail"), reused below as the value keywords.
+  const platform = currentDesktopPlatform();
+  const toggleLeft = bindings.find((b) => b.id === "toggle.left")!;
+  const toggleRight = bindings.find((b) => b.id === "toggle.right")!;
+  const toggleLeftKeys = comboKeys(toggleLeft.combo, platform);
+  const toggleRightKeys = comboKeys(toggleRight.combo, platform);
 
   // The project a "New worktree…" lands under: the selected one if it's
   // git-backed, otherwise the first git-backed project (worktrees need git).
@@ -146,14 +166,17 @@
                   </Command.Item>
                 {/if}
                 {#if $selectedParent}
-                  <Command.Item
-                    class="p-item"
-                    value="launch claude agent"
-                    onSelect={() => run(() => void openSession($selectedParent!, "claude", ["claude"]))}
-                  >
-                    <Claude class="pi-ico pi-claude" />
-                    <span class="pi-label">Launch Claude in this worktree</span>
-                  </Command.Item>
+                  {#each LAUNCHABLE_AGENTS as a (a.kind)}
+                    {@const Mark = a.icon}
+                    <Command.Item
+                      class="p-item"
+                      value={`launch ${a.title} agent`}
+                      onSelect={() => run(() => void openSession($selectedParent!, a.kind, a.launchArgv))}
+                    >
+                      <Mark class="pi-ico pi-{a.kind}" />
+                      <span class="pi-label">Launch {a.title} in this worktree</span>
+                    </Command.Item>
+                  {/each}
                 {/if}
                 {#if canCreatePr}
                   <Command.Item
@@ -219,6 +242,30 @@
                 </Command.Item>
                 <Command.Item
                   class="p-item"
+                  value="toggle left rail sidebar tree show hide"
+                  keywords={[toggleLeft.description]}
+                  onSelect={() => run(() => toggleLeftRailRequest.update((n) => n + 1))}
+                >
+                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                    ><rect x="2.5" y="3" width="11" height="10" /><line x1="6" y1="3" x2="6" y2="13" /></svg
+                  >
+                  <span class="pi-label">{toggleLeft.description}</span>
+                  <span class="keys">{#each toggleLeftKeys as k (k)}<b class="kbd">{k}</b>{/each}</span>
+                </Command.Item>
+                <Command.Item
+                  class="p-item"
+                  value="toggle right rail changes git panel show hide"
+                  keywords={[toggleRight.description]}
+                  onSelect={() => run(() => toggleRightRailRequest.update((n) => n + 1))}
+                >
+                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+                    ><rect x="2.5" y="3" width="11" height="10" /><line x1="10" y1="3" x2="10" y2="13" /></svg
+                  >
+                  <span class="pi-label">{toggleRight.description}</span>
+                  <span class="keys">{#each toggleRightKeys as k (k)}<b class="kbd">{k}</b>{/each}</span>
+                </Command.Item>
+                <Command.Item
+                  class="p-item"
                   value="diff toggle split unified view side by side"
                   onSelect={() => run(() => diffStyle.set($diffStyle === "split" ? "unified" : "split"))}
                 >
@@ -269,5 +316,17 @@
      so it inverts correctly under selection. */
   :global(.p-item .pi-ico.pi-claude) {
     color: var(--mark-claude);
+  }
+  :global(.p-item .pi-ico.pi-codex) {
+    color: var(--mark-codex);
+  }
+  /* Trailing chord hint on the rail-toggle rows. Quiet by default; inverts to
+     the iris ink on the selected row so the keycaps read against the wash. */
+  :global(.p-item .keys .kbd) {
+    color: var(--ink-2);
+  }
+  :global(.p-item[data-selected] .keys .kbd) {
+    color: var(--iris-ink);
+    border-color: var(--iris-line);
   }
 </style>
