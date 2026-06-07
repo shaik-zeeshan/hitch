@@ -24,7 +24,7 @@
     commit,
     commitLog,
     defaultBase,
-    diffPath,
+    activeDiffPath,
     diffStaged,
     discardAllFiles,
     discardFile,
@@ -830,7 +830,7 @@
           </h3>
           {#each staged as file (file.path)}
             {@const parts = splitPath(file.path)}
-            <button class="frow" data-path={file.path} data-staged="true" class:active={$diffPath === file.path && $diffStaged !== false} class:roving={activeKey === rowKey(file)} onpointerdown={focusWithoutScroll} onclick={() => { activeKey = rowKey(file); void viewDiff(file.path, true, true); }}>
+            <button class="frow" data-path={file.path} data-staged="true" class:active={$activeDiffPath === file.path && $diffStaged !== false} class:roving={activeKey === rowKey(file)} onpointerdown={focusWithoutScroll} onclick={() => { activeKey = rowKey(file); void viewDiff(file.path, true, true); }}>
               <span
                 class="chk on"
                 role="button"
@@ -884,7 +884,7 @@
           </h3>
           {#each unstaged as file (file.path)}
             {@const parts = splitPath(file.path)}
-            <button class="frow" data-path={file.path} data-staged="false" class:active={$diffPath === file.path && $diffStaged !== true} class:roving={activeKey === rowKey(file)} onpointerdown={focusWithoutScroll} onclick={() => { activeKey = rowKey(file); void viewDiff(file.path, true, false); }}>
+            <button class="frow" data-path={file.path} data-staged="false" class:active={$activeDiffPath === file.path && $diffStaged !== true} class:roving={activeKey === rowKey(file)} onpointerdown={focusWithoutScroll} onclick={() => { activeKey = rowKey(file); void viewDiff(file.path, true, false); }}>
               <span
                 class="chk"
                 role="button"

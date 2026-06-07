@@ -224,10 +224,9 @@ export const activeDiffPath = writable<string | null>(null);
 // what the tab bar and center pane switch on.
 export const diffActive = writable<boolean>(false);
 
-// Active-tab projections kept for the diff renderer + Changes-panel highlight,
-// which only ever care about the visible diff. They derive off the tab set so
+// Active-tab projection kept for the diff renderer + Changes-panel highlight,
+// which only ever care about the visible diff. It derives off the tab set so
 // there's a single source of truth (`diffTabs` + `activeDiffPath`).
-export const diffPath = derived(activeDiffPath, ($path) => $path);
 // Which side the visible diff tab shows. A partially-staged file appears as two
 // Changes-panel rows (staged + unstaged), so the highlight must compare both
 // axes; `undefined` (legacy/no explicit side) matches either row.
@@ -726,8 +725,38 @@ export const currentDirty = derived(
   ([$id, $dirty]) => ($id ? $dirty[$id] : undefined),
 );
 
-export const defaultBase = derived(projectWorktrees, ($worktrees) =>
-  $worktrees.find((w) => w.is_main)?.branch ?? null,
+// The base branch for PR-base defaults and "from {base}" labels. The DAEMON owns
+// the convention now (GitStatus.base_branch, shared with git_log's ahead-of-base
+// markers) — so when a git status is loaded for the selected worktree, the
+// daemon-provided value WINS: it is the single definition, and only it correctly
+// handles the remote-less-worktree fallback that the client can't see.
+//
+// Two cases keep the worktree-derived value as a fallback rather than regressing:
+//  - Rolling upgrade: an OLD daemon omits the field entirely (`undefined`). We
+//    can't trust its absence as "no base", so we recompute client-side.
+//  - No status yet: `gitStatus` is null before a worktree is selected/loaded, and
+//    consumers like CreateWorktreeDialog run with no selection at all. The
+//    worktree-derived main branch is available as soon as worktrees load, so we
+//    keep it for that window (matching the prior behavior, never null when a main
+//    worktree exists).
+// A new daemon that explicitly resolves to `null` (the main worktree relative to
+// itself — no cross-branch base) is authoritative ONLY when its status is the one
+// for the selected worktree; otherwise the stale/absent status doesn't speak for
+// the selection, so we fall back.
+export const defaultBase = derived(
+  [projectWorktrees, gitStatus, gitWorktreeId],
+  ([$worktrees, $status, $worktreeId]) => {
+    const worktreeDerived = $worktrees.find((w) => w.is_main)?.branch ?? null;
+    // Only let the daemon's base speak when the loaded status is for the
+    // currently-selected worktree (per-worktree, arrives later than worktrees).
+    if ($status && $status.worktree_id === $worktreeId && "base_branch" in $status) {
+      // New daemon: `string` is the resolved base, explicit `null` means "no
+      // cross-branch base" for this worktree — both authoritative.
+      return $status.base_branch ?? null;
+    }
+    // Old daemon (field absent) or no/foreign status loaded yet: recompute.
+    return worktreeDerived;
+  },
 );
 
 export const visibleSessions = derived(
@@ -1059,6 +1088,27 @@ function omitKey<T>(record: Record<Id, T>, id: Id): Record<Id, T> {
   return next;
 }
 
+// Evict every diff-cache entry belonging to a worktree. All these Maps key by
+// `${worktreeId}\0…` (working-tree diff variants use `\0<path>\0<options>`,
+// commit diffs use `\0<sha>`), so a single prefix sweep covers them. Called when
+// a worktree disappears (removed directly, or as part of a removed project) — the
+// entries (especially commit diffs, which hold full multi-file CommitDiffData and
+// otherwise live until disposeDaemon) would leak forever otherwise.
+function sweepWorktreeCaches(worktreeId: Id): void {
+  const prefix = `${worktreeId}\0`;
+  for (const map of [
+    diffCache,
+    diffRequestSeq,
+    diffCacheWriteSeq,
+    commitDiffCache,
+    commitDiffInFlight,
+  ]) {
+    for (const key of map.keys()) {
+      if (key.startsWith(prefix)) map.delete(key);
+    }
+  }
+}
+
 function removeWorktreeLocal(worktreeId: Id): void {
   const removedSessionIds = get(sessions)
     .filter((session) => session.parent.kind === "worktree" && session.parent.id === worktreeId)
@@ -1076,16 +1126,7 @@ function removeWorktreeLocal(worktreeId: Id): void {
   prByWorktree.update((current) => omitKey(current, worktreeId));
   prByWorktreeApplied.delete(worktreeId);
   prByWorktreeStarted.delete(worktreeId);
-  const diffCachePrefix = `${worktreeId}\0`;
-  for (const key of diffCache.keys()) {
-    if (key.startsWith(diffCachePrefix)) diffCache.delete(key);
-  }
-  for (const key of diffRequestSeq.keys()) {
-    if (key.startsWith(diffCachePrefix)) diffRequestSeq.delete(key);
-  }
-  for (const key of diffCacheWriteSeq.keys()) {
-    if (key.startsWith(diffCachePrefix)) diffCacheWriteSeq.delete(key);
-  }
+  sweepWorktreeCaches(worktreeId);
 
   if (get(gitStatus)?.worktree_id === worktreeId) gitStatus.set(null);
   if (get(gitWorktreeId) === worktreeId) {
@@ -1477,6 +1518,13 @@ export function applyHitchEvent(event: HitchEvent): void {
     }
     projects.update((items) => items.filter((p) => p.id !== projectId));
     worktrees.update((items) => items.filter((w) => w.project_id !== projectId));
+    // Evict every vanished worktree's diff caches (working-tree AND commit), which
+    // are keyed per worktree and would otherwise leak until disposeDaemon. We sweep
+    // caches directly rather than call removeWorktreeLocal per worktree: this handler
+    // already owns selection reset above, and the daemon broadcasts session-closed
+    // for any killed sessions (pruned in the session-closed branch) — so the only
+    // unhandled leak is the cache, which is exactly what sweepWorktreeCaches covers.
+    for (const id of removedWorktreeIds) sweepWorktreeCaches(id);
   }
 }
 
@@ -2431,6 +2479,12 @@ export function refreshOpenDiffs(): void {
   const tabs = get(diffTabs);
   for (const tab of tabs) {
     if (tab.path === ALL_CHANGES_TAB) continue;
+    // Commit tabs are fed by the commit-diff path (`fetchCommitDiff` /
+    // `commitDiffCache`, immutable per-sha snapshots) and rendered client-side
+    // via `diffViewOptions` — never re-diffed here. Sending their sentinel
+    // (`\0commit:<sha>`) to `viewDiff` would emit it verbatim as a git pathspec,
+    // yielding an empty diff that clobbers the tab's text and the diff cache.
+    if (isCommitTab(tab.path)) continue;
     void viewDiff(tab.path, false, tab.staged);
   }
   if (tabs.some((tab) => tab.path === ALL_CHANGES_TAB)) void viewAllChanges(false);

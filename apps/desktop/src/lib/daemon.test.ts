@@ -47,15 +47,16 @@ import {
   loadCommitLog,
   loadMoreCommits,
   openCommitTab,
+  refreshOpenDiffs,
   fetchAllChangesRow,
   invalidateDiffCacheVariants,
   viewAllChanges,
   createWorktree,
   daemonReason,
+  defaultBase,
   displaySessionStates,
   activeDiffPath,
   diffActive,
-  diffPath,
   diffTabs,
   diffText,
   dirtyWorktrees,
@@ -429,6 +430,85 @@ describe("agent state propagation", () => {
     expect(get(sessionAgents)).toEqual({});
     expect(get(sessionOutputActive)).toEqual({});
     expect(get(agentStateByWorktree)).toEqual({});
+  });
+});
+
+describe("defaultBase: daemon owns the base, worktree-derived is the fallback", () => {
+  const mainWt = {
+    id: "w-main",
+    project_id: "p1",
+    path: "/repo",
+    branch: "main",
+    is_main: true,
+    is_hitch_managed: false,
+  } as const;
+  const featureWt = {
+    id: "w-feat",
+    project_id: "p1",
+    path: "/repo/.hitch/worktrees/feature",
+    branch: "feature",
+    is_main: false,
+    is_hitch_managed: true,
+  } as const;
+
+  function statusFor(worktreeId: string, base: string | null | "absent") {
+    const status: Record<string, unknown> = {
+      worktree_id: worktreeId,
+      branch: worktreeId === mainWt.id ? "main" : "feature",
+      dirty: false,
+      ahead: 0,
+      behind: 0,
+      additions: 0,
+      deletions: 0,
+      files: [],
+    };
+    // "absent" models an OLD daemon that omits base_branch entirely; an explicit
+    // value (including null) models a NEW daemon that resolved it.
+    if (base !== "absent") status.base_branch = base;
+    return status as never;
+  }
+
+  beforeEach(() => {
+    projects.set([{ id: "p1", name: "Hitch", root: "/repo", kind: "git-backed" }]);
+    worktrees.set([mainWt, featureWt]);
+    selectedProjectId.set("p1");
+  });
+
+  it("falls back to the main-worktree branch before any status loads", () => {
+    // CreateWorktreeDialog can run with no selection/status; the worktree-derived
+    // base must still be available (never regress to null), exactly as before.
+    expect(get(gitStatus)).toBeNull();
+    expect(get(defaultBase)).toBe("main");
+  });
+
+  it("uses the daemon-provided base for the selected worktree", () => {
+    selectedWorktreeId.set(featureWt.id);
+    gitStatus.set(statusFor(featureWt.id, "main"));
+    expect(get(defaultBase)).toBe("main");
+  });
+
+  it("honors an explicit null base from a new daemon (main worktree, no cross-branch base)", () => {
+    selectedWorktreeId.set(mainWt.id);
+    // New daemon resolved base_branch to null (the main worktree relative to
+    // itself). That is authoritative — not the rolling-upgrade absent case.
+    gitStatus.set(statusFor(mainWt.id, null));
+    expect(get(defaultBase)).toBeNull();
+  });
+
+  it("falls back to the worktree-derived base for an OLD daemon that omits the field", () => {
+    selectedWorktreeId.set(featureWt.id);
+    gitStatus.set(statusFor(featureWt.id, "absent"));
+    // Field absent → can't trust its absence as "no base"; recompute client-side.
+    expect(get(defaultBase)).toBe("main");
+  });
+
+  it("ignores a status that belongs to a different worktree than the selection", () => {
+    // The loaded status is for the main worktree but the feature worktree is
+    // selected: the stale/foreign status doesn't speak for the selection, so we
+    // fall back to the worktree-derived base rather than its null.
+    selectedWorktreeId.set(featureWt.id);
+    gitStatus.set(statusFor(mainWt.id, null));
+    expect(get(defaultBase)).toBe("main");
   });
 });
 
@@ -1269,7 +1349,6 @@ describe("Windows project paths", () => {
     expect(requests).toEqual([{ type: "git-diff", worktree_id: worktree.id, path: filePath }]);
     expect(get(diffTabs)).toEqual([{ path: filePath, text: "diff --git" }]);
     expect(get(activeDiffPath)).toBe(filePath);
-    expect(get(diffPath)).toBe(filePath);
     expect(get(diffText)).toBe("diff --git");
   });
 
@@ -2654,6 +2733,43 @@ describe("History commit log + Commit Tabs", () => {
     expect(get(activeDiffPath)).toBe(commitTabPath("sha-1"));
   });
 
+  it("refreshOpenDiffs skips commit tabs but still re-diffs file tabs", async () => {
+    selectWorktree();
+    gitStatus.set({
+      worktree_id: worktree.id,
+      branch: "feature",
+      dirty: true,
+      ahead: 0,
+      behind: 0,
+      additions: 1,
+      deletions: 0,
+      files: [{ path: "src/a.ts", status: "modified", staged: false }],
+    });
+    const diffRequests: string[] = [];
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; path?: string } }) => {
+        if (request.type === "git-diff") {
+          diffRequests.push(request.path ?? "");
+          return { type: "git-diff", diff: { diff: `diff for ${request.path}` } };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Open a regular file tab and a commit tab side by side.
+    await viewDiff("src/a.ts", true, false);
+    openCommitTab("sha-1");
+    expect(get(diffTabs).map((t) => t.path)).toEqual(["src/a.ts", commitTabPath("sha-1")]);
+    diffRequests.length = 0;
+
+    // Re-diffing under new view options must re-fetch the file tab but never
+    // send the commit sentinel as a working-tree pathspec.
+    refreshOpenDiffs();
+    await flush();
+    expect(diffRequests).toEqual(["src/a.ts"]);
+    expect(diffRequests).not.toContain(commitTabPath("sha-1"));
+  });
+
   it("fetches a commit diff once and serves the immutable cache thereafter", async () => {
     let calls = 0;
     invokeMock.mockImplementation(
@@ -2686,5 +2802,82 @@ describe("History commit log + Commit Tabs", () => {
     const second = await fetchCommitDiff(worktree.id, "sha-x");
     expect(second).toBe(first);
     expect(calls).toBe(1);
+  });
+
+  it("evicts a worktree's cached commit diff when the worktree is removed", async () => {
+    selectWorktree();
+    let calls = 0;
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; commit_id?: string } }) => {
+        if (request.type === "commit-diff") {
+          calls += 1;
+          return {
+            type: "commit-diff",
+            meta: {
+              id: request.commit_id,
+              summary: "feat: x",
+              body: null,
+              author: "Ada",
+              time: 1_700_000_000,
+              is_merge: false,
+              additions: 2,
+              deletions: 1,
+            },
+            files: [{ path: "src/a.ts", status: "modified", diff: "diff" }],
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    // Populate the immutable per-sha commit-diff cache.
+    await fetchCommitDiff(worktree.id, "sha-x");
+    expect(calls).toBe(1);
+
+    // Removing the worktree must evict its commit-diff entry (it would otherwise
+    // pin full CommitDiffData until disposeDaemon).
+    applyHitchEvent({ type: "worktree-removed", worktree_id: worktree.id });
+
+    // A re-fetch (e.g. the worktree is re-created with the same id) must hit the
+    // daemon again rather than serve a stale, supposedly-evicted entry.
+    await fetchCommitDiff(worktree.id, "sha-x");
+    expect(calls).toBe(2);
+  });
+
+  it("evicts cached commit diffs for every worktree when the project is removed", async () => {
+    selectWorktree();
+    let calls = 0;
+    invokeMock.mockImplementation(
+      async (_command: string, { request }: { request: { type: string; commit_id?: string } }) => {
+        if (request.type === "commit-diff") {
+          calls += 1;
+          return {
+            type: "commit-diff",
+            meta: {
+              id: request.commit_id,
+              summary: "feat: x",
+              body: null,
+              author: "Ada",
+              time: 1_700_000_000,
+              is_merge: false,
+              additions: 2,
+              deletions: 1,
+            },
+            files: [{ path: "src/a.ts", status: "modified", diff: "diff" }],
+          };
+        }
+        throw new Error(`unexpected request ${request.type}`);
+      },
+    );
+
+    await fetchCommitDiff(worktree.id, "sha-x");
+    expect(calls).toBe(1);
+
+    // Removing the whole project must sweep every cached diff for each of its
+    // worktrees, not just filter the stores.
+    applyHitchEvent({ type: "project-removed", project_id: project.id });
+
+    await fetchCommitDiff(worktree.id, "sha-x");
+    expect(calls).toBe(2);
   });
 });

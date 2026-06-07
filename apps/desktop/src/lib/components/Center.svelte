@@ -18,8 +18,8 @@
     activeSessionId,
     ALL_CHANGES_TAB,
     connection,
+    activeDiffPath,
     diffActive,
-    diffPath,
     commitShaFromTab,
     error,
     reconnect,
@@ -30,7 +30,7 @@
     worktrees,
   } from "../daemon";
   import { sessionBelongsTo } from "../types";
-  import { theme as themeStore } from "../theme";
+  import { isDark } from "../theme";
   import {
     terminalSurfaceOverride,
     terminalThemeDark,
@@ -49,13 +49,11 @@
   // vars, so they're unaffected). Without this the active tab would keep the
   // built-in surface color while the terminal below shows the theme background,
   // leaving a visible seam. Re-derives on every app-mode flip and either selection
-  // change (same axes as Terminal's palette $effect): $themeStore picks the
-  // data-theme, the two selection stores pick the id; "" for the built-in theme.
-  const surfaceOverride = $derived.by(() => {
-    void $themeStore;
-    const dark = document.documentElement.getAttribute("data-theme") === "dark";
-    return terminalSurfaceOverride(dark ? $terminalThemeDark : $terminalThemeLight);
-  });
+  // change (same axes as Terminal's palette $effect): $isDark picks the mode, the
+  // two selection stores pick the id; "" for the built-in theme.
+  const surfaceOverride = $derived(
+    terminalSurfaceOverride($isDark ? $terminalThemeDark : $terminalThemeLight),
+  );
 
   const parentLabel = $derived(
     $selectedParent?.kind === "worktree"
@@ -119,19 +117,19 @@
           shell or launch an agent.
         </p>
       </div>
-    {:else if $diffActive && $diffPath === ALL_CHANGES_TAB}
+    {:else if $diffActive && $activeDiffPath === ALL_CHANGES_TAB}
       <!-- The all-changes view: every changed file in one scroll, as collapsible
            sections. Same overlay behavior as a single-file diff. -->
       <DiffAllTab />
-    {:else if $diffActive && $diffPath && commitShaFromTab($diffPath) !== null}
+    {:else if $diffActive && $activeDiffPath && commitShaFromTab($activeDiffPath) !== null}
       <!-- A Commit Tab: one immutable commit's metadata header + collapsible
            per-file sections, keyed by sha. Keyed on the sha so switching between
            open commit tabs remounts with the right commit (the per-sha diff
            cache means a remount never refetches an already-loaded commit). -->
-      {#key $diffPath}
-        <CommitTab sha={commitShaFromTab($diffPath)!} />
+      {#key $activeDiffPath}
+        <CommitTab sha={commitShaFromTab($activeDiffPath)!} />
       {/key}
-    {:else if $diffActive && $diffPath}
+    {:else if $diffActive && $activeDiffPath}
       <!-- The diff OVERLAYS the (now hidden) terminals rather than replacing
            them; closing it reveals the active terminal with scroll + buffer
            intact, since it was never destroyed. -->

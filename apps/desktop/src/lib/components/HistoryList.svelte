@@ -87,16 +87,13 @@
   // a calendar date once a week old. No external dep — the History plan asks for
   // simple coarse buckets, and no relative-time helper exists in the codebase.
   //
-  // Memoized by timestamp: a paginated log re-renders the whole row set on every
-  // append, and the buckets are coarse (minute-grained at the finest), so a cached
-  // string is fine within a render cycle — staleness only ever lags one bucket and
-  // the next status-driven render recomputes anyway. The cache is module-level so
-  // it survives component remounts (the rail toggles in/out) and shared across the
-  // few logs a session views; it's capped so a long-running window can't grow it
-  // without bound.
-  const RELATIVE_TIME_CACHE_CAP = 4096;
-  const relativeTimeCache = new Map<number, string>();
-  function computeRelativeTime(unixSeconds: number): string {
+  // Not memoized: it's a handful of integer comparisons, so it's recomputed every
+  // render. Labels therefore advance only when a row re-renders — a pagination
+  // append, a HEAD-move refresh, or selection/roving change — not on a wall-clock
+  // timer (the component subscribes to no per-second store, and adding one for a
+  // cosmetic label isn't worth it). An old cache keyed on the immutable timestamp
+  // would have frozen each label forever, so a fresh recompute is the correct call.
+  function relativeTime(unixSeconds: number): string {
     const deltaMs = Date.now() - unixSeconds * 1000;
     const sec = Math.floor(deltaMs / 1000);
     if (sec < 60) return "now";
@@ -110,14 +107,6 @@
       month: "short",
       day: "numeric",
     });
-  }
-  function relativeTime(unixSeconds: number): string {
-    const cached = relativeTimeCache.get(unixSeconds);
-    if (cached !== undefined) return cached;
-    const value = computeRelativeTime(unixSeconds);
-    if (relativeTimeCache.size >= RELATIVE_TIME_CACHE_CAP) relativeTimeCache.clear();
-    relativeTimeCache.set(unixSeconds, value);
-    return value;
   }
 
   function commitTitle(commit: CommitInfo): string {

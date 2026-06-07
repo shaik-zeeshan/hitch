@@ -18,7 +18,7 @@
   // renders into (its module pulls in @pierre/diffs' web-components side effect,
   // which owns the shadow root + adopted Pierre stylesheet).
   import { processPatch, type FileDiffMetadata } from "@pierre/diffs";
-  import { diffPath, diffText } from "../daemon";
+  import { activeDiffPath, diffText } from "../daemon";
   import { parseDiff } from "../diff";
   import { diffViewOptions, fileDiffView } from "../diffView";
   import { theme } from "../theme";
@@ -54,7 +54,7 @@
 <div class="diff">
   <div class="diff-head">
     <span class="glyph" aria-hidden="true">±</span>
-    <span class="path">{$diffPath}</span>
+    <span class="path">{$activeDiffPath}</span>
     <span class="head-right">
       {#if parsed && !parsed.isEmpty}
         <span class="meta">

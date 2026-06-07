@@ -81,6 +81,12 @@ export type GitStatus = {
   // History view refetches its log when this changes. Optional for rolling
   // upgrades — an older daemon omits it (serde `default`).
   head_commit_id?: string | null;
+  // The daemon-resolved base branch (the project's main-worktree branch, falling
+  // back to the repo's default). The single definition of the base convention,
+  // consumed by `defaultBase`. Optional for rolling upgrades — an older daemon
+  // omits it (serde `default`); `null` also means "no cross-branch base" (the
+  // main worktree relative to itself).
+  base_branch?: string | null;
   files: ChangedFile[];
 };
 
