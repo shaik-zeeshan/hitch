@@ -26,6 +26,8 @@
 
 :root {
   /* ---- neutrals: paper + ink (light / paper theme) ---- */
+  /* Canonical window-base color; app.html hex + lib.rs PAPER_0_* mirror this,
+     enforced by src/lib/paperColors.test.ts. */
   --paper-0: oklch(97.4% 0.008 80); /* page behind window; body backdrop base */
   --paper-1: oklch(96.6% 0.010 78); /* rails (left + right), facepile ring */
   --paper-2: oklch(98.0% 0.008 82); /* raised cards, inputs, popover, fills */

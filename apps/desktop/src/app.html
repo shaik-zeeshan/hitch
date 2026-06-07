@@ -9,8 +9,10 @@
          overrides) loads asynchronously, so without this the native window
          and document paint browser-white for a frame — a white flash, and for
          dusk users the WRONG theme. This blocking inline script reads the SAME
-         persisted theme (localStorage "hitch-theme") that theme.ts uses, sets
-         data-theme="dark" on <html> before first paint, and paints the matching
+         persisted theme (localStorage "hitch-theme") that theme.ts uses — or, on
+         first run with no saved preference, the OS appearance via prefers-color-
+         scheme — sets data-theme="dark" on <html> before first paint, and paints
+         the matching
          --paper-0 letterpress background (doc-design/colors.md: light
          oklch(97.4% 0.008 80) = #f9f6f1, dusk oklch(16.5% 0.012 72) = #120e09)
          so launch reads as the user's theme with no flash. Kept tiny and
@@ -19,9 +21,19 @@
     <script>
       (function () {
         try {
-          var dark = localStorage.getItem("hitch-theme") === "dark";
+          var saved = localStorage.getItem("hitch-theme");
+          // First run (no saved preference): follow the OS appearance so a
+          // dark-OS user reads as dusk with no flash — same first-run rule the
+          // Rust side uses to paint the native window background.
+          var dark =
+            saved === "dark" ||
+            (saved === null &&
+              window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
           var root = document.documentElement;
           if (dark) root.setAttribute("data-theme", "dark");
+          // These two hexes must match app.css --paper-0 + lib.rs PAPER_0_* —
+          // enforced by src/lib/paperColors.test.ts.
           root.style.backgroundColor = dark ? "#120e09" : "#f9f6f1";
         } catch (e) {}
       })();

@@ -2015,6 +2015,8 @@ fn daemon_log_path() -> PathBuf {
 /// `oklch(16.5% 0.012 72)`. These are the ONLY two background colors the native
 /// window is ever painted; they match the pre-paint values in `app.html` so the
 /// native frame, the document, and the app CSS all agree before first paint.
+// Kept in sync with app.css --paper-0 + app.html pre-paint hex by
+// apps/desktop/src/lib/paperColors.test.ts.
 const PAPER_0_LIGHT: Color = Color(0xf9, 0xf6, 0xf1, 0xff);
 const PAPER_0_DARK: Color = Color(0x12, 0x0e, 0x09, 0xff);
 
@@ -2026,24 +2028,53 @@ fn window_theme_path(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_config_dir().ok().map(|dir| dir.join("theme"))
 }
 
-/// Read the persisted window theme, falling back to the OS appearance when the
-/// mirror file is absent (first run / installs predating the mirror), and to
-/// light if even that is unavailable. Only ever returns one of the two themes.
-fn persisted_window_theme(app: &AppHandle) -> Theme {
-    if let Some(path) = window_theme_path(app) {
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            match contents.trim() {
-                "dark" => return Theme::Dark,
-                "light" => return Theme::Light,
-                _ => {}
-            }
+/// Read the persisted window theme from the mirror file. Returns `None` when no
+/// preference has been recorded yet (first run / installs predating the mirror),
+/// leaving the caller to resolve a first-run default from the OS appearance —
+/// this function never guesses on its own. Only ever returns one of the two
+/// themes (or `None`).
+fn persisted_window_theme(app: &AppHandle) -> Option<Theme> {
+    let path = window_theme_path(app)?;
+    let contents = std::fs::read_to_string(&path).ok()?;
+    match contents.trim() {
+        "dark" => Some(Theme::Dark),
+        "light" => Some(Theme::Light),
+        _ => None,
+    }
+}
+
+/// Best-effort detection of the OS appearance for first-run, used only when no
+/// theme has been persisted yet. The "main" window doesn't exist at startup
+/// (it's built programmatically below, and there's no static window in the
+/// config), so we can't ask a window for its theme — instead, on macOS, read the
+/// global `AppleInterfaceStyle` user default, which is `"Dark"` exactly when the
+/// system is in dark mode and unset otherwise. A single blocking one-shot at
+/// startup (before the window is built) is acceptable here. Other platforms have
+/// no equivalent one-liner without a window, so they fall back to light; once the
+/// user picks a theme the mirror file takes over on every subsequent launch.
+fn os_appearance() -> Theme {
+    #[cfg(target_os = "macos")]
+    {
+        let dark = std::process::Command::new("defaults")
+            .args(["read", "-g", "AppleInterfaceStyle"])
+            .output()
+            .map(|out| {
+                out.status.success()
+                    && String::from_utf8_lossy(&out.stdout).trim() == "Dark"
+            })
+            .unwrap_or(false);
+        if dark {
+            return Theme::Dark;
         }
     }
-    // No mirror yet: match the OS appearance so the native frame still reads
-    // right on first launch. Default to light if the platform can't report one.
-    app.get_webview_window("main")
-        .and_then(|w| w.theme().ok())
-        .unwrap_or(Theme::Light)
+    Theme::Light
+}
+
+/// The theme to paint the native window with: the persisted preference if one
+/// exists, otherwise the OS appearance on first run. Always one of the two
+/// themes.
+fn startup_window_theme(app: &AppHandle) -> Theme {
+    persisted_window_theme(app).unwrap_or_else(os_appearance)
 }
 
 fn window_background_color(theme: Theme) -> Color {
@@ -2060,7 +2091,7 @@ fn window_background_color(theme: Theme) -> Color {
 /// window config that used to live in `tauri.conf.json` / `tauri.windows.conf.json`
 /// is reproduced here, cfg-gated per platform.
 fn build_main_window(app: &AppHandle) -> tauri::Result<()> {
-    let theme = persisted_window_theme(app);
+    let theme = startup_window_theme(app);
     let mut builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
         .title("Hitch")
         .inner_size(1100.0, 720.0)
@@ -2960,7 +2991,12 @@ fn set_window_theme(app: AppHandle, theme: String) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create config dir: {err}"))?;
     }
-    std::fs::write(&path, value).map_err(|err| format!("failed to write theme mirror: {err}"))
+    // Write-then-rename so a concurrent cold-start reader (no single-instance
+    // plugin) or a crash mid-write never sees a torn/empty mirror — the rename
+    // is an atomic swap because the temp file lives on the same filesystem.
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, value).map_err(|err| format!("failed to write theme mirror: {err}"))?;
+    std::fs::rename(&tmp, &path).map_err(|err| format!("failed to swap theme mirror: {err}"))
 }
 
 /// Menu-bar status line mirroring the four-state Daemon Status (ADR 0009). The

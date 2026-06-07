@@ -9,12 +9,29 @@
 // once on mount (see +layout.svelte) to apply the persisted/default value to the
 // document; toggleTheme() flips and persists.
 
-import { writable } from "svelte/store";
+import { derived, type Readable, type Writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
+import { persisted } from "./settings";
 
 export type Theme = "light" | "dark";
 
 const STORAGE_KEY = "hitch-theme";
+
+/**
+ * First-run default when nothing is saved: follow the OS appearance so a
+ * dark-OS user starts in dusk. Without this, the store would default to "light"
+ * and undo the dark prepaint that app.html (prefers-color-scheme) and the Rust
+ * side (os_appearance) already resolved — a dark→light flash at mount. Guarded
+ * for SSR/test envs where matchMedia is undefined. (persisted() writes this back
+ * to localStorage on init, which records the OS appearance as the chosen value,
+ * consistent with the Rust mirror.)
+ */
+function osDefaultTheme(): Theme {
+  return typeof matchMedia !== "undefined" &&
+    matchMedia("(prefers-color-scheme: dark)").matches
+    ? "dark"
+    : "light";
+}
 
 /**
  * Mirror the theme into a file the Rust side reads synchronously at the next
@@ -26,14 +43,25 @@ function mirrorThemeToBackend(value: Theme): void {
   void invoke("set_window_theme", { theme: value }).catch(() => {});
 }
 
-/** The active theme. Default is light ("paper"). */
-export const theme = writable<Theme>("light");
+/**
+ * The active theme. Backed by localStorage via the shared `persisted` helper,
+ * so it reads the saved value at creation (same "hitch-theme" key the app.html
+ * prepaint script reads) and writes back on every change — normalizing anything
+ * other than "dark" to light. With no saved value the initial is the OS
+ * appearance (see osDefaultTheme), matching the prepaint/native-frame default.
+ */
+export const theme = persisted(STORAGE_KEY, osDefaultTheme(), (value) =>
+  value === "dark" ? "dark" : "light",
+) as Writable<Theme>;
 
-function readPersisted(): Theme {
-  if (typeof localStorage === "undefined") return "light";
-  const saved = localStorage.getItem(STORAGE_KEY);
-  return saved === "dark" ? "dark" : "light";
-}
+/**
+ * Whether the active theme is dusk (dark). Derived from the store value so
+ * consumers never re-read the DOM `data-theme` attribute to learn the mode:
+ * the store already holds the resolved "light"/"dark", and applyTheme() (wired
+ * by initTheme()) keeps the attribute in sync with it. Reactive contexts read
+ * `$isDark`; non-reactive code paths read `get(isDark)`.
+ */
+export const isDark: Readable<boolean> = derived(theme, ($t) => $t === "dark");
 
 /** Apply a theme to <html> (data-theme="dark" for dusk, removed for paper). */
 function applyTheme(value: Theme): void {
@@ -47,18 +75,15 @@ function applyTheme(value: Theme): void {
 }
 
 /**
- * Initialize the theme on mount: read the persisted value (default light),
- * apply it to the document, and keep <html> + localStorage in sync with every
- * future store change. Idempotent enough to call once from the root layout.
+ * Initialize the theme on mount: the store already holds the persisted value
+ * (read at creation, default light) and writes back to localStorage itself, so
+ * this just attaches the document/backend side-effects. The subscribe fires
+ * synchronously with the current value, applying it to <html> right away, then
+ * on every future store change. Idempotent enough to call once from the layout.
  */
 export function initTheme(): void {
-  const initial = readPersisted();
-  theme.set(initial);
   theme.subscribe((value) => {
     applyTheme(value);
-    if (typeof localStorage !== "undefined") {
-      localStorage.setItem(STORAGE_KEY, value);
-    }
     // Seed/refresh the Rust-readable mirror so the native window picks up the
     // current theme on the next launch — including for users who already had a
     // theme saved before the mirror existed (this fires on init too).

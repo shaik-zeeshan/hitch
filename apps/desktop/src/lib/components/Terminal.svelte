@@ -26,7 +26,7 @@
     type IDisposable,
     type ITheme,
   } from "@xterm/xterm";
-  import { theme as themeStore } from "../theme";
+  import { isDark } from "../theme";
   import {
     HITCH_THEME_ID,
     getTerminalTheme,
@@ -205,9 +205,10 @@
       probe.style.color = color;
       return getComputedStyle(probe).color || "#d4d6da";
     };
-    // colors.md in-terminal accents (literal; per theme).
-    const dark =
-      document.documentElement.getAttribute("data-theme") === "dark";
+    // colors.md in-terminal accents (literal; per theme). The active mode comes
+    // from the theme store (get(isDark)) — same resolved light/dark the rest of
+    // the app reads — not a DOM `data-theme` lookup.
+    const dark = get(isDark);
     const a = dark
       ? {
           grn: "oklch(82% 0.13 150)",
@@ -262,15 +263,13 @@
 
   // Resolve the ITheme to actually apply, honoring the user's per-mode terminal
   // theme selection. Dark mode reads `terminalThemeDark`, light reads
-  // `terminalThemeLight` (same data-theme axis resolveTheme() keys off, kept in
-  // sync via the app theme store). The default — and the fallback for the Hitch
-  // sentinel OR any unknown/stale id — is the built-in palette, so this can
-  // never break the out-of-box look. A curated theme's `colors` is already an
-  // ITheme-shaped hex map covering every field resolveTheme() sets, so a straight
-  // spread produces a complete ITheme.
+  // `terminalThemeLight` (same theme-store axis resolveTheme() keys off). The
+  // default — and the fallback for the Hitch sentinel OR any unknown/stale id —
+  // is the built-in palette, so this can never break the out-of-box look. A
+  // curated theme's `colors` is already an ITheme-shaped hex map covering every
+  // field resolveTheme() sets, so a straight spread produces a complete ITheme.
   function currentTheme(): ITheme {
-    const dark =
-      document.documentElement.getAttribute("data-theme") === "dark";
+    const dark = get(isDark);
     const id = dark ? get(terminalThemeDark) : get(terminalThemeLight);
     if (id === HITCH_THEME_ID) return resolveTheme();
     const def = getTerminalTheme(id);
@@ -479,14 +478,14 @@
   // tokens (--term-bg2/--term-fg/--term-dim) differ per theme, so a light↔dark
   // swap must repaint every mounted terminal — including hidden ones, so they're
   // already correct when re-shown; a per-mode selection change must too. Reading
-  // $themeStore and BOTH selection stores here registers all three dependencies
+  // $isDark and BOTH selection stores here registers all three dependencies
   // (currentTheme() reads the stores via get(), which doesn't register, so we
   // touch them explicitly). No first-run gating: the effect's first run happens
   // before onMount creates `term` (so it bails on !term), and `term` isn't
   // reactive — gating on "first real change" here would swallow the first toggle
   // instead. Reapplying is idempotent and cheap, so every store change repaints.
   $effect(() => {
-    void $themeStore;
+    void $isDark;
     void $terminalThemeDark;
     void $terminalThemeLight;
     if (!term) return;
