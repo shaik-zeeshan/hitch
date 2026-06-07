@@ -6,6 +6,7 @@
   // confirm vocabulary (.modal/.btn.danger-btn).
   import { Dialog } from "bits-ui";
   import { removeSshHost } from "../sshHosts";
+  import { forgetRemoteScope } from "../daemon";
   import { removeSshHostTarget } from "../overlays";
 
   const target = $derived($removeSshHostTarget);
@@ -17,6 +18,11 @@
   function confirm() {
     const host = target;
     if (!host) return;
+    // Prune the host's GUI-local entities/sessions/jobs FIRST (while its scope
+    // tags still resolve), then forget the saved attachment — which drops its
+    // tree scope row and, via the sshHosts subscription, disconnects the proxy.
+    // The remote Daemon + its Sessions keep running (ADR 0014).
+    forgetRemoteScope(host.id);
     removeSshHost(host.id);
     removeSshHostTarget.set(null);
   }

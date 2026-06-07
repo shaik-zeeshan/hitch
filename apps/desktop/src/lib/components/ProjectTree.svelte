@@ -29,6 +29,7 @@
     agentActRollupByScope,
     agentStateByWorktree,
     daemonScopesOrdered,
+    liveScopes,
     openSession,
     prByWorktree,
     projectsByScope,
@@ -50,6 +51,7 @@
     removeWorktreeTarget,
   } from "../overlays";
   import { sshHosts } from "../sshHosts";
+  import { showsCollapsedScopeRollup } from "../scopeCopy";
   import { focusedPane, matchBinding } from "../keymap";
   import {
     currentDesktopPlatform,
@@ -408,6 +410,12 @@
     {@const sshHost = scope.kind === "ssh-host" ? $sshHosts.find((h) => h.id === scope.id) : null}
     {@const scopeRollup = $agentActRollupByScope[scope.id]}
     {@const scopeDown = scope.status === "unreachable" || scope.status === "failed"}
+    <!-- A scope is STALE (greyed, daemon actions disabled) whenever it is not
+         LIVE (`running`) — issue #32. Local mirrors the local daemon, so a healthy
+         Local reads live and nothing changes there. The host subtree greys and its
+         daemon-backed context-menu items disable while stale; the host row's own
+         affordances (Retry, Remove) stay enabled (they're GUI-local). -->
+    {@const scopeLive = $liveScopes.has(scope.id)}
     <ContextMenu.Root>
       <ContextMenu.Trigger>
         {#snippet child({ props })}
@@ -443,7 +451,7 @@
                  a collapsed host can still page for needs-approval/error across
                  its remote sessions. Shown whenever the host is collapsed and has
                  act-state sessions. -->
-            {#if scopeRollup && !scopeExpanded}
+            {#if showsCollapsedScopeRollup({ hasRollup: !!scopeRollup, expanded: scopeExpanded })}
               <span class="scope-rollup rollup">
                 <span class="g">◆</span>
                 {scopeRollup.count}
@@ -476,8 +484,10 @@
         <ContextMenu.Portal>
           <ContextMenu.Content class="menu">
             <!-- Add a Project inside this SSH Host scope (issue #28, ADR 0014):
-                 opens the remote folder browser locked to this host's daemon. -->
-            <ContextMenu.Item class="mi" onSelect={() => remoteBrowserScope.set(scope.id)}>
+                 opens the remote folder browser locked to this host's daemon. The
+                 browser is daemon-backed, so it is disabled while the host is
+                 stale (issue #32) — Retry/Remove below stay enabled. -->
+            <ContextMenu.Item class="mi" disabled={!scopeLive} onSelect={() => remoteBrowserScope.set(scope.id)}>
               <Plus class="mi-ico icon" />
               Add project…
             </ContextMenu.Item>
@@ -508,7 +518,7 @@
         {@const rollup = $agentActRollupByProject[project.id]}
         {@const expanded = isExpanded(project)}
         {@const isGit = project.kind === "git-backed"}
-        <div class="proj">
+        <div class="proj" class:stale={!scopeLive}>
       <ContextMenu.Root>
         <ContextMenu.Trigger>
           {#snippet child({ props })}
@@ -557,7 +567,7 @@
                   <span class="pkind">{isGit ? "git" : "folder"}</span>
                 {/if}
 
-                {#if isGit}
+                {#if isGit && scopeLive}
                   <button
                     class="quick-add"
                     aria-label={`New worktree in ${project.name}`}
@@ -577,7 +587,9 @@
         <ContextMenu.Portal>
           <ContextMenu.Content class="menu">
             {#if isGit}
-              <ContextMenu.Item class="mi" onSelect={() => createWorktreeFor.set(project)}>
+              <!-- Daemon-backed: disabled while the owning scope is stale (issue
+                   #32) — a worktree can't be created on an unreachable host. -->
+              <ContextMenu.Item class="mi" disabled={!scopeLive} onSelect={() => createWorktreeFor.set(project)}>
                 <Plus class="mi-ico icon" />
                 New worktree…
               </ContextMenu.Item>
@@ -596,7 +608,9 @@
               Copy path
             </ContextMenu.Item>
             <ContextMenu.Separator class="m-sep" />
-            <ContextMenu.Item class="mi danger" onSelect={() => removeProjectTarget.set(project)}>
+            <!-- Daemon-backed: removing a project on a host is a remote op, so it
+                 is disabled while the scope is stale (issue #32). -->
+            <ContextMenu.Item class="mi danger" disabled={!scopeLive} onSelect={() => removeProjectTarget.set(project)}>
               <Trash2 class="mi-ico icon" />
               Remove project…
             </ContextMenu.Item>
@@ -679,13 +693,17 @@
                 </ContextMenu.Trigger>
                 <ContextMenu.Portal>
                   <ContextMenu.Content class="menu">
-                    <ContextMenu.Item class="mi" onSelect={() => launch(worktree, null, "shell")}>
+                    <!-- Daemon-backed: launching a session spawns a PTY on the
+                         owning daemon, so these are disabled while the scope is
+                         stale (issue #32). The OS-path items (reveal/editor/copy)
+                         below stay enabled. -->
+                    <ContextMenu.Item class="mi" disabled={!scopeLive} onSelect={() => launch(worktree, null, "shell")}>
                       <TerminalIcon class="mi-ico icon" />
                       Open shell session<span class="mi-k">{shellShortcutLabel}</span>
                     </ContextMenu.Item>
                     {#each LAUNCHABLE_AGENTS as a (a.kind)}
                       {@const Mark = a.icon}
-                      <ContextMenu.Item class="mi" onSelect={() => launch(worktree, a.launchArgv, a.kind)}>
+                      <ContextMenu.Item class="mi" disabled={!scopeLive} onSelect={() => launch(worktree, a.launchArgv, a.kind)}>
                         <Mark class="mi-ico icon" />
                         Launch {a.title}
                       </ContextMenu.Item>
@@ -705,7 +723,9 @@
                     </ContextMenu.Item>
                     {#if worktree.is_hitch_managed && !worktree.is_main}
                       <ContextMenu.Separator class="m-sep" />
-                      <ContextMenu.Item class="mi danger" onSelect={() => removeWorktreeTarget.set(worktree)}>
+                      <!-- Daemon-backed remote op: disabled while the scope is
+                           stale (issue #32). -->
+                      <ContextMenu.Item class="mi danger" disabled={!scopeLive} onSelect={() => removeWorktreeTarget.set(worktree)}>
                         <Trash2 class="mi-ico icon" />
                         Remove worktree…
                       </ContextMenu.Item>
@@ -839,6 +859,30 @@
   }
   .scope-retry:hover {
     background: var(--st-need-wash);
+  }
+
+  /* ---- stale scope subtree (issue #32, ADR 0014) ----
+     When an SSH Host is unreachable/failed (or mid-reconnect), its last known
+     tree stays visible but greys as stale UI and its daemon-backed actions are
+     disabled. Opacity is multiplicative through a stacking context (a child can
+     never be MORE opaque than its parent), so to keep attention readable we do
+     NOT dim the whole `.proj` container — we ease back only the quiet,
+     non-attention parts (names, icons, diffstat, facepile). The attention rollup
+     pill and the AWAITING/ERROR state word are deliberately left untouched at
+     full oxide so a stale host can still page the user (attention beats stale,
+     ADR 0014). Selection (.sel) keeps its own iris styling regardless. */
+  .proj.stale .pname,
+  .proj.stale .pkind,
+  .proj.stale .name,
+  .proj.stale .kindcue,
+  .proj.stale .mainsuf,
+  .proj.stale .diffn,
+  .proj.stale .prchip,
+  .proj.stale .pile,
+  .proj.stale :global(.folder),
+  .proj.stale :global(.branchic),
+  .proj.stale .tw {
+    opacity: 0.5;
   }
 
   /* ---- project row ---- */

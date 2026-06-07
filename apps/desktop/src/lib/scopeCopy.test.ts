@@ -12,6 +12,11 @@ import {
   remotePathAttribution,
   removeProjectTitle,
   removeWorktreeTitle,
+  scopeMetadataPrefix,
+  scopedSearchMetadata,
+  showsCollapsedScopeRollup,
+  statusIsLive,
+  statusIsStale,
   type ScopeAttribution,
 } from "./scopeCopy";
 import { LOCAL_SCOPE_ID } from "./types";
@@ -72,5 +77,46 @@ describe("discard confirm copy", () => {
   it("is unchanged for a local discard-all", () => {
     expect(discardAllConfirm(2, LOCAL)).toBe("Discard all 2 changed files?");
     expect(discardAllConfirm(1, LOCAL)).toBe("Discard all 1 changed file?");
+  });
+});
+
+// ---- issue #32 polish helpers ----
+
+describe("scope liveness (statusIsLive / statusIsStale)", () => {
+  it("is live only while running; stale for every other status", () => {
+    expect(statusIsLive("running")).toBe(true);
+    expect(statusIsStale("running")).toBe(false);
+    for (const status of ["starting", "unreachable", "failed"] as const) {
+      expect(statusIsLive(status)).toBe(false);
+      expect(statusIsStale(status)).toBe(true);
+    }
+  });
+});
+
+describe("global-search scope metadata", () => {
+  it("returns the host label as the muted prefix for a remote result", () => {
+    expect(scopeMetadataPrefix(REMOTE)).toBe("prod");
+  });
+  it("returns null (no prefix) for a Local result", () => {
+    expect(scopeMetadataPrefix(LOCAL)).toBeNull();
+  });
+  it("renders host-first `prod · project · branch` for a remote result", () => {
+    expect(scopedSearchMetadata(REMOTE, "app · feature")).toBe("prod · app · feature");
+  });
+  it("leaves a Local result's context unchanged (no `Local ·`)", () => {
+    expect(scopedSearchMetadata(LOCAL, "app · feature")).toBe("app · feature");
+  });
+});
+
+describe("collapsed-host attention paging", () => {
+  it("shows the rollup pill only when collapsed AND a rollup exists", () => {
+    expect(showsCollapsedScopeRollup({ hasRollup: true, expanded: false })).toBe(true);
+    expect(showsCollapsedScopeRollup({ hasRollup: true, expanded: true })).toBe(false);
+    expect(showsCollapsedScopeRollup({ hasRollup: false, expanded: false })).toBe(false);
+  });
+  it("pages a collapsed host regardless of status (attention beats stale)", () => {
+    // The predicate takes no status input by design: a STALE (unreachable) host
+    // with an attention rollup still pages while collapsed.
+    expect(showsCollapsedScopeRollup({ hasRollup: true, expanded: false })).toBe(true);
   });
 });

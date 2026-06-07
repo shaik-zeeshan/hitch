@@ -675,6 +675,17 @@ html[data-theme="dark"] {
   .p-item .pi-label .ctx {
     color: var(--ink-2);
   }
+  /* Leading local/SSH Host scope metadata on a remote Project/Worktree/Session
+     result (ADR 0014: `prod · project · branch`). Muted mono so it reads as
+     attribution, not the primary label; Local results omit it entirely. */
+  .p-item .pi-label .scope-meta {
+    font-family: var(--mono);
+    font-size: var(--r0);
+    color: var(--ink-3);
+  }
+  .p-item[data-selected] .pi-label .scope-meta {
+    color: var(--iris-ink);
+  }
   .p-foot {
     display: flex;
     gap: 16px;

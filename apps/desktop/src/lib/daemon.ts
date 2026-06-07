@@ -1269,6 +1269,44 @@ export const agentActRollupByScope = derived(
   },
 );
 
+// ---- scope liveness (issue #32, ADR 0014) ---------------------------------
+//
+// The single source of "is this daemon scope actionable right now?". A scope is
+// LIVE only while its Daemon Status is `running`; an unreachable/failed (or
+// mid-reconnect `starting`) SSH Host is STALE — its last tree greys, and every
+// daemon-backed action in that scope is disabled (ADR 0014). Every surface (tree
+// greying, context menus, palette result/action gating, RightRail + Composer git
+// actions) reads this one map/helper so the rule never drifts across components.
+//
+// `scopeStatusById` projects `daemonScopes` to an id→status map for cheap reactive
+// lookups; `scopeIsLive`/`scopeIsStale` are the non-reactive `get`-based helpers
+// the imperative action paths (openSession, git ops) call before hitting the
+// daemon. A scope absent from the map (never seen) is treated as NOT live — a
+// remote scope only becomes actionable once it reports `running`.
+export const scopeStatusById = derived(daemonScopes, ($scopes) => {
+  const map: Record<DaemonScopeId, DaemonStatus> = {};
+  for (const scope of $scopes) map[scope.id] = scope.status;
+  return map;
+});
+
+// Reactive set of scope ids that are currently LIVE (status `running`). Components
+// read `$liveScopes.has(scopeId)` to grey/disable their stale-scope affordances.
+export const liveScopes = derived(scopeStatusById, ($byId) => {
+  const live = new Set<DaemonScopeId>();
+  for (const [id, status] of Object.entries($byId)) {
+    if (status === "running") live.add(id);
+  }
+  return live;
+});
+
+// Whether a daemon scope is LIVE (actionable) right now — `running`. The Local
+// scope mirrors the local daemon's status, so a healthy local daemon reads live
+// and local behavior is unchanged. Used by imperative action paths; UI reads the
+// `liveScopes` store instead so it re-renders on status flips.
+export function scopeIsLive(scopeId: DaemonScopeId): boolean {
+  return get(daemonScopes).find((s) => s.id === scopeId)?.status === "running";
+}
+
 // ---- request helper -------------------------------------------------------
 
 function isError(response: Response): response is Response & {
@@ -1538,6 +1576,53 @@ function failAllJobs(reason: string): void {
   // Composite chains are ephemeral too: a daemon drop strands every in-flight
   // chain display. (A re-attach re-queries `active-jobs` to restore the truth.)
   compositeChains.set({});
+}
+
+// Fail every in-flight Job owned by ONE daemon scope when that scope's SSH link
+// drops (issue #32, ADR 0014). A remote scope going unreachable strands its
+// scoped Jobs exactly like a local daemon restart strands all Jobs — they cannot
+// survive the connection loss, so they are reported failed (with a clear,
+// host-named reason) rather than lingering forever in a "running" display. Local
+// is untouched here: a Local-scope drop runs through `failAllJobs` on the
+// `hitch-disconnected`/local-status path, so its behavior is unchanged. Jobs,
+// pending resolvers, and locally-started/early-completion bookkeeping all key by
+// the composite `jobKey`, so we identify this scope's keys off the `jobs` store
+// (each entry carries its `scopeId`) and clear only those; the scope's in-flight
+// composite chains (keyed per worktree) are cleared by resolving their owning
+// worktrees through `scopeForWorktree`.
+function failScopeJobs(scopeId: DaemonScopeId, reason: string): void {
+  if (scopeId === LOCAL_SCOPE_ID) {
+    // Local keeps its existing all-jobs semantics (the local link drop fails
+    // everything via failAllJobs); never narrow it here.
+    failAllJobs(reason);
+    return;
+  }
+  const message = `connection to ${scopeLabel(scopeId)} lost: ${reason}`;
+  const scopeKeys = Object.entries(get(jobs))
+    .filter(([, job]) => job.scopeId === scopeId)
+    .map(([key]) => key);
+  for (const key of scopeKeys) {
+    const pending = jobPending.get(key);
+    if (pending) pending.reject(new Error(message));
+    jobPending.delete(key);
+    earlyCompletions.delete(key);
+    locallyStartedJobs.delete(key);
+  }
+  jobs.update((current) => {
+    const next = { ...current };
+    for (const key of scopeKeys) delete next[key];
+    return next;
+  });
+  // Strand this scope's in-flight composite chains (keyed per worktree). A
+  // re-attach re-queries `active-jobs` to restore the truth, exactly like the
+  // local path.
+  compositeChains.update((chains) => {
+    const next: Record<Id, CompositeChainState> = {};
+    for (const [worktreeId, chain] of Object.entries(chains)) {
+      if (scopeForWorktree(worktreeId) !== scopeId) next[worktreeId] = chain;
+    }
+    return next;
+  });
 }
 
 // Ask the daemon to cancel a running Job (signals its worker to kill any child).
@@ -1897,6 +1982,22 @@ export async function refreshAll(
   const scopeId = options.scope ?? LOCAL_SCOPE_ID;
   const isLocal = scopeId === LOCAL_SCOPE_ID;
 
+  // The scope's entities BEFORE this snapshot, so a remote re-attach can prune
+  // whatever vanished on the host while we were disconnected (issue #32): a
+  // worktree/session removed out of band must lose its per-entity GUI state
+  // (output channels, agent state, scope tags, diff caches), not linger as a
+  // greyed orphan. Local replaces wholesale, so it needs no prior-set bookkeeping.
+  const priorScopeWorktreeIds = isLocal
+    ? new Set<Id>()
+    : new Set(
+        get(worktrees)
+          .filter((w) => scopeForProject(w.project_id) === scopeId)
+          .map((w) => w.id),
+      );
+  const priorScopeSessionIds = isLocal
+    ? new Set<Id>()
+    : new Set(get(sessions).filter((s) => scopeForSession(s.id) === scopeId).map((s) => s.id));
+
   const projectResponse = await daemonRequest<Response & { projects: Project[] }>(
     { type: "list-projects" },
     scopeId,
@@ -1936,11 +2037,32 @@ export async function refreshAll(
   if (isLocal) {
     worktrees.set(scopeWorktrees);
   } else {
-    // Replace only this scope's worktrees (those whose project belongs to it).
+    // Replace ALL of this scope's worktrees, keyed off the PRIOR scope membership
+    // (`priorScopeWorktreeIds`, captured before the project re-tag). Filtering on
+    // the NEW `scopeProjectIds` would wrongly KEEP a worktree whose project
+    // vanished from the snapshot (its project is no longer in the set, so it would
+    // survive as a greyed orphan) — the exact reconnect-prune bug this fixes. The
+    // fresh snapshot's worktrees are then appended.
+    const liveScopeWtById = new Set(scopeWorktrees.map((w) => w.id));
     worktrees.update((items) => [
-      ...items.filter((w) => !scopeProjectIds.has(w.project_id)),
+      ...items.filter((w) => !priorScopeWorktreeIds.has(w.id) && !liveScopeWtById.has(w.id)),
       ...scopeWorktrees,
     ]);
+    // Prune per-worktree GUI state for this scope's worktrees that vanished on the
+    // host while we were disconnected (issue #32): their diff/commit caches,
+    // PR-freshness maps, dirty/line-stat entries, and any composite chain would
+    // otherwise linger forever as greyed orphans after the replay.
+    const liveScopeWorktreeIds = new Set(scopeWorktrees.map((w) => w.id));
+    for (const goneId of priorScopeWorktreeIds) {
+      if (!liveScopeWorktreeIds.has(goneId)) {
+        sweepWorktreeCaches(goneId);
+        dirtyWorktrees.update((current) => omitKey(current, goneId));
+        worktreeLineStats.update((current) => omitKey(current, goneId));
+        prByWorktree.update((current) => omitKey(current, goneId));
+        compositeChains.update((current) => omitKey(current, goneId));
+        if (get(selectedWorktreeId) === goneId) selectedWorktreeId.set(null);
+      }
+    }
   }
 
   // Populate every worktree's PR chip in the background — one batched lookup per
@@ -1968,14 +2090,35 @@ export async function refreshAll(
     sessions.set(scopeSessions);
     liveSessions = scopeSessions;
   } else {
-    // Replace only this scope's sessions (parented under one of its worktrees or
-    // projects); a remote session id is unique only within its daemon.
-    const scopeWorktreeIds = new Set(scopeWorktrees.map((w) => w.id));
-    const belongsToScope = (s: Session): boolean =>
-      (s.parent.kind === "worktree" && scopeWorktreeIds.has(s.parent.id)) ||
-      (s.parent.kind === "project" && scopeProjectIds.has(s.parent.id));
-    sessions.update((items) => [...items.filter((s) => !belongsToScope(s)), ...scopeSessions]);
+    // Replace ALL of this scope's sessions, keyed off the PRIOR scope membership
+    // (`priorScopeSessionIds`, captured before the re-tag) plus the fresh ids — a
+    // remote session id is unique only within its daemon. Keying off prior
+    // membership (not the new worktree/project set) is what prunes a session whose
+    // worktree vanished while disconnected; the snapshot's sessions are appended.
+    const liveSessionById = new Set(scopeSessions.map((s) => s.id));
+    sessions.update((items) => [
+      ...items.filter((s) => !priorScopeSessionIds.has(s.id) && !liveSessionById.has(s.id)),
+      ...scopeSessions,
+    ]);
     liveSessions = get(sessions);
+    // Prune per-session GUI state for this scope's sessions that closed on the
+    // host while we were disconnected (issue #32): agent state/identity, the
+    // output-active gate, foreground command, scope tag, and notification
+    // bookkeeping. `reconcileSessionOutputs` (below) closes their output channels;
+    // these maps need an explicit sweep or they leak as stale orphans after the
+    // replay (and a closed session could keep paging an attention rollup).
+    const liveScopeSessionIds = new Set(scopeSessions.map((s) => s.id));
+    for (const goneId of priorScopeSessionIds) {
+      if (!liveScopeSessionIds.has(goneId)) {
+        agentStates.update((current) => omitKey(current, goneId));
+        sessionAgents.update((current) => omitKey(current, goneId));
+        sessionOutputActive.update((current) => omitKey(current, goneId));
+        sessionCommands.update((current) => omitKey(current, goneId));
+        forgetSessionNotifications(goneId);
+        forgetSessionScope(goneId);
+        if (get(activeSessionId) === goneId) activeSessionId.set(null);
+      }
+    }
   }
   if (options.restoreLiveSessionSelection) {
     restoreLiveSessionSelection(scopeSessions, scopeWorktrees);
@@ -2620,6 +2763,7 @@ const snapshottedScopes = new Set<DaemonScopeId>();
 // its scope. Exported as the seam the `hitch-scope-status` listener and tests
 // drive.
 export function applyScopeStatus(scopeId: DaemonScopeId, status: DaemonStatus, reason: string | null): void {
+  const wasLive = scopeIsLive(scopeId);
   daemonScopes.update((scopes) =>
     scopes.map((scope) =>
       scope.id === scopeId && scope.status !== status ? { ...scope, status } : scope,
@@ -2627,14 +2771,27 @@ export function applyScopeStatus(scopeId: DaemonScopeId, status: DaemonStatus, r
   );
   if (status === "running") {
     // First reach to running for this scope: pull its registry into the tree.
+    // The scoped `refreshAll` REPLACES this scope's entities (issue #32) — a
+    // project/worktree/session that vanished on the host while we were
+    // disconnected is pruned (see `refreshAll`/`reconcileScopeProjects`), so the
+    // stale greyed tree is replaced by daemon replay rather than merged into.
     if (!snapshottedScopes.has(scopeId)) {
       snapshottedScopes.add(scopeId);
       void refreshAll({ scope: scopeId }).catch((err) => error.set(toMessage(err)));
     }
   } else {
-    // Left running: a later reconnect must re-snapshot. Keep the stale tree for
-    // now (stale-remote polish is issue #32); only the status changes here.
+    // Left running (unreachable/failed/reconnecting): keep the last known tree as
+    // STALE, greyed UI (the tree/menus read `liveScopes` and disable this scope's
+    // daemon actions) until a reconnect replays it (issue #32, ADR 0014). A later
+    // reconnect must re-snapshot, so clear the snapshot guard.
     snapshottedScopes.delete(scopeId);
+    // On the falling edge out of `running`, strand this scope's in-flight Jobs:
+    // they cannot survive the dropped SSH link, so they are failed with a clear
+    // host-named reason rather than lingering (issue #32). Only on the edge so a
+    // repeated unreachable→failed transition doesn't re-fail nothing.
+    if (wasLive) {
+      failScopeJobs(scopeId, reason ?? status);
+    }
   }
 }
 
@@ -2642,6 +2799,83 @@ export function applyScopeStatus(scopeId: DaemonScopeId, status: DaemonStatus, r
 // into the correct scope via `applyHitchEvent`. Exported as the test seam.
 export function applyScopeEvent(scopeId: DaemonScopeId, event: HitchEvent): void {
   applyHitchEvent(event, scopeId);
+}
+
+// Forget all GUI-local state for a removed SSH Host scope (issue #32, ADR 0014).
+// Removing a host forgets ONLY the GUI-local attachment — it does NOT shut down
+// the remote Daemon or kill its Sessions (the Rust pool just disconnects the ssh
+// child). This is the FRONTEND half: prune the scope's projects, worktrees, and
+// sessions from every store; close its sessions' GUI terminals (their tabs
+// disappear); drop its scoped Jobs/composite chains; sweep per-entity caches; and
+// reset selection if it pointed into the removed scope. The `daemonScopes` row is
+// dropped by `reconcileSshHostScopes` when the persisted host list shrinks
+// (sshHosts.ts → removeSshHost), so this never touches the scope row itself.
+//
+// A no-op for the Local scope (Local is never "removed"; this guards a
+// mis-wired caller). The dialog calls this BEFORE `removeSshHost` so the entity
+// prune runs while the scope tags still resolve; pool disconnect is driven by the
+// `sshHosts` subscription (`syncSshHostsToPool`).
+export function forgetRemoteScope(scopeId: DaemonScopeId): void {
+  if (scopeId === LOCAL_SCOPE_ID) return;
+
+  const scopeProjectIds = new Set(
+    get(projects).filter((p) => scopeForProject(p.id) === scopeId).map((p) => p.id),
+  );
+  const scopeWorktreeIds = new Set(
+    get(worktrees).filter((w) => scopeProjectIds.has(w.project_id)).map((w) => w.id),
+  );
+  const scopeSessionIds = get(sessions)
+    .filter((s) => scopeForSession(s.id) === scopeId)
+    .map((s) => s.id);
+
+  // Fail any in-flight scoped Jobs first (their resolvers reject with a clear
+  // reason) and drop this scope's composite chains.
+  failScopeJobs(scopeId, "host removed");
+
+  // Close each session's GUI terminal (channel/ring + daemon unregister) and drop
+  // its per-session bookkeeping so its tab disappears and nothing leaks.
+  for (const sessionId of scopeSessionIds) {
+    closeSessionOutput(sessionId);
+    agentStates.update((current) => omitKey(current, sessionId));
+    sessionAgents.update((current) => omitKey(current, sessionId));
+    sessionOutputActive.update((current) => omitKey(current, sessionId));
+    sessionCommands.update((current) => omitKey(current, sessionId));
+    forgetSessionNotifications(sessionId);
+    forgetSessionScope(sessionId);
+  }
+
+  // Sweep each worktree's per-worktree caches/state.
+  for (const worktreeId of scopeWorktreeIds) {
+    sweepWorktreeCaches(worktreeId);
+    dirtyWorktrees.update((current) => omitKey(current, worktreeId));
+    worktreeLineStats.update((current) => omitKey(current, worktreeId));
+    prByWorktree.update((current) => omitKey(current, worktreeId));
+    compositeChains.update((current) => omitKey(current, worktreeId));
+  }
+
+  // Drop the scope's entities + scope tags from the global stores.
+  const sessionGone = new Set(scopeSessionIds);
+  sessions.update((items) => items.filter((s) => !sessionGone.has(s.id)));
+  worktrees.update((items) => items.filter((w) => !scopeWorktreeIds.has(w.id)));
+  projects.update((items) => items.filter((p) => !scopeProjectIds.has(p.id)));
+  projectScopes.update((current) => {
+    const next = { ...current };
+    for (const id of scopeProjectIds) delete next[id];
+    return next;
+  });
+
+  // The scope no longer exists, so its snapshot guard must reset (a re-add of the
+  // same target later must re-snapshot from scratch).
+  snapshottedScopes.delete(scopeId);
+
+  // Fall selection back sanely if it pointed into the removed scope.
+  if (get(selectedProjectId) && scopeProjectIds.has(get(selectedProjectId) as Id)) {
+    selectedProjectId.set(null);
+    selectedWorktreeId.set(null);
+  }
+  if (get(activeSessionId) && sessionGone.has(get(activeSessionId) as Id)) {
+    activeSessionId.set(null);
+  }
 }
 
 // Reconcile the remote connection pool to the saved SSH Hosts (issue #27). Called
@@ -3426,7 +3660,14 @@ function clearResizeDebounce(sessionId: Id): void {
 export function sendInput(sessionId: Id, data: string): void {
   // Keystrokes route to the session's owning daemon (a remote session's input
   // crosses its SSH connection); `scope` is omitted for Local (issue #27).
-  const scope = scopeArg(scopeForSession(sessionId));
+  const scopeId = scopeForSession(sessionId);
+  // A stale scope (unreachable SSH Host, ADR 0014) has no working PTY stream, so
+  // input is no-op'd: the user can still read the session's existing greyed
+  // scrollback (the ring buffer is kept; selecting the row is GUI state), but a
+  // keystroke is quietly dropped rather than fired at a half-open proxy. Local is
+  // always live while its daemon runs, so the local path is unchanged.
+  if (!scopeIsLive(scopeId)) return;
+  const scope = scopeArg(scopeId);
   void invoke("send_session_input", { sessionId, data, scope });
 }
 

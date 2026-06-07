@@ -33,6 +33,7 @@
     gitBusy,
     gitStatus,
     gitWorktreeId,
+    liveScopes,
     loadGitStatus,
     loadPrStatus,
     openPrInfo,
@@ -40,6 +41,7 @@
     pull,
     push,
     scopeAttributionForWorktree,
+    selectedScopeId,
     setFileStaged,
     setFilesStaged,
     startCommitAndPush,
@@ -425,7 +427,13 @@
   const openPr = $derived($openPrInfo);
   const hasChanges = $derived(files.length > 0);
   const onDefault = $derived(isDefaultBranch);
-  const busy = $derived($gitBusy || autoRunning);
+  // The selected worktree's owning daemon scope is STALE when its SSH Host is
+  // unreachable/failed (issue #32, ADR 0014). Every mutating git action here is
+  // daemon-backed, so a stale scope blocks them by folding into `busy` (the single
+  // gate the primary action + dropdown rows already read). Local is always live
+  // while its daemon runs, so local behavior is unchanged.
+  const scopeStale = $derived(!$liveScopes.has($selectedScopeId));
+  const busy = $derived($gitBusy || autoRunning || scopeStale);
 
   function openCommit() {
     commitOpen.set(true);
