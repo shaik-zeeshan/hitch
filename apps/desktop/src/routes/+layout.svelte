@@ -64,6 +64,7 @@
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import AddProjectDialog from "$lib/components/AddProjectDialog.svelte";
   import CloneProjectDialog from "$lib/components/CloneProjectDialog.svelte";
+  import RemoteFolderBrowserDialog from "$lib/components/RemoteFolderBrowserDialog.svelte";
   import AddSshHostDialog from "$lib/components/AddSshHostDialog.svelte";
   import RemoveSshHostDialog from "$lib/components/RemoveSshHostDialog.svelte";
   import CreateWorktreeDialog from "$lib/components/CreateWorktreeDialog.svelte";
@@ -419,6 +420,7 @@
 <CommandPalette />
 <AddProjectDialog />
 <CloneProjectDialog />
+<RemoteFolderBrowserDialog />
 <AddSshHostDialog />
 <RemoveSshHostDialog />
 <CreateWorktreeDialog />

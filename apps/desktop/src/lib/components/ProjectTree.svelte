@@ -44,6 +44,7 @@
   import { LAUNCHABLE_AGENTS, TAB_MARK, sessionTabKind } from "../sessionDisplay";
   import {
     createWorktreeFor,
+    remoteBrowserScope,
     removeProjectTarget,
     removeSshHostTarget,
     removeWorktreeTarget,
@@ -474,6 +475,12 @@
       {#if sshHost}
         <ContextMenu.Portal>
           <ContextMenu.Content class="menu">
+            <!-- Add a Project inside this SSH Host scope (issue #28, ADR 0014):
+                 opens the remote folder browser locked to this host's daemon. -->
+            <ContextMenu.Item class="mi" onSelect={() => remoteBrowserScope.set(scope.id)}>
+              <Plus class="mi-ico icon" />
+              Add project…
+            </ContextMenu.Item>
             <ContextMenu.Item class="mi" onSelect={() => void copyPath(sshHost.target)}>
               <Copy class="mi-ico icon" />
               Copy target

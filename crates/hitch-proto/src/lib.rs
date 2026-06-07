@@ -57,6 +57,7 @@ Request:
   add-project(root)
   clone-project(remote_url, destination, name?)
   remove-project(project_id, force)
+  list-directory(path?, show_hidden)
   list-worktrees(project_id)
   create-worktree(project_id, branch, base?, mode)
   remove-worktree(worktree_id, delete_branch, force)
@@ -93,6 +94,7 @@ Response:
   hello(protocol_version)
   ack
   projects(projects)
+  directory-listing(path, parent?, home, entries)
   worktrees(worktrees)
   sessions(sessions)
   session-opened(session)

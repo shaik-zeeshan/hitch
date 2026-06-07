@@ -35,6 +35,7 @@ import {
   type DaemonScope,
   type DaemonScopeId,
   type DaemonStatus,
+  type DirectoryListing,
   LOCAL_SCOPE_ID,
   type DraftGenerationSettings,
   type FileStatus,
@@ -1306,12 +1307,18 @@ function takeEarlyCompletion(jobId: Id): Response | null {
 export async function runJob<T extends Response>(
   request: JobRequest,
   kind: string | null = null,
+  scopeId: DaemonScopeId = LOCAL_SCOPE_ID,
 ): Promise<T> {
   startingJobRequests += 1;
   let started: Response & { job_id: Id };
   try {
     const startRequest: StartJobRequest = { type: "start-job", request };
-    started = await daemonRequest<Response & { job_id: Id }>(startRequest);
+    // Route the StartJob to the owning daemon: a remote clone starts its Job on
+    // that host's daemon and its lifecycle events flow back tagged to the scope
+    // (issue #27 event path). The returned JobId is interpreted within that
+    // scope; the pending-resolver map keys by JobId across scopes, which is safe
+    // because JobIds are uuids minted per daemon.
+    started = await daemonRequest<Response & { job_id: Id }>(startRequest, scopeId);
   } finally {
     startingJobRequests = Math.max(0, startingJobRequests - 1);
   }
@@ -2851,11 +2858,39 @@ function optimisticallySetFilesStaged(
 // create-PR) throw on failure so they can surface the error inline and only
 // dismiss on success. The fire-and-forget actions below (open/rename/close
 // session, stage, commit, push) instead swallow into the `error` store.
-export async function addProject(root: string): Promise<void> {
+export async function addProject(
+  root: string,
+  scopeId: DaemonScopeId = LOCAL_SCOPE_ID,
+): Promise<void> {
   const trimmed = root.trim();
   if (!trimmed) return;
-  await daemonRequest({ type: "add-project", root: trimmed });
-  await refreshAll();
+  // Route AddProject to the owning daemon: a remote scope sends it to that host's
+  // daemon, which returns the Project and broadcasts `project-updated` tagged to
+  // the scope (issue #27 event path), landing it under the SSH Host. The
+  // scoped refreshAll merges that scope's snapshot without clobbering Local.
+  await daemonRequest({ type: "add-project", root: trimmed }, scopeId);
+  await refreshAll({ scope: scopeId });
+}
+
+/// List remote (or local) directories for the folder browser. `path: null` opens
+/// the daemon user's home directory; `show_hidden` includes dot-prefixed folders.
+/// Routes to the owning daemon so the SSH-Host browser navigates that host (ADR
+/// 0014); the GUI never maps remote paths onto local paths.
+export async function listDirectory(
+  path: string | null,
+  showHidden: boolean,
+  scopeId: DaemonScopeId = LOCAL_SCOPE_ID,
+): Promise<DirectoryListing> {
+  const response = await daemonRequest<Response & DirectoryListing>(
+    { type: "list-directory", path, show_hidden: showHidden },
+    scopeId,
+  );
+  return {
+    path: response.path,
+    parent: response.parent,
+    home: response.home,
+    entries: response.entries,
+  };
 }
 
 // Open the native folder picker and add the chosen directory as a project.
@@ -2880,7 +2915,12 @@ export async function cloneProject(
   remoteUrl: string,
   destination: string,
   name: string | null = null,
+  scopeId: DaemonScopeId = LOCAL_SCOPE_ID,
 ): Promise<void> {
+  // Remote clone routes the CloneProject Job to the target host's daemon, which
+  // clones into the remote `destination` and broadcasts the new Project tagged to
+  // that scope (issue #27 event path). The scoped refreshAll then merges that
+  // host's snapshot. Local keeps its exact prior behavior.
   await runJob(
     {
       type: "clone-project",
@@ -2889,8 +2929,9 @@ export async function cloneProject(
       name: name?.trim() || null,
     },
     "clone",
+    scopeId,
   );
-  await refreshAll();
+  await refreshAll({ scope: scopeId });
 }
 
 export async function removeProject(projectId: Id, force: boolean): Promise<void> {

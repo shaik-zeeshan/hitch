@@ -277,6 +277,24 @@ export type ActiveJobInfo = {
   step: CompositeStep;
 };
 
+// One child directory in a remote-folder-browser listing (ADR 0014). The browser
+// is folders-first and only folders are selectable, so the daemon lists folders
+// only. `path` is the absolute path so the GUI navigates/AddProjects it without
+// re-joining (the GUI never maps remote paths onto local paths).
+export type DirEntry = {
+  name: string;
+  path: string;
+};
+
+// A directory listing returned by `list-directory` for the remote folder browser.
+// `parent` is null at the filesystem root; `home` backs the browser's Home control.
+export type DirectoryListing = {
+  path: string;
+  parent: string | null;
+  home: string;
+  entries: DirEntry[];
+};
+
 export type Request = { type: string; [key: string]: unknown };
 export type GitDiffRequest = {
   type: "git-diff";

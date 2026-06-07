@@ -13,8 +13,8 @@ use hitch_core::{Project, Session, SessionId, SessionParent, Worktree};
 use hitch_proto::transport::{connect_daemon, DaemonStream};
 #[cfg(any(unix, windows))]
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, CommitDraft, Event, FileDiff, GitStatus, JobRequest,
-    JobStatus, PullRequestDraft, WorktreeCreateMode,
+    encode_control_message, encode_pty_frame, CommitDraft, DirEntry, Event, FileDiff, GitStatus,
+    JobRequest, JobStatus, PullRequestDraft, WorktreeCreateMode,
 };
 use hitch_proto::{ControlMessage, ErrorCode, KnownAgent, Request, Response, PROTOCOL_VERSION};
 
@@ -42,6 +42,97 @@ fn daemon_transport_answers_hello_ping_and_shutdown() {
     send_transport_request(&mut stream, 3, Request::ShutdownDaemon);
     expect_transport_response(&mut stream, 3, |response| matches!(response, Response::Ack));
     daemon.wait_for_exit();
+}
+
+#[cfg(unix)]
+#[test]
+fn list_directory_defaults_to_home_and_lists_folders_first_hiding_dotfiles() {
+    let socket = test_socket_path("ld-home");
+    let store = test_file_path("ld-home-store", "sqlite");
+    let managed_root = test_dir_path("ld-home-managed");
+    let home = test_dir_path("ld-home-home");
+
+    // A home directory the daemon will open by default: two visible folders, one
+    // hidden folder, and a regular file (which must never appear — folders only).
+    std::fs::create_dir_all(home.join("Zeta")).unwrap();
+    std::fs::create_dir_all(home.join("alpha")).unwrap();
+    std::fs::create_dir_all(home.join(".hidden")).unwrap();
+    std::fs::write(home.join("notes.txt"), b"hi").unwrap();
+    let canonical_home = home.canonicalize().unwrap();
+
+    let mut daemon = spawn_daemon_with_home(&socket, &store, &managed_root, &home);
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+
+    // `path: None` opens the daemon user's home directory.
+    let listing = client.list_directory(2, None, false).unwrap();
+    assert_eq!(listing.path, canonical_home.to_string_lossy());
+    assert_eq!(listing.home, canonical_home.to_string_lossy());
+    assert_eq!(
+        listing.parent.as_deref(),
+        canonical_home.parent().map(|p| p.to_str().unwrap())
+    );
+
+    // Folders only, dotfiles hidden by default, sorted case-insensitively so
+    // `alpha` precedes `Zeta`. The regular file never appears.
+    let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["alpha", "Zeta"]);
+    // Each entry carries its absolute path so the GUI never re-joins paths.
+    let alpha = &listing.entries[0];
+    assert_eq!(alpha.path, canonical_home.join("alpha").to_string_lossy());
+
+    // Toggling hidden re-lists with the dot-folder included, still folders-first
+    // and file-free.
+    let with_hidden = client.list_directory(3, None, true).unwrap();
+    let names: Vec<&str> = with_hidden.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec![".hidden", "alpha", "Zeta"]);
+
+    client.send_request(4, Request::ShutdownDaemon);
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&managed_root);
+    let _ = std::fs::remove_file(&store);
+}
+
+#[cfg(unix)]
+#[test]
+fn list_directory_jumps_to_an_explicit_absolute_path() {
+    let socket = test_socket_path("ld-jump");
+    let store = test_file_path("ld-jump-store", "sqlite");
+    let managed_root = test_dir_path("ld-jump-managed");
+    let home = test_dir_path("ld-jump-home");
+    let elsewhere = test_dir_path("ld-jump-target");
+
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(elsewhere.join("child")).unwrap();
+    let canonical = elsewhere.canonicalize().unwrap();
+
+    let mut daemon = spawn_daemon_with_home(&socket, &store, &managed_root, &home);
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+
+    // Typing an absolute path jumps there regardless of home.
+    let listing = client
+        .list_directory(2, Some(canonical.to_str().unwrap()), false)
+        .unwrap();
+    assert_eq!(listing.path, canonical.to_string_lossy());
+    let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["child"]);
+    // Home is still reported so the browser's Home control works after a jump.
+    assert_eq!(listing.home, home.canonicalize().unwrap().to_string_lossy());
+
+    // A nonexistent path is a NotFound error row, not a panic.
+    let err = client
+        .list_directory(3, Some("/nope/does/not/exist/hitch"), false)
+        .unwrap_err();
+    assert_eq!(err, ErrorCode::NotFound);
+
+    client.send_request(4, Request::ShutdownDaemon);
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&elsewhere);
+    let _ = std::fs::remove_dir_all(&managed_root);
+    let _ = std::fs::remove_file(&store);
 }
 
 #[cfg(windows)]
@@ -1535,6 +1626,48 @@ impl TestClient {
         }
     }
 
+    #[cfg(unix)]
+    fn list_directory(
+        &mut self,
+        id: u64,
+        path: Option<&str>,
+        show_hidden: bool,
+    ) -> Result<DirectoryListing, ErrorCode> {
+        self.send_request(
+            id,
+            Request::ListDirectory {
+                path: path.map(|p| p.to_string()),
+                show_hidden,
+            },
+        );
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response:
+                        Response::DirectoryListing {
+                            path,
+                            parent,
+                            home,
+                            entries,
+                        },
+                }) if response_id == id => {
+                    return Ok(DirectoryListing {
+                        path,
+                        parent,
+                        home,
+                        entries,
+                    })
+                }
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::Error { error },
+                }) if response_id == id => return Err(error.code),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
+
     fn list_projects(&mut self, id: u64) -> Vec<Project> {
         self.send_request(id, Request::ListProjects);
         loop {
@@ -2248,6 +2381,15 @@ enum Packet {
     },
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct DirectoryListing {
+    path: String,
+    parent: Option<String>,
+    home: String,
+    entries: Vec<DirEntry>,
+}
+
 fn daemon_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hitch-daemon"))
 }
@@ -2255,6 +2397,13 @@ fn daemon_bin() -> PathBuf {
 #[cfg(unix)]
 fn spawn_daemon(socket: &Path, store: &Path, managed_root: &Path) -> Child {
     spawn_daemon_full(socket, store, managed_root, None)
+}
+
+#[cfg(unix)]
+fn spawn_daemon_with_home(socket: &Path, store: &Path, managed_root: &Path, home: &Path) -> Child {
+    let mut command = daemon_command(socket, store, managed_root);
+    command.env("HOME", home);
+    spawn_daemon_command(command)
 }
 
 fn spawn_daemon_full(socket: &Path, store: &Path, managed_root: &Path, gh: Option<&Path>) -> Child {

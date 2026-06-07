@@ -62,8 +62,14 @@ use serde::{Deserialize, Serialize};
 /// failure carrying prior steps' results), and the `Request::ActiveJobs` /
 /// `Response::ActiveJobs` query a re-attaching GUI uses to restore button state
 /// from a worktree's in-flight chains. An old daemon at v23 has none of these,
-/// so a client's composite chain would never run.
-pub const PROTOCOL_VERSION: u16 = 24;
+/// so a client's composite chain would never run. v25 adds
+/// `Request::ListDirectory`/`Response::DirectoryListing` (the remote directory
+/// browser backing "Add Project inside an SSH Host scope", ADR 0014) — a fast
+/// synchronous filesystem read, not a Job, that lets the GUI navigate a remote
+/// daemon user's readable directories (folders-first, hidden-folder toggle) and
+/// type an absolute path before sending the existing AddProject/CloneProject to
+/// that remote daemon. An old daemon at v24 has neither request nor response.
+pub const PROTOCOL_VERSION: u16 = 25;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -197,6 +203,19 @@ pub enum Request {
     },
     /// Forget a project and its Hitch-owned layout. Does not delete the project root.
     RemoveProject { project_id: ProjectId, force: bool },
+
+    /// List the directories under `path` on the daemon host so the GUI can render
+    /// a remote directory browser before sending AddProject/CloneProject to this
+    /// daemon (ADR 0014). `path: None` means the daemon user's home directory.
+    /// `show_hidden` controls whether dot-prefixed entries are included (off by
+    /// default in the browser). Replies with [`Response::DirectoryListing`]; an
+    /// unreadable or nonexistent directory returns a [`ProtocolError`]
+    /// (`NotFound`/`Unauthorized`) so the browser can render an error row. A fast
+    /// synchronous filesystem read, not a Job.
+    ListDirectory {
+        path: Option<String>,
+        show_hidden: bool,
+    },
 
     /// Return local and remote branches for a git-backed project.
     ListBranches { project_id: ProjectId },
@@ -611,6 +630,18 @@ pub enum Response {
     Projects {
         projects: Vec<Project>,
     },
+    /// A directory listing for the remote folder browser (reply to
+    /// [`Request::ListDirectory`]). `path` is the absolute directory that was
+    /// listed (the home directory when the request omitted a path), `parent` is
+    /// its parent directory or `None` at the filesystem root, `home` is the
+    /// daemon user's home directory (for the browser's Home control), and
+    /// `entries` are its child directories sorted case-insensitively by name.
+    DirectoryListing {
+        path: String,
+        parent: Option<String>,
+        home: String,
+        entries: Vec<DirEntry>,
+    },
     Branches {
         branches: Vec<BranchSummary>,
     },
@@ -904,6 +935,17 @@ pub struct ActiveJobInfo {
     pub kind: CompositeJobKind,
     /// The step the chain is currently executing.
     pub step: CompositeStep,
+}
+
+/// One child directory in a [`Response::DirectoryListing`] (the remote folder
+/// browser's row data). The browser is folders-first and only folders are
+/// selectable, so the daemon lists directories only — files never appear. `path`
+/// is the absolute path of the entry so the GUI can navigate or AddProject it
+/// without re-joining paths (the GUI never maps remote paths onto local paths).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirEntry {
+    pub name: String,
+    pub path: String,
 }
 
 /// A branch name with remote flag for branch-picker UI.
@@ -1643,7 +1685,65 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 24);
+        assert_eq!(PROTOCOL_VERSION, 25);
+    }
+
+    #[test]
+    fn list_directory_request_and_directory_listing_response_round_trip_as_contract() {
+        // The remote folder browser request: `path: None` means the daemon user's
+        // home directory, `show_hidden` defaults off in the browser.
+        let request = Request::ListDirectory {
+            path: None,
+            show_hidden: false,
+        };
+        let value: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["type"], "list-directory");
+        assert!(value["path"].is_null());
+        assert_eq!(value["show_hidden"], false);
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(request, back);
+
+        let jump = Request::ListDirectory {
+            path: Some("/home/dev/code".into()),
+            show_hidden: true,
+        };
+        let value: serde_json::Value = serde_json::to_value(&jump).unwrap();
+        assert_eq!(value["path"], "/home/dev/code");
+        assert_eq!(value["show_hidden"], true);
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(jump, back);
+
+        // The listing reply carries the absolute path, its parent (null at the
+        // filesystem root), the home directory for the Home control, and
+        // folders-only entries with their absolute paths.
+        let response = Response::DirectoryListing {
+            path: "/home/dev".into(),
+            parent: Some("/home".into()),
+            home: "/home/dev".into(),
+            entries: vec![DirEntry {
+                name: "code".into(),
+                path: "/home/dev/code".into(),
+            }],
+        };
+        let value: serde_json::Value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "directory-listing");
+        assert_eq!(value["path"], "/home/dev");
+        assert_eq!(value["parent"], "/home");
+        assert_eq!(value["home"], "/home/dev");
+        assert_eq!(value["entries"][0]["name"], "code");
+        assert_eq!(value["entries"][0]["path"], "/home/dev/code");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(response, back);
+
+        // The filesystem-root case carries a null parent.
+        let root = Response::DirectoryListing {
+            path: "/".into(),
+            parent: None,
+            home: "/home/dev".into(),
+            entries: vec![],
+        };
+        let value: serde_json::Value = serde_json::to_value(&root).unwrap();
+        assert!(value["parent"].is_null());
     }
 
     #[test]
@@ -2029,6 +2129,14 @@ mod tests {
                 project_id,
                 force: true,
             },
+            Request::ListDirectory {
+                path: Some("/home/dev/code".into()),
+                show_hidden: true,
+            },
+            Request::ListDirectory {
+                path: None,
+                show_hidden: false,
+            },
             Request::ListWorktrees { project_id },
             Request::CreateWorktree {
                 project_id,
@@ -2196,6 +2304,15 @@ mod tests {
             Response::Ack,
             Response::Projects {
                 projects: vec![project],
+            },
+            Response::DirectoryListing {
+                path: "/home/dev".into(),
+                parent: Some("/home".into()),
+                home: "/home/dev".into(),
+                entries: vec![DirEntry {
+                    name: "code".into(),
+                    path: "/home/dev/code".into(),
+                }],
             },
             Response::Worktrees {
                 worktrees: vec![worktree],

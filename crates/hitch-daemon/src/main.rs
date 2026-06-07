@@ -51,7 +51,7 @@ use hitch_proto::{
     encode_control_message, encode_pty_frame,
     transport::{connect_daemon, DaemonListener, DaemonStream},
     ActiveJobInfo, ChangedFile, CommitAndPushResult, CommitDraft, CommitFileDiff, CommitInfo,
-    CommitMeta, CompositeJobKind, CompositeJobResult, CompositeStep, ControlMessage,
+    CommitMeta, CompositeJobKind, CompositeJobResult, CompositeStep, ControlMessage, DirEntry,
     DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
     JobRequest, JobStatus, KnownAgent, PrInfo, ProtocolError, PullRequestDraft, Request, Response,
     StepPhase, WorktreeCreateMode, WorktreePr, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
@@ -1171,6 +1171,10 @@ fn handle_request<R: Read>(
             }
             broadcast_event(state, Event::ProjectRemoved { project_id })?;
         }
+        Request::ListDirectory { path, show_hidden } => {
+            let listing = list_directory(path.as_deref(), show_hidden)?;
+            send_response(state, client_id, request_id, listing)?;
+        }
         Request::ListBranches { project_id } => {
             let branches = list_branches(state, project_id)?;
             send_response(
@@ -1523,6 +1527,132 @@ fn handle_request<R: Read>(
     }
 
     Ok(())
+}
+
+/// Resolve the daemon user's home directory portably (the remote browser opens
+/// here and the Home control returns to it). `HOME` on Unix, `USERPROFILE`
+/// (falling back to `HOMEDRIVE`+`HOMEPATH`) on Windows.
+fn home_directory() -> Result<PathBuf, ProtocolError> {
+    #[cfg(windows)]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            if !profile.is_empty() {
+                return Ok(PathBuf::from(profile));
+            }
+        }
+        if let (Some(drive), Some(path)) =
+            (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+        {
+            let mut home = OsString::from(drive);
+            home.push(path);
+            if !home.is_empty() {
+                return Ok(PathBuf::from(home));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            if !home.is_empty() {
+                return Ok(PathBuf::from(home));
+            }
+        }
+    }
+    Err(internal("could not resolve the daemon user's home directory"))
+}
+
+/// List the child directories of a path on the daemon host for the remote folder
+/// browser (ADR 0014). `path == None` lists the daemon user's home directory.
+/// Folders-only and folders-first by construction (files are never selectable in
+/// the browser); entries are sorted case-insensitively by name. Hidden
+/// (dot-prefixed) entries are dropped unless `show_hidden`. Unreadable or
+/// nonexistent directories map to a `NotFound`/`Unauthorized` `ProtocolError` so
+/// the GUI can render an error row.
+fn list_directory(path: Option<&str>, show_hidden: bool) -> Result<Response, ProtocolError> {
+    // Canonicalize home once so the `home` field (Home control) agrees with the
+    // `path` field of a home-default listing — both resolve symlinks the same way.
+    let home = home_directory()?
+        .canonicalize()
+        .map_err(|err| internal(format!("cannot resolve home directory: {err}")))?;
+    let target = match path {
+        Some(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
+        _ => home.clone(),
+    };
+
+    // Resolve symlinks and `.`/`..` to an absolute path the GUI can navigate and
+    // AddProject without re-joining. A failed canonicalize is the not-found /
+    // unreadable case the browser renders as an error row.
+    let canonical = target.canonicalize().map_err(|err| {
+        let code = match err.kind() {
+            io::ErrorKind::NotFound => ErrorCode::NotFound,
+            io::ErrorKind::PermissionDenied => ErrorCode::Unauthorized,
+            _ => ErrorCode::InvalidRequest,
+        };
+        ProtocolError::new(
+            code,
+            format!("cannot open {}: {err}", target.display()),
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("not a directory: {}", canonical.display()),
+        ));
+    }
+
+    let read_dir = fs::read_dir(&canonical).map_err(|err| {
+        let code = match err.kind() {
+            io::ErrorKind::NotFound => ErrorCode::NotFound,
+            io::ErrorKind::PermissionDenied => ErrorCode::Unauthorized,
+            _ => ErrorCode::Internal,
+        };
+        ProtocolError::new(
+            code,
+            format!("cannot read {}: {err}", canonical.display()),
+        )
+    })?;
+
+    let mut entries: Vec<DirEntry> = Vec::new();
+    for entry in read_dir {
+        // Skip unreadable individual entries rather than failing the whole
+        // listing — the rest of the directory is still browsable.
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        // `file_type()` avoids a stat where possible; fall back to is_dir() for
+        // symlinks pointing at directories so a symlinked folder stays navigable.
+        let is_dir = match entry.file_type() {
+            Ok(ft) if ft.is_dir() => true,
+            Ok(ft) if ft.is_symlink() => entry.path().is_dir(),
+            _ => false,
+        };
+        if !is_dir {
+            continue;
+        }
+        let path = entry.path().to_string_lossy().into_owned();
+        entries.push(DirEntry { name, path });
+    }
+    entries.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let parent = canonical
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned());
+
+    Ok(Response::DirectoryListing {
+        path: canonical.to_string_lossy().into_owned(),
+        parent,
+        home: home.to_string_lossy().into_owned(),
+        entries,
+    })
 }
 
 fn add_project_from_root(
