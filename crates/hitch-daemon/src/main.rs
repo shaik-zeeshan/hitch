@@ -2548,6 +2548,10 @@ fn git_status(
     let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
     let summary = repo.status().map_err(git_error)?;
     let (ahead, behind) = repo.ahead_behind().unwrap_or((0, 0));
+    // Resolve the base branch here so the frontend's `defaultBase` consumes the
+    // daemon's single definition (shared with `git_log`) instead of recomputing
+    // it client-side.
+    let base_branch = resolve_base_branch(state, &worktree, &repo);
     if branch_changed {
         broadcast_event(
             state,
@@ -2565,6 +2569,7 @@ fn git_status(
         additions: summary.additions.min(u32::MAX as usize) as u32,
         deletions: summary.deletions.min(u32::MAX as usize) as u32,
         head_commit_id: summary.head_commit_id,
+        base_branch,
         files: status_entries_to_proto(&summary.entries),
     })
 }
@@ -2686,46 +2691,69 @@ fn git_diff(
     })
 }
 
+/// The branch of the project's main worktree, if one is known to the daemon.
+/// This is the first half of the base convention (see [`resolve_base_branch`]);
+/// it is read under the state lock so callers that already hold a worktree can
+/// resolve the base without re-locking.
+fn main_worktree_branch(state: &DaemonState, project_id: ProjectId) -> Option<String> {
+    state
+        .worktrees
+        .values()
+        .find(|w| w.project_id == project_id && w.is_main)
+        .map(|w| w.branch.clone())
+}
+
+/// The single definition of the "base branch" convention, shared by `git_log`'s
+/// `ahead_of_base` markers and the `GitStatus.base_branch` the frontend's
+/// `defaultBase` consumes. The base is the branch checked out in the project's
+/// main worktree, NOT the repo's default branch: a remote-less linked worktree
+/// has no `refs/remotes/origin/HEAD`, so `default_branch()` falls back to the
+/// worktree's OWN branch and nothing would ever be marked ahead. We fall back to
+/// the repo's default branch only when no main worktree is known.
+///
+/// Returns `None` when neither resolves, OR when the resolved base IS the
+/// worktree's own branch (the main worktree relative to itself): there is then no
+/// cross-branch work to mark and no sensible PR-base default. Callers therefore
+/// get the exact value they should act on without re-applying the self-branch
+/// filter.
+fn resolve_base_branch(
+    state: &Arc<Mutex<DaemonState>>,
+    worktree: &Worktree,
+    repo: &GitRepository,
+) -> Option<String> {
+    let main_branch = {
+        let state = state.lock().ok()?;
+        main_worktree_branch(&state, worktree.project_id)
+    };
+    let resolved = match main_branch {
+        Some(branch) => Some(branch),
+        None => repo.default_branch().ok(),
+    };
+    resolved.filter(|base| *base != worktree.branch)
+}
+
 fn git_log(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
     limit: u32,
     offset: u32,
 ) -> Result<(Vec<CommitInfo>, bool), ProtocolError> {
-    let (worktree, main_branch) = {
+    let worktree = {
         let state = state.lock().map_err(|_| internal("state lock poisoned"))?;
-        let worktree = state
+        state
             .worktrees
             .get(&worktree_id)
             .cloned()
-            .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?;
-        // The base convention (matching the frontend's `defaultBase`) is the
-        // branch checked out in the project's main worktree, not the repo's
-        // default branch: a remote-less linked worktree has no
-        // `refs/remotes/origin/HEAD`, so `default_branch()` falls back to the
-        // worktree's OWN branch and nothing would ever be marked ahead.
-        let main_branch = state
-            .worktrees
-            .values()
-            .find(|w| w.project_id == worktree.project_id && w.is_main)
-            .map(|w| w.branch.clone());
-        (worktree, main_branch)
+            .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "worktree not found"))?
     };
     let repo = GitRepository::discover(&worktree.path).map_err(git_error)?;
-    // Mark commits ahead of the project's main-worktree branch, except on the
-    // main worktree itself (its own branch is the base, so there is no branch
-    // work to mark). Fall back to the repo's default branch when no main
-    // worktree is known; an unresolvable base degrades to no markers in the
-    // git layer.
-    let resolved_base = match main_branch {
-        Some(branch) => Some(branch),
-        None => repo.default_branch().ok(),
-    };
-    let base = resolved_base
-        .as_deref()
-        .filter(|base| *base != worktree.branch);
+    // Mark commits ahead of the resolved base branch (the shared convention).
+    // `resolve_base_branch` already returns `None` on the main worktree (its own
+    // branch is the base, so there is no branch work to mark) and when no base is
+    // resolvable; an unresolvable base degrades to no markers in the git layer.
+    let base = resolve_base_branch(state, &worktree, &repo);
     let (commits, has_more) = repo
-        .log_enriched(base, offset as usize, limit as usize)
+        .log_enriched(base.as_deref(), offset as usize, limit as usize)
         .map_err(git_error)?;
     Ok((
         commits.into_iter().map(log_commit_to_proto).collect(),

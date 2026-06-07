@@ -741,6 +741,16 @@ pub struct GitStatus {
     /// upgrades, matching the other added GitStatus fields.
     #[serde(default)]
     pub head_commit_id: Option<String>,
+    /// The daemon-resolved "base branch" for this worktree — the branch checked
+    /// out in the project's main worktree (falling back to the repo's default
+    /// branch), or `None` when neither resolves. This is the SINGLE definition of
+    /// the base convention: the History `ahead_of_base` markers and the
+    /// frontend's PR-base default / "from {base}" labels both read it from here
+    /// instead of each recomputing it. `#[serde(default)]` keeps older
+    /// daemons/clients decodable during rolling upgrades, matching the other
+    /// added GitStatus fields.
+    #[serde(default)]
+    pub base_branch: Option<String>,
     pub files: Vec<ChangedFile>,
 }
 
@@ -985,6 +995,53 @@ mod tests {
         assert_eq!(status.deletions, 0);
         // An old daemon's status without the head id decodes to None.
         assert_eq!(status.head_commit_id, None);
+        // An old daemon's status without the daemon-resolved base also decodes to
+        // None — the frontend then falls back to its worktree-derived base for the
+        // rolling-upgrade window.
+        assert_eq!(status.base_branch, None);
+    }
+
+    #[test]
+    fn git_status_carries_daemon_resolved_base_branch_as_contract() {
+        let (_, worktree_id, _) = ids();
+        let status = GitStatus {
+            worktree_id,
+            branch: "feature".into(),
+            dirty: false,
+            ahead: 2,
+            behind: 0,
+            additions: 0,
+            deletions: 0,
+            head_commit_id: Some("a".repeat(40)),
+            base_branch: Some("main".into()),
+            files: vec![],
+        };
+        let response = Response::GitStatus { status };
+        let value: serde_json::Value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "git-status");
+        // The base rides on the status backbone under a snake_case key so the
+        // frontend's `defaultBase` can read it without recomputing the convention.
+        assert_eq!(value["status"]["base_branch"], "main");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(response, back);
+
+        // A main worktree whose own branch is the base resolves to null; that is a
+        // distinct, intentional shape (no cross-branch default), not the
+        // rolling-upgrade missing-field case.
+        let no_base = GitStatus {
+            worktree_id,
+            branch: "main".into(),
+            dirty: false,
+            ahead: 0,
+            behind: 0,
+            additions: 0,
+            deletions: 0,
+            head_commit_id: Some("a".repeat(40)),
+            base_branch: None,
+            files: vec![],
+        };
+        let value: serde_json::Value = serde_json::to_value(&no_base).unwrap();
+        assert!(value["base_branch"].is_null());
     }
 
     #[test]
@@ -1588,6 +1645,7 @@ mod tests {
             additions: 12,
             deletions: 3,
             head_commit_id: Some("a".repeat(40)),
+            base_branch: Some("main".into()),
             files: vec![ChangedFile {
                 path: "src/lib.rs".into(),
                 status: FileStatus::Modified,

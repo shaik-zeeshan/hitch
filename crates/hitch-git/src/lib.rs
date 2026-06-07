@@ -1158,7 +1158,12 @@ fn diff_line_stats(repo: &Repository) -> Result<DiffLineStats> {
 
     let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
     let index = repo.index()?;
-    let mut staged = repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), None)?;
+    // line_stats only needs add/del counts; zero context so libgit2 skips
+    // generating context content on the 1s status poll.
+    let mut staged_options = DiffOptions::new();
+    staged_options.context_lines(0).interhunk_lines(0);
+    let mut staged =
+        repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), Some(&mut staged_options))?;
     detect_diff_renames(&mut staged)?;
     let mut staged_per_path = HashMap::new();
     let (sa, sd) = accumulate_diff_line_stats(&staged, &mut staged_per_path)?;
@@ -1170,7 +1175,11 @@ fn diff_line_stats(repo: &Repository) -> Result<DiffLineStats> {
     options
         .include_untracked(true)
         .recurse_untracked_dirs(false)
-        .show_untracked_content(true);
+        .show_untracked_content(true)
+        // line_stats only needs add/del counts; zero context so libgit2 skips
+        // generating context content on the 1s status poll.
+        .context_lines(0)
+        .interhunk_lines(0);
     let index = repo.index()?;
     let mut worktree = repo.diff_index_to_workdir(Some(&index), Some(&mut options))?;
     detect_diff_renames(&mut worktree)?;
@@ -1952,20 +1961,12 @@ fn commit_line_totals(repo: &Repository, commit: &git2::Commit<'_>) -> Result<(u
     Ok(totals)
 }
 
-/// Sum a diff's added/deleted lines from its per-patch `line_stats`. Binary
-/// deltas have no patch and contribute nothing, matching `accumulate_diff_line_stats`.
+/// Sum a diff's added/deleted lines. Delegates to `accumulate_diff_line_stats`
+/// so the binary-delta/`line_stats` handling lives in exactly one place; the
+/// per-path map is discarded here since this cold path only needs the aggregate.
 fn diff_totals(diff: &git2::Diff<'_>) -> Result<(usize, usize)> {
-    let mut additions = 0;
-    let mut deletions = 0;
-    for idx in 0..diff.deltas().len() {
-        let Some(patch) = git2::Patch::from_diff(diff, idx)? else {
-            continue;
-        };
-        let (_context, added, deleted) = patch.line_stats()?;
-        additions += added;
-        deletions += deleted;
-    }
-    Ok((additions, deletions))
+    let mut sink = HashMap::new();
+    accumulate_diff_line_stats(diff, &mut sink)
 }
 
 /// Split a tree-to-tree diff into per-file patches, mirroring the working-tree
