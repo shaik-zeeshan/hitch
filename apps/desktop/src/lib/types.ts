@@ -111,18 +111,9 @@ export type CommitInfo = {
   deletions: number;
 };
 
-// The metadata header of a Commit Tab. Mirrors hitch-proto's `CommitMeta`
-// (CommitInfo minus `ahead_of_base`).
-export type CommitMeta = {
-  id: string;
-  summary: string | null;
-  body: string | null;
-  author: string | null;
-  time: number;
-  is_merge: boolean;
-  additions: number;
-  deletions: number;
-};
+// The metadata header of a Commit Tab. Mirrors hitch-proto's `CommitMeta`,
+// which is `CommitInfo` minus `ahead_of_base`.
+export type CommitMeta = Omit<CommitInfo, "ahead_of_base">;
 
 // One file's diff within a Commit Tab. Mirrors the working-tree per-file diff
 // shape (path + status + patch text) so the frontend reuses its diff renderer.
