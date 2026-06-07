@@ -21,14 +21,14 @@
   import {
     cancelJob,
     cancellableJobForSelectedWorktree,
-    commit,
     commitLog,
+    compositeChainForSelectedWorktree,
+    clearCompositeChain,
     defaultBase,
     activeDiffPath,
     diffStaged,
     discardAllFiles,
     discardFile,
-    generateCommitDraft,
     fetchRemote,
     gitBusy,
     gitStatus,
@@ -41,9 +41,11 @@
     push,
     setFileStaged,
     setFilesStaged,
+    startCommitAndPush,
     viewAllChanges,
     viewDiff,
   } from "../daemon";
+  import { autoErrorMessage, autoToastMessage } from "../composerToast";
   import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
   import { focusWithoutScroll } from "../focusWithoutScroll";
   import { fileIconUrl } from "../file-icons";
@@ -51,8 +53,7 @@
   import { autoCommitPush, railView } from "../settings";
   import { commitOpen, createPrOpen } from "../overlays";
   import { STATUS_GLYPH, statusGlyphClass } from "../types";
-  import CommitDialog from "./CommitDialog.svelte";
-  import CreatePrDialog from "./CreatePrDialog.svelte";
+  import Composer from "./Composer.svelte";
   import HistoryList from "./HistoryList.svelte";
   import toast from "svelte-french-toast";
 
@@ -66,8 +67,9 @@
     collapsed?: boolean;
   } = $props();
 
-  // Commit-shortcut hints. The handler (CommitDialog) is platform-aware via
-  // isShortcutModifier, so the hints must agree: ⌘ on macOS, Ctrl elsewhere.
+  // Commit-shortcut hints. The handler (the Composer + the layout dispatcher) is
+  // platform-aware via isShortcutModifier, so the hints must agree: ⌘ on macOS,
+  // Ctrl elsewhere.
   const platform = currentDesktopPlatform();
   const commitKeys = shortcutKeys(platform, "↵");
   const commitHint = shortcutLabel(platform, "↵");
@@ -83,7 +85,19 @@
 
   const cancellableJob = $derived($cancellableJobForSelectedWorktree);
 
-  let autoRunning = $state(false);
+  // The daemon-owned composite chain for the selected worktree (auto commit-push
+  // or PR). Splits by kind for the .actions slot: the auto chain renders a
+  // header-only Composer morph; a parked failure keeps that morph in the oxide
+  // retry state until retried/dismissed.
+  const chain = $derived($compositeChainForSelectedWorktree);
+  const autoChain = $derived(chain?.kind === "commit-and-push" ? chain : null);
+  // A daemon-owned create-pr chain (in-flight or a parked failure) for the
+  // selected worktree. Drives PR-mode Composer rendering even when the user did
+  // NOT open it locally — i.e. restored after navigating away mid-chain.
+  const prChain = $derived(chain?.kind === "create-pr" ? chain : null);
+  // A chain is actively running (not a parked failure) → block other mutating
+  // actions for this worktree, same as the old GUI-orchestrated autoRunning flag.
+  const autoRunning = $derived(Boolean(chain && !chain.failed));
 
   // ---- roving keyboard focus (slice 4) ------------------------------------
   // The staged + unstaged groups are navigated as ONE list in visual order
@@ -489,29 +503,24 @@
     return idx === -1 ? { dir: "", name: path } : { dir: path.slice(0, idx + 1), name: path.slice(idx + 1) };
   }
 
+  // Auto commit & push now runs the daemon-owned `commit-and-push` COMPOSITE
+  // Job (ADR 0013 amendment): one chain (stage → draft → commit → push) that
+  // survives navigation/quit. Progress shows as the action button morphing in
+  // place (the Composer's auto mode reads the same chain store); this handler
+  // only kicks it off and raises the completion toast. A daemon-side draft
+  // failure aborts the chain before any commit. The chain store drives the oxide
+  // failed-button state + retry, so we don't park failure here.
   async function handleAutoCommitPush() {
     const worktreeId = $gitWorktreeId;
-    if ($gitBusy || autoRunning || !worktreeId) return;
-    const pathsToStage = unstaged.map((file) => file.path);
-    autoRunning = true;
+    if (busy || !worktreeId) return;
+    // Clear any parked failure from a previous run before re-triggering.
+    clearCompositeChain(worktreeId);
     const id = toast.loading("Staging files…");
     try {
-      if (pathsToStage.length > 0) {
-        await setFilesStaged(pathsToStage, true, worktreeId);
-      }
-      toast.loading("Generating commit message…", { id });
-      const draft = await generateCommitDraft(worktreeId);
-      toast.loading("Committing…", { id });
-      await commit(draft.subject, draft.body, worktreeId);
-      toast.loading("Pushing…", { id });
-      await push(worktreeId);
-      void loadGitStatus(worktreeId).catch(() => {});
-      void loadPrStatus(worktreeId);
-      toast.success(draft.subject, { id });
+      const result = await startCommitAndPush(worktreeId);
+      toast.success(autoToastMessage(result), { id });
     } catch (err) {
-      toast.error(shortError(err), { id });
-    } finally {
-      autoRunning = false;
+      toast.error(autoErrorMessage(err), { id });
     }
   }
 
@@ -587,6 +596,7 @@
   bind:this={railEl}
   class="rail-right"
   class:collapsed
+  class:composing={$commitOpen || $createPrOpen || Boolean(prChain)}
   data-pane="git"
   tabindex="-1"
   onfocusin={() => focusedPane.set("git")}
@@ -681,7 +691,28 @@
     </div>
 
     <div class="actions">
-      {#if cancellableJob}
+      {#if $commitOpen}
+        <!-- Button Morph: the split button's row morphs IN PLACE into the
+             Composer's header; only the card body overlays the dimmed file list.
+             The Composer occupies this exact slot, so there is zero layout shift. -->
+        <Composer mode="commit" />
+      {:else if $createPrOpen || prChain}
+        <!-- PR mode: same morph. Pre-flight (base select) then a hands-off chain
+             whose per-step progress shows in the same card. `prChain` (without a
+             local open) is the restored-mid-chain case: a create-pr chain the
+             daemon reports for this worktree after the user navigated away. -->
+        <Composer mode="pr" />
+      {:else if autoChain}
+        <!-- Auto commit-push chain: header-ONLY morph (no body opens; the file
+             list stays visible & undimmed). Driven by the daemon-owned chain
+             store, so a leave-and-return restores the exact step. -->
+        <Composer mode="auto" />
+        {#if !autoChain.failed}
+          <div class="why-primary">
+            <span>auto · commit &amp; push</span><span class="sep" aria-hidden="true">·</span><span>daemon Job</span>
+          </div>
+        {/if}
+      {:else if cancellableJob}
         <button
           class="cancel"
           title="Cancel the running operation"
@@ -943,10 +974,9 @@
     </div>
   {/if}
 
-  <!-- Mounted once, triggerless: opened from the action menu (and the command
-       palette) via the commitOpen / createPrOpen stores. -->
-  <CommitDialog triggerless />
-  <CreatePrDialog triggerless />
+  <!-- The Composer is NOT mounted separately: it morphs in place from the split
+       button in the .actions slot above (Button Morph) for all three modes —
+       commit, PR pre-flight/progress, and the auto chain header. -->
 </aside>
 
 <style>
@@ -1315,6 +1345,15 @@
     overflow: auto;
     min-height: 0;
     padding: 6px 10px 12px;
+    transition: opacity 0.18s ease-out;
+  }
+  /* While the Composer is open its body overlays this list, which dims (but does
+     NOT move — the Composer occupies the split button's exact in-flow slot, so
+     there is zero layout shift). No backdrop; the dim is the only depth cue. */
+  .rail-right.composing .files {
+    opacity: 0.32;
+    filter: saturate(0.6);
+    pointer-events: none;
   }
   .empty {
     padding: 38px 20px;

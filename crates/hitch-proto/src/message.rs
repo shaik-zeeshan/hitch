@@ -50,8 +50,20 @@ use serde::{Deserialize, Serialize};
 /// log) and `Request::CommitDiff`/`Response::CommitDiff` (one commit's
 /// first-parent per-file diff), and adds `head_commit_id` to `GitStatus` so the
 /// log can refetch off the existing status backbone — an old daemon at v22 has
-/// neither request nor the head id.
-pub const PROTOCOL_VERSION: u16 = 23;
+/// neither request nor the head id. v24 adds optional `commit_instructions`/
+/// `pr_instructions` to `DraftGenerationSettings` — the Composer's Draft
+/// Instructions, appended to the built-in draft prompts as an extra block
+/// (ADR 0007 amendment 2026-06-07); an old daemon at v23 ignores them, so a
+/// client's instructions would silently not reach the prompt. v24 also adds the
+/// daemon-owned composite Job chains (ADR 0013 amendment 2026-06-07): the
+/// `JobRequest::CommitAndPush`/`JobRequest::CreatePr` kinds, the per-step
+/// `Event::CompositeJobProgress` broadcast, the `Response::CommitAndPushed`
+/// completion payload (and `Response::CompositeJobFailed` for a mid-chain
+/// failure carrying prior steps' results), and the `Request::ActiveJobs` /
+/// `Response::ActiveJobs` query a re-attaching GUI uses to restore button state
+/// from a worktree's in-flight chains. An old daemon at v23 has none of these,
+/// so a client's composite chain would never run.
+pub const PROTOCOL_VERSION: u16 = 24;
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -138,6 +150,26 @@ pub enum JobRequest {
         body: Option<String>,
         base: Option<String>,
         draft: bool,
+    },
+    /// The auto commit-and-push **composite Job** (ADR 0013 amendment
+    /// 2026-06-07): one daemon-owned chain of staging -> drafting -> committing
+    /// -> pushing, so the chain survives GUI navigation/quit. Per-step progress
+    /// rides [`Event::CompositeJobProgress`]; the [`Event::JobCompleted`] carries
+    /// [`Response::CommitAndPushed`] on success or [`Response::CompositeJobFailed`]
+    /// on a mid-chain failure (a draft failure aborts before any commit is made).
+    CommitAndPush {
+        worktree_id: WorktreeId,
+        settings: Option<DraftGenerationSettings>,
+    },
+    /// The autonomous PR **composite Job** (ADR 0013 amendment 2026-06-07): a
+    /// daemon-owned chain of pushing -> drafting (title/body) -> creating a
+    /// GitHub **draft** PR. Completion carries the created PR URL inside
+    /// [`Response::PullRequestCreated`]; the daemon never opens a browser (an
+    /// attached GUI does that off the completion event).
+    CreatePr {
+        worktree_id: WorktreeId,
+        base: Option<String>,
+        settings: Option<DraftGenerationSettings>,
     },
 }
 
@@ -312,6 +344,24 @@ pub enum Request {
         base: Option<String>,
         draft: bool,
     },
+    /// Run the auto commit-and-push composite Job for a worktree (the bare form
+    /// of [`JobRequest::CommitAndPush`]; dispatches through the async Job path).
+    CommitAndPush {
+        worktree_id: WorktreeId,
+        settings: Option<DraftGenerationSettings>,
+    },
+    /// Run the autonomous PR composite Job for a worktree (the bare form of
+    /// [`JobRequest::CreatePr`]; dispatches through the async Job path).
+    CreatePr {
+        worktree_id: WorktreeId,
+        base: Option<String>,
+        settings: Option<DraftGenerationSettings>,
+    },
+    /// Return a worktree's currently in-flight **Jobs** (ADR 0008 + ADR 0013
+    /// amendment), so a (re)attaching GUI can restore the Composer/button state
+    /// for chains already running in the daemon. A fast in-memory read, not a
+    /// Job; Jobs remain ephemeral across daemon restarts.
+    ActiveJobs { worktree_id: WorktreeId },
 
     /// Install/merge known-agent hooks in the target worktree.
     InstallAgentHooks { worktree_id: WorktreeId },
@@ -422,6 +472,22 @@ impl From<JobRequest> for Request {
                 base,
                 draft,
             },
+            JobRequest::CommitAndPush {
+                worktree_id,
+                settings,
+            } => Request::CommitAndPush {
+                worktree_id,
+                settings,
+            },
+            JobRequest::CreatePr {
+                worktree_id,
+                base,
+                settings,
+            } => Request::CreatePr {
+                worktree_id,
+                base,
+                settings,
+            },
         }
     }
 }
@@ -489,6 +555,22 @@ impl TryFrom<Request> for JobRequest {
                 body,
                 base,
                 draft,
+            }),
+            Request::CommitAndPush {
+                worktree_id,
+                settings,
+            } => Ok(JobRequest::CommitAndPush {
+                worktree_id,
+                settings,
+            }),
+            Request::CreatePr {
+                worktree_id,
+                base,
+                settings,
+            } => Ok(JobRequest::CreatePr {
+                worktree_id,
+                base,
+                settings,
             }),
             other => Err(other),
         }
@@ -580,6 +662,28 @@ pub enum Response {
     },
     PullRequestCreated {
         url: String,
+    },
+    /// Terminal payload of a successful `commit-and-push` composite Job, carried
+    /// inside [`Event::JobCompleted`]. The GUI builds its completion toast from
+    /// this (subject, short sha, pushed commit count, file count).
+    CommitAndPushed {
+        result: CommitAndPushResult,
+    },
+    /// Terminal payload of a composite Job that failed mid-chain, carried inside
+    /// [`Event::JobCompleted`]. `failed_step` names the step that failed and
+    /// `reason` is its error; `result` carries whatever prior steps completed
+    /// (e.g. the commit that landed before a push failure) so the GUI can report
+    /// the partial chain accurately.
+    CompositeJobFailed {
+        kind: CompositeJobKind,
+        failed_step: CompositeStep,
+        reason: String,
+        result: CompositeJobResult,
+    },
+    /// A worktree's in-flight composite Jobs (reply to [`Request::ActiveJobs`]),
+    /// so a (re)attaching GUI restores chain/button state. Empty when none run.
+    ActiveJobs {
+        jobs: Vec<ActiveJobInfo>,
     },
     CommitDraft {
         draft: CommitDraft,
@@ -706,6 +810,20 @@ pub enum Event {
         /// Stable UI-facing job kind (e.g. `push`, `pr-draft`) when known.
         kind: Option<String>,
     },
+    /// A **composite Job** (ADR 0013 amendment) advanced to a new step, or that
+    /// step finished. Broadcast per step start/finish so an attached GUI morphs
+    /// the action button's label in place (staging -> drafting -> committing ->
+    /// pushing for `commit-and-push`; pushing -> drafting -> creating-pr for
+    /// `create-pr`). `worktree_id` lets a worktree-scoped client route it without
+    /// a Job lookup; `kind` and `step` identify the chain and its current rung,
+    /// and `phase` distinguishes the step starting from it finishing.
+    CompositeJobProgress {
+        job_id: JobId,
+        worktree_id: WorktreeId,
+        kind: CompositeJobKind,
+        step: CompositeStep,
+        phase: StepPhase,
+    },
     /// A **Job** finished. The wrapped request's final [`Response`] rides inside
     /// (`Response::Ack` / `PullRequestCreated` / `CommitDraft` / …, or
     /// `Response::Error` on failure). The GUI resolves the awaiting caller from
@@ -714,6 +832,82 @@ pub enum Event {
         job_id: JobId,
         response: Box<Response>,
     },
+}
+
+/// Which daemon-owned **composite Job** chain a step/result belongs to (ADR 0013
+/// amendment 2026-06-07). The string tags match the UI-facing job kinds carried
+/// by [`Event::JobProgress::kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompositeJobKind {
+    /// staging -> drafting -> committing -> pushing.
+    CommitAndPush,
+    /// pushing -> drafting -> creating the GitHub draft PR.
+    CreatePr,
+}
+
+/// One rung of a composite Job chain, reported on [`Event::CompositeJobProgress`].
+/// The two chains use overlapping subsets: `commit-and-push` runs `Staging`,
+/// `Drafting`, `Committing`, `Pushing`; `create-pr` runs `Pushing`, `Drafting`,
+/// `CreatingPr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompositeStep {
+    Staging,
+    Drafting,
+    Committing,
+    Pushing,
+    CreatingPr,
+}
+
+/// Whether a [`CompositeStep`] is starting or has finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StepPhase {
+    Started,
+    Finished,
+}
+
+/// Result of a successful `commit-and-push` composite Job. The GUI's completion
+/// toast reads all four fields (subject - short sha - pushed count - file count).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitAndPushResult {
+    /// The committed subject line.
+    pub subject: String,
+    /// Short (7-char) SHA of the new commit.
+    pub short_sha: String,
+    /// Number of commits pushed to the remote in the push step.
+    pub pushed_commits: u32,
+    /// Number of files in the commit.
+    pub file_count: u32,
+}
+
+/// Whatever a composite Job completed before failing, so a failure can report
+/// prior steps' results intact (ADR 0013 amendment): the commit that landed
+/// before a push failure, or the PR URL if a later step failed. All `None` when
+/// the chain aborted before producing anything (e.g. a draft-generation failure
+/// that aborts before any commit).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CompositeJobResult {
+    /// The commit produced by a `commit-and-push` chain before a later step
+    /// failed (the commit stays — only the push failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<CommitAndPushResult>,
+    /// The PR URL produced before a later step failed, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+}
+
+/// One in-flight composite Job for a worktree (entry in [`Response::ActiveJobs`]).
+/// Carries enough for a re-attaching GUI to restore the action button's state:
+/// which chain, which step it is currently on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveJobInfo {
+    pub job_id: JobId,
+    pub worktree_id: WorktreeId,
+    pub kind: CompositeJobKind,
+    /// The step the chain is currently executing.
+    pub step: CompositeStep,
 }
 
 /// A branch name with remote flag for branch-picker UI.
@@ -862,6 +1056,16 @@ pub struct DraftGenerationSettings {
     pub model: Option<String>,
     pub claude_path: Option<PathBuf>,
     pub codex_path: Option<PathBuf>,
+    /// Optional Draft Instructions appended to the built-in commit prompt as an
+    /// extra block; never replaces the prompt or its JSON output contract (ADR
+    /// 0007 amendment 2026-06-07). `#[serde(default)]` keeps older clients that
+    /// omit the field decodable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_instructions: Option<String>,
+    /// Optional Draft Instructions appended to the built-in pull-request prompt;
+    /// same append-never-replace contract as `commit_instructions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_instructions: Option<String>,
 }
 
 /// Headless provider used for Draft Generator runs.
@@ -1393,6 +1597,8 @@ mod tests {
             model: Some("sonnet".into()),
             claude_path: Some(r"C:\Program Files\Claude\claude.exe".into()),
             codex_path: None,
+            commit_instructions: Some("Reference the ticket id".into()),
+            pr_instructions: None,
         };
 
         let request = Request::ListDraftModels {
@@ -1409,6 +1615,13 @@ mod tests {
             r"C:\Program Files\Claude\claude.exe"
         );
         assert!(value["settings"]["codex_path"].is_null());
+        // Draft Instructions ride the same settings payload; an unset field is
+        // omitted entirely so older daemons still decode it.
+        assert_eq!(
+            value["settings"]["commit_instructions"],
+            "Reference the ticket id"
+        );
+        assert!(value["settings"].get("pr_instructions").is_none());
         let back: Request = serde_json::from_value(value).unwrap();
 
         let job = JobRequest::try_from(request.clone()).unwrap();
@@ -1434,7 +1647,7 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 23);
+        assert_eq!(PROTOCOL_VERSION, 24);
     }
 
     #[test]
@@ -1547,6 +1760,129 @@ mod tests {
         assert_eq!(progress["kind"], "push");
     }
 
+    #[test]
+    fn composite_job_messages_serialize_as_contract() {
+        let (_, worktree_id, _) = ids();
+        let job_id = JobId::new();
+
+        // The composite chains start through the StartJob allowlist and map back
+        // and forth across the bare-request boundary.
+        let start = Request::StartJob {
+            request: JobRequest::CommitAndPush {
+                worktree_id,
+                settings: None,
+            },
+        };
+        let value: serde_json::Value = serde_json::to_value(&start).unwrap();
+        assert_eq!(value["request"]["type"], "commit-and-push");
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(start, back);
+        assert_eq!(
+            JobRequest::try_from(Request::CommitAndPush {
+                worktree_id,
+                settings: None,
+            })
+            .unwrap(),
+            JobRequest::CommitAndPush {
+                worktree_id,
+                settings: None,
+            }
+        );
+        assert_eq!(
+            JobRequest::try_from(Request::CreatePr {
+                worktree_id,
+                base: Some("main".into()),
+                settings: None,
+            })
+            .unwrap(),
+            JobRequest::CreatePr {
+                worktree_id,
+                base: Some("main".into()),
+                settings: None,
+            }
+        );
+
+        // Per-step progress identifies job, worktree, chain kind, step, and phase.
+        let progress = Event::CompositeJobProgress {
+            job_id,
+            worktree_id,
+            kind: CompositeJobKind::CommitAndPush,
+            step: CompositeStep::Pushing,
+            phase: StepPhase::Started,
+        };
+        let value: serde_json::Value = serde_json::to_value(&progress).unwrap();
+        assert_eq!(value["type"], "composite-job-progress");
+        assert_eq!(value["kind"], "commit-and-push");
+        assert_eq!(value["step"], "pushing");
+        assert_eq!(value["phase"], "started");
+        assert_eq!(value["worktree_id"], worktree_id.to_string());
+        let back: Event = serde_json::from_value(value).unwrap();
+        assert_eq!(progress, back);
+
+        // The success completion payload carries the toast's four fields.
+        let done = Response::CommitAndPushed {
+            result: CommitAndPushResult {
+                subject: "feat: add proto".into(),
+                short_sha: "abc1234".into(),
+                pushed_commits: 1,
+                file_count: 2,
+            },
+        };
+        let value: serde_json::Value = serde_json::to_value(&done).unwrap();
+        assert_eq!(value["type"], "commit-and-pushed");
+        assert_eq!(value["result"]["short_sha"], "abc1234");
+        assert_eq!(value["result"]["pushed_commits"], 1);
+        assert_eq!(value["result"]["file_count"], 2);
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(done, back);
+
+        // A push failure keeps the landed commit in `result.commit`.
+        let failed = Response::CompositeJobFailed {
+            kind: CompositeJobKind::CommitAndPush,
+            failed_step: CompositeStep::Pushing,
+            reason: "remote rejected push".into(),
+            result: CompositeJobResult {
+                commit: Some(CommitAndPushResult {
+                    subject: "feat: add proto".into(),
+                    short_sha: "abc1234".into(),
+                    pushed_commits: 0,
+                    file_count: 2,
+                }),
+                pr_url: None,
+            },
+        };
+        let value: serde_json::Value = serde_json::to_value(&failed).unwrap();
+        assert_eq!(value["type"], "composite-job-failed");
+        assert_eq!(value["failed_step"], "pushing");
+        assert_eq!(value["result"]["commit"]["short_sha"], "abc1234");
+        // An empty prior-step result omits the optional fields entirely.
+        assert!(value["result"].get("pr_url").is_none());
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(failed, back);
+
+        // The active-Jobs query and reply round-trip.
+        let query = Request::ActiveJobs { worktree_id };
+        let value: serde_json::Value = serde_json::to_value(&query).unwrap();
+        assert_eq!(value["type"], "active-jobs");
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(query, back);
+
+        let reply = Response::ActiveJobs {
+            jobs: vec![ActiveJobInfo {
+                job_id,
+                worktree_id,
+                kind: CompositeJobKind::CreatePr,
+                step: CompositeStep::Drafting,
+            }],
+        };
+        let value: serde_json::Value = serde_json::to_value(&reply).unwrap();
+        assert_eq!(value["type"], "active-jobs");
+        assert_eq!(value["jobs"][0]["kind"], "create-pr");
+        assert_eq!(value["jobs"][0]["step"], "drafting");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(reply, back);
+    }
+
     fn ids() -> (ProjectId, WorktreeId, SessionId) {
         (ProjectId::new(), WorktreeId::new(), SessionId::new())
     }
@@ -1591,6 +1927,8 @@ mod tests {
                     model: None,
                     claude_path: None,
                     codex_path: Some(r"C:\Program Files\Codex\codex.exe".into()),
+                    commit_instructions: None,
+                    pr_instructions: None,
                 }),
             },
             JobRequest::GenerateCommitDraft {
@@ -1600,6 +1938,8 @@ mod tests {
                     model: Some("sonnet".into()),
                     claude_path: Some(r"C:\Program Files\Claude\claude.exe".into()),
                     codex_path: None,
+                    commit_instructions: None,
+                    pr_instructions: None,
                 }),
             },
             JobRequest::GeneratePullRequestDraft {
@@ -1610,6 +1950,8 @@ mod tests {
                     model: Some("gpt-5-codex".into()),
                     claude_path: None,
                     codex_path: Some(r"C:\Program Files\Codex\codex.exe".into()),
+                    commit_instructions: None,
+                    pr_instructions: None,
                 }),
             },
             JobRequest::Push { worktree_id },
@@ -1622,6 +1964,15 @@ mod tests {
                 body: Some("Body".into()),
                 base: Some("main".into()),
                 draft: true,
+            },
+            JobRequest::CommitAndPush {
+                worktree_id,
+                settings: None,
+            },
+            JobRequest::CreatePr {
+                worktree_id,
+                base: Some("main".into()),
+                settings: None,
             },
         ]
     }
@@ -1767,6 +2118,8 @@ mod tests {
                     model: None,
                     claude_path: None,
                     codex_path: Some(r"C:\Program Files\Codex\codex.exe".into()),
+                    commit_instructions: None,
+                    pr_instructions: None,
                 }),
             },
             Request::GenerateCommitDraft {
@@ -1776,6 +2129,8 @@ mod tests {
                     model: Some("sonnet".into()),
                     claude_path: Some(r"C:\Program Files\Claude\claude.exe".into()),
                     codex_path: None,
+                    commit_instructions: None,
+                    pr_instructions: None,
                 }),
             },
             Request::GeneratePullRequestDraft {
@@ -1786,6 +2141,8 @@ mod tests {
                     model: Some("gpt-5-codex".into()),
                     claude_path: None,
                     codex_path: Some(r"C:\Program Files\Codex\codex.exe".into()),
+                    commit_instructions: None,
+                    pr_instructions: None,
                 }),
             },
             Request::Fetch { worktree_id },
@@ -1798,6 +2155,16 @@ mod tests {
                 base: Some("main".into()),
                 draft: true,
             },
+            Request::CommitAndPush {
+                worktree_id,
+                settings: None,
+            },
+            Request::CreatePr {
+                worktree_id,
+                base: Some("main".into()),
+                settings: None,
+            },
+            Request::ActiveJobs { worktree_id },
             Request::InstallAgentHooks { worktree_id },
             Request::ReportAgentState {
                 agent: KnownAgent::ClaudeCode,
@@ -1898,6 +2265,36 @@ mod tests {
             Response::PullRequestCreated {
                 url: "https://github.com/example/hitch/pull/1".into(),
             },
+            Response::CommitAndPushed {
+                result: CommitAndPushResult {
+                    subject: "feat: add proto".into(),
+                    short_sha: "abc1234".into(),
+                    pushed_commits: 1,
+                    file_count: 2,
+                },
+            },
+            Response::CompositeJobFailed {
+                kind: CompositeJobKind::CommitAndPush,
+                failed_step: CompositeStep::Pushing,
+                reason: "remote rejected push".into(),
+                result: CompositeJobResult {
+                    commit: Some(CommitAndPushResult {
+                        subject: "feat: add proto".into(),
+                        short_sha: "abc1234".into(),
+                        pushed_commits: 0,
+                        file_count: 2,
+                    }),
+                    pr_url: None,
+                },
+            },
+            Response::ActiveJobs {
+                jobs: vec![ActiveJobInfo {
+                    job_id: JobId::new(),
+                    worktree_id,
+                    kind: CompositeJobKind::CreatePr,
+                    step: CompositeStep::Drafting,
+                }],
+            },
             Response::CommitDraft {
                 draft: CommitDraft {
                     subject: "chore: update src".into(),
@@ -1983,6 +2380,13 @@ mod tests {
                 status: JobStatus::Running,
                 message: Some("Pushing…".into()),
                 kind: Some("push".into()),
+            },
+            Event::CompositeJobProgress {
+                job_id: JobId::new(),
+                worktree_id,
+                kind: CompositeJobKind::CommitAndPush,
+                step: CompositeStep::Committing,
+                phase: StepPhase::Started,
             },
             Event::JobCompleted {
                 job_id: JobId::new(),

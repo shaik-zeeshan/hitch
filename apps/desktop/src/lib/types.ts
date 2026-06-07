@@ -158,6 +158,55 @@ export type BranchSummary = {
   is_remote: boolean;
 };
 
+// ---- composite Jobs (ADR 0013 amendment 2026-06-07) -----------------------
+//
+// The two daemon-owned autonomous chains. Wire tags mirror hitch-proto's
+// `CompositeJobKind` / `CompositeStep` / `StepPhase` (kebab-case).
+
+// Which chain a progress event / active-Job entry belongs to. Same strings the
+// UI-facing job kind carries, so `Job.kind` and these line up.
+export type CompositeJobKind = "commit-and-push" | "create-pr";
+
+// One rung of a chain. `commit-and-push` runs staging → drafting → committing →
+// pushing; `create-pr` runs pushing → drafting → creating-pr.
+export type CompositeStep =
+  | "staging"
+  | "drafting"
+  | "committing"
+  | "pushing"
+  | "creating-pr";
+
+// Whether a step is starting or has finished (a step is the "current" rung
+// between its started and finished phases).
+export type StepPhase = "started" | "finished";
+
+// Terminal payload of a successful `commit-and-push` chain (rides inside the
+// `job-completed` envelope as `commit-and-pushed`). The auto-mode toast reads all
+// four fields: subject · short sha · pushed count · file count.
+export type CommitAndPushResult = {
+  subject: string;
+  short_sha: string;
+  pushed_commits: number;
+  file_count: number;
+};
+
+// Whatever a chain completed before failing (e.g. the commit that landed before
+// a push failure, or a PR url). All-absent when it aborted before producing
+// anything (a draft-generation failure aborts before any commit).
+export type CompositeJobResult = {
+  commit?: CommitAndPushResult | null;
+  pr_url?: string | null;
+};
+
+// One in-flight chain for a worktree, returned by the `active-jobs` query so a
+// re-attaching GUI restores the exact button/Composer step.
+export type ActiveJobInfo = {
+  job_id: Id;
+  worktree_id: Id;
+  kind: CompositeJobKind;
+  step: CompositeStep;
+};
+
 export type Request = { type: string; [key: string]: unknown };
 export type GitDiffRequest = {
   type: "git-diff";
@@ -205,6 +254,12 @@ export type DraftGenerationSettings = {
   model: string | null;
   claude_path: string | null;
   codex_path: string | null;
+  // Draft Instructions appended to the built-in draft prompts as an extra
+  // block; never replace the prompt or its JSON output contract (ADR 0007
+  // amendment 2026-06-07). Optional on the wire (`#[serde(default)]` daemon
+  // side), so existing call sites that omit them still compile.
+  commit_instructions?: string | null;
+  pr_instructions?: string | null;
 };
 
 // Shared allowlist accepted inside `start-job`. Keep this in lockstep with
@@ -251,6 +306,21 @@ export type JobRequest =
       body: string | null;
       base: string | null;
       draft: boolean;
+    }
+  // The two daemon-owned composite chains (ADR 0013 amendment 2026-06-07). Each
+  // runs as ONE Job whose steps are reported as `composite-job-progress` events;
+  // completion rides the existing `job-completed` envelope. `commit-and-push`
+  // carries the COMMIT draft instructions; `create-pr` carries the PR ones.
+  | {
+      type: "commit-and-push";
+      worktree_id: Id;
+      settings: DraftGenerationSettings | null;
+    }
+  | {
+      type: "create-pr";
+      worktree_id: Id;
+      base: string | null;
+      settings: DraftGenerationSettings | null;
     };
 
 export type StartJobRequest = { type: "start-job"; request: JobRequest };

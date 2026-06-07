@@ -20,7 +20,9 @@
     DRAFT_MODEL_OPTIONS,
     draftClaudePath,
     draftCodexPath,
+    draftCommitInstructions,
     draftModel,
+    draftPrInstructions,
     draftProvider,
     editorApp,
     notificationMinTurnSeconds,
@@ -166,6 +168,8 @@
   let modelOptions = $state<string[]>(DRAFT_MODEL_OPTIONS[DEFAULT_DRAFT_PROVIDER]);
   let claudePath = $state("");
   let codexPath = $state("");
+  let commitInstructions = $state("");
+  let prInstructions = $state("");
   let modelsLoading = $state(false);
   let modelsError = $state<string | null>(null);
   let modelLoadSeq = 0;
@@ -224,6 +228,8 @@
     selectedDraftModel = $draftModel || DEFAULT_MODEL_VALUE;
     claudePath = $draftClaudePath;
     codexPath = $draftCodexPath;
+    commitInstructions = $draftCommitInstructions;
+    prInstructions = $draftPrInstructions;
     lastDraftProvider = draftProviderValue;
     draftsHydrated = true;
     // Hydrate the terminal-font picker and fetch the installed families.
@@ -342,6 +348,10 @@
     draftModel.set(model);
     draftClaudePath.set(claude);
     draftCodexPath.set(codex);
+    // Draft Instructions are free-text guidance; persist them trimmed (a value
+    // that's only whitespace stores empty), and the request builder omits empties.
+    draftCommitInstructions.set(commitInstructions.trim());
+    draftPrInstructions.set(prInstructions.trim());
     draftSaved = true;
     void loadModels(draftProviderValue);
     setTimeout(() => (draftSaved = false), 1600);
@@ -669,6 +679,27 @@
             Leave paths empty to use the daemon default. Windows paths with spaces are supported:
             paste the normal path, for example
             <span class="mono">C:\Program Files\Claude\claude.exe</span>; do not wrap it in quotes.
+          </p>
+          <label class="field">
+            <span>Commit instructions</span>
+            <textarea
+              bind:value={commitInstructions}
+              rows="4"
+              placeholder="e.g. Use Conventional Commits; reference the Jira ticket in the body."
+            ></textarea>
+          </label>
+          <label class="field">
+            <span>PR instructions</span>
+            <textarea
+              bind:value={prInstructions}
+              rows="4"
+              placeholder="e.g. Write in past tense; include a Testing section."
+            ></textarea>
+          </label>
+          <p class="help">
+            Standing guidance appended to the built-in draft prompt — it never replaces the
+            prompt. Leave empty for none. The <span class="mono">stub</span> provider ignores
+            instructions.
           </p>
           <div class="row">
             <button class="btn primary" onclick={commitDraftSettings}>Save</button>

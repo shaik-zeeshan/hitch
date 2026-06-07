@@ -279,17 +279,18 @@
       if (project?.kind !== "git-backed") return false; // declined — no key consumed
       createWorktreeFor.set(project);
     },
-    // ---- git (slice 4) ----------------------------------------------------
-    // Cmd+Enter opens the commit dialog — the key the right-rail footer
+    // ---- git --------------------------------------------------------------
+    // Cmd+Enter opens the Composer (commit mode) — the key the right-rail footer
     // advertises. `git.commit` is a modifier combo, so `matchBinding` does NOT
     // pane-gate it (only bare keys are gated); we gate it HERE to the git pane so
     // it stays scoped to the Changes context the footer legend implies, rather
-    // than hijacking Cmd+Enter globally. While the commit dialog is open the
-    // dispatcher returns early (commitOpen is an overlay), so the dialog's own
-    // Cmd+Enter submit handler is the sole route there — no conflict. The bare
-    // git keys (↑/↓/Space/Enter/Backspace/R) are handled component-locally in
-    // RightRail (DOM focus is inside the pane); their keymap ids stay unwired
-    // here so the dispatcher lets them fall through to the rail.
+    // than hijacking Cmd+Enter globally. While the Composer is open the dispatcher
+    // returns early (commitOpen counts as an overlay in anyOverlayOpen), so the
+    // Composer's own Cmd/Ctrl+Enter handler is the sole route there — that key
+    // confirms the commit (or queues commit-on-arrival mid-generation), no
+    // conflict. The bare git keys (↑/↓/Space/Enter/Backspace/R) are handled
+    // component-locally in RightRail (DOM focus is inside the pane); their keymap
+    // ids stay unwired here so the dispatcher lets them fall through to the rail.
     "git.commit": () => {
       if (get(focusedPane) !== "git") return false; // declined — no key consumed
       commitOpen.set(true);

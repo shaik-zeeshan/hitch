@@ -90,3 +90,35 @@ describe("persistedNumber clamp-on-write", () => {
     );
   });
 });
+
+const COMMIT_INSTRUCTIONS_KEY = "hitch.draftCommitInstructions";
+const PR_INSTRUCTIONS_KEY = "hitch.draftPrInstructions";
+
+describe("Draft Instructions persistence", () => {
+  it("defaults both instruction settings to empty strings", async () => {
+    const { settings } = await loadSettings();
+
+    expect(get(settings.draftCommitInstructions)).toBe("");
+    expect(get(settings.draftPrInstructions)).toBe("");
+  });
+
+  it("round-trips a written value to localStorage", async () => {
+    const { storage, settings } = await loadSettings();
+
+    settings.draftCommitInstructions.set("Use Conventional Commits.");
+    settings.draftPrInstructions.set("Write in past tense.");
+
+    expect(storage.values.get(COMMIT_INSTRUCTIONS_KEY)).toBe("Use Conventional Commits.");
+    expect(storage.values.get(PR_INSTRUCTIONS_KEY)).toBe("Write in past tense.");
+  });
+
+  it("reads stored values back on init", async () => {
+    const { settings } = await loadSettings({
+      [COMMIT_INSTRUCTIONS_KEY]: "Reference the ticket.",
+      [PR_INSTRUCTIONS_KEY]: "Include a Testing section.",
+    });
+
+    expect(get(settings.draftCommitInstructions)).toBe("Reference the ticket.");
+    expect(get(settings.draftPrInstructions)).toBe("Include a Testing section.");
+  });
+});

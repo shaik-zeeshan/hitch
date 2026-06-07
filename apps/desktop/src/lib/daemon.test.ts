@@ -30,9 +30,16 @@ import {
   applyJobProgress,
   cancellableJobForSelectedWorktree,
   cancelJob,
+  cancelCompositeChain,
+  clearCompositeChain,
   closeDiff,
   commit,
   completeJob,
+  compositeChains,
+  compositeChainForSelectedWorktree,
+  refreshActiveJobs,
+  startCommitAndPush,
+  startCreatePr,
   connection,
   ALL_CHANGES_TAB,
   COMMIT_TAB_PREFIX,
@@ -66,6 +73,7 @@ import {
   error,
   fetchRemote,
   generateCommitDraft,
+  generatePullRequestDraft,
   gitStatus,
   initDaemon,
   isJobCancellable,
@@ -102,7 +110,9 @@ import {
   diffIgnoreWhitespace,
   draftClaudePath,
   draftCodexPath,
+  draftCommitInstructions,
   draftModel,
+  draftPrInstructions,
   draftProvider,
   railView,
 } from "./settings";
@@ -144,9 +154,13 @@ beforeEach(() => {
   draftModel.set("");
   draftClaudePath.set("");
   draftCodexPath.set("");
+  draftCommitInstructions.set("");
+  draftPrInstructions.set("");
+  selectedProjectId.set(null);
   diffIgnoreWhitespace.set(false);
   railView.set("changes");
   commitLog.set({ worktreeId: null, commits: [], hasMore: false, loading: false, prependedCount: 0, tick: 0 });
+  compositeChains.set({});
 });
 
 describe("daemon status mapping", () => {
@@ -952,6 +966,108 @@ describe("job store: StartJob -> JobCompleted", () => {
     await expect(promise).resolves.toEqual({ subject: "feat: generated", body: "- Generated" });
   });
 
+  it("includes non-empty commit Draft Instructions in the commit-draft request", async () => {
+    draftProvider.set("claude");
+    draftCommitInstructions.set("Use Conventional Commits.");
+    // PR instructions are set too, but the commit request must NOT carry them.
+    draftPrInstructions.set("Write in past tense.");
+    invokeMock.mockResolvedValueOnce({ type: "job-started", job_id: "j-ci" });
+
+    const promise = generateCommitDraft("w-ci");
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "generate-commit-draft",
+          worktree_id: "w-ci",
+          settings: {
+            provider: "claude",
+            model: null,
+            claude_path: null,
+            codex_path: null,
+            commit_instructions: "Use Conventional Commits.",
+          },
+        },
+      },
+    });
+
+    completeJob("j-ci", { type: "commit-draft", draft: { subject: "x", body: "" } });
+    await promise;
+  });
+
+  it("omits whitespace-only commit Draft Instructions from the commit-draft request", async () => {
+    draftProvider.set("claude");
+    draftCommitInstructions.set("   \n  ");
+    invokeMock.mockResolvedValueOnce({ type: "job-started", job_id: "j-cw" });
+
+    const promise = generateCommitDraft("w-cw");
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "generate-commit-draft",
+          worktree_id: "w-cw",
+          settings: {
+            provider: "claude",
+            model: null,
+            claude_path: null,
+            codex_path: null,
+          },
+        },
+      },
+    });
+
+    completeJob("j-cw", { type: "commit-draft", draft: { subject: "x", body: "" } });
+    await promise;
+  });
+
+  it("includes non-empty PR Draft Instructions (trimmed) in the pull-request-draft request", async () => {
+    draftProvider.set("claude");
+    draftPrInstructions.set("  Include a Testing section.  ");
+    // Commit instructions are set too, but the PR request must NOT carry them.
+    draftCommitInstructions.set("Use Conventional Commits.");
+    projects.set([
+      { id: "p-pr", name: "p", root: "/p", kind: "git-backed" },
+    ]);
+    worktrees.set([
+      { id: "w-pr", project_id: "p-pr", path: "/p", branch: "feat", is_main: false, is_hitch_managed: true },
+    ]);
+    selectedProjectId.set("p-pr");
+    selectedWorktreeId.set("w-pr");
+    invokeMock.mockResolvedValueOnce({ type: "job-started", job_id: "j-pr-draft" });
+
+    const promise = generatePullRequestDraft(null);
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "generate-pull-request-draft",
+          worktree_id: "w-pr",
+          base: null,
+          settings: {
+            provider: "claude",
+            model: null,
+            claude_path: null,
+            codex_path: null,
+            pr_instructions: "Include a Testing section.",
+          },
+        },
+      },
+    });
+
+    completeJob("j-pr-draft", {
+      type: "pull-request-draft",
+      draft: { title: "t", body: "b" },
+    });
+    await promise;
+  });
+
   it("rebuilds a replayed running job so its later completion is applied", () => {
     applyJobProgress("j-reattach", "running", "Pushing…", "push");
 
@@ -1244,6 +1360,215 @@ describe("job store: StartJob -> JobCompleted", () => {
   });
 
 });
+
+describe("composite chains (commit-and-push / create-pr)", () => {
+  function selectWorktree(worktreeId: string) {
+    projects.set([{ id: "p", name: "p", root: "/p", kind: "git-backed" } as any]);
+    worktrees.set([
+      { id: worktreeId, project_id: "p", path: "/p", branch: "feat", is_main: false, is_hitch_managed: true } as any,
+    ]);
+    selectedProjectId.set("p");
+    selectedWorktreeId.set(worktreeId);
+  }
+
+  it("starts commit-and-push routing the COMMIT draft instructions and resolves with the result", async () => {
+    draftProvider.set("claude");
+    draftCommitInstructions.set("  Use Conventional Commits.  ");
+    draftPrInstructions.set("Should not appear on a commit-and-push request.");
+    invokeMock.mockResolvedValue({ type: "job-started", job_id: "j-cap" });
+
+    const promise = startCommitAndPush("w-cap");
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "commit-and-push",
+          worktree_id: "w-cap",
+          settings: {
+            provider: "claude",
+            model: null,
+            claude_path: null,
+            codex_path: null,
+            commit_instructions: "Use Conventional Commits.",
+          },
+        },
+      },
+    });
+    // Optimistic display so the button morphs before the first progress event.
+    expect(get(compositeChains)["w-cap"]).toMatchObject({
+      kind: "commit-and-push",
+      step: "staging",
+      failed: null,
+    });
+
+    completeJob("j-cap", {
+      type: "commit-and-pushed",
+      result: { subject: "feat: x", short_sha: "3f2c1a9", pushed_commits: 1, file_count: 4 },
+    });
+    await expect(promise).resolves.toMatchObject({
+      subject: "feat: x",
+      short_sha: "3f2c1a9",
+      pushed_commits: 1,
+      file_count: 4,
+    });
+    // Success clears the in-flight display (the toast carries the info).
+    expect(get(compositeChains)["w-cap"]).toBeUndefined();
+  });
+
+  it("starts create-pr routing the PR draft instructions and resolves with the url", async () => {
+    draftProvider.set("claude");
+    draftPrInstructions.set("Include a Testing section.");
+    invokeMock.mockResolvedValue({ type: "job-started", job_id: "j-cpr" });
+
+    const promise = startCreatePr("main", "w-cpr");
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: {
+        type: "start-job",
+        request: {
+          type: "create-pr",
+          worktree_id: "w-cpr",
+          base: "main",
+          settings: {
+            provider: "claude",
+            model: null,
+            claude_path: null,
+            codex_path: null,
+            pr_instructions: "Include a Testing section.",
+          },
+        },
+      },
+    });
+    expect(get(compositeChains)["w-cpr"]).toMatchObject({ kind: "create-pr", step: "pushing" });
+
+    completeJob("j-cpr", { type: "pull-request-created", url: "https://x/pull/9" });
+    await expect(promise).resolves.toBe("https://x/pull/9");
+    expect(get(compositeChains)["w-cpr"]).toBeUndefined();
+  });
+
+  it("advances the chain display from composite-job-progress 'started' events", () => {
+    applyHitchEvent({
+      type: "composite-job-progress",
+      job_id: "j-prog",
+      worktree_id: "w-prog",
+      kind: "commit-and-push",
+      step: "drafting",
+      phase: "started",
+    } as any);
+    expect(get(compositeChains)["w-prog"]).toMatchObject({
+      jobId: "j-prog",
+      kind: "commit-and-push",
+      step: "drafting",
+      failed: null,
+    });
+
+    // A 'finished' phase is ignored for display (the next step's 'started' advances).
+    applyHitchEvent({
+      type: "composite-job-progress",
+      job_id: "j-prog",
+      worktree_id: "w-prog",
+      kind: "commit-and-push",
+      step: "drafting",
+      phase: "finished",
+    } as any);
+    expect(get(compositeChains)["w-prog"].step).toBe("drafting");
+
+    applyHitchEvent({
+      type: "composite-job-progress",
+      job_id: "j-prog",
+      worktree_id: "w-prog",
+      kind: "commit-and-push",
+      step: "pushing",
+      phase: "started",
+    } as any);
+    expect(get(compositeChains)["w-prog"].step).toBe("pushing");
+  });
+
+  it("parks the oxide failure state on a composite-job-failed completion", async () => {
+    invokeMock.mockResolvedValue({ type: "job-started", job_id: "j-fail" });
+    const promise = startCommitAndPush("w-fail");
+    await flush();
+
+    completeJob("j-fail", {
+      type: "composite-job-failed",
+      kind: "commit-and-push",
+      failed_step: "pushing",
+      reason: "remote rejected: updates were rejected — fetch first",
+      result: { commit: { subject: "feat: x", short_sha: "abc1234", pushed_commits: 0, file_count: 2 } },
+    });
+    await expect(promise).rejects.toThrow(/remote rejected/);
+
+    expect(get(compositeChains)["w-fail"]).toMatchObject({
+      kind: "commit-and-push",
+      step: "pushing",
+      failed: { step: "pushing", reason: "remote rejected: updates were rejected — fetch first" },
+    });
+  });
+
+  it("restores an in-flight chain from the active-jobs query and exposes it for the selected worktree", async () => {
+    selectWorktree("w-active");
+    invokeMock.mockResolvedValueOnce({
+      type: "active-jobs",
+      jobs: [
+        { job_id: "j-active", worktree_id: "w-active", kind: "create-pr", step: "drafting" },
+      ],
+    });
+
+    const restored = await refreshActiveJobs("w-active");
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: { type: "active-jobs", worktree_id: "w-active" },
+    });
+    expect(restored).toMatchObject({ jobId: "j-active", kind: "create-pr", step: "drafting" });
+    expect(get(compositeChainForSelectedWorktree)).toMatchObject({
+      kind: "create-pr",
+      step: "drafting",
+    });
+  });
+
+  it("clears a stale in-flight display when active-jobs reports none (but keeps a parked failure)", async () => {
+    compositeChains.set({
+      "w-stale": { jobId: "j-old", kind: "commit-and-push", step: "pushing", failed: null },
+      "w-kept": {
+        jobId: null,
+        kind: "commit-and-push",
+        step: "pushing",
+        failed: { step: "pushing", reason: "boom" },
+      },
+    });
+    invokeMock.mockResolvedValue({ type: "active-jobs", jobs: [] });
+
+    await refreshActiveJobs("w-stale");
+    expect(get(compositeChains)["w-stale"]).toBeUndefined();
+
+    await refreshActiveJobs("w-kept");
+    expect(get(compositeChains)["w-kept"]).toMatchObject({ failed: { step: "pushing" } });
+  });
+
+  it("cancels the in-flight chain by its job id and clears the display", async () => {
+    compositeChains.set({
+      "w-cancel": { jobId: "j-cancel", kind: "commit-and-push", step: "drafting", failed: null },
+    });
+    invokeMock.mockResolvedValue({ type: "ack" });
+
+    await cancelCompositeChain("w-cancel");
+    expect(invokeMock).toHaveBeenCalledWith("hitch_request", {
+      request: { type: "cancel-job", job_id: "j-cancel" },
+    });
+    expect(get(compositeChains)["w-cancel"]).toBeUndefined();
+  });
+
+  it("clears a chain display on demand (success ack / dismissed failure)", () => {
+    compositeChains.set({
+      "w-clear": { jobId: null, kind: "create-pr", step: "creating-pr", failed: null },
+    });
+    clearCompositeChain("w-clear");
+    expect(get(compositeChains)["w-clear"]).toBeUndefined();
+  });
+});
+
 describe("Windows project paths", () => {
   const projectRoot = String.raw`C:\Users\Ada Lovelace\Repo With Spaces`;
   const filePath = String.raw`src\folder with spaces\file name.ts`;

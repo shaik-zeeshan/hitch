@@ -8,6 +8,8 @@ const DRAFT_PROVIDER_KEY = "hitch.draftProvider";
 const DRAFT_MODEL_KEY = "hitch.draftModel";
 const DRAFT_CLAUDE_PATH_KEY = "hitch.draftClaudePath";
 const DRAFT_CODEX_PATH_KEY = "hitch.draftCodexPath";
+const DRAFT_COMMIT_INSTRUCTIONS_KEY = "hitch.draftCommitInstructions";
+const DRAFT_PR_INSTRUCTIONS_KEY = "hitch.draftPrInstructions";
 const AUTO_COMMIT_PUSH_KEY = "hitch.autoCommitPush";
 const DIFF_STYLE_KEY = "hitch.diffStyle";
 const DIFF_WRAP_KEY = "hitch.diffWrap";
@@ -167,6 +169,16 @@ export const draftProvider = persistedDraftProvider();
 export const draftModel = persisted(DRAFT_MODEL_KEY, DEFAULT_DRAFT_MODEL);
 export const draftClaudePath = persisted(DRAFT_CLAUDE_PATH_KEY, "");
 export const draftCodexPath = persisted(DRAFT_CODEX_PATH_KEY, "");
+
+// Draft Instructions (CONTEXT.md): app-global standing guidance appended into
+// the built-in draft prompts as an extra block — one for commit messages, one
+// for PR descriptions. They never replace the prompt or its JSON output
+// contract (ADR 0007 amendment 2026-06-07), and the stub provider ignores them.
+// Default empty = no instructions; draft requests omit the field when the
+// trimmed value is empty (see daemon.ts).
+export const draftCommitInstructions = persisted(DRAFT_COMMIT_INSTRUCTIONS_KEY, "");
+export const draftPrInstructions = persisted(DRAFT_PR_INSTRUCTIONS_KEY, "");
+
 export const autoCommitPush = persistedBool(AUTO_COMMIT_PUSH_KEY, false);
 
 // Diff view preferences. The render-side pair (`diffStyle`, `diffWrap`) only

@@ -18,9 +18,15 @@ import {
   parentKey,
   sessionBelongsTo,
   type ActRollup,
+  type ActiveJobInfo,
   type AgentState,
   type BranchSummary,
   type ChangedFile,
+  type CommitAndPushResult,
+  type CompositeJobKind,
+  type CompositeJobResult,
+  type CompositeStep,
+  type StepPhase,
   type CommitDiffRequest,
   type CommitDraft,
   type CommitFileDiff,
@@ -56,7 +62,9 @@ import {
   diffIgnoreWhitespace,
   draftClaudePath,
   draftCodexPath,
+  draftCommitInstructions,
   draftModel,
+  draftPrInstructions,
   draftProvider,
   railView,
   terminalFontFamily,
@@ -971,6 +979,7 @@ const cancellableJobKinds = new Set([
   "fetch",
   "pull",
   "create-pr",
+  "commit-and-push",
   "draft-models",
   "commit-draft",
   "pr-draft",
@@ -1088,6 +1097,21 @@ export function applyJobProgress(
 
 // Resolve a Job from its `JobCompleted` event: the wrapped response rides inside.
 export function completeJob(jobId: Id, response: Response): void {
+  // Resolve a composite chain's per-worktree DISPLAY state FIRST (before the job
+  // is dropped from the store below, so the worktree lookup still works): clear
+  // on success, park the oxide failure on a mid-chain failure. The worktree id
+  // rides the live Jobs store entry or the chain display whose jobId matches.
+  if (
+    response.type === "composite-job-failed" ||
+    response.type === "commit-and-pushed" ||
+    response.type === "pull-request-created"
+  ) {
+    const worktreeId =
+      get(jobs)[jobId]?.worktreeId ??
+      Object.entries(get(compositeChains)).find(([, c]) => c.jobId === jobId)?.[0] ??
+      null;
+    if (worktreeId) applyCompositeCompletion(worktreeId, response);
+  }
   const pending = jobPending.get(jobId);
   const local = locallyStartedJobs.has(jobId);
   jobPending.delete(jobId);
@@ -1123,6 +1147,9 @@ function failAllJobs(reason: string): void {
   earlyCompletions.clear();
   locallyStartedJobs.clear();
   jobs.set({});
+  // Composite chains are ephemeral too: a daemon drop strands every in-flight
+  // chain display. (A re-attach re-queries `active-jobs` to restore the truth.)
+  compositeChains.set({});
 }
 
 // Ask the daemon to cancel a running Job (signals its worker to kill any child).
@@ -1132,6 +1159,249 @@ export async function cancelJob(jobId: Id): Promise<void> {
   } catch (err) {
     error.set(toMessage(err));
   }
+}
+
+// ---- composite chains (ADR 0013 amendment 2026-06-07) ---------------------
+//
+// The two autonomous chains — auto commit & push and PR create — run as ONE
+// daemon-owned Job each. Their per-step progress is broadcast as
+// `composite-job-progress` events and their result rides the normal
+// `job-completed` envelope. The chain is daemon-owned, so its *display* state
+// must NOT live in a component (which unmounts on navigation): it lives here, in
+// a per-worktree store, fed by the progress events AND seeded by the
+// `active-jobs` query a (re)attaching GUI runs. RightRail's auto-mode header
+// morph and the Composer's PR progress both read this one store, so leaving and
+// returning mid-chain restores the exact in-flight step.
+
+// The live state of one worktree's in-flight chain (at most one per worktree —
+// the daemon serializes mutating git ops per worktree). `step` is the current
+// rung; `failed` carries the terminal failure for the oxide retry state.
+export type CompositeChainState = {
+  jobId: Id | null;
+  kind: CompositeJobKind;
+  step: CompositeStep;
+  // A terminal failure: the chain stopped on `failed.step` with `failed.reason`.
+  // The button shows the oxide `✗ <step> failed — retry` state until retried or
+  // dismissed; `step` stays the failed rung for the label.
+  failed: { step: CompositeStep; reason: string } | null;
+};
+// Per worktree id. Absent = no chain in flight (and no unacknowledged failure).
+export const compositeChains = writable<Record<Id, CompositeChainState>>({});
+
+// The chain for the currently-selected worktree (what RightRail / Composer read).
+export const compositeChainForSelectedWorktree = derived(
+  [compositeChains, gitWorktreeId],
+  ([$chains, $worktreeId]) => ($worktreeId ? ($chains[$worktreeId] ?? null) : null),
+);
+
+function setCompositeChain(worktreeId: Id, state: CompositeChainState): void {
+  compositeChains.update((current) => ({ ...current, [worktreeId]: state }));
+}
+
+// Clear a worktree's chain display (success ack, dismissed failure, or a fresh
+// retry replacing the old failed state).
+export function clearCompositeChain(worktreeId: Id): void {
+  compositeChains.update((current) => omitKey(current, worktreeId));
+}
+
+// Apply a `composite-job-progress` event: a step `started` becomes the current
+// rung; we ignore `finished` for display (the next step's `started` advances the
+// label, and the terminal step's result clears the chain on completion). A live
+// progress event also clears any stale failure for that worktree.
+export function applyCompositeJobProgress(
+  jobId: Id,
+  worktreeId: Id,
+  kind: CompositeJobKind,
+  step: CompositeStep,
+  phase: StepPhase,
+): void {
+  if (phase !== "started") return;
+  setCompositeChain(worktreeId, { jobId, kind, step, failed: null });
+}
+
+// Resolve a chain on its `job-completed`. Success clears the chain display
+// (RightRail flashes its calm "committed"/PR state via the completion handlers,
+// then the chip/diffstat refresh takes over); a `composite-job-failed` parks the
+// oxide retry state on the worktree.
+function applyCompositeCompletion(worktreeId: Id, response: Response): void {
+  if (response.type === "composite-job-failed") {
+    const failedStep = response.failed_step as CompositeStep;
+    const reason = (response.reason as string | null) ?? "Chain failed.";
+    const kind = response.kind as CompositeJobKind;
+    setCompositeChain(worktreeId, {
+      jobId: null,
+      kind,
+      step: failedStep,
+      failed: { step: failedStep, reason },
+    });
+    return;
+  }
+  // Success (commit-and-pushed / pull-request-created) — drop the in-flight
+  // display; the calling start fn handles the auto-mode toast / status refresh.
+  clearCompositeChain(worktreeId);
+  // PR chain finale: OPEN the created draft PR in the browser. The daemon never
+  // opens it (ADR 0013 amendment) — the GUI does, here, only because this handler
+  // only runs while attached. Centralized here (not in the confirm path) so a
+  // chain RESTORED after navigating away also opens on completion, and a single
+  // open guard prevents a double-open. If no GUI is attached when it completes,
+  // nothing opens and the rail's PR chip reflects it on next attach.
+  if (response.type === "pull-request-created" && typeof response.url === "string") {
+    openCreatedPrUrl(worktreeId, response.url);
+  }
+}
+
+// PR urls already opened, so a duplicate completion (or a confirm path that also
+// tried) can't open the browser twice for the same chain.
+const openedPrUrls = new Set<string>();
+function openCreatedPrUrl(worktreeId: Id, url: string): void {
+  if (openedPrUrls.has(url)) return;
+  openedPrUrls.add(url);
+  void (async () => {
+    try {
+      const { openUrl } = await import("@tauri-apps/plugin-opener");
+      await openUrl(url);
+    } catch {
+      // Best-effort: the rail's PR chip still links to the created PR.
+    }
+  })();
+}
+
+// Start the auto commit-and-push chain for a worktree. Resolves with the
+// `CommitAndPushResult` (subject · short sha · pushed · files) for the toast.
+// Routes the COMMIT draft instructions per slice 5. A failure rejects with the
+// chain's failed-step reason (the oxide retry state is already parked by the
+// completion handler).
+export async function startCommitAndPush(
+  worktreeId: Id | null = get(gitWorktreeId),
+): Promise<CommitAndPushResult> {
+  if (!worktreeId) throw new Error("Select a git worktree first.");
+  // Optimistically show the first step so the button morphs immediately, even
+  // before the daemon's first progress event lands.
+  setCompositeChain(worktreeId, {
+    jobId: null,
+    kind: "commit-and-push",
+    step: "staging",
+    failed: null,
+  });
+  const response = await runJob<Response & { result?: CommitAndPushResult }>(
+    {
+      type: "commit-and-push",
+      worktree_id: worktreeId,
+      settings: draftGenerationSettings({ commit: get(draftCommitInstructions) }),
+    },
+    "commit-and-push",
+  );
+  // A mid-chain failure rides the normal `job-completed` envelope as a
+  // `composite-job-failed` response (not an `error`), so runJob RESOLVES it. The
+  // oxide retry state is already parked by the completion handler; surface the
+  // reason to the caller so the toast goes error.
+  throwIfCompositeFailed(response);
+  // Refresh status + PR chip so the rail reflects the pushed commit.
+  void loadGitStatus(worktreeId).catch(() => {});
+  void loadPrStatus(worktreeId);
+  if (!response.result) throw new Error("Commit-and-push completed without a result.");
+  return response.result;
+}
+
+// Throw the chain's failed-step reason when a composite Job resolved as a
+// `composite-job-failed` (runJob resolves it — only `type: "error"` rejects).
+function throwIfCompositeFailed(response: Response): void {
+  if (response.type === "composite-job-failed") {
+    const step = response.failed_step as string;
+    const reason = (response.reason as string | null) ?? "Chain failed.";
+    throw new Error(`${step} failed — ${reason}`);
+  }
+}
+
+// Start the autonomous PR chain for a worktree (push → draft → create GitHub
+// DRAFT PR). Resolves with the created PR url so the GUI can open the browser —
+// only the daemon never opens it. Routes the PR draft instructions per slice 5.
+export async function startCreatePr(
+  base: string | null,
+  worktreeId: Id | null = get(gitWorktreeId),
+): Promise<string> {
+  if (!worktreeId) throw new Error("Select a git worktree first.");
+  setCompositeChain(worktreeId, {
+    jobId: null,
+    kind: "create-pr",
+    step: "pushing",
+    failed: null,
+  });
+  const response = await runJob<Response & { url?: string }>(
+    {
+      type: "create-pr",
+      worktree_id: worktreeId,
+      base: base?.trim() || null,
+      settings: draftGenerationSettings({ pr: get(draftPrInstructions) }),
+    },
+    "create-pr",
+  );
+  throwIfCompositeFailed(response);
+  void loadGitStatus(worktreeId).catch(() => {});
+  void loadPrStatus(worktreeId);
+  if (!response.url) throw new Error("Create-PR completed without a url.");
+  return response.url;
+}
+
+// Query a worktree's in-flight composite chains and seed the display store, so a
+// (re)attaching GUI restores the exact button/Composer step. Returns the
+// restored entry (or null) for callers that want to also keep following events.
+// Only composite chains are reported; an empty reply clears any stale display
+// that is not a parked failure (a failure is local terminal state, not in-flight,
+// so it must survive a refresh).
+export async function refreshActiveJobs(
+  worktreeId: Id | null = get(gitWorktreeId),
+): Promise<CompositeChainState | null> {
+  if (!worktreeId) return null;
+  let response: Response & { jobs: ActiveJobInfo[] };
+  try {
+    response = await daemonRequest<Response & { jobs: ActiveJobInfo[] }>({
+      type: "active-jobs",
+      worktree_id: worktreeId,
+    });
+  } catch {
+    return null;
+  }
+  const active = response.jobs.find((j) => j.worktree_id === worktreeId) ?? response.jobs[0];
+  if (active) {
+    const state: CompositeChainState = {
+      jobId: active.job_id,
+      kind: active.kind,
+      step: active.step,
+      failed: null,
+    };
+    setCompositeChain(worktreeId, state);
+    return state;
+  }
+  // No chain running. Drop any in-flight display we hold UNLESS it is a parked
+  // failure (terminal local state the daemon doesn't track).
+  const held = get(compositeChains)[worktreeId];
+  if (held && !held.failed) clearCompositeChain(worktreeId);
+  return null;
+}
+
+// Cancel a worktree's in-flight composite chain (the × in the morphed header).
+// Resolves the Job id from the chain display, falling back to the live Jobs
+// store for the window before the first progress event sets the chain's jobId.
+export async function cancelCompositeChain(
+  worktreeId: Id | null = get(gitWorktreeId),
+): Promise<void> {
+  if (!worktreeId) return;
+  const chain = get(compositeChains)[worktreeId];
+  const jobId =
+    chain?.jobId ??
+    Object.values(get(jobs)).find(
+      (job) =>
+        job.worktreeId === worktreeId &&
+        (job.kind === "commit-and-push" || job.kind === "create-pr"),
+    )?.id ??
+    null;
+  if (jobId) await cancelJob(jobId);
+  // The daemon's cancellation maps to a Cancelled job status → job-completed
+  // with an error/cancelled response, which clears the chain display via the
+  // completion handler. Clear the optimistic display now so the button settles
+  // immediately even if the cancel raced the first progress event.
+  clearCompositeChain(worktreeId);
 }
 
 function upsert<T extends { id: Id }>(items: T[], item: T): T[] {
@@ -1182,6 +1452,7 @@ function removeWorktreeLocal(worktreeId: Id): void {
   worktrees.update((items) => items.filter((worktree) => worktree.id !== worktreeId));
   dirtyWorktrees.update((current) => omitKey(current, worktreeId));
   worktreeLineStats.update((current) => omitKey(current, worktreeId));
+  compositeChains.update((current) => omitKey(current, worktreeId));
   prByWorktree.update((current) => omitKey(current, worktreeId));
   prByWorktreeApplied.delete(worktreeId);
   prByWorktreeStarted.delete(worktreeId);
@@ -1557,7 +1828,18 @@ export function applyHitchEvent(event: HitchEvent): void {
       (event.kind as string | null) ?? null,
     );
   }
+  if (event.type === "composite-job-progress") {
+    applyCompositeJobProgress(
+      event.job_id as Id,
+      event.worktree_id as Id,
+      event.kind as CompositeJobKind,
+      event.step as CompositeStep,
+      event.phase as StepPhase,
+    );
+  }
   if (event.type === "job-completed") {
+    // `completeJob` also resolves the composite chain's per-worktree display
+    // state (clear on success, park the oxide failure on a mid-chain failure).
     completeJob(event.job_id as Id, event.response as Response);
   }
   if (event.type === "session-opened") {
@@ -1691,6 +1973,10 @@ export async function initDaemon(): Promise<void> {
     unlisteners.push(
       await listen("hitch-reconnected", () => {
         void refreshAll().catch((err) => error.set(toMessage(err)));
+        // A reconnect mid-chain must restore the selected worktree's in-flight
+        // composite chain display from the daemon's active Jobs (chains are
+        // ephemeral across a daemon RESTART, but survive a transient socket drop).
+        void refreshActiveJobs();
       }),
     );
 
@@ -1761,6 +2047,7 @@ export function disposeDaemon(): void {
   commitDiffInFlight.clear();
   commitLog.set(EMPTY_COMMIT_LOG);
   commitLogHeadId = null;
+  compositeChains.set({});
   booted = false;
 }
 
@@ -2716,7 +3003,7 @@ export async function setFilesStaged(
       gitStatus.set(before);
     }
     void loadGitStatus(worktreeId).catch((refreshErr) => error.set(toMessage(refreshErr)));
-    // Rethrow so awaiting callers (e.g. CommitDialog's stage-all-and-generate)
+    // Rethrow so awaiting callers (e.g. the Composer's auto-stage-then-generate)
     // can stop their flow instead of proceeding on a failed stage. The error
     // store + optimistic rollback above still surface the failure on their own,
     // so fire-and-forget callers must `.catch()` (see RightRail).
@@ -2818,7 +3105,7 @@ export async function generateCommitDraft(
     {
       type: "generate-commit-draft",
       worktree_id: worktreeId,
-      settings: draftGenerationSettings(),
+      settings: draftGenerationSettings({ commit: get(draftCommitInstructions) }),
     },
     "commit-draft",
   );
@@ -2833,7 +3120,7 @@ export async function generatePullRequestDraft(base: string | null): Promise<Pul
       type: "generate-pull-request-draft",
       worktree_id: worktreeId,
       base: base?.trim() || null,
-      settings: draftGenerationSettings(),
+      settings: draftGenerationSettings({ pr: get(draftPrInstructions) }),
     },
     "pr-draft",
   );
@@ -2848,27 +3135,48 @@ function draftDiscoverySettings(
   return draftSettingsForProvider(provider, null, paths);
 }
 
-function draftGenerationSettings(): DraftGenerationSettings | null {
+// Draft Instructions to fold into a generation request. Only one kind applies
+// per request (commit drafts carry the commit guidance; PR drafts the PR
+// guidance), so callers pass the relevant raw value; empties are omitted below.
+type DraftInstructions = { commit?: string; pr?: string };
+
+function draftGenerationSettings(
+  instructions: DraftInstructions = {},
+): DraftGenerationSettings | null {
   const provider = get(draftProvider);
   // No explicit desktop choice → omit settings so the daemon keeps its own
   // configured provider/model/path defaults instead of being forced to "stub".
   if (!provider) return null;
-  return draftSettingsForProvider(provider, get(draftModel).trim() || null);
+  return draftSettingsForProvider(
+    provider,
+    get(draftModel).trim() || null,
+    {},
+    instructions,
+  );
 }
 
 function draftSettingsForProvider(
   provider: DraftProvider,
   model: string | null,
   paths: { claudePath?: string; codexPath?: string } = {},
+  instructions: DraftInstructions = {},
 ): DraftGenerationSettings {
   const claudePath = (paths.claudePath ?? get(draftClaudePath)).trim() || null;
   const codexPath = (paths.codexPath ?? get(draftCodexPath)).trim() || null;
-  return {
+  const settings: DraftGenerationSettings = {
     provider,
     model,
     claude_path: claudePath,
     codex_path: codexPath,
   };
+  // Omit instruction fields entirely when blank/whitespace. The daemon treats
+  // whitespace as absent too, but keeping empties off the wire keeps the request
+  // shape identical to the no-instructions case (and to older callers).
+  const commit = instructions.commit?.trim();
+  if (commit) settings.commit_instructions = commit;
+  const pr = instructions.pr?.trim();
+  if (pr) settings.pr_instructions = pr;
+  return settings;
 }
 
 export async function push(worktreeId: Id | null = get(gitWorktreeId)): Promise<void> {
@@ -3147,6 +3455,10 @@ gitWorktreeId.subscribe(($id) => {
   if ($id) {
     void loadGitStatus($id).catch((err) => error.set(toMessage(err)));
     void loadPrStatus($id);
+    // Restore any daemon-owned composite chain in flight for this worktree, so
+    // switching INTO a worktree mid-chain shows the exact step (and keeps
+    // following its events). The query is a fast in-memory read.
+    void refreshActiveJobs($id);
     startGitStatusPolling($id);
     if (get(railView) === "history") void loadCommitLog();
   }
