@@ -28,3 +28,11 @@ export function sessionTabTitle(
   if (agent) return AGENT_DISPLAY[agent].title;
   return command ?? sessionName;
 }
+
+// Human-readable agent name for prose (e.g. notification titles "Claude Code
+// finished"). Reuses the same announced-identity → title map as the Session
+// mark so the two never drift; falls back to a generic "Agent" when no known
+// agent is announced (the notification still fires, just without a name).
+export function agentDisplayName(agent: KnownAgent | null | undefined): string {
+  return agent ? AGENT_DISPLAY[agent].title : "Agent";
+}

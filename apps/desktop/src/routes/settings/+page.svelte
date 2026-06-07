@@ -23,9 +23,14 @@
     draftModel,
     draftProvider,
     editorApp,
+    notificationMinTurnSeconds,
+    notificationMode,
+    NOTIFICATION_MIN_TURN_SECONDS_MAX,
+    NOTIFICATION_MIN_TURN_SECONDS_MIN,
     SYSTEM_DEFAULT_EDITOR,
     terminalFontFamily,
     type DraftProvider,
+    type NotificationMode,
   } from "$lib/settings";
   import {
     HITCH_THEME_ID,
@@ -34,7 +39,14 @@
     terminalThemeLight,
   } from "$lib/terminal-themes";
 
-  type Section = "editor" | "themes" | "drafts" | "git" | "keybindings" | "about";
+  type Section =
+    | "editor"
+    | "themes"
+    | "drafts"
+    | "git"
+    | "notifications"
+    | "keybindings"
+    | "about";
 
   // Split the curated palettes by app mode. Each group is the 10 themes for that
   // mode plus the built-in "Hitch (default)" sentinel, which renders from the
@@ -57,6 +69,15 @@
   // Same bits-ui empty-value constraint as the editor select: the stored ""
   // (built-in stack) rides behind a local placeholder value.
   const DEFAULT_TERM_FONT_VALUE = "__hitch_default_term_font__";
+  // Notification suppression tiers (notifications.ts). Labels match the store's
+  // three NotificationMode values; the default ("background-or-other-session")
+  // also pings for sessions you aren't currently viewing — called out in the
+  // panel caption so the broad default doesn't surprise.
+  const notificationModeOptions: Array<{ value: NotificationMode; label: string }> = [
+    { value: "off", label: "Off" },
+    { value: "app-in-background", label: "When app is in background" },
+    { value: "background-or-other-session", label: "Background or other session" },
+  ];
   const providerOptions: Array<{ value: DraftProvider; label: string }> = [
     { value: "stub", label: "Stub (deterministic)" },
     { value: "claude", label: "Claude" },
@@ -163,6 +184,12 @@
   // that's no longer installed (or while the list is loading) is prepended so
   // the select always shows what's actually saved — same shape as
   // selectableModels above.
+  // Notifications mode select. The store always holds a valid (non-empty)
+  // NotificationMode, so unlike the editor/font selects it needs no bits-ui
+  // placeholder sentinel — the local mirror hydrates from the store on mount
+  // and onValueChange writes straight back.
+  let selectedNotificationMode = $state<NotificationMode>($notificationMode);
+
   let selectedTermFont = $state(DEFAULT_TERM_FONT_VALUE);
   let fontOptions = $state<string[]>([]);
   let fontsLoading = $state(true);
@@ -357,6 +384,13 @@
       </button>
       <button class="nav-row" class:active={section === "git"} onclick={() => (section = "git")}>
         Git
+      </button>
+      <button
+        class="nav-row"
+        class:active={section === "notifications"}
+        onclick={() => (section = "notifications")}
+      >
+        Notifications
       </button>
       <button
         class="nav-row"
@@ -667,6 +701,59 @@
               {/snippet}
             </Toggle.Root>
           </div>
+        </section>
+      {:else if section === "notifications"}
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Notifications</h2>
+            <p class="help">
+              Native desktop notifications when an agent turn finishes. The default also pings for
+              sessions you're <b>not</b> currently viewing, so a background run still surfaces; pick
+              <b>When app is in background</b> to stay quiet while Hitch is focused, or <b>Off</b> to
+              silence them entirely.
+            </p>
+          </div>
+          <div class="field">
+            <span>When to notify</span>
+            <Select.Root
+              type="single"
+              bind:value={selectedNotificationMode}
+              onValueChange={(v) => notificationMode.set(v as NotificationMode)}
+            >
+              <Select.Trigger class="select-trigger base" aria-label="When to notify">
+                <Select.Value placeholder="Choose when to notify" />
+                <span class="select-chev" aria-hidden="true">⌄</span>
+              </Select.Trigger>
+              <Select.Portal>
+                <Select.Content class="select-content" sideOffset={6}>
+                  <Select.Viewport>
+                    {#each notificationModeOptions as option}
+                      <Select.Item class="select-item" value={option.value} label={option.label}>
+                        {option.label}
+                      </Select.Item>
+                    {/each}
+                  </Select.Viewport>
+                </Select.Content>
+              </Select.Portal>
+            </Select.Root>
+          </div>
+          <label class="field">
+            <span>Minimum turn duration (seconds)</span>
+            <input
+              class="base"
+              type="number"
+              min={NOTIFICATION_MIN_TURN_SECONDS_MIN}
+              max={NOTIFICATION_MIN_TURN_SECONDS_MAX}
+              step="1"
+              bind:value={$notificationMinTurnSeconds}
+              autocomplete="off"
+            />
+          </label>
+          <p class="help">
+            A <b>finished</b> notification only fires for agent turns that ran at least this long, so
+            a quick one-line answer doesn't ping you. Set it to <span class="mono">0</span> to notify
+            on every turn end.
+          </p>
         </section>
       {:else if section === "keybindings"}
         <section class="panel">

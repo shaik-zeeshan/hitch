@@ -14,6 +14,8 @@ const DIFF_WRAP_KEY = "hitch.diffWrap";
 const DIFF_IGNORE_WHITESPACE_KEY = "hitch.diffIgnoreWhitespace";
 const DIFF_CONTEXT_LINES_KEY = "hitch.diffContextLines";
 const TERM_FONT_FAMILY_KEY = "hitch.termFontFamily";
+const NOTIFICATION_MODE_KEY = "hitch.notificationMode";
+const NOTIFICATION_MIN_TURN_SECONDS_KEY = "hitch.notificationMinTurnSeconds";
 
 // Editor preference passed to the desktop backend. Empty string is the
 // default and means "System default": the backend resolves $VISUAL/$EDITOR at
@@ -206,3 +208,40 @@ export function terminalFontStack(family: string): string {
   const custom = family.trim().replace(/["']/g, "");
   return custom ? `"${custom}", ${TERM_FONT_BASE}` : TERM_FONT_BASE;
 }
+
+// Native OS notification suppression policy (notifications.ts fires on live
+// agent-state transitions). Three tiers, default the middle one so a focused
+// user watching the very session that changed isn't pinged, but anything else
+// (app backgrounded, or a *different* session acting) still surfaces:
+//  - "off": never notify.
+//  - "app-in-background": notify only when the app window is unfocused.
+//  - "background-or-other-session": notify unless the window is focused AND the
+//    session that changed is the one currently visible in the UI.
+export type NotificationMode = "off" | "app-in-background" | "background-or-other-session";
+export const DEFAULT_NOTIFICATION_MODE: NotificationMode = "background-or-other-session";
+
+function isNotificationMode(value: string): value is NotificationMode {
+  return (
+    value === "off" || value === "app-in-background" || value === "background-or-other-session"
+  );
+}
+
+export const notificationMode = persisted(
+  NOTIFICATION_MODE_KEY,
+  DEFAULT_NOTIFICATION_MODE,
+  (value) => (isNotificationMode(value) ? value : DEFAULT_NOTIFICATION_MODE),
+) as Writable<NotificationMode>;
+
+// Minimum turn duration (seconds) before a `running` → `waiting` "finished"
+// notification fires — short turns (a one-line answer) don't warrant an OS
+// ping. 0 means ungated (every turn end notifies). Clamped to a sane ceiling so
+// a stored value can't push the gate so high that "finished" never fires.
+export const DEFAULT_NOTIFICATION_MIN_TURN_SECONDS = 30;
+export const NOTIFICATION_MIN_TURN_SECONDS_MIN = 0;
+export const NOTIFICATION_MIN_TURN_SECONDS_MAX = 600;
+export const notificationMinTurnSeconds = persistedNumber(
+  NOTIFICATION_MIN_TURN_SECONDS_KEY,
+  DEFAULT_NOTIFICATION_MIN_TURN_SECONDS,
+  NOTIFICATION_MIN_TURN_SECONDS_MIN,
+  NOTIFICATION_MIN_TURN_SECONDS_MAX,
+);

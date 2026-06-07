@@ -63,6 +63,11 @@ import {
   terminalFontStack,
   type DraftProvider,
 } from "./settings";
+import {
+  forgetSession as forgetSessionNotifications,
+  noteAgentState,
+  primeNotificationPermission,
+} from "./notifications";
 
 export type Connection = "connecting" | "ready" | "offline";
 
@@ -1390,6 +1395,47 @@ function applySessionAgent(sessionId: Id, agent: KnownAgent | null): void {
   }
 }
 
+// The notification body for a session: `project · branch` of its worktree, so
+// an OS notification names *which* run acted without the user opening the app.
+// Resolves session → parent → worktree → branch + owning project; degrades to
+// the project name alone (plain-project sessions have no worktree), then the
+// session name, then null (no body) so the notification still fires unadorned.
+function notificationBodyForSession(sessionId: Id): string | null {
+  const session = get(sessions).find((s) => s.id === sessionId);
+  if (!session) return null;
+  if (session.parent.kind === "worktree") {
+    const worktree = get(worktrees).find((w) => w.id === session.parent.id);
+    if (worktree) {
+      const project = get(projects).find((p) => p.id === worktree.project_id);
+      return project ? `${project.name} · ${worktree.branch}` : worktree.branch;
+    }
+  } else {
+    const project = get(projects).find((p) => p.id === session.parent.id);
+    if (project) return project.name;
+  }
+  return session.name || null;
+}
+
+// Dispatch one agent-state transition to the notification engine, reading the
+// PREVIOUS stored state from `agentStates` (the single source of truth) before
+// it's overwritten. Both the live event and the SessionOpened replay route
+// through here; `replay` tells notifications.ts to set the baseline without
+// notifying (replayed state must never ping — ADR 0011 attach replay).
+function noteAgentStateTransition(
+  sessionId: Id,
+  nextState: AgentState | null,
+  agent: KnownAgent | null,
+  detail: string | null,
+  replay: boolean,
+): void {
+  noteAgentState(sessionId, get(agentStates)[sessionId] ?? null, nextState, detail, {
+    replay,
+    agent,
+    body: notificationBodyForSession(sessionId),
+    activeSessionId: get(activeSessionId),
+  });
+}
+
 export function applyHitchEvent(event: HitchEvent): void {
   if (event.type === "project-updated") {
     projects.update((items) => upsert(items, event.project as Project));
@@ -1421,7 +1467,18 @@ export function applyHitchEvent(event: HitchEvent): void {
     const sessionId = (event.session_id as Id | null) ?? null;
     const state = (event.state as AgentState | null) ?? null;
     const agent = (event.agent as KnownAgent | null | undefined) ?? null;
+    const detail = (event.detail as string | null | undefined) ?? null;
     if (sessionId) {
+      // Notify BEFORE applying so the engine sees the true previous state. Use
+      // the event's announced identity when present (an identity announce), else
+      // the session's already-known agent (a pure state report carries none).
+      noteAgentStateTransition(
+        sessionId,
+        state,
+        agent ?? get(sessionAgents)[sessionId] ?? null,
+        detail,
+        false,
+      );
       applyAgentState(sessionId, state);
       applySessionAgent(sessionId, agent);
     }
@@ -1456,7 +1513,12 @@ export function applyHitchEvent(event: HitchEvent): void {
     // attach so a late-joining window is immediately correct (ADR 0011).
     const state = (event.agent_state as AgentState | null | undefined) ?? null;
     const agent = (event.agent as KnownAgent | null | undefined) ?? null;
+    const detail = (event.agent_detail as string | null | undefined) ?? null;
     const outputActive = Boolean(event.output_active);
+    // Replayed state primes the notification baseline (and turn-start clock for
+    // an attach mid-turn) WITHOUT notifying — a catching-up window must never
+    // ping for state it merely learned about (ADR 0011 attach replay).
+    noteAgentStateTransition(session.id, state, agent, detail, true);
     applyAgentState(session.id, state);
     applySessionAgent(session.id, agent);
     sessionOutputActive.update((current) =>
@@ -1497,7 +1559,9 @@ export function applyHitchEvent(event: HitchEvent): void {
       return next;
     });
     closeSessionOutput(sessionId);
-
+    // Drop the session's notification bookkeeping (turn-start clock) so the
+    // per-session maps don't leak as sessions come and go.
+    forgetSessionNotifications(sessionId);
   }
   if (event.type === "project-removed") {
     // A project was forgotten (possibly by another window). Drop it and
@@ -1592,6 +1656,14 @@ export async function initDaemon(): Promise<void> {
 
     await invoke("connect_daemon");
     applyDaemonStatus("running", null);
+    // Warm the cached notification-permission decision once on connect (unless
+    // the user has notifications off) so the first fire doesn't pay an IPC
+    // round-trip. This shows no dialog on desktop — the plugin's desktop
+    // permission is an always-granted stub; the macOS prompt (and delivery) only
+    // happens when a notification is actually posted from an installed .app. Not
+    // awaited: it must not hold up the initial snapshot, and every send guards on
+    // the cached decision anyway.
+    void primeNotificationPermission();
     await refreshSnapshotAfterConnect();
   } catch (err) {
     applyDaemonStatus("failed", toMessage(err));

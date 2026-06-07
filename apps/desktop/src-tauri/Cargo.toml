@@ -32,6 +32,9 @@ tauri = { version = "2", features = ["tray-icon"] }
 # add-project folder picker. Pure frontend↔plugin calls — no daemon requests.
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+# Native desktop notifications: the frontend posts agent-state banners through
+# the plugin's JS API. Pure frontend↔plugin call — no daemon request.
+tauri-plugin-notification = "2"
 serde.workspace = true
 serde_json.workspace = true
 hitch-core.workspace = true

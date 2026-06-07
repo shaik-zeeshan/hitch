@@ -48,7 +48,8 @@ use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 #[cfg(windows)]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-#[cfg(feature = "packaged-smoke")]
+// Used by the packaged-smoke `Ready` hook and the macOS `Reopen` re-show handler.
+#[cfg(any(feature = "packaged-smoke", target_os = "macos"))]
 use tauri::RunEvent;
 use tauri::window::Color;
 use tauri::{
@@ -4394,6 +4395,7 @@ pub fn run() {
         .manage(HitchClient::new())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             #[cfg(target_os = "macos")]
             disable_press_and_hold();
@@ -4446,6 +4448,14 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(move |_app_handle, _event| {
+            // The close button only hides the window (see `on_window_event`), so
+            // clicking the dock icon or a notification banner just reactivates the
+            // app without restoring it. Reopen fires on that reactivation when no
+            // window is visible — re-show the main window so the app comes back.
+            #[cfg(target_os = "macos")]
+            if let RunEvent::Reopen { .. } = _event {
+                show_main_window(_app_handle);
+            }
             #[cfg(feature = "packaged-smoke")]
             if matches!(_event, RunEvent::Ready) && packaged_smoke_enabled() {
                 let app_handle = _app_handle.clone();

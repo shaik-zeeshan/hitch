@@ -68,6 +68,10 @@ _Avoid_: Log view (UI label is HISTORY), Timeline.
 A center-pane diff tab showing one commit, opened from **History** — one tab **per commit**, keyed by sha (peer of file diff tabs and all-changes). Label is a commit glyph + 7-char short sha; body is a metadata header (full sha, message, author, date, ±totals) above collapsible per-file sections in the all-changes style. Its content is immutable: cached per sha with no invalidation, and the tab survives history rewrites (an amended/rebased-away sha keeps its open tab; the object is still readable).
 _Avoid_: Commit view (it is a tab, not a rail view), Revision tab.
 
+**Desktop Notification**:
+A native OS notification raised by the GUI from **live** **Agent State** transitions — never from state replayed on attach (ADR 0011 replay is for catching up, not re-alerting). Three triggers (decided 2026-06-07): a Session entering *needs-approval*, entering *error*, and a **turn end** (*running* → *waiting*) gated on the turn having run at least a user-configurable minimum (default 30s); the gate's clock starts when the turn enters *running* and survives *needs-approval* pauses, so an approved-then-finished long task still notifies. Copy is agent + state in the title, `project · branch` in the body, with *error* detail appended when present; all three play the default OS sound. Click is the OS default (activate the app — no Session routing; revisit if it stings). Suppression is one user setting with three modes: *off*, *app-in-background* (notify only when the GUI is unfocused), and *background-or-other-session* (**default** — notify unless the GUI is focused AND that Session is the visible one). The GUI fires these (it owns chrome preferences, focus, and the visible Session); the **Daemon** raises none. OS permission is requested at GUI startup whenever the mode is not *off*.
+_Avoid_: Completed notification (a turn ends to *waiting*; nothing "completes"), Notification (bare — collides with the agents' own `Notification` hook event), Alert.
+
 ## Relationships
 
 - A **Project** is either git-backed or a plain folder (its *kind*).
@@ -80,6 +84,7 @@ _Avoid_: Commit view (it is a tab, not a rail view), Revision tab.
 - A **Draft Generator** runs outside Sessions and does not produce **Agent State**.
 - A **Job** is owned by the **Daemon**, runs off the request loop, and reports its lifecycle via events; the GUI observes Jobs but never owns them. Fast git reads are not Jobs.
 - **Daemon Status** describes the Daemon process's own liveness; it is broader than, and contains, any single GUI's connection state.
+- A **Desktop Notification** derives from a live **Agent State** transition observed by the GUI; the **Daemon** stores and broadcasts state but never raises notifications. Codex's missing failure hook (known gap) means *error* notifications never fire for Codex.
 - **History** belongs to the right rail and shows exactly one **Worktree**'s log; a **Commit Tab** belongs to the center tab strip. Commit reads (log, commit diff) follow the fast synchronous git-read path, not **Jobs**.
 
 ## Flagged ambiguities
