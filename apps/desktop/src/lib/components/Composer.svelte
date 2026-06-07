@@ -464,11 +464,16 @@
       {:else if phase === "queued"}
         <span class="label on-iris"><span class="spin"></span> Commit on ready…</span>
       {:else}
-        <span class="label on-iris">
+        <button
+          class="label on-iris"
+          type="button"
+          disabled={phase === "committing"}
+          onclick={attemptConfirm}
+        >
           <GitCommitHorizontal class="btnic icon" />
           Commit
           <span class="keys">{#each enterKeys as k (k)}<kbd>{k}</kbd>{/each}</span>
-        </span>
+        </button>
       {/if}
       <button
         class="close"
@@ -711,10 +716,19 @@
     padding: 8px 12px;
     background: var(--iris);
     color: var(--iris-on);
+    border: 0;
     font-family: var(--ui);
     font-size: var(--r1);
     font-weight: 600;
     white-space: nowrap;
+  }
+  /* the label can render as a <button> (ready/error: click = confirm) */
+  button.label {
+    cursor: pointer;
+    transition: filter 0.15s ease-out;
+  }
+  button.label:hover:not(:disabled) {
+    filter: brightness(1.06);
   }
   .cmp-head .label :global(.btnic) {
     width: 14px;
