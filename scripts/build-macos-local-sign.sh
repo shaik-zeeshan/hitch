@@ -27,6 +27,14 @@ if [[ "${OSTYPE}" != darwin* ]]; then
   exit 1
 fi
 
+# python3 ships with macOS dev setups (Command Line Tools) and is used below to
+# read the canonical app metadata out of tauri.conf.json so this script never
+# drifts from the bundle it signs.
+if ! command -v python3 >/dev/null 2>&1; then
+  print -u2 "python3 is required (it parses tauri.conf.json) but was not found on PATH."
+  exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # Resolve a code-signing identity.
 #
@@ -60,12 +68,66 @@ print "Using signing identity: ${identity}"
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
+tauri_dir="${repo_root}/apps/desktop/src-tauri"
+tauri_conf="${tauri_dir}/tauri.conf.json"
+cargo_toml="${tauri_dir}/Cargo.toml"
+
+# ---------------------------------------------------------------------------
+# Derive the app name, bundle id, and main binary name from the canonical
+# Tauri config (and Cargo manifest) instead of hardcoding them, so this script
+# stays in sync with whatever the bundle actually produces.
+#
+#   - app_name      <- productName + ".app"        (Hitch.app)
+#   - bundle_id     <- identifier                   (com.hitch.desktop)
+#   - main_binary   <- mainBinaryName, falling back to the Cargo [package] name
+#                      (Tauri names the bundled main executable after the crate
+#                      when mainBinaryName is unset).
+#
+# Sidecar/helper binaries are NOT enumerated from config here; the signing loop
+# below globs the actual Mach-O files under Contents/MacOS so new sidecars are
+# picked up automatically.
+# ---------------------------------------------------------------------------
+read -r product_name bundle_id main_binary <<EOF
+$(python3 - "${tauri_conf}" "${cargo_toml}" <<'PY'
+import json, re, sys
+
+conf_path, cargo_path = sys.argv[1], sys.argv[2]
+with open(conf_path) as f:
+    conf = json.load(f)
+
+product_name = conf.get("productName")
+identifier = conf.get("identifier")
+main_binary = conf.get("mainBinaryName")
+
+if main_binary is None:
+    # Tauri falls back to the Cargo [package] name when mainBinaryName is unset.
+    with open(cargo_path) as f:
+        cargo = f.read()
+    m = re.search(r'(?ms)^\[package\]\s*$.*?^\s*name\s*=\s*"([^"]+)"', cargo)
+    if m:
+        main_binary = m.group(1)
+
+if not product_name or not identifier or not main_binary:
+    sys.exit("failed to derive productName/identifier/mainBinaryName from config")
+
+print(product_name, identifier, main_binary)
+PY
+)
+EOF
+
+if [[ -z "${product_name}" || -z "${bundle_id}" || -z "${main_binary}" ]]; then
+  print -u2 "Could not derive app metadata from ${tauri_conf}."
+  exit 1
+fi
+
+app_name="${product_name}.app"
+
+print "Derived from config: app_name=${app_name} bundle_id=${bundle_id} main_binary=${main_binary}"
+
 # Hitch is a Cargo workspace, so the Tauri bundle lands under the workspace
 # target dir at the repo root (NOT apps/desktop/src-tauri/target).
 macos_bundle_dir="${repo_root}/target/release/bundle/macos"
 dmg_dir="${repo_root}/target/release/bundle/dmg"
-app_name="Hitch.app"
-bundle_id="com.hitch.desktop"
 install_dir="/Applications"
 installed_app="${install_dir}/${app_name}"
 
@@ -103,13 +165,18 @@ sign() {
 }
 
 print "Signing nested binaries..."
-# Any Mach-O executables under Contents/MacOS other than nothing; sign helpers
-# (hitch-daemon, hitch-hook) before the main binary.
-for bin in "${built_app}/Contents/MacOS/hitch-daemon" "${built_app}/Contents/MacOS/hitch-hook"; do
-  if [[ -f "${bin}" ]]; then
-    print "  - ${bin:t}"
-    sign "${bin}"
-  fi
+# Sign every Mach-O executable under Contents/MacOS EXCEPT the main binary
+# (signed last, below, to preserve inside-out order). Globbing the real files —
+# rather than deriving from bundle.externalBin — means any new sidecar is signed
+# automatically, regardless of config.
+main_binary_path="${built_app}/Contents/MacOS/${main_binary}"
+for bin in "${built_app}/Contents/MacOS/"*; do
+  [[ -f "${bin}" ]] || continue
+  [[ "${bin}" == "${main_binary_path}" ]] && continue
+  # Only sign Mach-O files (skip stray scripts/resources).
+  file "${bin}" 2>/dev/null | grep -q "Mach-O" || continue
+  print "  - ${bin:t}"
+  sign "${bin}"
 done
 
 # Sign any frameworks / dylibs that may exist, just in case.
@@ -122,7 +189,7 @@ if [[ -d "${built_app}/Contents/Frameworks" ]]; then
 fi
 
 print "Signing main executable..."
-sign "${built_app}/Contents/MacOS/hitch-desktop"
+sign "${main_binary_path}"
 
 print "Signing app bundle..."
 sign "${built_app}"
@@ -187,9 +254,11 @@ fi
 print "Stopping any running Hitch processes..."
 osascript -e 'tell application "Hitch" to quit' >/dev/null 2>&1 || true
 # Kill the production daemon/desktop spawned from the installed bundle.
-pkill -f "${installed_app}/Contents/MacOS/hitch-daemon" 2>/dev/null || true
-pkill -f "${installed_app}/Contents/MacOS/hitch-desktop" 2>/dev/null || true
-pkill -f "${installed_app}/Contents/MacOS/hitch-hook" 2>/dev/null || true
+# Kill every helper plus the main binary spawned from the installed bundle.
+for proc in "${installed_app}/Contents/MacOS/"*; do
+  [[ -f "${proc}" ]] || continue
+  pkill -f "${proc}" 2>/dev/null || true
+done
 
 print "Installing to ${installed_app}..."
 rm -rf "${installed_app}"
