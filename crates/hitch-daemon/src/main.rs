@@ -21,6 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod drafts;
+mod proxy;
 
 /// How long a session's PTY may stay quiet before the output-activity gate falls
 /// to inactive (ADR 0011 amendment 2026-06-05). Agent TUIs repaint spinners
@@ -66,6 +67,16 @@ fn main() {
 }
 
 fn real_main() -> Result<(), Box<dyn std::error::Error>> {
+    // The daemon binary doubles as the remote `hitch` CLI (ADR 0014): a
+    // `hitch daemon proxy` invocation runs the SSH stdio bridge instead of the
+    // daemon proper. Detect it before normal flag parsing so the subcommand words
+    // (`daemon proxy`) are never mistaken for daemon options. The proxy owns its
+    // own exit code (and keeps stdout reserved for the protocol stream).
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if proxy::is_proxy_invocation(&raw_args) {
+        std::process::exit(proxy::run());
+    }
+
     let args = Args::parse()?;
     if args.detach {
         detach_spawn(&args)?;

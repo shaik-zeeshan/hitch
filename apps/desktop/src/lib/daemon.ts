@@ -236,6 +236,16 @@ export function scopeForProject(projectId: Id | null | undefined): DaemonScopeId
   return get(projectScopes)[projectId] ?? LOCAL_SCOPE_ID;
 }
 
+// The owning daemon scope of a Worktree id, resolved through its Project. A
+// Worktree is reached through the same daemon as its Project (CONTEXT.md), so a
+// scope-routed git read (git-status etc.) uses this. Defaults to Local for an
+// unknown/local worktree.
+export function scopeForWorktree(worktreeId: Id | null | undefined): DaemonScopeId {
+  if (!worktreeId) return LOCAL_SCOPE_ID;
+  const worktree = get(worktrees).find((w) => w.id === worktreeId);
+  return scopeForProject(worktree?.project_id);
+}
+
 // Tag a set of Projects as owned by a scope at ingestion. Replaces the scope map
 // wholesale for a full snapshot (so a project that vanished loses its tag);
 // `mergeProjectScopes` keeps existing tags for incremental upserts.
@@ -243,10 +253,81 @@ function setProjectScopes(projectIds: Id[], scopeId: DaemonScopeId): void {
   projectScopes.set(Object.fromEntries(projectIds.map((id) => [id, scopeId])));
 }
 
+// Re-tag exactly one scope's projects from a full per-scope snapshot, leaving
+// every OTHER scope's tags untouched. Used by the multi-daemon refreshAll: a
+// remote scope's snapshot replaces only its own projects' tags (so a remote
+// project removed out of band loses its tag) without disturbing Local or another
+// host. Returns the project ids that previously belonged to this scope but are
+// no longer present, so the caller can prune their entities.
+function reconcileScopeProjects(projectIds: Id[], scopeId: DaemonScopeId): Id[] {
+  const wanted = new Set(projectIds);
+  const removed: Id[] = [];
+  projectScopes.update((current) => {
+    const next: Record<Id, DaemonScopeId> = {};
+    for (const [id, owner] of Object.entries(current)) {
+      if (owner === scopeId) {
+        // Keep only this scope's projects that are still present; the rest are
+        // pruned (collected for entity cleanup).
+        if (wanted.has(id)) next[id] = owner;
+        else removed.push(id);
+      } else {
+        next[id] = owner;
+      }
+    }
+    for (const id of projectIds) next[id] = scopeId;
+    return next;
+  });
+  return removed;
+}
+
 function tagProjectScope(projectId: Id, scopeId: DaemonScopeId): void {
   projectScopes.update((current) =>
     current[projectId] === scopeId ? current : { ...current, [projectId]: scopeId },
   );
+}
+
+// Which daemon scope owns each Session, by session id. A Session is reached
+// through the same daemon as its parent Project (CONTEXT.md), so its scope is
+// fixed at ingestion to the scope the session-opened event arrived on. The
+// per-session output channel + input frames route to the owning daemon by this
+// map (session ids are unique only per daemon, ADR 0014). Absent = Local.
+const sessionScopes = writable<Record<Id, DaemonScopeId>>({});
+
+// The owning daemon scope of a Session id, defaulting to Local. The single
+// helper every scope-aware session reader (output register/unregister, input)
+// uses so the Local default lives in one place.
+export function scopeForSession(sessionId: Id | null | undefined): DaemonScopeId {
+  if (!sessionId) return LOCAL_SCOPE_ID;
+  return get(sessionScopes)[sessionId] ?? LOCAL_SCOPE_ID;
+}
+
+// Tag a Session as owned by a scope at ingestion (Local tags are dropped to keep
+// the map small; absence already means Local).
+function tagSessionScope(sessionId: Id, scopeId: DaemonScopeId): void {
+  sessionScopes.update((current) => {
+    if (scopeId === LOCAL_SCOPE_ID) {
+      if (!(sessionId in current)) return current;
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    }
+    return current[sessionId] === scopeId ? current : { ...current, [sessionId]: scopeId };
+  });
+}
+
+function forgetSessionScope(sessionId: Id): void {
+  sessionScopes.update((current) => {
+    if (!(sessionId in current)) return current;
+    const next = { ...current };
+    delete next[sessionId];
+    return next;
+  });
+}
+
+// The `scope` arg every scope-aware invoke passes. Omitted (undefined) for the
+// Local scope so the Rust commands keep their exact local back-compat path.
+function scopeArg(scopeId: DaemonScopeId): string | undefined {
+  return scopeId === LOCAL_SCOPE_ID ? undefined : scopeId;
 }
 
 export const selectedProjectId = writable<Id | null>(null);
@@ -1077,6 +1158,45 @@ export const agentActRollupByProject = derived(
   },
 );
 
+// Per-scope act-state rollup (ADR 0014): the highest-priority act state across
+// every session whose Project belongs to the scope, plus the count of sessions
+// in an act state. Mirrors `agentActRollupByProject` but aggregates one level up
+// so a COLLAPSED SSH Host header can still page for `needs-approval`/`error`
+// across all its remote sessions. `null` = nothing in the scope needs action.
+export const agentActRollupByScope = derived(
+  [projects, worktrees, sessions, agentStates, projectScopes],
+  ([$projects, $worktrees, $sessions, $agentStates, $projectScopes]) => {
+    const scopeOf = (projectId: Id): DaemonScopeId =>
+      $projectScopes[projectId] ?? LOCAL_SCOPE_ID;
+    // worktree id -> owning scope (via its project).
+    const worktreeScope = new Map<Id, DaemonScopeId>();
+    for (const w of $worktrees) worktreeScope.set(w.id, scopeOf(w.project_id));
+    // Gather each scope's session states.
+    const byScope = new Map<DaemonScopeId, Array<AgentState | undefined>>();
+    const push = (scope: DaemonScopeId, state: AgentState | undefined) => {
+      const list = byScope.get(scope) ?? [];
+      list.push(state);
+      byScope.set(scope, list);
+    };
+    const projectScopeOf = new Map<Id, DaemonScopeId>();
+    for (const p of $projects) projectScopeOf.set(p.id, scopeOf(p.id));
+    for (const s of $sessions) {
+      const scope =
+        s.parent.kind === "worktree"
+          ? worktreeScope.get(s.parent.id)
+          : projectScopeOf.get(s.parent.id);
+      if (!scope) continue;
+      push(scope, $agentStates[s.id]);
+    }
+    const map: Record<DaemonScopeId, ActRollup> = {};
+    for (const [scope, states] of byScope) {
+      const rollup = aggregateActRollup(states);
+      if (rollup) map[scope] = rollup;
+    }
+    return map;
+  },
+);
+
 // ---- request helper -------------------------------------------------------
 
 function isError(response: Response): response is Response & {
@@ -1087,8 +1207,13 @@ function isError(response: Response): response is Response & {
 
 export async function daemonRequest<T extends Response>(
   request: Request,
+  scopeId: DaemonScopeId = LOCAL_SCOPE_ID,
 ): Promise<T> {
-  const response = await invoke<Response>("hitch_request", { request });
+  // Route the request to the owning daemon: a remote `ssh:<target>` scope
+  // dispatches over the SSH stdio pool; Local omits `scope` for the exact
+  // back-compat local path (issue #27).
+  const scope = scopeArg(scopeId);
+  const response = await invoke<Response>("hitch_request", { request, scope });
   if (isError(response)) {
     throw new Error(response.error.message);
   }
@@ -1655,79 +1780,128 @@ function removeWorktreeLocal(worktreeId: Id): void {
 // ---- snapshot / refresh ---------------------------------------------------
 
 export async function refreshAll(
-  options: { restoreLiveSessionSelection?: boolean } = {},
+  options: { restoreLiveSessionSelection?: boolean; scope?: DaemonScopeId } = {},
 ): Promise<void> {
-  const projectResponse = await daemonRequest<Response & { projects: Project[] }>({
-    type: "list-projects",
-  });
-  projects.set(projectResponse.projects);
-  // Every project from `list-projects` over the local socket is owned by the
-  // Local scope (ADR 0014). A full snapshot replaces the scope map wholesale so
-  // a project removed out of band loses its tag. Issue #28 will instead tag a
-  // remote daemon's projects with its SSH Host scope at its own ingestion.
-  setProjectScopes(
-    projectResponse.projects.map((project) => project.id),
-    LOCAL_SCOPE_ID,
+  const scopeId = options.scope ?? LOCAL_SCOPE_ID;
+  const isLocal = scopeId === LOCAL_SCOPE_ID;
+
+  const projectResponse = await daemonRequest<Response & { projects: Project[] }>(
+    { type: "list-projects" },
+    scopeId,
   );
+  const scopeProjects = projectResponse.projects;
+  const scopeProjectIds = new Set(scopeProjects.map((p) => p.id));
+
+  if (isLocal) {
+    // Local keeps its exact wholesale-replace behavior (zero regression): the
+    // Local snapshot is the only one that ever sets the stores outright here. A
+    // remote scope (below) MERGES so it never clobbers Local or another host.
+    projects.set(scopeProjects);
+    setProjectScopes(scopeProjects.map((p) => p.id), LOCAL_SCOPE_ID);
+  } else {
+    // Remote scope: merge its projects into the global store. Keep every project
+    // NOT owned by this scope, drop this scope's old projects, then append the
+    // fresh snapshot. Re-tag this scope's projects (pruning vanished ones).
+    projects.update((items) => [
+      ...items.filter((p) => scopeForProject(p.id) !== scopeId),
+      ...scopeProjects,
+    ]);
+    reconcileScopeProjects(scopeProjects.map((p) => p.id), scopeId);
+  }
 
   const worktreeLists = await Promise.all(
-    projectResponse.projects
+    scopeProjects
       .filter((project) => project.kind === "git-backed")
       .map(async (project) => {
-        const response = await daemonRequest<Response & { worktrees: Worktree[] }>({
-          type: "list-worktrees",
-          project_id: project.id,
-        });
+        const response = await daemonRequest<Response & { worktrees: Worktree[] }>(
+          { type: "list-worktrees", project_id: project.id },
+          scopeId,
+        );
         return response.worktrees;
       }),
   );
-  const allWorktrees = worktreeLists.flat();
-  worktrees.set(allWorktrees);
+  const scopeWorktrees = worktreeLists.flat();
+  if (isLocal) {
+    worktrees.set(scopeWorktrees);
+  } else {
+    // Replace only this scope's worktrees (those whose project belongs to it).
+    worktrees.update((items) => [
+      ...items.filter((w) => !scopeProjectIds.has(w.project_id)),
+      ...scopeWorktrees,
+    ]);
+  }
 
   // Populate every worktree's PR chip in the background — one batched lookup per
   // project, throttled internally. Not awaited: a slow `gh` must not hold up the
-  // rest of the snapshot (sessions, dirty state).
-  for (const project of projectResponse.projects) {
-    if (project.kind === "git-backed") {
-      void loadProjectPrStatuses(project.id);
+  // rest of the snapshot (sessions, dirty state). PR lookups stay on the local
+  // path for now; remote PR routing is issue #30.
+  if (isLocal) {
+    for (const project of scopeProjects) {
+      if (project.kind === "git-backed") {
+        void loadProjectPrStatuses(project.id);
+      }
     }
   }
 
-  const sessionResponse = await daemonRequest<Response & { sessions: Session[] }>({
-    type: "list-sessions",
-    parent: null,
-  });
-  sessions.set(sessionResponse.sessions);
-  if (options.restoreLiveSessionSelection) {
-    restoreLiveSessionSelection(sessionResponse.sessions, allWorktrees);
+  const sessionResponse = await daemonRequest<Response & { sessions: Session[] }>(
+    { type: "list-sessions", parent: null },
+    scopeId,
+  );
+  const scopeSessions = sessionResponse.sessions;
+  // Tag this scope's sessions so their output/input route to the owning daemon.
+  for (const session of scopeSessions) tagSessionScope(session.id, scopeId);
+  let liveSessions: Session[];
+  if (isLocal) {
+    sessions.set(scopeSessions);
+    liveSessions = scopeSessions;
+  } else {
+    // Replace only this scope's sessions (parented under one of its worktrees or
+    // projects); a remote session id is unique only within its daemon.
+    const scopeWorktreeIds = new Set(scopeWorktrees.map((w) => w.id));
+    const belongsToScope = (s: Session): boolean =>
+      (s.parent.kind === "worktree" && scopeWorktreeIds.has(s.parent.id)) ||
+      (s.parent.kind === "project" && scopeProjectIds.has(s.parent.id));
+    sessions.update((items) => [...items.filter((s) => !belongsToScope(s)), ...scopeSessions]);
+    liveSessions = get(sessions);
   }
-  reconcileSessionOutputs(sessionResponse.sessions);
+  if (options.restoreLiveSessionSelection) {
+    restoreLiveSessionSelection(scopeSessions, scopeWorktrees);
+  }
+  reconcileSessionOutputs(liveSessions);
 
-  // Seed dirty indicators and line stats so the tree is useful before the Changes panel opens.
+  // Seed dirty indicators and line stats so the tree is useful before the Changes
+  // panel opens. Routed to the owning daemon by scope.
   const statusEntries = await Promise.all(
-    allWorktrees.map(async (worktree) => {
+    scopeWorktrees.map(async (worktree) => {
       try {
-        const response = await daemonRequest<Response & { status: GitStatus }>({
-          type: "git-status",
-          worktree_id: worktree.id,
-        });
+        const response = await daemonRequest<Response & { status: GitStatus }>(
+          { type: "git-status", worktree_id: worktree.id },
+          scopeId,
+        );
         return [worktree.id, response.status] as const;
       } catch {
         return [worktree.id, null] as const;
       }
     }),
   );
-  dirtyWorktrees.set(
-    Object.fromEntries(statusEntries.map(([id, status]) => [id, status?.dirty ?? false])),
+  const dirtyEntries = Object.fromEntries(
+    statusEntries.map(([id, status]) => [id, status?.dirty ?? false]),
   );
-  worktreeLineStats.set(
-    Object.fromEntries(
-      statusEntries.map(([id, status]) => [
-        id,
-        { additions: status?.additions ?? 0, deletions: status?.deletions ?? 0 },
-      ]),
-    ),
+  const lineStatEntries = Object.fromEntries(
+    statusEntries.map(([id, status]) => [
+      id,
+      { additions: status?.additions ?? 0, deletions: status?.deletions ?? 0 },
+    ]),
   );
+  if (isLocal) {
+    // Local replaces wholesale (its snapshot is authoritative for all local ids).
+    dirtyWorktrees.set(dirtyEntries);
+    worktreeLineStats.set(lineStatEntries);
+  } else {
+    // A remote scope merges only its own worktrees' entries.
+    dirtyWorktrees.update((current) => ({ ...current, ...dirtyEntries }));
+    worktreeLineStats.update((current) => ({ ...current, ...lineStatEntries }));
+  }
 }
 
 function restoreLiveSessionSelection(liveSessions: Session[], allWorktrees: Worktree[]): void {
@@ -1854,7 +2028,11 @@ function openSessionOutput(sessionId: Id): void {
     subscribers.get(sessionId)?.onData(ringFor(sessionId).bytesSince(offsetBefore));
   };
   channels.set(sessionId, channel);
-  void Promise.resolve(invoke("register_session_output", { sessionId, channel })).catch(() => {
+  // Route the channel registration to the session's owning daemon (the SSH pool
+  // for a remote session, the local router otherwise). `scope` is omitted for
+  // Local so the Rust command keeps its back-compat path.
+  const scope = scopeArg(scopeForSession(sessionId));
+  void Promise.resolve(invoke("register_session_output", { sessionId, channel, scope })).catch(() => {
     if (channels.get(sessionId) === channel) channels.delete(sessionId);
   });
 }
@@ -1866,7 +2044,8 @@ function closeSessionOutput(sessionId: Id): void {
   channels.delete(sessionId);
   // A closing session must not have a trailing resize fire against its dead PTY.
   clearResizeDebounce(sessionId);
-  void Promise.resolve(invoke("unregister_session_output", { sessionId })).catch(() => {});
+  const scope = scopeArg(scopeForSession(sessionId));
+  void Promise.resolve(invoke("unregister_session_output", { sessionId, scope })).catch(() => {});
 }
 
 function reconcileSessionOutputs(liveSessions: Session[]): void {
@@ -1954,13 +2133,14 @@ function noteAgentStateTransition(
   });
 }
 
-export function applyHitchEvent(event: HitchEvent): void {
+export function applyHitchEvent(event: HitchEvent, scopeId: DaemonScopeId = LOCAL_SCOPE_ID): void {
   if (event.type === "project-updated") {
     const project = event.project as Project;
     projects.update((items) => upsert(items, project));
-    // A project pushed over the local socket is Local-scoped (ADR 0014). Keep
-    // an existing tag (idempotent) so an upsert never re-homes a project.
-    tagProjectScope(project.id, LOCAL_SCOPE_ID);
+    // A project pushed over the local socket is Local-scoped; one arriving on a
+    // remote scope's event stream belongs to that SSH Host (ADR 0014). Tag it so
+    // the tree homes it under the right scope. Idempotent re-tag is fine.
+    tagProjectScope(project.id, scopeId);
   }
   if (event.type === "worktree-updated") {
     worktrees.update((items) => upsert(items, event.worktree as Worktree));
@@ -2041,6 +2221,10 @@ export function applyHitchEvent(event: HitchEvent): void {
   }
   if (event.type === "session-opened") {
     const session = event.session as Session;
+    // Tag the session's owning scope BEFORE registering its output channel so the
+    // registration routes to the right daemon (a remote session's bytes cross its
+    // SSH connection). A session inherits the scope its event arrived on.
+    tagSessionScope(session.id, scopeId);
     sessions.update((items) => upsert(items, session));
     // Replay the daemon-owned state, announced identity, and output gate on
     // attach so a late-joining window is immediately correct (ADR 0011).
@@ -2095,6 +2279,8 @@ export function applyHitchEvent(event: HitchEvent): void {
     // Drop the session's notification bookkeeping (turn-start clock) so the
     // per-session maps don't leak as sessions come and go.
     forgetSessionNotifications(sessionId);
+    // closeSessionOutput already resolved the scope above; drop the tag last.
+    forgetSessionScope(sessionId);
   }
   if (event.type === "project-removed") {
     // A project was forgotten (possibly by another window). Drop it and
@@ -2145,6 +2331,22 @@ export async function initDaemon(): Promise<void> {
   try {
     unlisteners.push(
       await listen<HitchEvent>("hitch-event", (message) => applyHitchEvent(message.payload)),
+    );
+
+    // Scope-tagged events + status from remote daemons reached over SSH (issue
+    // #27). Routed into the owning scope; the local path stays on the untagged
+    // events above for zero regression.
+    unlisteners.push(
+      await listen<{ scope: DaemonScopeId; event: HitchEvent }>("hitch-scope-event", (message) =>
+        applyScopeEvent(message.payload.scope, message.payload.event),
+      ),
+    );
+    unlisteners.push(
+      await listen<{ scope: DaemonScopeId; status: DaemonStatus; reason?: string | null }>(
+        "hitch-scope-status",
+        (message) =>
+          applyScopeStatus(message.payload.scope, message.payload.status, message.payload.reason ?? null),
+      ),
     );
 
     unlisteners.push(
@@ -2206,10 +2408,23 @@ export async function initDaemon(): Promise<void> {
     // the cached decision anyway.
     void primeNotificationPermission();
     await refreshSnapshotAfterConnect();
+    // Connect to every saved SSH Host (ADR 0014: hosts are enabled by default and
+    // connect on launch). Subsequent add/remove re-sync through the subscription
+    // installed below. The pool drives per-host backoff/reconnect and pushes
+    // scope status/events the listeners above ingest.
+    syncSshHostsToPool(get(sshHosts));
+    if (!sshHostSyncSubscribed) {
+      sshHostSyncSubscribed = true;
+      unlisteners.push(sshHosts.subscribe(syncSshHostsToPool));
+    }
   } catch (err) {
     applyDaemonStatus("failed", toMessage(err));
   }
 }
+
+// Guard so the host→pool sync subscription is installed exactly once across
+// reconnects (initDaemon may run again after disposeDaemon resets `booted`).
+let sshHostSyncSubscribed = false;
 
 // Apply a Daemon Status to the stores, deriving the narrower `connection` the
 // git-poll guard and the offline banner read. Exported as the seam the
@@ -2240,9 +2455,70 @@ export function applyDaemonStatus(status: DaemonStatus, reason: string | null): 
   }
 }
 
+// ---- remote scope status + events (issue #27, ADR 0014) -------------------
+//
+// Remote daemons reached over SSH push their Daemon Status as `hitch-scope-status`
+// and their entity/PTY events as scope-tagged `hitch-scope-event` (see
+// src-tauri/ssh_pool.rs). The local path keeps its untagged `hitch-status` /
+// `hitch-event`, so the local flow is unchanged.
+
+// Scopes whose snapshot has already been fetched since they last reached
+// `running`, so a transient heartbeat blip that re-fires `running` doesn't
+// re-snapshot needlessly. Cleared for a scope when it leaves `running`.
+const snapshottedScopes = new Set<DaemonScopeId>();
+
+// Apply a remote scope's Daemon Status: write it onto its tree scope row (so the
+// host header shows liveness + drives the Retry Now affordance), and on the
+// rising edge to `running` fetch that daemon's projects/worktrees/sessions into
+// its scope. Exported as the seam the `hitch-scope-status` listener and tests
+// drive.
+export function applyScopeStatus(scopeId: DaemonScopeId, status: DaemonStatus, reason: string | null): void {
+  daemonScopes.update((scopes) =>
+    scopes.map((scope) =>
+      scope.id === scopeId && scope.status !== status ? { ...scope, status } : scope,
+    ),
+  );
+  if (status === "running") {
+    // First reach to running for this scope: pull its registry into the tree.
+    if (!snapshottedScopes.has(scopeId)) {
+      snapshottedScopes.add(scopeId);
+      void refreshAll({ scope: scopeId }).catch((err) => error.set(toMessage(err)));
+    }
+  } else {
+    // Left running: a later reconnect must re-snapshot. Keep the stale tree for
+    // now (stale-remote polish is issue #32); only the status changes here.
+    snapshottedScopes.delete(scopeId);
+  }
+}
+
+// Apply a scope-tagged event from a remote daemon: route entity/PTY ingestion
+// into the correct scope via `applyHitchEvent`. Exported as the test seam.
+export function applyScopeEvent(scopeId: DaemonScopeId, event: HitchEvent): void {
+  applyHitchEvent(event, scopeId);
+}
+
+// Reconcile the remote connection pool to the saved SSH Hosts (issue #27). Called
+// on boot and whenever the saved host list changes, so the Rust pool always
+// mirrors the persisted hosts: new hosts connect (with backoff), removed hosts
+// disconnect their proxy. Best-effort — a failed invoke (e.g. before the window
+// is ready) is retried on the next host change.
+function syncSshHostsToPool(hosts: SshHost[]): void {
+  void invoke("set_ssh_hosts", { targets: hosts.map((h) => h.target) }).catch(() => {});
+}
+
+// Retry a host now: reset its backoff in the Rust pool and reconnect immediately.
+// Wired to the Retry Now affordance on an unreachable/failed host row (ADR 0014).
+export async function retrySshHost(target: string): Promise<void> {
+  await invoke("retry_ssh_host", { target }).catch(() => {});
+}
+
 export function disposeDaemon(): void {
   unlisteners.forEach((unlisten) => unlisten());
   unlisteners = [];
+  // The host→pool sync subscription was pushed onto `unlisteners`, so it was just
+  // torn down; allow `initDaemon` to re-install it on the next boot.
+  sshHostSyncSubscribed = false;
+  snapshottedScopes.clear();
   stopGitStatusPolling();
   stopPrStatusPolling();
   for (const sessionId of Array.from(channels.keys())) {
@@ -2319,10 +2595,15 @@ export async function openDaemonLog(): Promise<void> {
 
 export async function loadGitStatus(worktreeId: Id): Promise<GitStatus> {
   const requestSeq = ++statusRequestSeq;
-  const response = await daemonRequest<Response & { status: GitStatus }>({
-    type: "git-status",
-    worktree_id: worktreeId,
-  });
+  // Route the read to the worktree's owning daemon so a remote worktree's status
+  // crosses its SSH connection rather than hitting the local daemon (which would
+  // 404 the id). Local worktrees pass the omitted scope and behave as before.
+  // (Full git/Job routing audit is issue #30; this is the minimal route so the
+  // tree's selected-worktree status isn't broken for a remote selection.)
+  const response = await daemonRequest<Response & { status: GitStatus }>(
+    { type: "git-status", worktree_id: worktreeId },
+    scopeForWorktree(worktreeId),
+  );
   // A slow status response from a previous worktree/poll must not replace newer
   // UI state. This matters when agents edit files while the user stages changes.
   if (requestSeq === statusRequestSeq && get(gitWorktreeId) === worktreeId) {
@@ -2904,7 +3185,10 @@ function clearResizeDebounce(sessionId: Id): void {
 }
 
 export function sendInput(sessionId: Id, data: string): void {
-  void invoke("send_session_input", { sessionId, data });
+  // Keystrokes route to the session's owning daemon (a remote session's input
+  // crosses its SSH connection); `scope` is omitted for Local (issue #27).
+  const scope = scopeArg(scopeForSession(sessionId));
+  void invoke("send_session_input", { sessionId, data, scope });
 }
 
 // Write a tab's fetched text into the open set, if a tab for `path` still

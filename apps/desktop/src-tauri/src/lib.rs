@@ -5,6 +5,7 @@
 //! requests/responses/events to Tauri IPC.
 
 mod ssh;
+mod ssh_pool;
 mod window_chrome;
 
 use hitch_proto::transport::{connect_daemon as connect_transport, is_endpoint_busy, DaemonStream};
@@ -576,7 +577,7 @@ fn wait_for_socket_release(path: &Path, timeout: Duration) -> Result<(), String>
 /// `new Uint8Array([...]).buffer`, large via the fetch-channel path), matching
 /// the JS side `new Channel<ArrayBuffer>()`.
 #[derive(Default)]
-struct OutputRouter {
+pub(crate) struct OutputRouter {
     channels: HashMap<SessionId, Channel<InvokeResponseBody>>,
     /// Bytes that arrived before the channel was registered, per session.
     staging: HashMap<SessionId, Vec<u8>>,
@@ -605,7 +606,7 @@ impl OutputRouter {
     /// by the JS ring reset that happens during fresh registration. Preserve
     /// bytes staged before the first SessionOpened for a brand-new session: a PTY
     /// can emit its first prompt before the daemon broadcasts SessionOpened.
-    fn prepare_fresh_registration(&mut self, session_id: SessionId) {
+    pub(crate) fn prepare_fresh_registration(&mut self, session_id: SessionId) {
         let already_opened = !self.opened_sessions.insert(session_id);
         self.channels.remove(&session_id);
         if already_opened {
@@ -617,7 +618,7 @@ impl OutputRouter {
     /// completes. Sending is best-effort: a dead webview channel should not tear
     /// down the daemon reader loop. If the channel has gone stale, remove it and
     /// stage the payload so the next registration can catch up.
-    fn send_or_stage(&mut self, session_id: SessionId, payload: Vec<u8>) {
+    pub(crate) fn send_or_stage(&mut self, session_id: SessionId, payload: Vec<u8>) {
         if let Some(channel) = self.channels.get(&session_id) {
             if channel
                 .send(InvokeResponseBody::Raw(payload.clone()))
@@ -633,7 +634,7 @@ impl OutputRouter {
 
     /// Register (or re-register) a webview channel and flush bytes staged during
     /// the registration gap.
-    fn register_channel(&mut self, session_id: SessionId, channel: Channel<InvokeResponseBody>) {
+    pub(crate) fn register_channel(&mut self, session_id: SessionId, channel: Channel<InvokeResponseBody>) {
         if let Some(staged) = self.staging.remove(&session_id) {
             if !staged.is_empty()
                 && channel
@@ -649,13 +650,13 @@ impl OutputRouter {
     }
 
     /// Drop a session's output channel and any bytes staged for it.
-    fn unregister_channel(&mut self, session_id: SessionId) {
+    pub(crate) fn unregister_channel(&mut self, session_id: SessionId) {
         self.channels.remove(&session_id);
         self.staging.remove(&session_id);
     }
 
     /// Forget all routing state for a session that the daemon has closed.
-    fn close_session(&mut self, session_id: SessionId) {
+    pub(crate) fn close_session(&mut self, session_id: SessionId) {
         self.unregister_channel(session_id);
         self.opened_sessions.remove(&session_id);
     }
@@ -1907,7 +1908,7 @@ fn reader_loop(
     }
 }
 
-fn read_control_message<R: BufRead>(reader: &mut R) -> io::Result<Option<ControlMessage>> {
+pub(crate) fn read_control_message<R: BufRead>(reader: &mut R) -> io::Result<Option<ControlMessage>> {
     let mut line = Vec::new();
     let len = reader.read_until(b'\n', &mut line)?;
     if len == 0 {
@@ -1924,7 +1925,7 @@ fn read_control_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Control
         .map_err(io::Error::other)
 }
 
-fn read_pty_payload<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
+pub(crate) fn read_pty_payload<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut prefix = [0_u8; 4];
     reader.read_exact(&mut prefix)?;
     let len = u32::from_be_bytes(prefix) as usize;
@@ -2909,16 +2910,54 @@ async fn restart_daemon_command(
     .map_err(|err| format!("daemon restart task failed: {err}"))?
 }
 
+/// True for any scope id that names a remote SSH Host daemon (`ssh:<target>`).
+/// The absent/`local` scope routes to the local daemon for zero regression.
+fn is_remote_scope(scope: Option<&str>) -> bool {
+    matches!(scope, Some(s) if s.starts_with("ssh:"))
+}
+
 #[tauri::command]
 async fn hitch_request(
     app: AppHandle,
     state: State<'_, HitchClient>,
+    ssh: State<'_, ssh_pool::SshConnections>,
     request: Request,
+    scope: Option<String>,
 ) -> Result<Response, String> {
+    // Route by scope: a remote `ssh:<target>` scope dispatches over the SSH stdio
+    // pool; the default/`local` scope keeps the exact local path (issue #27). The
+    // frontend omits `scope` for every local request, so the local flow is
+    // unchanged.
+    if is_remote_scope(scope.as_deref()) {
+        let pool = ssh.inner().clone();
+        let scope = scope.unwrap();
+        return tauri::async_runtime::spawn_blocking(move || {
+            pool.send_request(&scope, request, None)
+        })
+        .await
+        .map_err(|err| format!("remote daemon request task failed: {err}"))?;
+    }
     let client = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || client.send_request(&app, request))
         .await
         .map_err(|err| format!("daemon request task failed: {err}"))?
+}
+
+/// Reconcile the remote connection pool to the saved SSH Hosts (issue #27). The
+/// frontend invokes this on boot with every saved host and again on every host
+/// add/remove, so the pool always mirrors the persisted list: new hosts connect
+/// (with backoff), removed hosts disconnect their proxy and drop their state. The
+/// remote Daemon keeps running across a removal (ADR 0014).
+#[tauri::command]
+fn set_ssh_hosts(app: AppHandle, ssh: State<'_, ssh_pool::SshConnections>, targets: Vec<String>) {
+    ssh.inner().set_hosts(&app, targets);
+}
+
+/// Retry a host now: reset its backoff and reconnect immediately (the Retry Now
+/// affordance on an unreachable/failed host row, ADR 0014).
+#[tauri::command]
+fn retry_ssh_host(app: AppHandle, ssh: State<'_, ssh_pool::SshConnections>, target: String) {
+    ssh.inner().retry(&app, &target);
 }
 
 /// Fire-and-forget keystroke path (Slice 6, "input fast path"). The old
@@ -2936,9 +2975,19 @@ async fn hitch_request(
 #[tauri::command]
 fn send_session_input(
     state: State<'_, HitchClient>,
+    ssh: State<'_, ssh_pool::SshConnections>,
     session_id: SessionId,
     data: String,
+    scope: Option<String>,
 ) -> Result<Response, String> {
+    // Session ids are unique only per daemon, so input routes to the owning
+    // scope: a remote session's keystrokes go to its SSH connection, local
+    // sessions keep the ordered input lane (issue #27).
+    if is_remote_scope(scope.as_deref()) {
+        ssh.inner()
+            .send_session_input(&scope.unwrap(), session_id, data.into_bytes());
+        return Ok(Response::Ack);
+    }
     state
         .0
         .input_tx
@@ -2954,9 +3003,19 @@ fn send_session_input(
 #[tauri::command]
 fn register_session_output(
     state: State<'_, HitchClient>,
+    ssh: State<'_, ssh_pool::SshConnections>,
     session_id: SessionId,
     channel: Channel<InvokeResponseBody>,
+    scope: Option<String>,
 ) -> Result<(), String> {
+    // Per-session output channels are scope-aware: a remote session registers its
+    // channel on the owning SSH connection's router, local sessions on the local
+    // router (issue #27).
+    if is_remote_scope(scope.as_deref()) {
+        return ssh
+            .inner()
+            .register_session_output(&scope.unwrap(), session_id, channel);
+    }
     let mut router = state
         .0
         .output_router
@@ -2971,8 +3030,13 @@ fn register_session_output(
 #[tauri::command]
 fn unregister_session_output(
     state: State<'_, HitchClient>,
+    ssh: State<'_, ssh_pool::SshConnections>,
     session_id: SessionId,
+    scope: Option<String>,
 ) -> Result<(), String> {
+    if is_remote_scope(scope.as_deref()) {
+        return ssh.inner().unregister_session_output(&scope.unwrap(), session_id);
+    }
     let mut router = state
         .0
         .output_router
@@ -4410,6 +4474,10 @@ fn start_daemon_connection_on_launch(app: &tauri::App) {
 pub fn run() {
     tauri::Builder::default()
         .manage(HitchClient::new())
+        // The remote-daemon connection pool: one connection per saved SSH Host,
+        // keyed by `ssh:<target>` scope id (issue #27). The local daemon stays
+        // owned by `HitchClient` above; this pool never touches it.
+        .manage(ssh_pool::SshConnections::new())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -4454,6 +4522,8 @@ pub fn run() {
             read_font_face,
             connect_daemon,
             hitch_request,
+            set_ssh_hosts,
+            retry_ssh_host,
             send_session_input,
             register_session_output,
             unregister_session_output,

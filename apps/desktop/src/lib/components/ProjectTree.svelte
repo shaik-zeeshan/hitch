@@ -26,12 +26,14 @@
   import { editorApp } from "../settings";
   import {
     agentActRollupByProject,
+    agentActRollupByScope,
     agentStateByWorktree,
     daemonScopesOrdered,
     openSession,
     prByWorktree,
     projectsByScope,
     projects,
+    retrySshHost,
     selectedProjectId,
     selectedWorktreeId,
     sessionAgents,
@@ -403,6 +405,8 @@
          neutral `unreachable` placeholder. -->
     {@const ScopeIcon = scope.kind === "ssh-host" ? Server : MonitorIcon}
     {@const sshHost = scope.kind === "ssh-host" ? $sshHosts.find((h) => h.id === scope.id) : null}
+    {@const scopeRollup = $agentActRollupByScope[scope.id]}
+    {@const scopeDown = scope.status === "unreachable" || scope.status === "failed"}
     <ContextMenu.Root>
       <ContextMenu.Trigger>
         {#snippet child({ props })}
@@ -434,10 +438,36 @@
             </button>
             <ScopeIcon class="scope-ic icon" />
             <span class="scope-name" class:lower={scope.kind === "ssh-host"}>{scope.label}</span>
+            <!-- Same attention rollup shape collapsed Project rows use (ADR 0014):
+                 a collapsed host can still page for needs-approval/error across
+                 its remote sessions. Shown whenever the host is collapsed and has
+                 act-state sessions. -->
+            {#if scopeRollup && !scopeExpanded}
+              <span class="scope-rollup rollup">
+                <span class="g">◆</span>
+                {scopeRollup.count}
+                {ROLLUP_WORD[scopeRollup.state]}
+              </span>
+            {/if}
             <span
               class="scope-dot {scope.status === 'running' ? 'ok' : scope.status === 'failed' || scope.status === 'unreachable' ? 'down' : 'pending'}"
               title={`Daemon ${scope.status}`}
             ></span>
+            <!-- Retry Now: inline quiet action on an unreachable/failed SSH Host
+                 row (ADR 0014). Resets backoff and reconnects immediately. -->
+            {#if sshHost && scopeDown}
+              <button
+                class="scope-retry"
+                title={`Retry ${sshHost.target}`}
+                aria-label={`Retry ${sshHost.target}`}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  void retrySshHost(sshHost.target);
+                }}
+              >
+                Retry
+              </button>
+            {/if}
           </div>
         {/snippet}
       </ContextMenu.Trigger>
@@ -770,6 +800,38 @@
   }
   .scope-dot.pending {
     background: var(--ink-3);
+  }
+
+  /* The collapsed-host attention rollup reuses the project `.rollup` pill but
+     trims padding to sit on the tighter scope row. flex:none so it never steals
+     the label's ellipsis space. */
+  .scope-rollup {
+    flex: none;
+    padding: 0 6px;
+  }
+
+  /* Retry Now: a quiet inline mono action on an unreachable/failed SSH Host row.
+     Always visible (the ADR says the row "includes" it), oxide-tinted to read as
+     the recovery affordance without shouting. */
+  .scope-retry {
+    flex: none;
+    font-family: var(--mono);
+    font-size: 0.5625rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--st-need);
+    background: transparent;
+    border: 1px solid var(--st-need-line);
+    border-radius: 0;
+    padding: 1px 6px;
+    cursor: pointer;
+    transition:
+      color 0.15s ease-out,
+      background 0.15s ease-out;
+  }
+  .scope-retry:hover {
+    background: var(--st-need-wash);
   }
 
   /* ---- project row ---- */
