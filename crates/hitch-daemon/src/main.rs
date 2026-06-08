@@ -410,27 +410,42 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     }
     fs::create_dir_all(&config.managed_root)?;
 
+    // Acquire the pidfile singleton lock BEFORE binding. The lock — not the socket
+    // bind — is the authority on "am I the one daemon for this path". Binding first
+    // would unlink a live daemon's socket via `remove_stale_socket` and only then
+    // discover (too late) that we never owned the path; ordering the lock first
+    // means a losing daemon exits without ever touching the live owner's socket.
+    #[cfg(unix)]
+    let pid_lock = match acquire_pidfile(&config.socket_path) {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            // A live daemon already holds this socket path. Refuse to start rather
+            // than stealing its socket and orphaning it with its live Sessions.
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "hitch-daemon: another daemon already owns {}; refusing to start a second instance",
+                    config.socket_path.display()
+                ),
+            ));
+        }
+        Err(err) => {
+            // Could not even open the pidfile (permissions, odd filesystem). The
+            // singleton gate is unavailable, but this is orthogonal to the
+            // split-brain bug and rare; preserve the prior fail-open behaviour so a
+            // broken pidfile path never bricks startup. Forced recovery is lost.
+            eprintln!("hitch-daemon: pidfile recovery disabled: {err}");
+            None
+        }
+    };
+    #[cfg(windows)]
+    let pid_lock = None;
+
     let listener = DaemonListener::bind(&config.socket_path)?;
     // The listener stays in blocking mode: a dedicated accept thread parks in
     // `accept()` so no poll gap exists in which a connect-write-close client is
     // dropped (see the accept thread below and ADR 0012). The old nonblocking
     // poll loop is gone, not cfg-switched.
-    #[cfg(unix)]
-    let pid_lock = {
-        // Record our pid beside the socket so the GUI can force-kill us even when it
-        // never completed a `Hello` handshake (e.g. a protocol mismatch — the path
-        // that returns no pid in the response). Best-effort: a missing pidfile only
-        // costs the client its force-kill fast path, it does not break startup.
-        match write_pidfile(&config.socket_path) {
-            Ok(pid_lock) => pid_lock,
-            Err(err) => {
-                eprintln!("hitch-daemon: pidfile recovery disabled: {err}");
-                None
-            }
-        }
-    };
-    #[cfg(windows)]
-    let pid_lock = None;
     // The setup that follows (`Store::open`, `restore_layout`, the accept loop)
     // can early-return via `?`. Own Unix pidfile + socket cleanup with a guard so
     // every exit path clears filesystem rendezvous state. Windows local sockets
@@ -601,8 +616,9 @@ fn wake_accept_thread(socket_path: &Path) {
 }
 
 /// Removes Unix daemon files whenever `run_daemon` returns — by normal shutdown
-/// or by an early `?` during startup. Created right after the pidfile is written
-/// so no exit path can leak a stale pid (see `write_pidfile`).
+/// or by an early `?` during startup. Created right after the socket bind (once we
+/// already hold the pidfile lock) so no exit path can leak a stale pid or socket
+/// (see `acquire_pidfile`).
 struct DaemonFileGuard {
     #[cfg(unix)]
     socket_path: PathBuf,
@@ -622,35 +638,40 @@ impl Drop for DaemonFileGuard {
     }
 }
 
-/// Write our pid to the daemon's pidfile (see `transport::pidfile_path`) and take
-/// an exclusive advisory lock on it, held via the returned handle for our whole
-/// lifetime. The lock is what lets a client tell a *live* daemon (lock held) from
-/// a *stale* pidfile left by an unclean exit (lock free) before it force-kills the
-/// pid named there — without it, PID reuse could send the kill to an unrelated
-/// process. The OS drops the lock when this process exits by any means, so an
-/// abrupt kill can't strand it.
+/// Take the exclusive advisory lock on the daemon's pidfile (see
+/// `transport::pidfile_path`), write our pid, and hold the lock via the returned
+/// handle for our whole lifetime. This lock is the daemon **singleton gate**: it
+/// is acquired *before* binding the socket (see `run_daemon`), so a second daemon
+/// started against the same socket path loses the lock race and refuses to start
+/// rather than unlinking a live daemon's socket out from under it (the split-brain
+/// that orphaned a process holding live Sessions). It also lets a client tell a
+/// *live* daemon (lock held) from a *stale* pidfile left by an unclean exit (lock
+/// free) before it force-kills the pid named there — without it, PID reuse could
+/// send the kill to an unrelated process. The OS drops the lock when this process
+/// exits by any means, so an abrupt kill can't strand it.
 ///
-/// The pidfile is the GUI's only handle on a daemon it could not handshake with,
-/// so a stale entry must never linger: `truncate` overwrites any prior pid, and
-/// the bind that precedes this call guarantees we are the sole owner of this
-/// socket path. Any failure here only disables forced recovery; it never blocks
-/// startup, so we return `None` and carry on.
+/// Returns `Ok(Some(file))` when we won the lock and own this socket path,
+/// `Ok(None)` when a live daemon already holds it (the caller must abort startup
+/// without touching the socket), or `Err` only on an IO fault opening the pidfile.
 #[cfg(unix)]
-fn write_pidfile(socket_path: &Path) -> io::Result<Option<File>> {
+fn acquire_pidfile(socket_path: &Path) -> io::Result<Option<File>> {
     let path = hitch_proto::transport::pidfile_path(socket_path);
+    // Open without `truncate`: the file must not be clobbered until we hold the
+    // lock, or a losing daemon would wipe the live owner's pid on its way out.
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
         .open(&path)?;
     // SAFETY: `flock` on a freshly opened, valid fd. `LOCK_NB` so a contended lock
-    // fails fast instead of blocking startup. We already own the socket bind, so
-    // contention is not expected; if it happens, skip writing a pid we can't defend
-    // with the lock rather than leave a kill-target we don't own.
+    // fails fast instead of blocking startup. Contention means another daemon is
+    // alive on this socket path; the caller aborts rather than stealing it.
     let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
     if !locked {
         return Ok(None);
     }
+    // We hold the lock and are the sole owner: now it is safe to overwrite any pid
+    // left by a prior unclean exit.
+    file.set_len(0)?;
     write!(file, "{}", std::process::id())?;
     file.flush()?;
     Ok(Some(file))
@@ -5754,6 +5775,58 @@ mod tests {
         assert_eq!(best_pr_for_branch(&prs, "feature").unwrap().number, 7);
         // A branch with no PR yields None rather than borrowing another's.
         assert!(best_pr_for_branch(&prs, "missing").is_none());
+    }
+
+    // Regression: two daemons against one socket path must never both run. A
+    // process holding live Sessions was orphaned because the second daemon bound
+    // the socket first (unlinking the live one's via `remove_stale_socket`) and
+    // only then checked the pidfile lock — too late. The lock is now the gate,
+    // acquired before the bind: a second acquirer must LOSE while the first holds
+    // it, which is what makes `run_daemon` refuse to start instead of stealing the
+    // socket. A loser must also leave the live pid intact (no truncate-before-lock).
+    #[cfg(unix)]
+    #[test]
+    fn second_daemon_loses_pidfile_lock_and_leaves_live_pid_intact() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-pidfile-gate-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("daemon.sock");
+        let pidfile = hitch_proto::transport::pidfile_path(&socket_path);
+
+        // First daemon wins the lock and records its pid.
+        let first = super::acquire_pidfile(&socket_path).unwrap();
+        assert!(first.is_some(), "first acquirer must win the lock");
+        let me = std::process::id().to_string();
+        assert_eq!(std::fs::read_to_string(&pidfile).unwrap().trim(), me);
+
+        // Second daemon on the same path loses the lock (the gate `run_daemon`
+        // turns into a refusal) and must not clobber the live owner's recorded pid.
+        let second = super::acquire_pidfile(&socket_path).unwrap();
+        assert!(
+            second.is_none(),
+            "second acquirer must lose the lock while the first holds it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pidfile).unwrap().trim(),
+            me,
+            "a losing acquirer must not clobber the live pid"
+        );
+
+        // Releasing the holder frees the path for a legitimate replacement.
+        drop(first);
+        let third = super::acquire_pidfile(&socket_path).unwrap();
+        assert!(
+            third.is_some(),
+            "the lock must be reacquirable once the holder drops"
+        );
+
+        drop(third);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

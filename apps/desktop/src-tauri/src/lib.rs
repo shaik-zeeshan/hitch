@@ -280,7 +280,7 @@ fn describe_handshake_failure(outcome: &Result<Response, String>) -> String {
 /// returns no pid), so it's what makes force-killing such a daemon possible — but
 /// a pidfile left by an unclean exit names a pid the OS may have since reused, and
 /// SIGKILLing that would hit an unrelated process. The daemon holds the lock for
-/// its whole lifetime (see `write_pidfile`), so a *free* lock means the writer is
+/// its whole lifetime (see `acquire_pidfile`), so a *free* lock means the writer is
 /// gone and the pid is unsafe to target. Returns `None` if the file is absent,
 /// unparsable, or stale (lock free).
 #[cfg(unix)]
