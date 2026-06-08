@@ -1124,6 +1124,17 @@ export const defaultBase = derived(
   },
 );
 
+// True when the selected worktree IS the repo's main/anchor worktree — i.e. the
+// user is on the default branch, so there is nothing to open a PR *from*. The
+// main worktree's branch is the base convention (see `defaultBase`), and git
+// allows only one worktree per branch, so `is_main` is the authoritative
+// "on the default branch" signal — independent of daemon version (older daemons
+// omit `base_branch`, which otherwise collapses `defaultBase` to null on main).
+export const selectedWorktreeIsMain = derived(
+  [projectWorktrees, gitWorktreeId],
+  ([$worktrees, $id]) => $worktrees.find((w) => w.id === $id)?.is_main ?? false,
+);
+
 export const visibleSessions = derived(
   [sessions, selectedParent],
   ([$sessions, $parent]) => $sessions.filter((s) => sessionBelongsTo(s, $parent)),

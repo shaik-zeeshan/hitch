@@ -10,8 +10,8 @@
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { get } from "svelte/store";
   import ChevronRight from "~icons/lucide/chevron-right";
-  import MonitorIcon from "~icons/lucide/monitor";
-  import Server from "~icons/lucide/server";
+  import Cloud from "~icons/lucide/cloud";
+  import RotateCw from "~icons/lucide/rotate-cw";
   import Folder from "~icons/lucide/folder";
   import GitBranch from "~icons/lucide/git-branch";
   import GitPullRequest from "~icons/lucide/git-pull-request";
@@ -26,7 +26,6 @@
   import { editorApp } from "../settings";
   import {
     agentActRollupByProject,
-    agentActRollupByScope,
     agentStateByWorktree,
     daemonScopesOrdered,
     liveScopes,
@@ -45,13 +44,11 @@
   import { LAUNCHABLE_AGENTS, TAB_MARK, sessionTabKind } from "../sessionDisplay";
   import {
     createWorktreeFor,
-    remoteBrowserScope,
     removeProjectTarget,
     removeSshHostTarget,
     removeWorktreeTarget,
   } from "../overlays";
   import { sshHosts } from "../sshHosts";
-  import { showsCollapsedScopeRollup } from "../scopeCopy";
   import { focusedPane, matchBinding } from "../keymap";
   import {
     currentDesktopPlatform,
@@ -60,7 +57,6 @@
   } from "../desktopPlatform";
   import {
     type AgentState,
-    type DaemonScope,
     type Id,
     type KnownAgent,
     type PrInfo,
@@ -164,13 +160,6 @@
   // Per-project expand state; git projects start expanded so worktrees show.
   let collapsed = $state<Record<Id, boolean>>({});
 
-  // Per-scope expand state (ADR 0014 multi-daemon tree). A daemon scope (Local,
-  // and later SSH Hosts) is a top-level group whose projects hang under it.
-  // Scopes start EXPANDED — absent means expanded — so Local shows its projects
-  // by default and stays stable across reloads (it is the first scope, always
-  // present). Keyed by scope id, mirroring the per-project `collapsed` map.
-  let scopeCollapsed = $state<Record<Id, boolean>>({});
-
   const projectsForScope = (scopeId: Id): Project[] => $projectsByScope[scopeId] ?? [];
 
   const worktreesFor = (projectId: Id) =>
@@ -193,16 +182,6 @@
 
   function toggleExpand(p: Project) {
     collapsed = { ...collapsed, [p.id]: !collapsed[p.id] };
-  }
-
-  // A daemon scope is expanded unless explicitly collapsed (so Local shows its
-  // projects by default). Collapsing a scope hides every project beneath it.
-  function isScopeExpanded(scope: DaemonScope): boolean {
-    return !scopeCollapsed[scope.id];
-  }
-
-  function toggleScope(scope: DaemonScope) {
-    scopeCollapsed = { ...scopeCollapsed, [scope.id]: !scopeCollapsed[scope.id] };
   }
 
   // Clicking a project row selects it (for palette context + the quick-add
@@ -232,15 +211,14 @@
   // keyed `proj:<id>` / `wt:<id>` so the active key survives reorders/refreshes
   // (the element refs are re-collected each render via the `bind:this` actions).
   type Row =
-    | { key: string; kind: "scope"; scope: DaemonScope }
     | { key: string; kind: "project"; project: Project }
     | { key: string; kind: "worktree"; worktree: Worktree };
 
   const visibleRows = $derived.by<Row[]>(() => {
     const rows: Row[] = [];
+    // Iterate scopes only to preserve project ORDER (Local first, hosts alpha);
+    // scopes no longer have their own visible/roving rows — the tree is flat.
     for (const scope of $daemonScopesOrdered) {
-      rows.push({ key: `scope:${scope.id}`, kind: "scope", scope });
-      if (!isScopeExpanded(scope)) continue;
       for (const project of projectsForScope(scope.id)) {
         rows.push({ key: `proj:${project.id}`, kind: "project", project });
         if (isExpanded(project)) {
@@ -321,11 +299,6 @@
   // project (→ is a no-op, worktrees have no children). Mirrors a file-tree's
   // arrow semantics.
   function rowRight(row: Row) {
-    if (row.kind === "scope") {
-      if (!isScopeExpanded(row.scope)) toggleScope(row.scope);
-      else moveRoving(1); // already expanded → descend to first child
-      return;
-    }
     if (row.kind !== "project") return;
     if (row.project.kind === "git-backed" && collapsed[row.project.id]) {
       toggleExpand(row.project);
@@ -335,10 +308,6 @@
   }
 
   function rowLeft(row: Row) {
-    if (row.kind === "scope") {
-      if (isScopeExpanded(row.scope)) toggleScope(row.scope);
-      return;
-    }
     if (row.kind === "worktree") {
       focusRow(`proj:${row.worktree.project_id}`);
       return;
@@ -349,10 +318,7 @@
   }
 
   function selectRow(row: Row) {
-    // A scope row is a pure expand/collapse group header — it carries no
-    // selection (no Project/Worktree). Enter/Space toggles its children.
-    if (row.kind === "scope") toggleScope(row.scope);
-    else if (row.kind === "project") selectProject(row.project);
+    if (row.kind === "project") selectProject(row.project);
     else selectWorktree(row.worktree);
   }
 
@@ -397,124 +363,29 @@
      command) routes bare-key bindings here. Forwards to a real row when the
      focus landed on the inert container/root rather than a row. -->
 <div class="tree" onfocusin={() => focusedPane.set("tree")}>
+  <!-- Flat project tree: scope/host parent rows are gone. We still iterate
+       $daemonScopesOrdered as the OUTER loop purely to keep project ORDER stable
+       (Local first, then each host's projects together, hosts alpha) and to carry
+       per-project REMOTE context (cloud + host suffix, host actions, liveness)
+       from the owning scope — but each scope renders its projects directly, with
+       no header and no expand/collapse gate. -->
+  {#if $projects.length === 0}
+    <p class="empty-copy">No projects yet. Add a local repo or folder to begin.</p>
+  {/if}
+
   {#each $daemonScopesOrdered as scope (scope.id)}
-    {@const scopeExpanded = isScopeExpanded(scope)}
     {@const scopeProjects = projectsForScope(scope.id)}
-    <!-- Top-level daemon scope header (ADR 0014): a quiet mono group row,
-         twisty + monitor/server glyph + label + a liveness dot. Local is first
-         and always present (monitor glyph, uppercase LOCAL); saved SSH Hosts
-         follow (server glyph, target string) and carry a remove affordance. The
-         host's real Daemon Status arrives in issue #27; until then it reads as a
-         neutral `unreachable` placeholder. -->
-    {@const ScopeIcon = scope.kind === "ssh-host" ? Server : MonitorIcon}
-    {@const sshHost = scope.kind === "ssh-host" ? $sshHosts.find((h) => h.id === scope.id) : null}
-    {@const scopeRollup = $agentActRollupByScope[scope.id]}
-    {@const scopeDown = scope.status === "unreachable" || scope.status === "failed"}
+    {@const isRemote = scope.kind === "ssh-host"}
+    {@const sshHost = isRemote ? $sshHosts.find((h) => h.id === scope.id) : null}
+    {@const host = sshHost?.target}
     <!-- A scope is STALE (greyed, daemon actions disabled) whenever it is not
          LIVE (`running`) — issue #32. Local mirrors the local daemon, so a healthy
-         Local reads live and nothing changes there. The host subtree greys and its
-         daemon-backed context-menu items disable while stale; the host row's own
-         affordances (Retry, Remove) stay enabled (they're GUI-local). -->
+         Local reads live and nothing changes there. A remote project's row greys
+         and its daemon-backed context-menu items disable while stale; the host
+         actions (Retry, Remove) stay enabled (they're GUI-local). -->
     {@const scopeLive = $liveScopes.has(scope.id)}
-    <ContextMenu.Root>
-      <ContextMenu.Trigger>
-        {#snippet child({ props })}
-          <div
-            {...props}
-            use:registerRow={`scope:${scope.id}`}
-            class="scope-row"
-            class:ssh={scope.kind === "ssh-host"}
-            role="button"
-            tabindex={activeKey() === `scope:${scope.id}` ? 0 : -1}
-            aria-expanded={scopeExpanded}
-            onclick={() => {
-              activeRowKey = `scope:${scope.id}`;
-              toggleScope(scope);
-            }}
-            onfocus={() => (activeRowKey = `scope:${scope.id}`)}
-            onkeydown={(e) => onRowKey(e, { key: `scope:${scope.id}`, kind: "scope", scope })}
-          >
-            <button
-              class="tw"
-              class:open={scopeExpanded}
-              aria-label={scopeExpanded ? "Collapse" : "Expand"}
-              onclick={(e) => {
-                e.stopPropagation();
-                toggleScope(scope);
-              }}
-            >
-              <ChevronRight class="icon" />
-            </button>
-            <ScopeIcon class="scope-ic icon" />
-            <span class="scope-name" class:lower={scope.kind === "ssh-host"}>{scope.label}</span>
-            <!-- Same attention rollup shape collapsed Project rows use (ADR 0014):
-                 a collapsed host can still page for needs-approval/error across
-                 its remote sessions. Shown whenever the host is collapsed and has
-                 act-state sessions. -->
-            {#if showsCollapsedScopeRollup({ hasRollup: !!scopeRollup, expanded: scopeExpanded })}
-              <span class="scope-rollup rollup">
-                <span class="g">◆</span>
-                {scopeRollup.count}
-                {ROLLUP_WORD[scopeRollup.state]}
-              </span>
-            {/if}
-            <span
-              class="scope-dot {scope.status === 'running' ? 'ok' : scope.status === 'failed' || scope.status === 'unreachable' ? 'down' : 'pending'}"
-              title={`Daemon ${scope.status}`}
-            ></span>
-            <!-- Retry Now: inline quiet action on an unreachable/failed SSH Host
-                 row (ADR 0014). Resets backoff and reconnects immediately. -->
-            {#if sshHost && scopeDown}
-              <button
-                class="scope-retry"
-                title={`Retry ${sshHost.target}`}
-                aria-label={`Retry ${sshHost.target}`}
-                onclick={(e) => {
-                  e.stopPropagation();
-                  void retrySshHost(sshHost.target);
-                }}
-              >
-                Retry
-              </button>
-            {/if}
-          </div>
-        {/snippet}
-      </ContextMenu.Trigger>
-      {#if sshHost}
-        <ContextMenu.Portal>
-          <ContextMenu.Content class="menu">
-            <!-- Add a Project inside this SSH Host scope (issue #28, ADR 0014):
-                 opens the remote folder browser locked to this host's daemon. The
-                 browser is daemon-backed, so it is disabled while the host is
-                 stale (issue #32) — Retry/Remove below stay enabled. -->
-            <ContextMenu.Item class="mi" disabled={!scopeLive} onSelect={() => remoteBrowserScope.set(scope.id)}>
-              <Plus class="mi-ico icon" />
-              Add project…
-            </ContextMenu.Item>
-            <ContextMenu.Item class="mi" onSelect={() => void copyPath(sshHost.target)}>
-              <Copy class="mi-ico icon" />
-              Copy target
-            </ContextMenu.Item>
-            <ContextMenu.Separator class="m-sep" />
-            <ContextMenu.Item class="mi danger" onSelect={() => removeSshHostTarget.set(sshHost)}>
-              <Trash2 class="mi-ico icon" />
-              Remove host…
-            </ContextMenu.Item>
-          </ContextMenu.Content>
-        </ContextMenu.Portal>
-      {/if}
-    </ContextMenu.Root>
-
-    {#if scopeExpanded}
-      {#if scopeProjects.length === 0}
-        {#if scope.kind === "ssh-host"}
-          <p class="empty-copy">Not connected. Remote projects appear here once the host connects.</p>
-        {:else}
-          <p class="empty-copy">No projects yet. Add a local repo or folder to begin.</p>
-        {/if}
-      {/if}
-
-      {#each scopeProjects as project (project.id)}
+    {@const scopeDown = scope.status === "unreachable" || scope.status === "failed"}
+    {#each scopeProjects as project (project.id)}
         {@const rollup = $agentActRollupByProject[project.id]}
         {@const expanded = isExpanded(project)}
         {@const isGit = project.kind === "git-backed"}
@@ -555,6 +426,17 @@
               <Folder class="folder icon" />
 
               <span class="pname">{project.name}</span>
+
+              {#if isRemote && host}
+                <!-- Remote project marker (flat tree, no host parent row): a quiet
+                     cloud + the dim OpenSSH target, sitting immediately right of
+                     the name. Local projects render nothing here, so they look
+                     identical to before. -->
+                <span class="rhost" title={`Remote on ${host}`}>
+                  <Cloud class="rhost-ic icon" />
+                  <span class="rhost-target">{host}</span>
+                </span>
+              {/if}
 
               <span class="trailing">
                 {#if !expanded && rollup}
@@ -614,6 +496,24 @@
               <Trash2 class="mi-ico icon" />
               Remove project…
             </ContextMenu.Item>
+            {#if isRemote && sshHost}
+              <!-- Host actions live on the project context menu now that there is
+                   no host parent row. Retry (only when the host is down) and
+                   Remove host are GUI-local, so they stay enabled while stale.
+                   "Add project" is deliberately NOT here — that lives on the
+                   global "+" in LeftRail. -->
+              <ContextMenu.Separator class="m-sep" />
+              {#if scopeDown}
+                <ContextMenu.Item class="mi" onSelect={() => void retrySshHost(sshHost.target)}>
+                  <RotateCw class="mi-ico icon" />
+                  Retry {sshHost.target}
+                </ContextMenu.Item>
+              {/if}
+              <ContextMenu.Item class="mi danger" onSelect={() => removeSshHostTarget.set(sshHost)}>
+                <Trash2 class="mi-ico icon" />
+                Remove host…
+              </ContextMenu.Item>
+            {/if}
           </ContextMenu.Content>
         </ContextMenu.Portal>
       </ContextMenu.Root>
@@ -738,8 +638,7 @@
         </ul>
       {/if}
     </div>
-      {/each}
-    {/if}
+    {/each}
   {/each}
 </div>
 
@@ -755,112 +654,6 @@
     line-height: 1.5;
   }
 
-  /* ---- daemon scope header (Local, and later SSH Hosts) ----
-     A quiet top-level group row: twisty · monitor glyph · uppercase mono label
-     · liveness dot. Reuses the project row's mono/twisty vocabulary but reads as
-     a higher-level group (smaller uppercase label, no selection state). */
-  .scope-row {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    width: 100%;
-    min-width: 0;
-    overflow: hidden;
-    text-align: left;
-    padding: 6px 8px;
-    border-radius: 0;
-    cursor: pointer;
-    border: 1px solid transparent;
-    background: transparent;
-    transition: background 0.15s ease-out;
-  }
-  .scope-row:hover {
-    background: var(--paper-3);
-  }
-  /* `:focus` (not `:focus-visible`) for the same WKWebView script-focus reason
-     as `.row:focus` — roving moves focus programmatically. */
-  .scope-row:focus {
-    outline: 1px solid var(--iris-line);
-    outline-offset: -1px;
-  }
-  .scope-row :global(.scope-ic) {
-    width: 13px;
-    height: 13px;
-    flex: 0 0 13px;
-    color: var(--ink-3);
-  }
-  .scope-name {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: var(--mono);
-    font-size: 0.625rem;
-    font-weight: 700;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--ink-2);
-  }
-  /* An SSH Host's caption is its literal OpenSSH target (`user@example.com`),
-     shown verbatim — not the uppercased scope-label treatment Local uses. */
-  .scope-name.lower {
-    text-transform: none;
-    letter-spacing: 0.02em;
-  }
-  /* liveness dot, keyed off Daemon Status: running = ok (green glow), starting =
-     pending (faint), failed/unreachable = down (oxide). Mirrors the top-bar
-     daemon indicator's dot so the scope reads the same at a glance. */
-  .scope-dot {
-    width: 6px;
-    height: 6px;
-    flex: none;
-    border-radius: 50%;
-    background: var(--ink-3);
-  }
-  .scope-dot.ok {
-    background: var(--st-ok);
-    box-shadow: 0 0 0 2px var(--st-ok-glow);
-  }
-  .scope-dot.down {
-    background: var(--st-need);
-  }
-  .scope-dot.pending {
-    background: var(--ink-3);
-  }
-
-  /* The collapsed-host attention rollup reuses the project `.rollup` pill but
-     trims padding to sit on the tighter scope row. flex:none so it never steals
-     the label's ellipsis space. */
-  .scope-rollup {
-    flex: none;
-    padding: 0 6px;
-  }
-
-  /* Retry Now: a quiet inline mono action on an unreachable/failed SSH Host row.
-     Always visible (the ADR says the row "includes" it), oxide-tinted to read as
-     the recovery affordance without shouting. */
-  .scope-retry {
-    flex: none;
-    font-family: var(--mono);
-    font-size: 0.5625rem;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--st-need);
-    background: transparent;
-    border: 1px solid var(--st-need-line);
-    border-radius: 0;
-    padding: 1px 6px;
-    cursor: pointer;
-    transition:
-      color 0.15s ease-out,
-      background 0.15s ease-out;
-  }
-  .scope-retry:hover {
-    background: var(--st-need-wash);
-  }
-
   /* ---- stale scope subtree (issue #32, ADR 0014) ----
      When an SSH Host is unreachable/failed (or mid-reconnect), its last known
      tree stays visible but greys as stale UI and its daemon-backed actions are
@@ -873,6 +666,7 @@
      ADR 0014). Selection (.sel) keeps its own iris styling regardless. */
   .proj.stale .pname,
   .proj.stale .pkind,
+  .proj.stale .rhost-target,
   .proj.stale .name,
   .proj.stale .kindcue,
   .proj.stale .mainsuf,
@@ -880,6 +674,7 @@
   .proj.stale .prchip,
   .proj.stale .pile,
   .proj.stale :global(.folder),
+  .proj.stale :global(.rhost-ic),
   .proj.stale :global(.branchic),
   .proj.stale .tw {
     opacity: 0.5;
@@ -961,11 +756,42 @@
   }
 
   .pname {
-    flex: 1;
+    /* flex:0 1 auto (not 1) so the name no longer eats all the row's free space:
+       the remote cloud+host badge can sit immediately to its right while the
+       `.trailing` cluster's margin-left:auto still pins the kind label / rollup /
+       quick-add to the far right. Local rows render nothing between the name and
+       the auto-margined trailing, so they are visually unchanged. */
+    flex: 0 1 auto;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* Remote project marker: a quiet dim cloud + OpenSSH target right after the
+     project name (the flat tree's replacement for the old host parent row). */
+  .rhost {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex: none;
+    min-width: 0;
+  }
+  .rhost :global(.rhost-ic) {
+    width: 12px;
+    height: 12px;
+    flex: 0 0 12px;
+    color: var(--ink-3);
+  }
+  .rhost-target {
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    font-weight: 500;
+    color: var(--ink-3);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
   }
 
   .trailing {

@@ -9,10 +9,8 @@
   import {
     activeSessionId,
     agentStateByWorktree,
-    defaultBase,
     diffActive,
     gitBusy,
-    gitStatus,
     gitWorktreeId,
     liveScopes,
     openSession,
@@ -26,6 +24,7 @@
     selectedProject,
     selectedProjectId,
     selectedWorktreeId,
+    selectedWorktreeIsMain,
     sessions,
     worktrees,
   } from "../daemon";
@@ -78,7 +77,7 @@
   const selectedParentLive = $derived(
     $selectedParent ? $liveScopes.has(scopeForParent($selectedParent)) : false,
   );
-  const canCreatePr = $derived(Boolean($gitWorktreeId && !$gitBusy && selectedParentLive && (!$defaultBase || $gitStatus?.branch !== $defaultBase)));
+  const canCreatePr = $derived(Boolean($gitWorktreeId && !$gitBusy && selectedParentLive && !$selectedWorktreeIsMain));
 
   function run(action: () => void) {
     commandOpen.set(false);

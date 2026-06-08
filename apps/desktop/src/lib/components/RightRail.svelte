@@ -42,6 +42,7 @@
     push,
     scopeAttributionForWorktree,
     selectedScopeId,
+    selectedWorktreeIsMain,
     setFileStaged,
     setFilesStaged,
     startCommitAndPush,
@@ -86,7 +87,13 @@
   const behind = $derived($gitStatus?.behind ?? 0);
   const additions = $derived($gitStatus?.additions ?? 0);
   const deletions = $derived($gitStatus?.deletions ?? 0);
-  const isDefaultBranch = $derived(Boolean($defaultBase && $gitStatus?.branch === $defaultBase));
+  // On the default branch there is nothing to open a PR *from*. `is_main` is the
+  // authoritative signal (daemon-version independent — old daemons collapse
+  // `defaultBase` to null on the main worktree); the branch-string compare is a
+  // belt-and-suspenders fallback.
+  const isDefaultBranch = $derived(
+    $selectedWorktreeIsMain || Boolean($defaultBase && $gitStatus?.branch === $defaultBase),
+  );
 
   const cancellableJob = $derived($cancellableJobForSelectedWorktree);
 
