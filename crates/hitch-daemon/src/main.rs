@@ -1659,13 +1659,20 @@ fn handle_request<R: Read>(
             send_response(state, client_id, request_id, Response::Ack)?;
         }
         Request::ShutdownDaemon => {
-            send_response(state, client_id, request_id, Response::Ack)?;
             // Resolve the endpoint before flipping the flag so the wake connect
             // below targets our own listener.
             let socket_path = {
                 let guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
                 guard.config.socket_path.clone()
             };
+            // The Ack is best-effort: `request_daemon_shutdown` on the GUI side
+            // returns as soon as the request is flushed and the app then exits,
+            // so it is usually gone before this Ack can be written. Setting the
+            // shutdown flag and waking the accept thread are mandatory and MUST
+            // run even when the Ack write fails against a closed peer — gating
+            // them behind `send_response(..)?` is what left the daemon alive
+            // after "Quit Hitch".
+            let _ = send_response(state, client_id, request_id, Response::Ack);
             shutdown.store(true, Ordering::SeqCst);
             wake_accept_thread(&socket_path);
         }

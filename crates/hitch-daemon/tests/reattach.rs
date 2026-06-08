@@ -44,6 +44,60 @@ fn daemon_transport_answers_hello_ping_and_shutdown() {
     daemon.wait_for_exit();
 }
 
+/// The GUI's "Quit Hitch" returns from `request_daemon_shutdown` as soon as the
+/// request is flushed and then calls `app.exit(0)`, abruptly terminating the
+/// process with daemon responses/events still unread in its receive buffer — so
+/// the OS tears the socket down with an RST and the daemon's Ack write fails
+/// with `ECONNRESET`. The daemon MUST still shut down in that case: regression
+/// for the handler gating the shutdown flag behind a `send_response(Ack)?` that
+/// propagated that error and left the daemon running after an explicit quit.
+#[cfg(unix)]
+#[test]
+fn daemon_shuts_down_when_client_resets_before_reading_ack() {
+    use std::os::unix::io::AsRawFd;
+
+    let socket = test_socket_path("quit-no-ack");
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut stream = connect_test_daemon(&socket);
+    send_transport_request(
+        &mut stream,
+        1,
+        Request::Hello {
+            client_name: "quit-no-ack".into(),
+            protocol_version: PROTOCOL_VERSION,
+        },
+    );
+    expect_transport_response(&mut stream, 1, |response| {
+        matches!(response, Response::Hello { .. })
+    });
+
+    // Send the shutdown but never read the Ack. Arm SO_LINGER with a zero
+    // timeout so closing the socket sends an RST (not a graceful FIN), the way
+    // an abrupt `app.exit(0)` with unread data does — this makes the daemon's
+    // Ack write fail with ECONNRESET, reproducing the GUI-exited-before-ack
+    // race deterministically.
+    send_transport_request(&mut stream, 2, Request::ShutdownDaemon);
+    let raw = stream.into_inner();
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            raw.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&linger as *const libc::linger).cast(),
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "arming SO_LINGER failed: {}", io::Error::last_os_error());
+    drop(raw); // close() now sends RST
+
+    daemon.wait_for_exit();
+}
+
 #[cfg(unix)]
 #[test]
 fn list_directory_defaults_to_home_and_lists_folders_first_hiding_dotfiles() {
