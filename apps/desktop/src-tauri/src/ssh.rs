@@ -56,8 +56,13 @@ const SSH_CONNECT_TIMEOUT_SECS: u32 = 10;
 
 /// The exact manual command surfaced in every failure message so the user can
 /// reproduce the test in their own terminal. `<target>` is substituted per host.
+///
+/// This mirrors the client's candidate probe (approach C, ADR 0014 amendment):
+/// a Hitch self-install puts the binary at the known location `~/.local/bin/hitch`,
+/// while a manual install is expected to put `hitch` on its own login PATH. The
+/// advertised command tries the known location first, then bare `hitch`.
 pub fn manual_command(target: &str) -> String {
-    format!("ssh -o BatchMode=yes {target} hitch daemon proxy")
+    format!("ssh -o BatchMode=yes {target} '~/.local/bin/hitch daemon proxy || hitch daemon proxy'")
 }
 
 /// Actionable failure category for a failed connection test (ADR 0014). Each maps
@@ -230,8 +235,9 @@ pub fn classify(
         return SshTestResult::failure(
             FailureCategory::MissingHitch,
             format!(
-                "Connected, but `hitch` was not found on {target}. Install the Hitch daemon binary on the host \
-                 and make sure it is on the login PATH as `hitch`. Manual test: {manual}"
+                "Connected, but `hitch` was not found on {target}. Install Hitch on the host (a self-install \
+                 symlinks `hitch`/`hitch-hook` into `~/.local/bin`), or for a manual install put `hitch` on the \
+                 login PATH (or symlink it into `~/.local/bin`). Manual test: {manual}"
             ),
             tail,
         );
@@ -503,7 +509,7 @@ mod tests {
         assert!(result.message.contains(&PROTOCOL_VERSION.to_string()));
         assert!(result.message.contains(&remote.to_string()));
         // Every failure embeds the manual command.
-        assert!(result.message.contains("ssh -o BatchMode=yes prod hitch daemon proxy"));
+        assert!(result.message.contains(&manual_command("prod")));
     }
 
     #[test]
@@ -595,6 +601,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 daemon_pid: 1234,
                 os_family: hitch_proto::OsFamily::Unix,
+                exe_path: None,
             },
         ))
         .unwrap();
@@ -621,6 +628,7 @@ mod tests {
                     protocol_version: PROTOCOL_VERSION,
                     daemon_pid: 9,
                     os_family: hitch_proto::OsFamily::Unix,
+                    exe_path: None,
                 },
             ))
             .unwrap(),

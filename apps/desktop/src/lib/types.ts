@@ -111,6 +111,24 @@ export type SshTestResult = {
   detail?: string;
 };
 
+// Status of the local `hitch` CLI install (ADR 0014 amendment). Mirrors
+// src-tauri's `cli_install::CliInstallStatus`. `state` drives the Remote Hosts
+// "this machine as a remote host" control:
+//  - `installed`     — our `~/.local/bin/hitch` symlink is present and ours,
+//  - `not-installed` — nothing at the link path; Install can proceed,
+//  - `conflict`      — a foreign file occupies the link path; we won't clobber,
+//  - `unavailable`   — no bundled daemon (dev build) or Windows (manual install).
+// The client reaches a self-installed host by learning the daemon's absolute path
+// from the Hello handshake (ADR 0014 amendment 2026-06-08), so install no longer
+// edits shell rc files and there is no PATH signal to report.
+export type CliInstallState = "installed" | "not-installed" | "conflict" | "unavailable";
+export type CliInstallStatus = {
+  state: CliInstallState;
+  linkPath: string | null;
+  target: string | null;
+  detail: string | null;
+};
+
 // Lifecycle of an async Job (CONTEXT.md, ADR 0008). Mirrors hitch-proto's
 // `JobStatus`.
 export type JobStatus =

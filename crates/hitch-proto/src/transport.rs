@@ -548,6 +548,7 @@ mod tests {
                     protocol_version: PROTOCOL_VERSION,
                     daemon_pid: 42,
                     os_family: crate::OsFamily::Unix,
+                    exe_path: None,
                 },
             ))
             .unwrap();
@@ -573,6 +574,7 @@ mod tests {
                     protocol_version: PROTOCOL_VERSION,
                     daemon_pid: 42,
                     os_family: crate::OsFamily::Unix,
+                    exe_path: None,
                 }
             )]
         );

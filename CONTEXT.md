@@ -9,7 +9,7 @@ A workspace rooted at a directory on the machine where its owning **Daemon** run
 _Avoid_: Repo (a Project may not be a repo), Workspace, Remote Host Project (use **Remote Project** only when the GUI reaches the owning Daemon through SSH).
 
 **SSH Host**:
-A GUI-local saved OpenSSH target string through which the GUI can reach a Hitch **Daemon** running on that host; SSH auth remains non-interactive and owned by the user's OpenSSH config, ssh-agent, and known_hosts.
+A GUI-local saved OpenSSH target string through which the GUI can reach a Hitch **Daemon** running on that host; SSH auth remains non-interactive and owned by the user's OpenSSH config, ssh-agent, and known_hosts. A Hitch install makes its own machine reachable as one by self-installing the `hitch` CLI locally as a pure symlink (`~/.local/bin/hitch` → bundled `hitch-daemon`, plus `~/.local/bin/hitch-hook` for hook adjacency) with **no shell-rc edits**; the Hitch client then reaches that self-installed host with **zero config** by learning the daemon's absolute path from the `Hello` handshake and invoking it directly (Approach C). Making bare `ssh <host> hitch` work for a *human* against a self-installed host is out of scope; a *manual* host just needs a compatible `hitch` on its own PATH. This is local-only and never uploads binaries to a remote (ADR 0014 amendment).
 _Avoid_: Server (reserved as an avoided synonym for **Daemon**), Machine, Box.
 
 **Remote Project**:

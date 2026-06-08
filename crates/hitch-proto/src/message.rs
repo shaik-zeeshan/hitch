@@ -81,7 +81,14 @@ use serde::{Deserialize, Serialize};
 /// `Response::Hello` so the GUI quotes inserted remote paths for the remote
 /// platform (POSIX vs Windows). An old daemon at v25 has neither the upload
 /// messages nor the platform field.
-pub const PROTOCOL_VERSION: u16 = 26;
+/// v27 adds `exe_path` (the daemon's startup `current_exe()` absolute path) to
+/// `Response::Hello` so the client can cache it and re-invoke the daemon binary
+/// directly on reconnect (approach C, ADR 0014 amendment), shell-free and
+/// PATH-free — identical resolution across OS without relying on the
+/// non-interactive `ssh host cmd` PATH. An old daemon at v26 omits it, so the
+/// field decodes to `None` and the client falls back to its candidate-path
+/// probe (the known Unix self-install location, then bare `hitch`).
+pub const PROTOCOL_VERSION: u16 = 27;
 
 /// Maximum bytes carried by one [`Request::UploadChunk`] frame (256 KiB). The
 /// upload stream is shared with interactive PTY traffic, so chunks are bounded
@@ -707,6 +714,14 @@ pub enum Response {
         /// upgrades; the version check already gates real upload use.
         #[serde(default = "os_family_default")]
         os_family: OsFamily,
+        /// The daemon's own executable path, captured from `current_exe()` at
+        /// startup (approach C, ADR 0014 amendment). The client caches it and
+        /// re-invokes this exact binary on reconnect — shell-free and PATH-free.
+        /// `#[serde(default)]` to `None` keeps an old daemon's Hello (no field)
+        /// decodable during rolling upgrades; the client then falls back to its
+        /// candidate-path probe.
+        #[serde(default)]
+        exe_path: Option<String>,
     },
     /// Command succeeded and has no body.
     Ack,
@@ -1704,6 +1719,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             daemon_pid: 7,
             os_family: OsFamily::Windows,
+            exe_path: None,
         };
         let value: serde_json::Value = serde_json::to_value(&hello).unwrap();
         assert_eq!(value["os_family"], "windows");
@@ -1721,6 +1737,36 @@ mod tests {
             panic!("expected hello");
         };
         assert_eq!(os_family, OsFamily::Unix);
+    }
+
+    #[test]
+    fn hello_carries_exe_path_and_decodes_without_it_for_rolling_upgrades() {
+        // A new daemon's Hello carrying its startup exe path round-trips and the
+        // path is readable for the client to cache (approach C, ADR 0014).
+        let hello = Response::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_pid: 7,
+            os_family: OsFamily::Unix,
+            exe_path: Some("/home/dev/.local/bin/hitch".into()),
+        };
+        let value: serde_json::Value = serde_json::to_value(&hello).unwrap();
+        assert_eq!(value["exe_path"], "/home/dev/.local/bin/hitch");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(hello, back);
+
+        // An old daemon at v26 omits `exe_path`; it must still decode (to `None`)
+        // so the client can fall back to its candidate-path probe.
+        let legacy = serde_json::json!({
+            "type": "hello",
+            "protocol_version": PROTOCOL_VERSION,
+            "daemon_pid": 7,
+            "os_family": "unix",
+        });
+        let back: Response = serde_json::from_value(legacy).unwrap();
+        let Response::Hello { exe_path, .. } = back else {
+            panic!("expected hello");
+        };
+        assert_eq!(exe_path, None);
     }
 
     fn value_tag(request: &Request) -> String {
@@ -1860,7 +1906,7 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 26);
+        assert_eq!(PROTOCOL_VERSION, 27);
     }
 
     #[test]
@@ -2491,6 +2537,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 daemon_pid: 42,
                 os_family: OsFamily::Unix,
+                exe_path: Some("/home/dev/.local/bin/hitch".into()),
             },
             Response::UploadStarted {
                 upload_id: "upload-1".into(),

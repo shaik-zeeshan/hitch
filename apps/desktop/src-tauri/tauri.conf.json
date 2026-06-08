@@ -40,11 +40,13 @@
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico",
         "installMode": "currentUser",
-        "languages": ["English"]
+        "languages": ["English"],
+        "installerHooks": "installer/cli-reach-in.nsh"
       },
       "wix": {
         "upgradeCode": "65651318-7c65-59f0-afed-f2cc25d05041",
-        "language": "en-US"
+        "language": "en-US",
+        "fragmentPaths": ["installer/cli-reach-in.wxs"]
       }
     }
   }

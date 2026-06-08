@@ -133,6 +133,68 @@ fn jitter_unit() -> f64 {
     (nanos % 1_000) as f64 / 1_000.0
 }
 
+// ---------------------------------------------------------------------------
+// Approach C: candidate orchestration (pure decision logic, ADR 0014 amendment)
+// ---------------------------------------------------------------------------
+
+/// One remote-command candidate for invoking `hitch daemon proxy` on the host.
+/// Each variant maps to the remote argv (after `ssh … -- <target>`) used to
+/// launch the daemon proxy. The first connect tries these in [`candidate_sequence`]
+/// order; a learned `exe_path` short-circuits to a direct launch on reconnect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyCandidate {
+    /// The known Unix self-install location. `~/.local/bin/hitch` is passed as a
+    /// LITERAL argv element (no local shell expansion); the remote login shell
+    /// (`$SHELL -c`) expands the leading `~`.
+    KnownLocation,
+    /// Bare `hitch`, resolved by the remote login PATH. Covers manual installs and
+    /// the Windows registry PATH set by the installer.
+    BarePath,
+    /// A learned absolute daemon path from a prior Hello (`exe_path`), launched
+    /// directly on reconnect — shell-free and PATH-free.
+    CachedExePath(String),
+}
+
+impl ProxyCandidate {
+    /// The remote argv for this candidate, i.e. the tokens appended after
+    /// `ssh … -- <target>`. The first token is the program; the rest are
+    /// `daemon proxy`. `~` in [`ProxyCandidate::KnownLocation`] is intentionally
+    /// NOT expanded here — it is a literal argv element the remote shell expands.
+    pub fn remote_args(&self) -> Vec<String> {
+        let program = match self {
+            ProxyCandidate::KnownLocation => "~/.local/bin/hitch".to_string(),
+            ProxyCandidate::BarePath => "hitch".to_string(),
+            ProxyCandidate::CachedExePath(path) => path.clone(),
+        };
+        vec![program, "daemon".to_string(), "proxy".to_string()]
+    }
+}
+
+/// The first-connect candidate sequence (no cached `exe_path`): try the known
+/// self-install location, then bare `hitch`. Pure so its order/contents are
+/// unit-tested without live SSH.
+pub fn candidate_sequence() -> Vec<ProxyCandidate> {
+    vec![ProxyCandidate::KnownLocation, ProxyCandidate::BarePath]
+}
+
+/// Decide whether a failed candidate should fall through to the next candidate
+/// or surface immediately. Per approach C, ONLY `MissingHitch` falls through
+/// (the binary genuinely wasn't at that location); `Auth`/`HostKey`/`Network`
+/// (and any other category) surface immediately — retrying those just doubles
+/// latency. `None` (no classified category, e.g. a spawn error) surfaces too.
+pub fn should_fall_through(category: Option<ssh::FailureCategory>) -> bool {
+    matches!(category, Some(ssh::FailureCategory::MissingHitch))
+}
+
+/// Decide whether a cached `exe_path` that just failed should trigger
+/// re-discovery (clear the cache + re-run the candidate sequence). The remote
+/// moved/updated/removed the binary iff the failure classifies as `MissingHitch`;
+/// any other category is a transient/auth/network problem the normal backoff
+/// handles, so the cache stays.
+pub fn should_rediscover_cached_path(category: Option<ssh::FailureCategory>) -> bool {
+    matches!(category, Some(ssh::FailureCategory::MissingHitch))
+}
+
 /// The writer half of a remote connection: the SSH child's stdin. Frames are
 /// written to it exactly as they would be to a `DaemonStream`.
 type RemoteWriter = ChildStdin;
@@ -161,6 +223,13 @@ struct RemoteConnection {
     /// remote-platform path quoting when inserting uploaded paths. Defaults to Unix
     /// until the first successful handshake fills it in.
     os_family: Mutex<OsFamily>,
+    /// The remote daemon's own executable path, learned from its Hello `exe_path`
+    /// (approach C, ADR 0014 amendment). Cached IN MEMORY only — re-learned each
+    /// session, never persisted to the localStorage host entry. When present, a
+    /// reconnect launches this exact binary directly (shell-free, PATH-free); a
+    /// `MissingHitch` from it (the remote moved/updated the binary) clears the
+    /// cache and re-runs the candidate probe.
+    exe_path: Mutex<Option<String>>,
     /// Set while a removal/disconnect is intentional, so the reader thread's EOF
     /// does not trigger auto-reconnect.
     shutting_down: AtomicBool,
@@ -182,6 +251,7 @@ impl RemoteConnection {
             child: Mutex::new(None),
             attempt: AtomicU64::new(0),
             os_family: Mutex::new(OsFamily::Unix),
+            exe_path: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             reconnecting: AtomicBool::new(false),
         }
@@ -579,13 +649,95 @@ impl SshConnections {
         }
     }
 
-    /// One connect attempt: spawn ssh, Hello-handshake over its stdio, and on
-    /// success attach the reader + heartbeat. Returns a classified failure on
-    /// any error.
+    /// One connect attempt, orchestrating the approach-C candidate sequence
+    /// (ADR 0014 amendment). Spawns ssh, Hello-handshakes over its stdio, and on
+    /// success attaches the reader + heartbeat. Returns the classified failure of
+    /// the last tried candidate on failure.
+    ///
+    /// - With a cached `exe_path` (a prior session learned the daemon's binary),
+    ///   it launches that path directly. A `MissingHitch` from it means the remote
+    ///   moved/updated the binary: clear the cache and re-run the full candidate
+    ///   sequence.
+    /// - Without a cache, it tries [`candidate_sequence`] in order, falling
+    ///   through 1→2 ONLY on `MissingHitch` ([`should_fall_through`]); any other
+    ///   category surfaces immediately.
     fn connect_once(
         &self,
         app: &AppHandle,
         connection: &Arc<RemoteConnection>,
+    ) -> Result<(), RemoteFailure> {
+        // Reconnect fast-path: a learned exe path is launched directly.
+        let cached = connection
+            .exe_path
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(path) = cached {
+            let candidate = ProxyCandidate::CachedExePath(path.clone());
+            match self.connect_attempt(app, connection, &candidate) {
+                Ok(()) => return Ok(()),
+                Err(failure) => {
+                    if should_rediscover_cached_path(failure.category) {
+                        // Self-healing: the remote moved/updated/removed the binary.
+                        // Drop the stale cache and fall back to re-discovery.
+                        eprintln!(
+                            "hitch: cached remote daemon path `{path}` for {} is stale \
+                             (MissingHitch); clearing cache and re-discovering",
+                            connection.target
+                        );
+                        if let Ok(mut slot) = connection.exe_path.lock() {
+                            *slot = None;
+                        }
+                        // Fall through to the candidate sequence below.
+                    } else {
+                        // Transient/auth/network: keep the cache, surface the error.
+                        return Err(failure);
+                    }
+                }
+            }
+        }
+
+        // First connect (or post-invalidation re-discovery): try candidates in
+        // order, falling through only on MissingHitch.
+        let candidates = candidate_sequence();
+        let mut last: Option<RemoteFailure> = None;
+        for candidate in &candidates {
+            match self.connect_attempt(app, connection, candidate) {
+                Ok(()) => {
+                    eprintln!(
+                        "hitch: remote daemon for {} connected via candidate {candidate:?}",
+                        connection.target
+                    );
+                    return Ok(());
+                }
+                Err(failure) => {
+                    let fall_through = should_fall_through(failure.category);
+                    last = Some(failure);
+                    if !fall_through {
+                        // Auth/HostKey/Network/etc: surface immediately rather than
+                        // doubling latency on a retry that can't succeed.
+                        break;
+                    }
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| RemoteFailure {
+            message: format!("no connect candidates for {}", connection.target),
+            outcome: None,
+            protocol_mismatch: false,
+            category: None,
+        }))
+    }
+
+    /// A single ssh-spawn-and-handshake attempt for one [`ProxyCandidate`]. On a
+    /// compatible Hello it takes ownership of the connection (writer/child set,
+    /// reader + heartbeat started) and returns `Ok`. Otherwise returns the
+    /// classified [`RemoteFailure`].
+    fn connect_attempt(
+        &self,
+        app: &AppHandle,
+        connection: &Arc<RemoteConnection>,
+        candidate: &ProxyCandidate,
     ) -> Result<(), RemoteFailure> {
         let mut command = Command::new("ssh");
         command
@@ -601,10 +753,14 @@ impl SshConnections {
             .arg("-o")
             .arg("ServerAliveCountMax=3")
             .arg("--")
-            .arg(&connection.target)
-            .arg("hitch")
-            .arg("daemon")
-            .arg("proxy")
+            .arg(&connection.target);
+        // The candidate's remote argv (program + `daemon proxy`). The known-location
+        // candidate passes `~/.local/bin/hitch` as a LITERAL arg — the remote login
+        // shell expands `~`, not the local process.
+        for token in candidate.remote_args() {
+            command.arg(token);
+        }
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -618,6 +774,7 @@ impl SshConnections {
             ),
             outcome: None,
             protocol_mismatch: false,
+            category: Some(ssh::FailureCategory::Network),
         })?;
 
         let mut stdin = child.stdin.take().expect("ssh child stdin piped");
@@ -651,6 +808,7 @@ impl SshConnections {
             message: format!("failed to encode hello: {err}"),
             outcome: None,
             protocol_mismatch: false,
+            category: None,
         })?;
         if stdin.write_all(&hello).and_then(|_| stdin.flush()).is_err() {
             let stderr = stderr_buf.lock().map(|s| s.clone()).unwrap_or_default();
@@ -808,11 +966,14 @@ struct HandshakeResult {
 }
 
 /// A classified remote connect failure: a user-facing message plus the raw
-/// handshake outcome (so the loop can decide failed-vs-unreachable).
+/// handshake outcome (so the loop can decide failed-vs-unreachable) and the
+/// classified category (so the candidate orchestrator can decide whether to fall
+/// through / re-discover, approach C).
 struct RemoteFailure {
     message: String,
     outcome: Option<HandshakeOutcome>,
     protocol_mismatch: bool,
+    category: Option<ssh::FailureCategory>,
 }
 
 /// Build a `RemoteFailure` from a finished ssh child + stderr + handshake using
@@ -830,6 +991,7 @@ fn classify_remote(
         message: result.message,
         outcome: Some(outcome.clone()),
         protocol_mismatch: matches!(outcome, HandshakeOutcome::Hello { protocol_version } if protocol_version != PROTOCOL_VERSION),
+        category: result.category,
     }
 }
 
@@ -870,6 +1032,7 @@ fn read_remote_hello<R: BufRead>(
                     Response::Hello {
                         protocol_version,
                         os_family,
+                        exe_path,
                         ..
                     },
             })) if id == request_id => {
@@ -877,6 +1040,16 @@ fn read_remote_hello<R: BufRead>(
                 // remote-appropriate quoting (issue #31).
                 if let Ok(mut slot) = connection.os_family.lock() {
                     *slot = os_family;
+                }
+                // Cache the daemon's own exe path so reconnects launch it directly
+                // (approach C). Only cache a compatible Hello — a version-mismatched
+                // daemon won't be used. `None` (old daemon) leaves the cache as-is.
+                if protocol_version == PROTOCOL_VERSION {
+                    if let (Ok(mut slot), Some(path)) =
+                        (connection.exe_path.lock(), exe_path.as_ref())
+                    {
+                        *slot = Some(path.clone());
+                    }
                 }
                 return HandshakeOutcome::Hello { protocol_version };
             }
@@ -1304,5 +1477,165 @@ mod tests {
         // base would clamp. Verify the floor explicitly via a synthetic call.
         let d = backoff_delay(0, 0.0);
         assert!(d >= Duration::from_secs(1));
+    }
+
+    // ----- Approach C: candidate orchestration (pure decision logic) -----
+
+    use ssh::FailureCategory;
+
+    #[test]
+    fn candidate_sequence_is_known_location_then_bare() {
+        // First connect tries the Unix self-install location, then bare `hitch`.
+        let seq = candidate_sequence();
+        assert_eq!(
+            seq,
+            vec![ProxyCandidate::KnownLocation, ProxyCandidate::BarePath]
+        );
+    }
+
+    #[test]
+    fn known_location_passes_tilde_as_literal_arg() {
+        // `~` is NOT locally expanded — it's a literal argv element the remote
+        // login shell expands. The program token is the first remote arg.
+        let args = ProxyCandidate::KnownLocation.remote_args();
+        assert_eq!(args, vec!["~/.local/bin/hitch", "daemon", "proxy"]);
+    }
+
+    #[test]
+    fn bare_path_candidate_uses_bare_hitch() {
+        let args = ProxyCandidate::BarePath.remote_args();
+        assert_eq!(args, vec!["hitch", "daemon", "proxy"]);
+    }
+
+    #[test]
+    fn cached_exe_path_candidate_launches_that_path_directly() {
+        // Reconnect launches the learned absolute path directly (no `~`, no PATH).
+        let args =
+            ProxyCandidate::CachedExePath("/opt/hitch/bin/hitch".into()).remote_args();
+        assert_eq!(args, vec!["/opt/hitch/bin/hitch", "daemon", "proxy"]);
+    }
+
+    #[test]
+    fn fall_through_only_on_missing_hitch() {
+        // Known-path → bare fall-through happens ONLY for MissingHitch.
+        assert!(should_fall_through(Some(FailureCategory::MissingHitch)));
+    }
+
+    #[test]
+    fn auth_host_key_network_surface_immediately_no_fall_through() {
+        // Retrying these on the next candidate just doubles latency.
+        assert!(!should_fall_through(Some(FailureCategory::Auth)));
+        assert!(!should_fall_through(Some(FailureCategory::HostKey)));
+        assert!(!should_fall_through(Some(FailureCategory::Network)));
+        assert!(!should_fall_through(Some(FailureCategory::ProtocolMismatch)));
+        assert!(!should_fall_through(Some(FailureCategory::ProxyStartup)));
+        // No classified category (spawn/encode error) also surfaces.
+        assert!(!should_fall_through(None));
+    }
+
+    #[test]
+    fn stale_cached_path_rediscovers_only_on_missing_hitch() {
+        // A MissingHitch from a cached path means the remote moved/updated the
+        // binary → clear cache + re-run the candidate sequence.
+        assert!(should_rediscover_cached_path(Some(FailureCategory::MissingHitch)));
+        // Every other category is transient/auth/network → keep the cache and let
+        // normal backoff handle it.
+        assert!(!should_rediscover_cached_path(Some(FailureCategory::Auth)));
+        assert!(!should_rediscover_cached_path(Some(FailureCategory::HostKey)));
+        assert!(!should_rediscover_cached_path(Some(FailureCategory::Network)));
+        assert!(!should_rediscover_cached_path(Some(FailureCategory::ProxyStartup)));
+        assert!(!should_rediscover_cached_path(None));
+    }
+
+    /// Simulate the first-connect candidate walk over a sequence of per-candidate
+    /// outcome categories, applying the pure fall-through rule. Returns the index
+    /// of the winning candidate (`Ok`) or the index of the candidate whose failure
+    /// was surfaced (`Err`). This mirrors `connect_once`'s loop without live SSH.
+    fn walk_candidates(outcomes: &[Option<FailureCategory>]) -> Result<usize, usize> {
+        let seq = candidate_sequence();
+        let mut last_idx = 0;
+        for (idx, _candidate) in seq.iter().enumerate() {
+            let category = outcomes.get(idx).copied().flatten();
+            // `None` here in the test harness means "this candidate succeeded".
+            if outcomes.get(idx).map(|c| c.is_none()).unwrap_or(false) {
+                return Ok(idx);
+            }
+            last_idx = idx;
+            if !should_fall_through(category) {
+                return Err(idx);
+            }
+        }
+        Err(last_idx)
+    }
+
+    #[test]
+    fn known_path_missing_then_bare_succeeds() {
+        // Candidate 0 (known location) MissingHitch → fall through; candidate 1
+        // (bare) succeeds.
+        let outcome = walk_candidates(&[Some(FailureCategory::MissingHitch), None]);
+        assert_eq!(outcome, Ok(1));
+    }
+
+    #[test]
+    fn known_path_auth_surfaces_without_trying_bare() {
+        // Candidate 0 Auth → surface immediately, candidate 1 is never tried.
+        let outcome = walk_candidates(&[Some(FailureCategory::Auth), None]);
+        assert_eq!(outcome, Err(0));
+    }
+
+    #[test]
+    fn both_candidates_missing_surfaces_last() {
+        // Both MissingHitch → the bare candidate's failure is the surfaced one.
+        let outcome = walk_candidates(&[
+            Some(FailureCategory::MissingHitch),
+            Some(FailureCategory::MissingHitch),
+        ]);
+        assert_eq!(outcome, Err(1));
+    }
+
+    #[test]
+    fn known_path_succeeds_first() {
+        let outcome = walk_candidates(&[None, None]);
+        assert_eq!(outcome, Ok(0));
+    }
+
+    /// The cached-path reconnect decision, expressed as the pure choice the
+    /// orchestrator makes: given a cached path's failure category, do we re-run
+    /// the candidate sequence (re-discovery) or surface? This mirrors
+    /// `connect_once`'s reconnect fast-path without live SSH.
+    fn reconnect_decision(cached_failure: Option<FailureCategory>) -> ReconnectChoice {
+        if should_rediscover_cached_path(cached_failure) {
+            ReconnectChoice::Rediscover
+        } else {
+            ReconnectChoice::Surface
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ReconnectChoice {
+        Rediscover,
+        Surface,
+    }
+
+    #[test]
+    fn cached_path_used_then_stale_triggers_rediscovery() {
+        // A stale cached path (MissingHitch) re-discovers via the candidate walk.
+        assert_eq!(
+            reconnect_decision(Some(FailureCategory::MissingHitch)),
+            ReconnectChoice::Rediscover
+        );
+        // And the subsequent candidate walk resolves to bare on the second try.
+        let outcome = walk_candidates(&[Some(FailureCategory::MissingHitch), None]);
+        assert_eq!(outcome, Ok(1));
+    }
+
+    #[test]
+    fn cached_path_transient_failure_keeps_cache() {
+        // A network blip on the cached path does NOT re-discover; backoff retries
+        // the same cached path.
+        assert_eq!(
+            reconnect_decision(Some(FailureCategory::Network)),
+            ReconnectChoice::Surface
+        );
     }
 }

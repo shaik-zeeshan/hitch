@@ -251,6 +251,12 @@ struct DaemonConfig {
     git: PathBuf,
     gh: PathBuf,
     draft_provider: DraftProviderConfig,
+    /// The daemon's own executable path, captured from `current_exe()` AT STARTUP
+    /// and reported in [`Response::Hello`] as `exe_path` (approach C, ADR 0014
+    /// amendment) so the client can re-invoke this exact binary on reconnect.
+    /// Captured at startup, not at Hello time, because the binary could move while
+    /// the daemon runs. `None` if `current_exe()` fails.
+    exe_path: Option<String>,
 }
 
 impl From<Args> for DaemonConfig {
@@ -264,6 +270,9 @@ impl From<Args> for DaemonConfig {
             git: args.git,
             gh: args.gh,
             draft_provider: args.draft_provider,
+            exe_path: std::env::current_exe()
+                .ok()
+                .map(|p| p.display().to_string()),
         }
     }
 }
@@ -1149,6 +1158,15 @@ fn handle_request<R: Read>(
                 )?;
                 return Ok(());
             }
+            // The startup-captured `current_exe()` path (approach C, ADR 0014
+            // amendment), so the client caches it and re-invokes this exact
+            // binary on reconnect — shell-free and PATH-free.
+            let exe_path = state
+                .lock()
+                .map_err(|_| internal("state lock poisoned"))?
+                .config
+                .exe_path
+                .clone();
             send_response(
                 state,
                 client_id,
@@ -1157,6 +1175,7 @@ fn handle_request<R: Read>(
                     protocol_version: PROTOCOL_VERSION,
                     daemon_pid: std::process::id(),
                     os_family: OsFamily::current(),
+                    exe_path,
                 },
             )?;
             // Replay must run ON the dispatcher thread so the snapshot it sends
@@ -5621,15 +5640,50 @@ fn default_hook_helper_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("hitch-hook"))
 }
 
+/// Resolve the `hitch-hook` helper that lives next to the daemon executable.
+///
+/// The hook is always adjacent to the daemon binary and named by transposing the
+/// daemon's name onto `hitch-hook`:
+/// - A Tauri sidecar daemon `hitch-daemon[-<target-triple>][.exe]` maps to
+///   `hitch-hook[-<target-triple>][.exe]` (the `hitch-daemon` prefix is swapped
+///   for `hitch-hook`, preserving any target-triple suffix and `.exe`). This is
+///   how the bundled sidecars are named.
+/// - A self-installed daemon symlink named `hitch` (or `hitch.exe`) — which is
+///   what `current_exe()` reports on macOS, where the symlink path is kept — maps
+///   to `hitch-hook` + the platform executable suffix
+///   ([`std::env::consts::EXE_SUFFIX`]: `""` on unix, `.exe` on Windows). The
+///   suffix comes from `EXE_SUFFIX`, not the daemon's own name, so a Windows
+///   daemon invoked as bare `hitch`/`hitch-daemon` still resolves an executable
+///   `hitch-hook.exe`.
 fn hook_helper_path_for_daemon_exe(exe: &Path) -> PathBuf {
-    let Some(parent) = exe.parent() else {
-        return PathBuf::from("hitch-hook");
-    };
-    let Some(file_name) = exe.file_name().and_then(|name| name.to_str()) else {
-        return parent.join("hitch-hook");
-    };
-    let suffix = file_name.strip_prefix("hitch-daemon").unwrap_or_default();
-    parent.join(format!("hitch-hook{suffix}"))
+    let hook_name = exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(hook_name_for_daemon_file_name)
+        .unwrap_or_else(|| format!("hitch-hook{}", std::env::consts::EXE_SUFFIX));
+    match exe.parent() {
+        Some(parent) => parent.join(hook_name),
+        None => PathBuf::from(hook_name),
+    }
+}
+
+/// Map a daemon binary *file name* to its adjacent hook file name.
+fn hook_name_for_daemon_file_name(file_name: &str) -> String {
+    // Sidecar form: swap the `hitch-daemon` prefix for `hitch-hook`, keeping any
+    // target-triple suffix and `.exe` exactly (e.g.
+    // `hitch-daemon-aarch64-apple-darwin` -> `hitch-hook-aarch64-apple-darwin`,
+    // `hitch-daemon.exe` -> `hitch-hook.exe`).
+    if let Some(rest) = file_name.strip_prefix("hitch-daemon") {
+        return format!("hitch-hook{rest}");
+    }
+    // Self-install symlink (`hitch` / `hitch.exe`) or any other name: keep the
+    // daemon's own `.exe` if it has one (a Windows binary invoked as bare
+    // `hitch.exe`), otherwise append the platform exe suffix ("" on unix). Either
+    // way the hook ends up executable on the host the daemon is running on.
+    if file_name.ends_with(".exe") {
+        return "hitch-hook.exe".to_string();
+    }
+    format!("hitch-hook{}", std::env::consts::EXE_SUFFIX)
 }
 
 fn store_error(err: hitch_store::StoreError) -> ProtocolError {
@@ -5793,6 +5847,38 @@ mod tests {
     }
 
     #[test]
+    fn hook_helper_path_resolves_hitch_hook_with_exe_suffix() {
+        // Every daemon binary name the self-install / sidecar layout produces
+        // resolves an adjacent `hitch-hook` carrying the right executable
+        // extension. Building inputs in a synthetic dir keeps the assertion about
+        // the resolved *file name*, independent of cwd.
+        let exe_suffix = std::env::consts::EXE_SUFFIX;
+        let dir = std::path::Path::new("/synthetic/bin");
+        // `hitch`/`hitch-daemon` carry no extension, so the hook gets the
+        // platform exe suffix ("" on unix, ".exe" on Windows). An explicit
+        // `.exe` daemon name keeps its `.exe` hook on any host (Windows binary).
+        let cases = [
+            ("hitch", format!("hitch-hook{exe_suffix}")),
+            ("hitch-daemon", format!("hitch-hook{exe_suffix}")),
+            ("hitch.exe", "hitch-hook.exe".to_string()),
+            ("hitch-daemon.exe", "hitch-hook.exe".to_string()),
+        ];
+        for (daemon_name, expected_hook) in cases {
+            let resolved = super::hook_helper_path_for_daemon_exe(&dir.join(daemon_name));
+            assert_eq!(
+                resolved.parent(),
+                Some(dir),
+                "hook for {daemon_name} stays adjacent to the daemon exe"
+            );
+            assert_eq!(
+                resolved.file_name().and_then(|n| n.to_str()),
+                Some(expected_hook.as_str()),
+                "daemon {daemon_name} should resolve hook {expected_hook}"
+            );
+        }
+    }
+
+    #[test]
     fn output_before_replay_is_in_snapshot_and_not_redelivered_live() {
         // The race: a live Output is appended to the log before the client's
         // replay runs. It must show up in the replay snapshot exactly once and
@@ -5839,6 +5925,7 @@ mod tests {
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
@@ -5933,6 +6020,7 @@ mod tests {
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
@@ -6020,6 +6108,7 @@ mod tests {
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
@@ -6114,6 +6203,7 @@ mod tests {
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
@@ -6198,6 +6288,7 @@ mod tests {
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
@@ -6262,6 +6353,7 @@ mod tests {
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
@@ -6540,6 +6632,7 @@ mod tests {
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
@@ -6632,6 +6725,7 @@ mod tests {
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
@@ -6747,6 +6841,7 @@ mod tests {
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
@@ -6859,6 +6954,7 @@ mod tests {
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
@@ -6971,6 +7067,7 @@ mod tests {
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
@@ -7037,6 +7134,7 @@ mod tests {
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
@@ -7845,6 +7943,7 @@ mod tests {
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider,
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));

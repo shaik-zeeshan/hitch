@@ -27,6 +27,7 @@ import {
   type CompositeJobResult,
   type CompositeStep,
   type StepPhase,
+  type CliInstallStatus,
   type CommitDiffRequest,
   type CommitDraft,
   type CommitFileDiff,
@@ -2891,6 +2892,30 @@ function syncSshHostsToPool(hosts: SshHost[]): void {
 // Wired to the Retry Now affordance on an unreachable/failed host row (ADR 0014).
 export async function retrySshHost(target: string): Promise<void> {
   await invoke("retry_ssh_host", { target }).catch(() => {});
+}
+
+// ---- local `hitch` CLI self-install (ADR 0014 amendment) ------------------
+//
+// So THIS machine is reachable as an SSH remote host without a manual `ln -s`,
+// Hitch symlinks `~/.local/bin/hitch` → the bundled daemon and writes a managed
+// PATH block into the user's shell rc files. The Remote Hosts settings section
+// shows the status and offers Install/Repair/Uninstall. Pure pass-throughs to
+// the Rust commands (which own all the idempotent disk logic).
+
+// Current install status (symlink + PATH block). Cheap; never mutates.
+export async function cliInstallStatus(): Promise<CliInstallStatus> {
+  return invoke<CliInstallStatus>("cli_install_status");
+}
+
+// Install (or repair) the local CLI; returns the post-install status.
+export async function cliInstall(): Promise<CliInstallStatus> {
+  return invoke<CliInstallStatus>("cli_install");
+}
+
+// Uninstall the local CLI (removes only our symlink + managed block); returns the
+// post-uninstall status.
+export async function cliUninstall(): Promise<CliInstallStatus> {
+  return invoke<CliInstallStatus>("cli_uninstall");
 }
 
 export function disposeDaemon(): void {
