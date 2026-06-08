@@ -17,9 +17,12 @@
 ; Environment\Path is REG_EXPAND_SZ we write it back as REG_EXPAND_SZ; if REG_SZ
 ; (or absent) we write REG_SZ. Blindly rewriting a REG_EXPAND_SZ PATH as REG_SZ
 ; would freeze any %VAR% references in the user's PATH, so we detect the type
-; first via a raw RegQueryValueEx. De-dup guards against double-appending on
-; repair/upgrade. Everything is self-contained — only LogicLib.nsh (always
-; included by Tauri's template) is assumed; no StrFunc/EnVar dependency.
+; first via a raw RegQueryValueEx (see HitchReadPath). Crucially the READ itself
+; also goes through RegQueryValueEx, NOT NSIS `ReadRegStr`: ReadRegStr returns ""
+; for a REG_EXPAND_SZ value, and a populated PATH read as "" turns the append into
+; a destructive bare overwrite of the whole PATH. De-dup guards against double-
+; appending on repair/upgrade. Everything is self-contained — only LogicLib.nsh
+; (always included by Tauri's template) is assumed; no StrFunc/EnVar dependency.
 
 !ifndef HITCH_CLI_REACH_IN_NSH
 !define HITCH_CLI_REACH_IN_NSH
@@ -141,16 +144,52 @@ FunctionEnd
   System::Call 'user32::SendMessageTimeout(i 0xffff, i 0x1a, i 0, t "Environment", i 0x0002, i 5000, *i .r0)'
 !macroend
 
-; Read HKCU\Environment\Path into $1 and its REG type code into $2
-; (REG_SZ=1, REG_EXPAND_SZ=2, 0 if absent/unknown -> caller defaults to REG_SZ).
+; Read HKCU\Environment\Path RAW (unexpanded) into $1 and its REG type code into
+; $2 (REG_SZ=1, REG_EXPAND_SZ=2, 0 if absent/unreadable -> caller defaults to
+; REG_SZ).
+;
+; We read via RegQueryValueExW, NOT NSIS `ReadRegStr`, ON PURPOSE: `ReadRegStr`
+; returns an EMPTY string for a REG_EXPAND_SZ value (it only handles REG_SZ), and
+; a user's PATH is normally REG_EXPAND_SZ. Reading a populated PATH as "" would
+; make the append in NSIS_HOOK_POSTINSTALL take the "$1 == ''" branch and write a
+; BARE $INSTDIR — silently destroying the user's entire PATH. The single direct
+; query also gets the real type so HitchWritePath can preserve REG_EXPAND_SZ.
+;
+; Uses $3..$6 as scratch and restores them, so the result is just $1/$2.
 !macro HitchReadPath
-  ReadRegStr $1 HKCU "${HITCH_ENV_KEY}" "Path"
+  Push $3   ; hKey
+  Push $4   ; Win32 return code (NOT the handle — that's $3)
+  Push $5   ; buffer byte-size (in: capacity, out: bytes written)
+  Push $6   ; buffer pointer
+
+  StrCpy $1 ""
   StrCpy $2 0
-  System::Call 'advapi32::RegOpenKeyExW(i 0x80000001, w "${HITCH_ENV_KEY}", i 0, i 0x20019, *i .r3)'
-  ${If} $3 == 0
-    System::Call 'advapi32::RegQueryValueExW(i r3, w "Path", i 0, *i .r2, i 0, i 0)'
+
+  ; KEY_READ = 0x20019, HKCU = 0x80000001. Capture the function's RETURN code in
+  ; $4 (the old code tested $3, the output handle, which is nonzero on success —
+  ; so the type query never ran and every write fell back to REG_SZ).
+  System::Call 'advapi32::RegOpenKeyExW(i 0x80000001, w "${HITCH_ENV_KEY}", i 0, i 0x20019, *i .r3) i .r4'
+  ${If} $4 == 0
+    ; 65536 bytes = 32768 UTF-16 units, covering the 32767-char registry limit.
+    System::Alloc 65536
+    Pop $6
+    ${If} $6 <> 0
+      StrCpy $5 65536
+      System::Call 'advapi32::RegQueryValueExW(i r3, w "Path", i 0, *i .r2, i r6, *i r5) i .r4'
+      ${If} $4 == 0
+        System::Call '*$6(w .r1)'   ; marshal the wide string into $1
+      ${Else}
+        StrCpy $2 0                 ; query failed -> treat as absent (REG_SZ)
+      ${EndIf}
+      System::Free $6
+    ${EndIf}
     System::Call 'advapi32::RegCloseKey(i r3)'
   ${EndIf}
+
+  Pop $6
+  Pop $5
+  Pop $4
+  Pop $3
 !macroend
 
 ; Write $1 back to HKCU\Environment\Path preserving the type captured in $2.
@@ -162,7 +201,33 @@ FunctionEnd
   ${EndIf}
 !macroend
 
+; Stop a running hitch-daemon.exe / hitch.exe so the installer can overwrite the
+; locked sidecars. Tauri's template closes the GUI app ($INSTDIR\Hitch.exe) but
+; knows nothing about the daemon sidecar (or the hitch.exe CLI copy of it), which
+; runs detached and keeps the .exe open — without this, an upgrade-over-a-running
+; -daemon dies with NSIS "Error opening file for writing: hitch-daemon.exe".
+;
+; taskkill /F kills by image name (the per-user install dir holds the only copy
+; of each), /T also reaps any child processes the daemon spawned. A non-zero exit
+; (nothing to kill) is ignored. The short Sleep lets the kernel release the file
+; handle before Tauri starts laying files down.
+!macro HitchStopDaemon
+  Push $0
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /T /IM hitch.exe'
+  Pop $0
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /T /IM hitch-daemon.exe'
+  Pop $0
+  Sleep 500
+  Pop $0
+!macroend
+
 ; --- Tauri hooks ---------------------------------------------------------
+
+; Invoked by Tauri's NSIS template BEFORE files are laid down in $INSTDIR. Stop
+; the running daemon first so its locked .exe can be overwritten on upgrade.
+!macro NSIS_HOOK_PREINSTALL
+  !insertmacro HitchStopDaemon
+!macroend
 
 !macro NSIS_HOOK_POSTINSTALL
   ; 1) Create the CLI entrypoint by copying the daemon sidecar to hitch.exe.
@@ -198,6 +263,14 @@ FunctionEnd
   Pop $2
   Pop $1
   Pop $0
+!macroend
+
+; Invoked by Tauri's NSIS template BEFORE files are removed. Stop the daemon so
+; its .exe (and the hitch.exe copy) can be deleted, mirroring the install side.
+; nsExec/Sleep work unchanged in the uninstall context (only Functions need the
+; `un.` prefix), so the same macro body is reused.
+!macro NSIS_HOOK_PREUNINSTALL
+  !insertmacro HitchStopDaemon
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
