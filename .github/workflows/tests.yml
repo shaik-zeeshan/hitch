@@ -48,11 +48,10 @@ jobs:
       # Build the daemon + hook sidecars first: the daemon integration tests
       # (proxy/reattach) spawn the hitch-daemon binary, mirroring `bun run rust:test`.
       #
-      # `--test-threads=1`: a few tests assert an operation finishes inside a
-      # 10s wall-clock bound (hitch-git disarm-before-join watchdog, hitch-daemon
-      # drafts SUCCESS_DRAIN_GRACE). Run fully parallel on a 2-core runner they
-      # starve and blow the ceiling — a false timeout, not a real failure. A
-      # genuine deadlock/regression still hangs past the watchdog, so serial
-      # execution keeps the assertion meaningful while removing the flake.
+      # `--test-threads=1`: the hitch-daemon drafts SUCCESS_DRAIN_GRACE test
+      # asserts a drain bounds at a 10s wall-clock ceiling; run fully parallel on
+      # a 2-core runner it starves and blows the ceiling — a false timeout, not a
+      # real failure. Serial execution gives it the CPU to fire on time while
+      # keeping the assertion meaningful (a genuine stall still exceeds the bound).
       - name: Build sidecars and run workspace tests
         run: cargo build -p hitch-daemon -p hitch-hook && cargo test --workspace -- --test-threads=1

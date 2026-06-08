@@ -4297,26 +4297,32 @@ mod tests {
 
     /// Regression: the external cancellation handle must be disarmed
     /// (`set_process_tree(None)`) *before* the stdout/stderr pipe readers are
-    /// joined, not after. Otherwise a concurrent cancel arriving during the
+    /// drained, not after. Otherwise a concurrent cancel arriving during the
     /// drain calls `tree.terminate()` on a child that has already been reaped;
     /// on Unix that is `kill(-pgid)` against a process group whose pgid the OS
     /// may have recycled.
     ///
-    /// The recycled-pgid race itself depends on OS pid reuse timing and cannot
-    /// be triggered deterministically, so this test instead pins the ordering
-    /// the fix guarantees. A signalling control creates a sentinel file the
-    /// moment the tree is disarmed; the child writes one line, then blocks until
-    /// that sentinel exists before exiting (keeping its stdout pipe open). If the
-    /// disarm runs before the join (correct), the sentinel appears, the child
-    /// exits, the pipe closes, and the join completes. If the disarm ran only
-    /// after the join (the pre-fix ordering), the join would wait on the child
-    /// while the child waits on the sentinel — a deadlock the watchdog catches.
+    /// The recycled-pgid race depends on OS pid-reuse timing and cannot be
+    /// triggered deterministically, so this test pins the *ordering* the fix
+    /// guarantees via a captured-output proxy rather than a wall-clock race.
+    ///
+    /// The leader prints `done` and exits (the NORMAL-EXIT path), having
+    /// backgrounded a grandchild that inherits stdout — keeping the pipe open
+    /// past the leader's reap — and blocks until the control's disarm writes a
+    /// sentinel, after which it prints `released`. A live (never-cancelled)
+    /// control makes disarm create that sentinel.
+    ///
+    /// If disarm runs before the bounded drain (correct), the grandchild is
+    /// released and its `released` bytes land in the pipe before the
+    /// `READER_DRAIN_GRACE` window closes, so the captured stdout is
+    /// `donereleased`. If disarm ran only after the drain (the pre-fix
+    /// ordering), the drain would time out on the still-blocked grandchild and
+    /// capture only `done`. Asserting on `released` therefore pins disarm
+    /// strictly before the drain — and, unlike the prior watchdog version, this
+    /// cannot itself deadlock, since the drain is always bounded.
     #[cfg(unix)]
     #[test]
     fn run_command_disarms_cancel_handle_before_joining_pipe_readers() {
-        use std::sync::Arc;
-        use std::time::Duration;
-
         struct SignalOnDisarm {
             sentinel: PathBuf,
         }
@@ -4326,7 +4332,7 @@ mod tests {
             }
             fn set_process_tree(&self, tree: Option<ProcessTree>) {
                 if tree.is_none() {
-                    // Disarm: release the child blocking on this sentinel.
+                    // Disarm: release the grandchild blocking on this sentinel.
                     let _ = fs::write(&self.sentinel, b"go");
                 }
             }
@@ -4334,42 +4340,30 @@ mod tests {
 
         let temp = TempDir::new().unwrap();
         let sentinel = temp.path().join("disarm-sentinel");
-        let script = temp.path().join("git-blocks-until-disarm");
+        let script = temp.path().join("git-releases-on-disarm");
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf 'done'\nwhile [ ! -e {sentinel} ]; do sleep 0.01; done\n",
+                "#!/bin/sh\nprintf 'done'\n( while [ ! -e {sentinel} ]; do sleep 0.005; done; printf 'released' ) &\n",
                 sentinel = shell_quote(&sentinel),
             ),
         )
         .unwrap();
         make_executable(&script);
 
-        let control = Arc::new(SignalOnDisarm {
+        let control = SignalOnDisarm {
             sentinel: sentinel.clone(),
-        });
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let runner = {
-            let control = Arc::clone(&control);
-            let script = script.clone();
-            let cwd = temp.path().to_path_buf();
-            thread::spawn(move || {
-                let result = run_command(&script, &cwd, Vec::new(), Some(control.as_ref()));
-                let _ = tx.send(());
-                result
-            })
         };
+        let output = run_command(&script, temp.path(), Vec::new(), Some(&control)).unwrap();
 
-        // Watchdog: a disarm-after-join ordering deadlocks here.
-        rx.recv_timeout(Duration::from_secs(10))
-            .expect("run_command deadlocked: cancel handle was not disarmed before pipe join");
-
-        let output = runner.join().unwrap().unwrap();
-        assert_eq!(output.stdout, "done");
+        assert_eq!(
+            output.stdout, "donereleased",
+            "disarm must release the grandchild before the bounded drain reads to \
+             EOF, so its post-release output is captured"
+        );
         assert!(
             sentinel.exists(),
-            "disarm should have created the sentinel that releases the child"
+            "disarm should have created the sentinel that releases the grandchild"
         );
     }
 
