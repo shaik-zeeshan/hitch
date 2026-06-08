@@ -35,9 +35,13 @@
 ; else "". Linear scan comparing fixed-length substrings.
 ;   Push <haystack>
 ;   Push <needle>
-;   Call Hitch_StrContains
+;   Call Hitch_StrContains        ; or `Call un.Hitch_StrContains` in uninstall
 ;   Pop $R0   ; "1" or ""
-Function Hitch_StrContains
+;
+; NSIS keeps install and uninstall as separate contexts; a function Call-ed from
+; the uninstall section must be named `un.<fn>`. We share one body macro and
+; instantiate it for both contexts so the two copies never drift.
+!macro HitchStrContainsBody
   Exch $R2          ; needle
   Exch
   Exch $R1          ; haystack
@@ -64,6 +68,12 @@ Function Hitch_StrContains
   Pop $R1
   Pop $R2
   Exch $R0          ; result on top of stack
+!macroend
+Function Hitch_StrContains
+  !insertmacro HitchStrContainsBody
+FunctionEnd
+Function un.Hitch_StrContains
+  !insertmacro HitchStrContainsBody
 FunctionEnd
 
 ; Hitch_StrReplace: replace every occurrence of $R2 with $R3 in $R1, leaving the
@@ -71,9 +81,9 @@ FunctionEnd
 ;   Push <haystack>
 ;   Push <find>
 ;   Push <replace>
-;   Call Hitch_StrReplace
+;   Call Hitch_StrReplace         ; or `Call un.Hitch_StrReplace` in uninstall
 ;   Pop $R0
-Function Hitch_StrReplace
+!macro HitchStrReplaceBody
   Exch $R3          ; replace
   Exch
   Exch $R2          ; find
@@ -116,6 +126,12 @@ Function Hitch_StrReplace
   Exch
   Pop $R0
   Exch $R0
+!macroend
+Function Hitch_StrReplace
+  !insertmacro HitchStrReplaceBody
+FunctionEnd
+Function un.Hitch_StrReplace
+  !insertmacro HitchStrReplaceBody
 FunctionEnd
 
 ; Broadcast WM_SETTINGCHANGE("Environment") so Explorer / running shells reload
@@ -203,7 +219,7 @@ FunctionEnd
     Push $0
     Push ";$INSTDIR;"
     Push ";"
-    Call Hitch_StrReplace
+    Call un.Hitch_StrReplace
     Pop $0
     ; Drop the leading and trailing ';' padding (StrCpy with negative len/skip).
     StrCpy $0 $0 "" 1        ; skip leading ';'
