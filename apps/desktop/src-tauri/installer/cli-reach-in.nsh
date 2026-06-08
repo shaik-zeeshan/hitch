@@ -144,24 +144,29 @@ FunctionEnd
   System::Call 'user32::SendMessageTimeout(i 0xffff, i 0x1a, i 0, t "Environment", i 0x0002, i 5000, *i .r0)'
 !macroend
 
-; Read HKCU\Environment\Path RAW (unexpanded) into $1 and its REG type code into
-; $2 (REG_SZ=1, REG_EXPAND_SZ=2, 0 if absent/unreadable -> caller defaults to
-; REG_SZ).
+; Read HKCU\Environment\Path. Outputs:
+;   $1 — the RAW (unexpanded) value, or "" if absent/unreadable.
+;   $2 — REG type code (REG_SZ=1, REG_EXPAND_SZ=2, 0 if absent -> default REG_SZ).
+;   $0 — "1" if a NON-EMPTY Path value EXISTS in the registry, else "". This is a
+;        fail-safe the caller MUST honour: never bare-overwrite PATH when $0=="1".
 ;
 ; We read via RegQueryValueExW, NOT NSIS `ReadRegStr`, ON PURPOSE: `ReadRegStr`
 ; returns an EMPTY string for a REG_EXPAND_SZ value (it only handles REG_SZ), and
 ; a user's PATH is normally REG_EXPAND_SZ. Reading a populated PATH as "" would
-; make the append in NSIS_HOOK_POSTINSTALL take the "$1 == ''" branch and write a
-; BARE $INSTDIR — silently destroying the user's entire PATH. The single direct
-; query also gets the real type so HitchWritePath can preserve REG_EXPAND_SZ.
+; make the append in NSIS_HOOK_POSTINSTALL bare-overwrite it — silently destroying
+; the user's entire PATH. So we (a) size-query for the real type + byte length,
+; (b) set the $0 "exists" guard from that length BEFORE any read can fail, then
+; (c) read the bytes into $1. Even if the marshal below ever comes back empty, $0
+; still tells the caller a real PATH is there, so it refuses the destructive write.
 ;
-; Uses $3..$6 as scratch and restores them, so the result is just $1/$2.
+; Uses $3..$6 as scratch and restores them, so the results are $0/$1/$2.
 !macro HitchReadPath
   Push $3   ; hKey
   Push $4   ; Win32 return code (NOT the handle — that's $3)
-  Push $5   ; buffer byte-size (in: capacity, out: bytes written)
+  Push $5   ; value byte-size (from the size query; reused as the read's in/out)
   Push $6   ; buffer pointer
 
+  StrCpy $0 ""
   StrCpy $1 ""
   StrCpy $2 0
 
@@ -170,18 +175,22 @@ FunctionEnd
   ; so the type query never ran and every write fell back to REG_SZ).
   System::Call 'advapi32::RegOpenKeyExW(i 0x80000001, w "${HITCH_ENV_KEY}", i 0, i 0x20019, *i .r3) i .r4'
   ${If} $4 == 0
-    ; 65536 bytes = 32768 UTF-16 units, covering the 32767-char registry limit.
-    System::Alloc 65536
-    Pop $6
-    ${If} $6 <> 0
-      StrCpy $5 65536
-      System::Call 'advapi32::RegQueryValueExW(i r3, w "Path", i 0, *i .r2, i r6, *i r5) i .r4'
-      ${If} $4 == 0
-        System::Call '*$6(w .r1)'   ; marshal the wide string into $1
-      ${Else}
-        StrCpy $2 0                 ; query failed -> treat as absent (REG_SZ)
+    ; Size query (lpData=NULL): real type -> $2, required byte length -> $5.
+    StrCpy $5 0
+    System::Call 'advapi32::RegQueryValueExW(i r3, w "Path", i 0, *i .r2, i 0, *i .r5) i .r4'
+    ; >2 bytes = more than the lone trailing wide NUL, i.e. a non-empty value.
+    ${If} $4 == 0
+    ${AndIf} $5 > 2
+      StrCpy $0 "1"           ; guard set from the size, before any read can fail.
+      System::Alloc $5
+      Pop $6
+      ${If} $6 <> 0
+        System::Call 'advapi32::RegQueryValueExW(i r3, w "Path", i 0, *i .r2, i r6, *i r5) i .r4'
+        ${If} $4 == 0
+          System::Call '*$6(&t$5 .r1)'   ; read $5 bytes of wide text into $1
+        ${EndIf}
+        System::Free $6
       ${EndIf}
-      System::Free $6
     ${EndIf}
     System::Call 'advapi32::RegCloseKey(i r3)'
   ${EndIf}
@@ -248,14 +257,23 @@ FunctionEnd
   Call Hitch_StrContains
   Pop $R0
   ${If} $R0 == ""
-    ; Not present -> append (or set bare if PATH was empty), then write + broadcast.
-    ${If} $1 == ""
-      StrCpy $1 "$INSTDIR"
-    ${Else}
+    ; Not already present. Add it WITHOUT ever clobbering a populated PATH:
+    ${If} $1 != ""
+      ; Read OK and non-empty -> append, preserving the captured type.
       StrCpy $1 "$1;$INSTDIR"
+      !insertmacro HitchWritePath
+      !insertmacro HitchBroadcastEnv
+    ${ElseIf} $0 == ""
+      ; PATH is genuinely empty/absent -> safe to set the bare install dir.
+      StrCpy $1 "$INSTDIR"
+      !insertmacro HitchWritePath
+      !insertmacro HitchBroadcastEnv
+    ${Else}
+      ; FAIL-SAFE: a non-empty PATH exists ($0=="1") but we read it as "" — do
+      ; NOT write, or we would wipe it. Leave PATH untouched; the Remote Hosts
+      ; settings panel shows "not-installed" so the user can re-run/repair.
+      DetailPrint "Hitch: skipped PATH update — couldn't read the existing PATH safely."
     ${EndIf}
-    !insertmacro HitchWritePath
-    !insertmacro HitchBroadcastEnv
   ${EndIf}
 
   Pop $R0
