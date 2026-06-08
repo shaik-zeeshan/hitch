@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -97,6 +97,12 @@ const REMOTE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const REMOTE_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
 const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const REMOTE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How many leading non-protocol lines (blank or non-JSON shell noise — a MOTD,
+/// banner, `Last login: …`) the Hello reader tolerates before the Hello frame
+/// before declaring the stream `Malformed`. Generous enough for a verbose login
+/// banner, bounded so a non-hitch program streaming text can't read forever.
+const MAX_HANDSHAKE_NOISE_LINES: usize = 64;
 
 /// Exponential backoff schedule for remote reconnect (ADR 0014): ~2s, 5s, 15s,
 /// 30s, then capped ~60s. Pure so it is unit-testable; jitter is applied on top
@@ -170,11 +176,60 @@ impl ProxyCandidate {
     }
 }
 
-/// The first-connect candidate sequence (no cached `exe_path`): try the known
-/// self-install location, then bare `hitch`. Pure so its order/contents are
+/// The first-connect candidate sequence (no cached `exe_path`), ordered by the
+/// remote's learned OS family ([`SshConnections::os_hint`]). Pure so its order is
 /// unit-tested without live SSH.
-pub fn candidate_sequence() -> Vec<ProxyCandidate> {
-    vec![ProxyCandidate::KnownLocation, ProxyCandidate::BarePath]
+///
+/// - `Some(Windows)`: a Windows host puts `hitch.exe` on the (machine/registry)
+///   PATH and has no `~/.local/bin` convention; its default shell (`cmd.exe`) can't
+///   expand `~`, so the known-location candidate is doomed there. Try bare `hitch`
+///   FIRST, keeping the known-location candidate only as a harmless fallback (for a
+///   Windows host whose `DefaultShell` is a POSIX shell with a `~/.local/bin/hitch`).
+/// - `Some(Unix)` / `None` (unknown, first ever connect): the Unix self-install
+///   location is the common case and may NOT be on the non-interactive PATH, so try
+///   it first, then bare. With no hint this is the safe default — the fall-through
+///   ([`should_fall_through`]) self-corrects either way; the hint just avoids the
+///   one wasted attempt on a known Windows host.
+pub fn candidate_sequence(os_hint: Option<OsFamily>) -> Vec<ProxyCandidate> {
+    match os_hint {
+        Some(OsFamily::Windows) => vec![ProxyCandidate::BarePath, ProxyCandidate::KnownLocation],
+        _ => vec![ProxyCandidate::KnownLocation, ProxyCandidate::BarePath],
+    }
+}
+
+/// The on-disk cache of each SSH Host's learned remote OS family. Lives beside the
+/// daemon's other side files in the Hitch data dir (the same resolver `daemon.log`
+/// and the CLI markers use), NOT in the frontend's localStorage host entry — it is
+/// a derived PERFORMANCE HINT, like the in-memory `exe_path` cache, not host config.
+///
+/// Correctness never depends on it: a missing/wrong hint costs at most one extra
+/// fall-through attempt on a cold first-connect, and every successful Hello rewrites
+/// it authoritatively. Sourced from our own protocol handshake, so — unlike a
+/// `uname`/`ver` shell probe — it can't be corrupted by shell banners or a missing
+/// `uname` on Windows.
+fn os_hints_path() -> PathBuf {
+    hitch_proto::transport::default_data_dir().join("ssh-os-hints.json")
+}
+
+/// Best-effort load of the persisted OS hints. Any IO/parse failure yields an empty
+/// map (we simply relearn on first connect).
+fn load_os_hints() -> HashMap<String, OsFamily> {
+    std::fs::read(os_hints_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Best-effort write of the OS hints to disk (creating the data dir if needed). The
+/// hint is advisory, so every failure is silently ignored.
+fn persist_os_hints(hints: &HashMap<String, OsFamily>) {
+    let path = os_hints_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(hints) {
+        let _ = std::fs::write(path, bytes);
+    }
 }
 
 /// Decide whether a failed candidate should fall through to the next candidate
@@ -298,6 +353,10 @@ struct SshConnectionsInner {
     /// `cancel_upload` flips a batch's flag; the streaming task checks it before
     /// each file/chunk and aborts the in-flight upload so nothing is inserted.
     upload_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Per-target learned remote OS family, loaded from disk at startup and rewritten
+    /// from each successful Hello. Orders the first-connect candidate probe (see
+    /// [`candidate_sequence`]). Advisory only; see [`os_hints_path`].
+    os_hints: Mutex<HashMap<String, OsFamily>>,
 }
 
 /// One file's result in an upload batch reported back to the frontend. `state`
@@ -367,7 +426,35 @@ impl SshConnections {
         Self(Arc::new(SshConnectionsInner {
             connections: Mutex::new(HashMap::new()),
             upload_cancels: Mutex::new(HashMap::new()),
+            os_hints: Mutex::new(load_os_hints()),
         }))
+    }
+
+    /// The cached remote OS family for a target, if a prior session learned it.
+    /// Orders the first-connect candidate probe.
+    fn os_hint(&self, target: &str) -> Option<OsFamily> {
+        self.0
+            .os_hints
+            .lock()
+            .ok()
+            .and_then(|map| map.get(target).copied())
+    }
+
+    /// Record the authoritative OS family from a successful Hello. Updates the
+    /// in-memory map and, only when the value actually changed, best-effort rewrites
+    /// the on-disk hint file (the hint is advisory, so IO failures are ignored).
+    fn record_os_hint(&self, target: &str, os: OsFamily) {
+        let snapshot = {
+            let Ok(mut map) = self.0.os_hints.lock() else {
+                return;
+            };
+            if map.get(target) == Some(&os) {
+                return; // unchanged — no write
+            }
+            map.insert(target.to_string(), os);
+            map.clone()
+        };
+        persist_os_hints(&snapshot);
     }
 
     fn connection(&self, scope_id: &str) -> Option<Arc<RemoteConnection>> {
@@ -391,6 +478,22 @@ impl SshConnections {
                     .map(|t| (format!("ssh:{t}"), t))
             })
             .collect();
+
+        // Drop OS hints for targets no longer saved, so a removed host doesn't leave
+        // a stale hint behind (and the file can't grow without bound). Persist only
+        // if something was actually pruned.
+        {
+            let kept: std::collections::HashSet<&String> = wanted.values().collect();
+            if let Ok(mut hints) = self.0.os_hints.lock() {
+                let before = hints.len();
+                hints.retain(|target, _| kept.contains(target));
+                if hints.len() != before {
+                    let snapshot = hints.clone();
+                    drop(hints);
+                    persist_os_hints(&snapshot);
+                }
+            }
+        }
 
         // Disconnect + drop any scope no longer wanted.
         let to_remove: Vec<String> = {
@@ -716,9 +819,9 @@ impl SshConnections {
             }
         }
 
-        // First connect (or post-invalidation re-discovery): try candidates in
-        // order, falling through only on MissingHitch.
-        let candidates = candidate_sequence();
+        // First connect (or post-invalidation re-discovery): try candidates in the
+        // OS-hint-aware order, falling through per `should_fall_through`.
+        let candidates = candidate_sequence(self.os_hint(&connection.target));
         let mut last: Option<RemoteFailure> = None;
         for candidate in &candidates {
             match self.connect_attempt(app, connection, candidate) {
@@ -732,9 +835,9 @@ impl SshConnections {
                 Err(failure) => {
                     let fall_through = should_fall_through(failure.category);
                     eprintln!(
-                        "hitch: [ssh-diag] {} candidate {candidate:?} failed (category={:?}, \
-                         fall_through={fall_through}): {}",
-                        connection.target, failure.category, failure.message
+                        "hitch: remote {} candidate {candidate:?} failed \
+                         (category={:?}, fall_through={fall_through})",
+                        connection.target, failure.category
                     );
                     last = Some(failure);
                     if !fall_through {
@@ -879,6 +982,16 @@ impl SshConnections {
                 *connection.writer.lock().expect("writer lock") = Some(stdin);
                 *connection.child.lock().expect("child lock") = Some(child);
                 connection.connected.store(true, Ordering::SeqCst);
+                // Persist the OS family the Hello just revealed (recorded into the
+                // connection by `read_remote_hello`) so a future cold first-connect
+                // orders its candidate probe correctly and skips the doomed `~`
+                // candidate on Windows.
+                let learned = connection
+                    .os_family
+                    .lock()
+                    .map(|f| *f)
+                    .unwrap_or(OsFamily::Unix);
+                self.record_os_hint(&connection.target, learned);
                 self.start_reader(app, connection.clone(), reader, generation);
                 self.start_heartbeat(app, connection.clone(), generation);
                 Ok(())
@@ -1011,9 +1124,12 @@ fn classify_remote(
     let _ = child.kill();
     let exit_code = child.wait().ok().and_then(|s| s.code());
     let result = ssh::classify(target, exit_code, stderr, outcome.clone(), false);
+    // Log the raw remote signal (exit/handshake/stderr) behind the classification —
+    // the detail needed to diagnose a remote attach without re-running with extra
+    // instrumentation. Fires only on a failed attempt.
     eprintln!(
-        "hitch: [ssh-diag] {target} connect failed — exit={exit_code:?} outcome={outcome:?} \
-         category={:?}\n  stderr: {}",
+        "hitch: remote {target} attempt failed — exit={exit_code:?} outcome={outcome:?} \
+         category={:?}; stderr: {}",
         result.category,
         stderr.trim()
     );
@@ -1049,14 +1165,41 @@ fn spawn_dead_child() -> Child {
 /// Read newline-delimited control JSON from the remote until the Hello response
 /// for `request_id` arrives, skipping non-matching frames. Mirrors `ssh::read_hello`
 /// but takes a generic `BufRead`.
+///
+/// Tolerates a bounded amount of leading non-protocol NOISE — blank lines and
+/// non-JSON text a chatty login shell can print (a MOTD/banner, `Last login: …`)
+/// before `hitch daemon proxy`'s first frame. This is a real-world SSH failure mode
+/// (VS Code's `uname` probe is famously broken by exactly this), and without it a
+/// banner makes a perfectly good remote look like a broken proxy on EVERY candidate.
+/// Bounded by [`MAX_HANDSHAKE_NOISE_LINES`] so genuine garbage (a non-hitch program
+/// streaming output) still fails fast as `Malformed` rather than reading forever;
+/// the overall `REMOTE_HANDSHAKE_TIMEOUT` is the ultimate backstop.
 fn read_remote_hello<R: BufRead>(
     reader: &mut R,
     request_id: RequestId,
     connection: &Arc<RemoteConnection>,
 ) -> HandshakeOutcome {
+    let mut noise = 0usize;
+    let mut line = Vec::new();
     loop {
-        match read_control_message(reader) {
-            Ok(Some(ControlMessage::Response {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => return HandshakeOutcome::NoResponse, // true EOF
+            Ok(_) => {}
+            Err(_) => return HandshakeOutcome::NoResponse,
+        }
+        let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
+        // A blank line (banner spacing) is noise, not the in-band empty-frame EOF
+        // `read_control_message` treats it as — skip it, bounded.
+        if trimmed.is_empty() {
+            noise += 1;
+            if noise > MAX_HANDSHAKE_NOISE_LINES {
+                return HandshakeOutcome::Malformed;
+            }
+            continue;
+        }
+        match serde_json::from_slice::<ControlMessage>(trimmed) {
+            Ok(ControlMessage::Response {
                 id,
                 response:
                     Response::Hello {
@@ -1065,7 +1208,7 @@ fn read_remote_hello<R: BufRead>(
                         exe_path,
                         ..
                     },
-            })) if id == request_id => {
+            }) if id == request_id => {
                 // Record the remote daemon's platform so inserted upload paths get
                 // remote-appropriate quoting (issue #31).
                 if let Ok(mut slot) = connection.os_family.lock() {
@@ -1083,9 +1226,18 @@ fn read_remote_hello<R: BufRead>(
                 }
                 return HandshakeOutcome::Hello { protocol_version };
             }
-            Ok(Some(_)) => {}
-            Ok(None) => return HandshakeOutcome::NoResponse,
-            Err(_) => return HandshakeOutcome::Malformed,
+            // A valid but non-matching control frame (an event, or a different
+            // response): part of the protocol — keep reading for the Hello without
+            // spending the noise budget.
+            Ok(_) => {}
+            // A line that isn't control JSON at all — shell noise. Skip a bounded
+            // number, then give up as Malformed.
+            Err(_) => {
+                noise += 1;
+                if noise > MAX_HANDSHAKE_NOISE_LINES {
+                    return HandshakeOutcome::Malformed;
+                }
+            }
         }
     }
 }
@@ -1514,12 +1666,34 @@ mod tests {
     use ssh::FailureCategory;
 
     #[test]
-    fn candidate_sequence_is_known_location_then_bare() {
-        // First connect tries the Unix self-install location, then bare `hitch`.
-        let seq = candidate_sequence();
+    fn candidate_sequence_without_hint_is_known_location_then_bare() {
+        // With no learned OS (first ever connect), try the Unix self-install
+        // location, then bare `hitch` — the fall-through self-corrects on Windows.
+        let seq = candidate_sequence(None);
         assert_eq!(
             seq,
             vec![ProxyCandidate::KnownLocation, ProxyCandidate::BarePath]
+        );
+    }
+
+    #[test]
+    fn candidate_sequence_unix_hint_is_known_location_then_bare() {
+        let seq = candidate_sequence(Some(OsFamily::Unix));
+        assert_eq!(
+            seq,
+            vec![ProxyCandidate::KnownLocation, ProxyCandidate::BarePath]
+        );
+    }
+
+    #[test]
+    fn candidate_sequence_windows_hint_tries_bare_first() {
+        // A known-Windows host (cmd.exe can't expand `~`, `hitch.exe` is on PATH)
+        // tries bare `hitch` first, skipping the doomed `~/.local/bin/hitch` round
+        // trip; the known-location candidate stays only as a harmless fallback.
+        let seq = candidate_sequence(Some(OsFamily::Windows));
+        assert_eq!(
+            seq,
+            vec![ProxyCandidate::BarePath, ProxyCandidate::KnownLocation]
         );
     }
 
@@ -1588,7 +1762,7 @@ mod tests {
     /// of the winning candidate (`Ok`) or the index of the candidate whose failure
     /// was surfaced (`Err`). This mirrors `connect_once`'s loop without live SSH.
     fn walk_candidates(outcomes: &[Option<FailureCategory>]) -> Result<usize, usize> {
-        let seq = candidate_sequence();
+        let seq = candidate_sequence(None);
         let mut last_idx = 0;
         for (idx, _candidate) in seq.iter().enumerate() {
             let category = outcomes.get(idx).copied().flatten();
@@ -1683,6 +1857,80 @@ mod tests {
         assert_eq!(
             reconnect_decision(Some(FailureCategory::Network)),
             ReconnectChoice::Surface
+        );
+    }
+
+    // ----- Handshake noise tolerance (#4) -----
+
+    fn hello_frame(os: OsFamily, exe_path: Option<&str>) -> Vec<u8> {
+        encode_control_message(&ControlMessage::response(
+            3,
+            Response::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_pid: 1,
+                os_family: os,
+                exe_path: exe_path.map(|p| p.to_string()),
+            },
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn read_remote_hello_skips_banner_noise_then_reads_hello() {
+        // A chatty login shell prints a MOTD/banner and blank lines before the proxy
+        // starts; the Hello must still be found rather than failing as Malformed.
+        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into()));
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"Welcome to Ubuntu 22.04 LTS\n");
+        buf.extend_from_slice(b"\n");
+        buf.extend_from_slice(b"Last login: Mon Jun 8 10:00:00 2026\n");
+        buf.extend(hello_frame(OsFamily::Unix, None));
+        let mut reader = std::io::Cursor::new(buf);
+        assert_eq!(
+            read_remote_hello(&mut reader, 3, &conn),
+            HandshakeOutcome::Hello {
+                protocol_version: PROTOCOL_VERSION
+            }
+        );
+    }
+
+    #[test]
+    fn read_remote_hello_records_os_family_and_exe_path() {
+        // The Hello's os_family + exe_path feed the OS hint and the reconnect cache.
+        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into()));
+        let mut reader =
+            std::io::Cursor::new(hello_frame(OsFamily::Windows, Some("C:/Tools/hitch.exe")));
+        let _ = read_remote_hello(&mut reader, 3, &conn);
+        assert_eq!(*conn.os_family.lock().unwrap(), OsFamily::Windows);
+        assert_eq!(
+            conn.exe_path.lock().unwrap().as_deref(),
+            Some("C:/Tools/hitch.exe")
+        );
+    }
+
+    #[test]
+    fn read_remote_hello_gives_up_after_noise_budget() {
+        // Pure non-JSON garbage past the budget fails fast as Malformed instead of
+        // reading forever.
+        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into()));
+        let mut buf = Vec::new();
+        for _ in 0..(MAX_HANDSHAKE_NOISE_LINES + 5) {
+            buf.extend_from_slice(b"this is not protocol json\n");
+        }
+        let mut reader = std::io::Cursor::new(buf);
+        assert_eq!(
+            read_remote_hello(&mut reader, 1, &conn),
+            HandshakeOutcome::Malformed
+        );
+    }
+
+    #[test]
+    fn read_remote_hello_eof_is_no_response() {
+        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into()));
+        let mut reader = std::io::Cursor::new(Vec::new());
+        assert_eq!(
+            read_remote_hello(&mut reader, 1, &conn),
+            HandshakeOutcome::NoResponse
         );
     }
 }
