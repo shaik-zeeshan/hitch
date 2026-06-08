@@ -13,8 +13,8 @@ use hitch_core::{Project, Session, SessionId, SessionParent, Worktree};
 use hitch_proto::transport::{connect_daemon, DaemonStream};
 #[cfg(any(unix, windows))]
 use hitch_proto::{
-    encode_control_message, encode_pty_frame, CommitDraft, Event, FileDiff, GitStatus, JobRequest,
-    JobStatus, PullRequestDraft, WorktreeCreateMode,
+    encode_control_message, encode_pty_frame, CommitDraft, DirEntry, Event, FileDiff, GitStatus,
+    JobRequest, JobStatus, PullRequestDraft, WorktreeCreateMode,
 };
 use hitch_proto::{ControlMessage, ErrorCode, KnownAgent, Request, Response, PROTOCOL_VERSION};
 
@@ -42,6 +42,151 @@ fn daemon_transport_answers_hello_ping_and_shutdown() {
     send_transport_request(&mut stream, 3, Request::ShutdownDaemon);
     expect_transport_response(&mut stream, 3, |response| matches!(response, Response::Ack));
     daemon.wait_for_exit();
+}
+
+/// The GUI's "Quit Hitch" returns from `request_daemon_shutdown` as soon as the
+/// request is flushed and then calls `app.exit(0)`, abruptly terminating the
+/// process with daemon responses/events still unread in its receive buffer — so
+/// the OS tears the socket down with an RST and the daemon's Ack write fails
+/// with `ECONNRESET`. The daemon MUST still shut down in that case: regression
+/// for the handler gating the shutdown flag behind a `send_response(Ack)?` that
+/// propagated that error and left the daemon running after an explicit quit.
+#[cfg(unix)]
+#[test]
+fn daemon_shuts_down_when_client_resets_before_reading_ack() {
+    use std::os::unix::io::AsRawFd;
+
+    let socket = test_socket_path("quit-no-ack");
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut stream = connect_test_daemon(&socket);
+    send_transport_request(
+        &mut stream,
+        1,
+        Request::Hello {
+            client_name: "quit-no-ack".into(),
+            protocol_version: PROTOCOL_VERSION,
+        },
+    );
+    expect_transport_response(&mut stream, 1, |response| {
+        matches!(response, Response::Hello { .. })
+    });
+
+    // Send the shutdown but never read the Ack. Arm SO_LINGER with a zero
+    // timeout so closing the socket sends an RST (not a graceful FIN), the way
+    // an abrupt `app.exit(0)` with unread data does — this makes the daemon's
+    // Ack write fail with ECONNRESET, reproducing the GUI-exited-before-ack
+    // race deterministically.
+    send_transport_request(&mut stream, 2, Request::ShutdownDaemon);
+    let raw = stream.into_inner();
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            raw.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&linger as *const libc::linger).cast(),
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "arming SO_LINGER failed: {}", io::Error::last_os_error());
+    drop(raw); // close() now sends RST
+
+    daemon.wait_for_exit();
+}
+
+#[cfg(unix)]
+#[test]
+fn list_directory_defaults_to_home_and_lists_folders_first_hiding_dotfiles() {
+    let socket = test_socket_path("ld-home");
+    let store = test_file_path("ld-home-store", "sqlite");
+    let managed_root = test_dir_path("ld-home-managed");
+    let home = test_dir_path("ld-home-home");
+
+    // A home directory the daemon will open by default: two visible folders, one
+    // hidden folder, and a regular file (which must never appear — folders only).
+    std::fs::create_dir_all(home.join("Zeta")).unwrap();
+    std::fs::create_dir_all(home.join("alpha")).unwrap();
+    std::fs::create_dir_all(home.join(".hidden")).unwrap();
+    std::fs::write(home.join("notes.txt"), b"hi").unwrap();
+    let canonical_home = home.canonicalize().unwrap();
+
+    let mut daemon = spawn_daemon_with_home(&socket, &store, &managed_root, &home);
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+
+    // `path: None` opens the daemon user's home directory.
+    let listing = client.list_directory(2, None, false).unwrap();
+    assert_eq!(listing.path, canonical_home.to_string_lossy());
+    assert_eq!(listing.home, canonical_home.to_string_lossy());
+    assert_eq!(
+        listing.parent.as_deref(),
+        canonical_home.parent().map(|p| p.to_str().unwrap())
+    );
+
+    // Folders only, dotfiles hidden by default, sorted case-insensitively so
+    // `alpha` precedes `Zeta`. The regular file never appears.
+    let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["alpha", "Zeta"]);
+    // Each entry carries its absolute path so the GUI never re-joins paths.
+    let alpha = &listing.entries[0];
+    assert_eq!(alpha.path, canonical_home.join("alpha").to_string_lossy());
+
+    // Toggling hidden re-lists with the dot-folder included, still folders-first
+    // and file-free.
+    let with_hidden = client.list_directory(3, None, true).unwrap();
+    let names: Vec<&str> = with_hidden.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec![".hidden", "alpha", "Zeta"]);
+
+    client.send_request(4, Request::ShutdownDaemon);
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&managed_root);
+    let _ = std::fs::remove_file(&store);
+}
+
+#[cfg(unix)]
+#[test]
+fn list_directory_jumps_to_an_explicit_absolute_path() {
+    let socket = test_socket_path("ld-jump");
+    let store = test_file_path("ld-jump-store", "sqlite");
+    let managed_root = test_dir_path("ld-jump-managed");
+    let home = test_dir_path("ld-jump-home");
+    let elsewhere = test_dir_path("ld-jump-target");
+
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(elsewhere.join("child")).unwrap();
+    let canonical = elsewhere.canonicalize().unwrap();
+
+    let mut daemon = spawn_daemon_with_home(&socket, &store, &managed_root, &home);
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+
+    // Typing an absolute path jumps there regardless of home.
+    let listing = client
+        .list_directory(2, Some(canonical.to_str().unwrap()), false)
+        .unwrap();
+    assert_eq!(listing.path, canonical.to_string_lossy());
+    let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["child"]);
+    // Home is still reported so the browser's Home control works after a jump.
+    assert_eq!(listing.home, home.canonicalize().unwrap().to_string_lossy());
+
+    // A nonexistent path is a NotFound error row, not a panic.
+    let err = client
+        .list_directory(3, Some("/nope/does/not/exist/hitch"), false)
+        .unwrap_err();
+    assert_eq!(err, ErrorCode::NotFound);
+
+    client.send_request(4, Request::ShutdownDaemon);
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&elsewhere);
+    let _ = std::fs::remove_dir_all(&managed_root);
+    let _ = std::fs::remove_file(&store);
 }
 
 #[cfg(windows)]
@@ -379,6 +524,222 @@ fn reconnect_replays_scrollback_and_receives_live_output() {
     );
 
     reattached.shutdown(99);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(project_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn upload_round_trip_writes_bytes_and_inserts_actual_remote_path() {
+    let socket = test_socket_path("upload-rt");
+    let project_root = test_dir_path("upload-rt-project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &project_root);
+    let session = client.open_default_session(3, SessionParent::Project(project.id));
+
+    // A payload larger than one chunk so the multi-chunk append path is exercised.
+    let payload: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
+    let (upload_id, final_name) = client
+        .begin_upload(4, session.id, "report.bin", payload.len() as u64)
+        .unwrap();
+    assert_eq!(final_name, "report.bin");
+    for chunk in payload.chunks(256 * 1024) {
+        client.upload_chunk(5, &upload_id, chunk);
+    }
+    let remote_path = client.finish_upload(6, &upload_id);
+
+    // The returned path is the actual file under the per-session upload dir, and
+    // its bytes match what we streamed.
+    let expected_dir = daemon.uploads_root().join(session.id.to_string());
+    assert_eq!(remote_path, expected_dir.join("report.bin").to_string_lossy());
+    let written = std::fs::read(&remote_path).unwrap();
+    assert_eq!(written, payload);
+
+    client.shutdown(99);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(project_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn upload_collision_suffixes_name_before_extension() {
+    let socket = test_socket_path("upload-collide");
+    let project_root = test_dir_path("upload-collide-project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &project_root);
+    let session = client.open_default_session(3, SessionParent::Project(project.id));
+
+    // Three uploads of the same name reserve file.txt, file-1.txt, file-2.txt.
+    let (u0, n0) = client.begin_upload(4, session.id, "file.txt", 1).unwrap();
+    let (u1, n1) = client.begin_upload(5, session.id, "file.txt", 1).unwrap();
+    let (u2, n2) = client.begin_upload(6, session.id, "file.txt", 1).unwrap();
+    assert_eq!(n0, "file.txt");
+    assert_eq!(n1, "file-1.txt");
+    assert_eq!(n2, "file-2.txt");
+
+    client.upload_chunk(7, &u1, b"second");
+    let path1 = client.finish_upload(8, &u1);
+    assert!(path1.ends_with("/file-1.txt"));
+    assert_eq!(std::fs::read(&path1).unwrap(), b"second");
+
+    // Dotfiles split on no extension: `.env` → `.env-1`.
+    let (_, dot0) = client.begin_upload(9, session.id, ".env", 0).unwrap();
+    let (_, dot1) = client.begin_upload(10, session.id, ".env", 0).unwrap();
+    assert_eq!(dot0, ".env");
+    assert_eq!(dot1, ".env-1");
+
+    let _ = (u0, u2);
+    client.shutdown(99);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(project_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn upload_abort_deletes_partial_file() {
+    let socket = test_socket_path("upload-abort");
+    let project_root = test_dir_path("upload-abort-project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &project_root);
+    let session = client.open_default_session(3, SessionParent::Project(project.id));
+
+    let (upload_id, _) = client.begin_upload(4, session.id, "partial.bin", 100).unwrap();
+    client.upload_chunk(5, &upload_id, b"half-written");
+    let path = daemon
+        .uploads_root()
+        .join(session.id.to_string())
+        .join("partial.bin");
+    assert!(path.exists(), "partial should exist mid-upload");
+
+    client.abort_upload(6, &upload_id);
+    assert!(!path.exists(), "abort should delete the partial file");
+
+    // A finish after abort is a NotFound, not a panic-y desync.
+    client.send_request(
+        7,
+        Request::FinishUpload {
+            upload_id: upload_id.clone(),
+        },
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_not_found = false;
+    while Instant::now() < deadline {
+        match client.read_packet_until(deadline) {
+            Packet::Control(ControlMessage::Response {
+                id: 7,
+                response: Response::Error { error },
+            }) => {
+                assert_eq!(error.code, ErrorCode::NotFound);
+                saw_not_found = true;
+                break;
+            }
+            Packet::Control(_) | Packet::Output { .. } => continue,
+        }
+    }
+    assert!(saw_not_found, "finish-after-abort should be NotFound");
+
+    client.shutdown(99);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(project_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn upload_dir_is_deleted_when_session_closes() {
+    let socket = test_socket_path("upload-close");
+    let project_root = test_dir_path("upload-close-project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &project_root);
+    let session = client.open_default_session(3, SessionParent::Project(project.id));
+
+    let (upload_id, _) = client.begin_upload(4, session.id, "keep.txt", 5).unwrap();
+    client.upload_chunk(5, &upload_id, b"hello");
+    let _ = client.finish_upload(6, &upload_id);
+    let dir = daemon.uploads_root().join(session.id.to_string());
+    assert!(dir.exists(), "upload dir should exist while session is open");
+
+    // Closing the session deletes its whole upload dir (ADR 0014 cleanup).
+    client.close_session(7, session.id, true);
+    client.read_session_closed(session.id, Duration::from_secs(5));
+    // The dir removal is best-effort and runs in close_session; give it a beat.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while dir.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(!dir.exists(), "closing the session should delete its upload dir");
+
+    client.shutdown(99);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(project_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn upload_rejects_bad_names_and_unknown_session() {
+    let socket = test_socket_path("upload-reject");
+    let project_root = test_dir_path("upload-reject-project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &project_root);
+    let session = client.open_default_session(3, SessionParent::Project(project.id));
+
+    for (i, bad) in ["../escape", "a/b", "..", ""].iter().enumerate() {
+        let err = client
+            .begin_upload(10 + i as u64, session.id, bad, 0)
+            .unwrap_err();
+        assert_eq!(err, ErrorCode::InvalidRequest, "name {bad:?} should reject");
+    }
+
+    // An upload onto a nonexistent session is NotFound.
+    let err = client
+        .begin_upload(20, SessionId::new(), "ok.txt", 0)
+        .unwrap_err();
+    assert_eq!(err, ErrorCode::NotFound);
+
+    client.shutdown(99);
+    daemon.wait_for_exit();
+    let _ = std::fs::remove_dir_all(project_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn upload_chunk_byte_count_mismatch_is_rejected() {
+    let socket = test_socket_path("upload-mismatch");
+    let project_root = test_dir_path("upload-mismatch-project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let mut daemon = DaemonGuard::start(&socket);
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project = client.add_project(2, &project_root);
+    let session = client.open_default_session(3, SessionParent::Project(project.id));
+
+    let (upload_id, _) = client.begin_upload(4, session.id, "x.bin", 10).unwrap();
+    // Announce 10 bytes but send 4: the daemon drains the frame then errors on the
+    // length mismatch (a desync would hang the next request instead).
+    let code = client.upload_chunk_with_count(5, &upload_id, b"abcd", 10);
+    assert_eq!(code, ErrorCode::InvalidRequest);
+
+    client.shutdown(99);
     daemon.wait_for_exit();
     let _ = std::fs::remove_dir_all(project_root);
 }
@@ -1367,6 +1728,13 @@ impl DaemonGuard {
         }
     }
 
+    /// The uploads root this daemon was launched with (issue #31), so a test can
+    /// assert on the per-session upload dir `uploads_root()/<session-id>`.
+    #[cfg(any(unix, windows))]
+    fn uploads_root(&self) -> PathBuf {
+        uploads_root_for(&self.managed_root)
+    }
+
     fn wait_for_exit(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
@@ -1388,6 +1756,7 @@ impl Drop for DaemonGuard {
         }
         let _ = std::fs::remove_file(&self.store);
         let _ = std::fs::remove_dir_all(&self.managed_root);
+        let _ = std::fs::remove_dir_all(uploads_root_for(&self.managed_root));
     }
 }
 
@@ -1530,6 +1899,48 @@ impl TestClient {
                     response: Response::Error { error },
                     ..
                 }) => panic!("add project failed: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn list_directory(
+        &mut self,
+        id: u64,
+        path: Option<&str>,
+        show_hidden: bool,
+    ) -> Result<DirectoryListing, ErrorCode> {
+        self.send_request(
+            id,
+            Request::ListDirectory {
+                path: path.map(|p| p.to_string()),
+                show_hidden,
+            },
+        );
+        loop {
+            match self.read_packet() {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response:
+                        Response::DirectoryListing {
+                            path,
+                            parent,
+                            home,
+                            entries,
+                        },
+                }) if response_id == id => {
+                    return Ok(DirectoryListing {
+                        path,
+                        parent,
+                        home,
+                        entries,
+                    })
+                }
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::Error { error },
+                }) if response_id == id => return Err(error.code),
                 Packet::Control(_) | Packet::Output { .. } => continue,
             }
         }
@@ -2060,6 +2471,121 @@ impl TestClient {
         self.read_ack(id);
     }
 
+    fn begin_upload(
+        &mut self,
+        id: u64,
+        session_id: SessionId,
+        file_name: &str,
+        total_bytes: u64,
+    ) -> Result<(String, String), ErrorCode> {
+        self.send_request(
+            id,
+            Request::BeginUpload {
+                session_id,
+                file_name: file_name.to_string(),
+                total_bytes,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response:
+                        Response::UploadStarted {
+                            upload_id,
+                            final_name,
+                        },
+                }) if response_id == id => return Ok((upload_id, final_name)),
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::Error { error },
+                }) if response_id == id => return Err(error.code),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for upload-started to request {id}");
+    }
+
+    fn upload_chunk(&mut self, id: u64, upload_id: &str, bytes: &[u8]) {
+        self.send_request_with_pty_frame(
+            id,
+            Request::UploadChunk {
+                upload_id: upload_id.to_string(),
+                byte_count: bytes.len() as u32,
+            },
+            bytes,
+        );
+        self.read_ack(id);
+    }
+
+    /// Send a chunk whose announced byte_count is wrong on purpose; returns the
+    /// daemon's error code (mismatch detection).
+    fn upload_chunk_with_count(
+        &mut self,
+        id: u64,
+        upload_id: &str,
+        bytes: &[u8],
+        announced: u32,
+    ) -> ErrorCode {
+        self.send_request_with_pty_frame(
+            id,
+            Request::UploadChunk {
+                upload_id: upload_id.to_string(),
+                byte_count: announced,
+            },
+            bytes,
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::Error { error },
+                }) if response_id == id => return error.code,
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::Ack,
+                }) if response_id == id => panic!("expected chunk mismatch error, got ack"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for chunk error to request {id}");
+    }
+
+    fn finish_upload(&mut self, id: u64, upload_id: &str) -> String {
+        self.send_request(
+            id,
+            Request::FinishUpload {
+                upload_id: upload_id.to_string(),
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match self.read_packet_until(deadline) {
+                Packet::Control(ControlMessage::Response {
+                    id: response_id,
+                    response: Response::UploadFinished { remote_path },
+                }) if response_id == id => return remote_path,
+                Packet::Control(ControlMessage::Response {
+                    response: Response::Error { error },
+                    ..
+                }) => panic!("finish upload failed: {error:?}"),
+                Packet::Control(_) | Packet::Output { .. } => continue,
+            }
+        }
+        panic!("timed out waiting for upload-finished to request {id}");
+    }
+
+    fn abort_upload(&mut self, id: u64, upload_id: &str) {
+        self.ack(
+            id,
+            Request::AbortUpload {
+                upload_id: upload_id.to_string(),
+            },
+        );
+    }
+
     fn resize_session(&mut self, id: u64, session_id: SessionId, cols: u16, rows: u16) {
         self.ack(
             id,
@@ -2165,9 +2691,29 @@ impl TestClient {
     fn send_request_with_pty_frame(&mut self, id: u64, request: Request, payload: &[u8]) {
         let control = encode_control_message(&ControlMessage::request(id, request)).unwrap();
         let frame = encode_pty_frame(payload).unwrap();
-        self.stream.get_mut().write_all(&control).unwrap();
-        self.stream.get_mut().write_all(&frame).unwrap();
+        self.write_all_blocking(&control);
+        // Upload chunk frames can be large (256 KiB) and the test socket is
+        // nonblocking, so a single write may not absorb the whole frame before the
+        // daemon drains it. Retry on WouldBlock so the test client behaves like the
+        // real (blocking) GUI writer.
+        self.write_all_blocking(&frame);
         self.stream.get_mut().flush().unwrap();
+    }
+
+    /// Write all bytes to the nonblocking test stream, spinning past WouldBlock.
+    fn write_all_blocking(&mut self, mut bytes: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !bytes.is_empty() {
+            match self.stream.get_mut().write(bytes) {
+                Ok(0) => panic!("test stream write returned 0"),
+                Ok(n) => bytes = &bytes[n..],
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "write blocked too long");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => panic!("test stream write: {err}"),
+            }
+        }
     }
 
     fn read_packet(&mut self) -> Packet {
@@ -2248,6 +2794,15 @@ enum Packet {
     },
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct DirectoryListing {
+    path: String,
+    parent: Option<String>,
+    home: String,
+    entries: Vec<DirEntry>,
+}
+
 fn daemon_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hitch-daemon"))
 }
@@ -2255,6 +2810,13 @@ fn daemon_bin() -> PathBuf {
 #[cfg(unix)]
 fn spawn_daemon(socket: &Path, store: &Path, managed_root: &Path) -> Child {
     spawn_daemon_full(socket, store, managed_root, None)
+}
+
+#[cfg(unix)]
+fn spawn_daemon_with_home(socket: &Path, store: &Path, managed_root: &Path, home: &Path) -> Child {
+    let mut command = daemon_command(socket, store, managed_root);
+    command.env("HOME", home);
+    spawn_daemon_command(command)
 }
 
 fn spawn_daemon_full(socket: &Path, store: &Path, managed_root: &Path, gh: Option<&Path>) -> Child {
@@ -2303,8 +2865,27 @@ fn daemon_command(socket: &Path, store: &Path, managed_root: &Path) -> Command {
         .arg("--store")
         .arg(store)
         .arg("--managed-root")
-        .arg(managed_root);
+        .arg(managed_root)
+        // Keep test uploads beside the managed root in the temp dir, never in the
+        // real dev-home `.hitch*/uploads` (issue #31). `uploads_root_for` derives
+        // the same path so a test can assert on the per-session upload dir.
+        .arg("--uploads-root")
+        .arg(uploads_root_for(managed_root));
     command
+}
+
+/// The uploads root the test daemon uses: a sibling of the managed worktree root
+/// in the same temp dir. Tests that assert on upload cleanup compute the
+/// per-session dir as `uploads_root_for(managed_root)/<session-id>`.
+#[cfg(any(unix, windows))]
+fn uploads_root_for(managed_root: &Path) -> PathBuf {
+    let mut root = managed_root.to_path_buf();
+    let name = root
+        .file_name()
+        .map(|n| format!("{}-uploads", n.to_string_lossy()))
+        .unwrap_or_else(|| "uploads".to_string());
+    root.set_file_name(name);
+    root
 }
 
 fn spawn_daemon_command(mut command: Command) -> Child {

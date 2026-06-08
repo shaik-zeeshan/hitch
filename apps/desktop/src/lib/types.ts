@@ -40,6 +40,95 @@ export type KnownAgent = "claude-code" | "codex";
 // socket link (CONTEXT.md, ADR 0009). Mirrors src-tauri's `DaemonStatus`.
 export type DaemonStatus = "starting" | "running" | "unreachable" | "failed";
 
+// ---- Daemon scope (ADR 0014, issue #25) -----------------------------------
+//
+// A GUI window may attach to several Daemons at once: the local Daemon plus
+// zero or more remote Daemons reached through SSH Hosts (CONTEXT.md). Every
+// Project, Worktree, Session, and Job identifier is interpreted within its
+// OWNING daemon scope, never as globally unique across attached daemons (ADR
+// 0014). A `DaemonScopeId` names one such scope; the local Daemon is the
+// well-known `LOCAL_SCOPE_ID`. Saved SSH Hosts will mint their own scope ids in
+// issue #27 — this slice ships Local only.
+export type DaemonScopeId = string;
+
+// The well-known scope id of the local Daemon. Stable across reloads so a
+// persisted Local expand/collapse state and any scope-keyed selection survive
+// a restart. SSH Host scope ids (issue #27) are minted per saved host and will
+// never collide with this reserved value.
+export const LOCAL_SCOPE_ID: DaemonScopeId = "local";
+
+// Whether a scope is the local Daemon or a remote one reached through an SSH
+// Host. Only `local` exists today; `ssh-host` is reserved for issue #27 so the
+// tree, status surfaces, and selection model already branch on the kind.
+export type DaemonScopeKind = "local" | "ssh-host";
+
+// One attached Daemon presented as a top-level scope in the multi-daemon tree
+// (ADR 0014): Local first, saved SSH Hosts sorted alphabetically by target.
+// `label` is the row's mono caption (`LOCAL`, or an SSH target). `status` is the
+// scope's own Daemon Status — broader than this window's socket link — so a
+// collapsed scope can still show liveness. SSH-only fields (target, connection
+// backoff) are deliberately omitted here and added with the SSH Host model.
+export type DaemonScope = {
+  id: DaemonScopeId;
+  kind: DaemonScopeKind;
+  label: string;
+  status: DaemonStatus;
+};
+
+// ---- SSH Host (ADR 0014, issue #26) ---------------------------------------
+//
+// A GUI-local saved OpenSSH target string through which the GUI can reach a
+// Hitch Daemon running on that host (CONTEXT.md). It stores ONLY the target
+// string — no private keys, passphrases, ports, or usernames as separate
+// fields: OpenSSH config, ssh-agent, hardware keys, ProxyJump, and known_hosts
+// remain the source of truth (ADR 0014). `id` is the well-known scope id this
+// host mints (`ssh:<target>`), so issue #27 can interpret remote entities under
+// a stable per-host scope without a separate rename-prone identity.
+export type SshHost = {
+  id: DaemonScopeId;
+  target: string;
+};
+
+// The actionable failure categories the backend classifier returns for a failed
+// Test Connection (ADR 0014). Mirrors src-tauri's `FailureCategory` (kebab-case).
+export type SshTestCategory =
+  | "auth"
+  | "host-key"
+  | "missing-hitch"
+  | "protocol-mismatch"
+  | "proxy-startup"
+  | "network";
+
+// Structured result of `test_ssh_host`. Mirrors src-tauri's `SshTestResult`:
+// `ok` true means the Hello handshake succeeded at a compatible protocol
+// version; otherwise `category` + a user-facing `message` (which embeds the
+// exact manual `ssh … hitch daemon proxy` command) and an optional `detail`
+// (stderr tail or version numbers).
+export type SshTestResult = {
+  ok: boolean;
+  category?: SshTestCategory;
+  message: string;
+  detail?: string;
+};
+
+// Status of the local `hitch` CLI install (ADR 0014 amendment). Mirrors
+// src-tauri's `cli_install::CliInstallStatus`. `state` drives the Remote Hosts
+// "this machine as a remote host" control:
+//  - `installed`     — our `~/.local/bin/hitch` symlink is present and ours,
+//  - `not-installed` — nothing at the link path; Install can proceed,
+//  - `conflict`      — a foreign file occupies the link path; we won't clobber,
+//  - `unavailable`   — no bundled daemon (dev build) or Windows (manual install).
+// The client reaches a self-installed host by learning the daemon's absolute path
+// from the Hello handshake (ADR 0014 amendment 2026-06-08), so install no longer
+// edits shell rc files and there is no PATH signal to report.
+export type CliInstallState = "installed" | "not-installed" | "conflict" | "unavailable";
+export type CliInstallStatus = {
+  state: CliInstallState;
+  linkPath: string | null;
+  target: string | null;
+  detail: string | null;
+};
+
 // Lifecycle of an async Job (CONTEXT.md, ADR 0008). Mirrors hitch-proto's
 // `JobStatus`.
 export type JobStatus =
@@ -204,6 +293,24 @@ export type ActiveJobInfo = {
   worktree_id: Id;
   kind: CompositeJobKind;
   step: CompositeStep;
+};
+
+// One child directory in a remote-folder-browser listing (ADR 0014). The browser
+// is folders-first and only folders are selectable, so the daemon lists folders
+// only. `path` is the absolute path so the GUI navigates/AddProjects it without
+// re-joining (the GUI never maps remote paths onto local paths).
+export type DirEntry = {
+  name: string;
+  path: string;
+};
+
+// A directory listing returned by `list-directory` for the remote folder browser.
+// `parent` is null at the filesystem root; `home` backs the browser's Home control.
+export type DirectoryListing = {
+  path: string;
+  parent: string | null;
+  home: string;
+  entries: DirEntry[];
 };
 
 export type Request = { type: string; [key: string]: unknown };

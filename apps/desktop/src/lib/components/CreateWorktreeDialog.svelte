@@ -10,12 +10,24 @@
   // git operation from which row you pick — you never name the distinction.
   // Throws surface inline; success dismisses and optionally opens a shell.
   import { Dialog, Select } from "bits-ui";
-  import { createWorktree, defaultBase, listBranches, openSession } from "../daemon";
+  import {
+    createWorktree,
+    defaultBase,
+    listBranches,
+    openSession,
+    scopeAttributionForProject,
+  } from "../daemon";
   import { createWorktreeFor } from "../overlays";
   import { localBranchNameForRemote, remoteBranchChoices } from "../branchChoices";
   import type { BranchSummary } from "../types";
 
   const project = $derived($createWorktreeFor);
+  // The project is already chosen, so the target daemon scope is a DISPLAY here
+  // (not a select like CloneProjectDialog): a remote project shows its SSH Host so
+  // the user knows the worktree is created on that machine (issue #30, ADR 0014).
+  // list-branches + create-worktree both route to this owning scope inside
+  // daemon.ts. Local shows no scope line (clean local copy).
+  const attribution = $derived(scopeAttributionForProject(project?.id));
 
   type Row =
     | { kind: "create"; key: string; name: string }
@@ -182,7 +194,10 @@
     <Dialog.Content class="modal" aria-describedby={undefined}>
       <div class="m-head">
         <Dialog.Title>New worktree</Dialog.Title>
-        <div class="sub">in <b>{project?.name ?? "project"}</b></div>
+        <div class="sub">
+          in <b>{project?.name ?? "project"}</b>{#if attribution.isRemote}
+            <span class="on-host"> on <b>{attribution.label}</b></span>{/if}
+        </div>
       </div>
       <div class="m-body">
         <div class="field">

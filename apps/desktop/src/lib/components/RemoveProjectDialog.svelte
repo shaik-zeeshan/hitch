@@ -3,10 +3,17 @@
   // deleting the user's project root (or worktree folders) from disk. Live
   // sessions under the project are killed after explicit confirmation.
   import { Dialog } from "bits-ui";
-  import { removeProject, sessions, worktrees } from "../daemon";
+  import { removeProject, scopeAttributionForProject, sessions, worktrees } from "../daemon";
   import { removeProjectTarget } from "../overlays";
+  import { removeProjectTitle, remotePathAttribution } from "../scopeCopy";
 
   const target = $derived($removeProjectTarget);
+  // Remote attribution (issue #30, ADR 0014): a remote project titles `Remove
+  // project on <host>?` and shows the SSH Host + remote root so it can't be
+  // mistaken for a same-path local project. Local copy is unchanged.
+  const attribution = $derived(scopeAttributionForProject(target?.id));
+  const title = $derived(removeProjectTitle(attribution));
+  const remoteLine = $derived(target ? remotePathAttribution(attribution, target.root) : null);
   const projectWorktrees = $derived(
     target ? $worktrees.filter((worktree) => worktree.project_id === target.id) : [],
   );
@@ -74,8 +81,11 @@
     <Dialog.Overlay class="modal-back" />
     <Dialog.Content class="modal" aria-describedby={undefined}>
       <div class="m-head">
-        <Dialog.Title>Remove project</Dialog.Title>
+        <Dialog.Title>{title}</Dialog.Title>
         <div class="sub"><b>{target?.name ?? ""}</b></div>
+        {#if remoteLine}
+          <div class="sub mono remote-attr">{remoteLine}</div>
+        {/if}
       </div>
       <div class="m-body">
         {#if liveSessions > 0}

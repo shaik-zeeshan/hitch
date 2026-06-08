@@ -1666,6 +1666,7 @@ dependencies = [
  "hitch-store",
  "libc",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

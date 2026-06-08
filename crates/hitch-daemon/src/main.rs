@@ -21,6 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod drafts;
+mod proxy;
 
 /// How long a session's PTY may stay quiet before the output-activity gate falls
 /// to inactive (ADR 0011 amendment 2026-06-05). Agent TUIs repaint spinners
@@ -50,10 +51,11 @@ use hitch_proto::{
     encode_control_message, encode_pty_frame,
     transport::{connect_daemon, DaemonListener, DaemonStream},
     ActiveJobInfo, ChangedFile, CommitAndPushResult, CommitDraft, CommitFileDiff, CommitInfo,
-    CommitMeta, CompositeJobKind, CompositeJobResult, CompositeStep, ControlMessage,
+    CommitMeta, CompositeJobKind, CompositeJobResult, CompositeStep, ControlMessage, DirEntry,
     DraftGenerationSettings, DraftProvider, ErrorCode, Event, FileDiff, FileStatus, GitStatus,
-    JobRequest, JobStatus, KnownAgent, PrInfo, ProtocolError, PullRequestDraft, Request, Response,
-    StepPhase, WorktreeCreateMode, WorktreePr, MAX_PTY_FRAME_LEN, PROTOCOL_VERSION,
+    JobRequest, JobStatus, KnownAgent, OsFamily, PrInfo, ProtocolError, PullRequestDraft, Request,
+    Response, StepPhase, UploadId, WorktreeCreateMode, WorktreePr, MAX_PTY_FRAME_LEN,
+    PROTOCOL_VERSION, UPLOAD_CHUNK_BYTES,
 };
 use hitch_pty::{ManagedPty, PtyEvent, PtySpawnConfig, TerminalSize, DEFAULT_SCROLLBACK_CAPACITY};
 use hitch_store::Store;
@@ -66,6 +68,16 @@ fn main() {
 }
 
 fn real_main() -> Result<(), Box<dyn std::error::Error>> {
+    // The daemon binary doubles as the remote `hitch` CLI (ADR 0014): a
+    // `hitch daemon proxy` invocation runs the SSH stdio bridge instead of the
+    // daemon proper. Detect it before normal flag parsing so the subcommand words
+    // (`daemon proxy`) are never mistaken for daemon options. The proxy owns its
+    // own exit code (and keeps stdout reserved for the protocol stream).
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if proxy::is_proxy_invocation(&raw_args) {
+        std::process::exit(proxy::run());
+    }
+
     let args = Args::parse()?;
     if args.detach {
         detach_spawn(&args)?;
@@ -104,6 +116,7 @@ struct Args {
     socket_path: PathBuf,
     store_path: PathBuf,
     managed_root: PathBuf,
+    uploads_root: PathBuf,
     hook_helper: PathBuf,
     git: PathBuf,
     gh: PathBuf,
@@ -116,6 +129,7 @@ impl Args {
         let mut socket_path = hitch_proto::transport::default_socket_path();
         let mut store_path = default_store_path();
         let mut managed_root = default_managed_worktree_root();
+        let mut uploads_root = default_uploads_root();
         let mut hook_helper = default_hook_helper_path();
         let mut git = PathBuf::from("git");
         let mut gh = PathBuf::from("gh");
@@ -141,6 +155,12 @@ impl Args {
                     managed_root = PathBuf::from(
                         args.next()
                             .ok_or_else(|| "--managed-root requires a path".to_string())?,
+                    );
+                }
+                "--uploads-root" => {
+                    uploads_root = PathBuf::from(
+                        args.next()
+                            .ok_or_else(|| "--uploads-root requires a path".to_string())?,
                     );
                 }
                 "--hook-helper" => {
@@ -196,7 +216,7 @@ impl Args {
                 "--detach" => detach = true,
                 "--help" | "-h" => {
                     println!(
-                        "usage: hitch-daemon [--socket PATH] [--store PATH] [--managed-root PATH] [--hook-helper PATH] [--git PATH] [--gh PATH] [--draft-provider stub|claude|codex] [--draft-model MODEL] [--claude PATH] [--codex PATH] [--draft-timeout-secs N] [--detach]"
+                        "usage: hitch-daemon [--socket PATH] [--store PATH] [--managed-root PATH] [--uploads-root PATH] [--hook-helper PATH] [--git PATH] [--gh PATH] [--draft-provider stub|claude|codex] [--draft-model MODEL] [--claude PATH] [--codex PATH] [--draft-timeout-secs N] [--detach]"
                     );
                     std::process::exit(0);
                 }
@@ -208,6 +228,7 @@ impl Args {
             socket_path,
             store_path,
             managed_root,
+            uploads_root,
             hook_helper,
             git,
             gh,
@@ -222,10 +243,20 @@ struct DaemonConfig {
     socket_path: PathBuf,
     store_path: PathBuf,
     managed_root: PathBuf,
+    /// Root of per-session file-drop upload dirs (issue #31). Each session's
+    /// uploads land under `<uploads_root>/<session-id>/`; the daemon deletes that
+    /// dir when the session closes. Defaults to `<data-dir>/uploads`.
+    uploads_root: PathBuf,
     hook_helper: PathBuf,
     git: PathBuf,
     gh: PathBuf,
     draft_provider: DraftProviderConfig,
+    /// The daemon's own executable path, captured from `current_exe()` AT STARTUP
+    /// and reported in [`Response::Hello`] as `exe_path` (approach C, ADR 0014
+    /// amendment) so the client can re-invoke this exact binary on reconnect.
+    /// Captured at startup, not at Hello time, because the binary could move while
+    /// the daemon runs. `None` if `current_exe()` fails.
+    exe_path: Option<String>,
 }
 
 impl From<Args> for DaemonConfig {
@@ -234,10 +265,14 @@ impl From<Args> for DaemonConfig {
             socket_path: args.socket_path,
             store_path: args.store_path,
             managed_root: args.managed_root,
+            uploads_root: args.uploads_root,
             hook_helper: args.hook_helper,
             git: args.git,
             gh: args.gh,
             draft_provider: args.draft_provider,
+            exe_path: std::env::current_exe()
+                .ok()
+                .map(|p| p.display().to_string()),
         }
     }
 }
@@ -259,6 +294,8 @@ fn detach_spawn(args: &Args) -> io::Result<()> {
         .arg(&args.store_path)
         .arg("--managed-root")
         .arg(&args.managed_root)
+        .arg("--uploads-root")
+        .arg(&args.uploads_root)
         .arg("--hook-helper")
         .arg(&args.hook_helper)
         .arg("--git")
@@ -373,27 +410,42 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     }
     fs::create_dir_all(&config.managed_root)?;
 
+    // Acquire the pidfile singleton lock BEFORE binding. The lock — not the socket
+    // bind — is the authority on "am I the one daemon for this path". Binding first
+    // would unlink a live daemon's socket via `remove_stale_socket` and only then
+    // discover (too late) that we never owned the path; ordering the lock first
+    // means a losing daemon exits without ever touching the live owner's socket.
+    #[cfg(unix)]
+    let pid_lock = match acquire_pidfile(&config.socket_path) {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            // A live daemon already holds this socket path. Refuse to start rather
+            // than stealing its socket and orphaning it with its live Sessions.
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "hitch-daemon: another daemon already owns {}; refusing to start a second instance",
+                    config.socket_path.display()
+                ),
+            ));
+        }
+        Err(err) => {
+            // Could not even open the pidfile (permissions, odd filesystem). The
+            // singleton gate is unavailable, but this is orthogonal to the
+            // split-brain bug and rare; preserve the prior fail-open behaviour so a
+            // broken pidfile path never bricks startup. Forced recovery is lost.
+            eprintln!("hitch-daemon: pidfile recovery disabled: {err}");
+            None
+        }
+    };
+    #[cfg(windows)]
+    let pid_lock = None;
+
     let listener = DaemonListener::bind(&config.socket_path)?;
     // The listener stays in blocking mode: a dedicated accept thread parks in
     // `accept()` so no poll gap exists in which a connect-write-close client is
     // dropped (see the accept thread below and ADR 0012). The old nonblocking
     // poll loop is gone, not cfg-switched.
-    #[cfg(unix)]
-    let pid_lock = {
-        // Record our pid beside the socket so the GUI can force-kill us even when it
-        // never completed a `Hello` handshake (e.g. a protocol mismatch — the path
-        // that returns no pid in the response). Best-effort: a missing pidfile only
-        // costs the client its force-kill fast path, it does not break startup.
-        match write_pidfile(&config.socket_path) {
-            Ok(pid_lock) => pid_lock,
-            Err(err) => {
-                eprintln!("hitch-daemon: pidfile recovery disabled: {err}");
-                None
-            }
-        }
-    };
-    #[cfg(windows)]
-    let pid_lock = None;
     // The setup that follows (`Store::open`, `restore_layout`, the accept loop)
     // can early-return via `?`. Own Unix pidfile + socket cleanup with a guard so
     // every exit path clears filesystem rendezvous state. Windows local sockets
@@ -564,8 +616,9 @@ fn wake_accept_thread(socket_path: &Path) {
 }
 
 /// Removes Unix daemon files whenever `run_daemon` returns — by normal shutdown
-/// or by an early `?` during startup. Created right after the pidfile is written
-/// so no exit path can leak a stale pid (see `write_pidfile`).
+/// or by an early `?` during startup. Created right after the socket bind (once we
+/// already hold the pidfile lock) so no exit path can leak a stale pid or socket
+/// (see `acquire_pidfile`).
 struct DaemonFileGuard {
     #[cfg(unix)]
     socket_path: PathBuf,
@@ -585,35 +638,40 @@ impl Drop for DaemonFileGuard {
     }
 }
 
-/// Write our pid to the daemon's pidfile (see `transport::pidfile_path`) and take
-/// an exclusive advisory lock on it, held via the returned handle for our whole
-/// lifetime. The lock is what lets a client tell a *live* daemon (lock held) from
-/// a *stale* pidfile left by an unclean exit (lock free) before it force-kills the
-/// pid named there — without it, PID reuse could send the kill to an unrelated
-/// process. The OS drops the lock when this process exits by any means, so an
-/// abrupt kill can't strand it.
+/// Take the exclusive advisory lock on the daemon's pidfile (see
+/// `transport::pidfile_path`), write our pid, and hold the lock via the returned
+/// handle for our whole lifetime. This lock is the daemon **singleton gate**: it
+/// is acquired *before* binding the socket (see `run_daemon`), so a second daemon
+/// started against the same socket path loses the lock race and refuses to start
+/// rather than unlinking a live daemon's socket out from under it (the split-brain
+/// that orphaned a process holding live Sessions). It also lets a client tell a
+/// *live* daemon (lock held) from a *stale* pidfile left by an unclean exit (lock
+/// free) before it force-kills the pid named there — without it, PID reuse could
+/// send the kill to an unrelated process. The OS drops the lock when this process
+/// exits by any means, so an abrupt kill can't strand it.
 ///
-/// The pidfile is the GUI's only handle on a daemon it could not handshake with,
-/// so a stale entry must never linger: `truncate` overwrites any prior pid, and
-/// the bind that precedes this call guarantees we are the sole owner of this
-/// socket path. Any failure here only disables forced recovery; it never blocks
-/// startup, so we return `None` and carry on.
+/// Returns `Ok(Some(file))` when we won the lock and own this socket path,
+/// `Ok(None)` when a live daemon already holds it (the caller must abort startup
+/// without touching the socket), or `Err` only on an IO fault opening the pidfile.
 #[cfg(unix)]
-fn write_pidfile(socket_path: &Path) -> io::Result<Option<File>> {
+fn acquire_pidfile(socket_path: &Path) -> io::Result<Option<File>> {
     let path = hitch_proto::transport::pidfile_path(socket_path);
+    // Open without `truncate`: the file must not be clobbered until we hold the
+    // lock, or a losing daemon would wipe the live owner's pid on its way out.
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
         .open(&path)?;
     // SAFETY: `flock` on a freshly opened, valid fd. `LOCK_NB` so a contended lock
-    // fails fast instead of blocking startup. We already own the socket bind, so
-    // contention is not expected; if it happens, skip writing a pid we can't defend
-    // with the lock rather than leave a kill-target we don't own.
+    // fails fast instead of blocking startup. Contention means another daemon is
+    // alive on this socket path; the caller aborts rather than stealing it.
     let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
     if !locked {
         return Ok(None);
     }
+    // We hold the lock and are the sole owner: now it is safe to overwrite any pid
+    // left by a prior unclean exit.
+    file.set_len(0)?;
     write!(file, "{}", std::process::id())?;
     file.flush()?;
     Ok(Some(file))
@@ -636,6 +694,26 @@ struct DaemonState {
     /// [`JobControl`] plus the UI metadata a late-attaching client needs to
     /// rebuild its live Job store before later `JobCompleted` arrives.
     jobs: HashMap<JobId, ActiveJob>,
+    /// In-flight file-drop **uploads** keyed by upload id (issue #31). Uploads are
+    /// connection-scoped: a client disconnecting mid-upload aborts and deletes its
+    /// partial files (see `unregister_client`). A session closing deletes its whole
+    /// upload dir and drops any of its in-flight uploads here.
+    uploads: HashMap<UploadId, ActiveUpload>,
+}
+
+/// One in-flight file-drop upload (issue #31). Holds the open file handle the
+/// chunks append to plus the bookkeeping needed to abort it on client disconnect
+/// or session close.
+struct ActiveUpload {
+    /// The connection that began the upload; only it may chunk/finish/abort, and
+    /// its disconnect aborts the upload.
+    client_id: u64,
+    /// The session the upload targets; closing it deletes the partial.
+    session_id: SessionId,
+    /// The reserved, collision-suffixed absolute path being written.
+    path: PathBuf,
+    /// The open file, appended to per chunk. `None` once finished/aborted.
+    file: Option<fs::File>,
 }
 
 impl DaemonState {
@@ -652,6 +730,7 @@ impl DaemonState {
             git,
             broadcaster: OutputBroadcaster::default(),
             jobs: HashMap::new(),
+            uploads: HashMap::new(),
         }
     }
 }
@@ -997,6 +1076,9 @@ fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &DaemonStream) -> io
 }
 
 fn unregister_client(state: &Arc<Mutex<DaemonState>>, client_id: u64) {
+    // A disconnect mid-upload leaves partial files no one will finish; abort and
+    // delete this connection's in-flight uploads (issue #31).
+    cleanup_client_uploads(state, client_id);
     if let Ok(mut state) = state.lock() {
         state.clients.remove(&client_id);
         state.broadcaster.forget_client(client_id);
@@ -1097,6 +1179,15 @@ fn handle_request<R: Read>(
                 )?;
                 return Ok(());
             }
+            // The startup-captured `current_exe()` path (approach C, ADR 0014
+            // amendment), so the client caches it and re-invokes this exact
+            // binary on reconnect — shell-free and PATH-free.
+            let exe_path = state
+                .lock()
+                .map_err(|_| internal("state lock poisoned"))?
+                .config
+                .exe_path
+                .clone();
             send_response(
                 state,
                 client_id,
@@ -1104,6 +1195,8 @@ fn handle_request<R: Read>(
                 Response::Hello {
                     protocol_version: PROTOCOL_VERSION,
                     daemon_pid: std::process::id(),
+                    os_family: OsFamily::current(),
+                    exe_path,
                 },
             )?;
             // Replay must run ON the dispatcher thread so the snapshot it sends
@@ -1159,6 +1252,10 @@ fn handle_request<R: Read>(
                 )?;
             }
             broadcast_event(state, Event::ProjectRemoved { project_id })?;
+        }
+        Request::ListDirectory { path, show_hidden } => {
+            let listing = list_directory(path.as_deref(), show_hidden)?;
+            send_response(state, client_id, request_id, listing)?;
         }
         Request::ListBranches { project_id } => {
             let branches = list_branches(state, project_id)?;
@@ -1419,6 +1516,69 @@ fn handle_request<R: Read>(
             // may have already completed and removed itself from the registry.
             send_response(state, client_id, request_id, Response::Ack)?;
         }
+        Request::BeginUpload {
+            session_id,
+            file_name,
+            total_bytes,
+        } => {
+            let (upload_id, final_name) =
+                begin_upload(state, client_id, session_id, &file_name, total_bytes)?;
+            send_response(
+                state,
+                client_id,
+                request_id,
+                Response::UploadStarted {
+                    upload_id,
+                    final_name,
+                },
+            )?;
+        }
+        Request::UploadChunk {
+            upload_id,
+            byte_count,
+        } => {
+            // The raw frame ALWAYS follows the control message on the stream, so it
+            // must be drained even on a rejected/oversize chunk or the next control
+            // message would desync. Read it first, then validate.
+            let payload = read_pty_payload(reader)?;
+            if payload.len() != byte_count as usize {
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "upload chunk frame length {} did not match announced byte_count {byte_count}",
+                        payload.len()
+                    ),
+                ));
+            }
+            if payload.len() > UPLOAD_CHUNK_BYTES {
+                // Abort the upload so its partial file is cleaned up, then error.
+                let _ = abort_upload(state, client_id, &upload_id);
+                return Err(ProtocolError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "upload chunk {} bytes exceeds max {UPLOAD_CHUNK_BYTES}",
+                        payload.len()
+                    ),
+                ));
+            }
+            write_upload_chunk(state, client_id, &upload_id, &payload)?;
+            send_response(state, client_id, request_id, Response::Ack)?;
+        }
+        Request::FinishUpload { upload_id } => {
+            let remote_path = finish_upload(state, client_id, &upload_id)?;
+            send_response(
+                state,
+                client_id,
+                request_id,
+                Response::UploadFinished { remote_path },
+            )?;
+        }
+        Request::AbortUpload { upload_id } => {
+            // Aborting an unknown upload is a no-op success (it may already be gone
+            // via a session close or client disconnect).
+            let _ = abort_upload(state, client_id, &upload_id);
+            send_response(state, client_id, request_id, Response::Ack)?;
+        }
         Request::Ping => {
             send_response(state, client_id, request_id, Response::Pong)?;
         }
@@ -1499,19 +1659,152 @@ fn handle_request<R: Read>(
             send_response(state, client_id, request_id, Response::Ack)?;
         }
         Request::ShutdownDaemon => {
-            send_response(state, client_id, request_id, Response::Ack)?;
             // Resolve the endpoint before flipping the flag so the wake connect
             // below targets our own listener.
             let socket_path = {
                 let guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
                 guard.config.socket_path.clone()
             };
+            // The Ack is best-effort: `request_daemon_shutdown` on the GUI side
+            // returns as soon as the request is flushed and the app then exits,
+            // so it is usually gone before this Ack can be written. Setting the
+            // shutdown flag and waking the accept thread are mandatory and MUST
+            // run even when the Ack write fails against a closed peer — gating
+            // them behind `send_response(..)?` is what left the daemon alive
+            // after "Quit Hitch".
+            let _ = send_response(state, client_id, request_id, Response::Ack);
             shutdown.store(true, Ordering::SeqCst);
             wake_accept_thread(&socket_path);
         }
     }
 
     Ok(())
+}
+
+/// Resolve the daemon user's home directory portably (the remote browser opens
+/// here and the Home control returns to it). `HOME` on Unix, `USERPROFILE`
+/// (falling back to `HOMEDRIVE`+`HOMEPATH`) on Windows.
+fn home_directory() -> Result<PathBuf, ProtocolError> {
+    #[cfg(windows)]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            if !profile.is_empty() {
+                return Ok(PathBuf::from(profile));
+            }
+        }
+        if let (Some(drive), Some(path)) =
+            (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+        {
+            let mut home = OsString::from(drive);
+            home.push(path);
+            if !home.is_empty() {
+                return Ok(PathBuf::from(home));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            if !home.is_empty() {
+                return Ok(PathBuf::from(home));
+            }
+        }
+    }
+    Err(internal("could not resolve the daemon user's home directory"))
+}
+
+/// List the child directories of a path on the daemon host for the remote folder
+/// browser (ADR 0014). `path == None` lists the daemon user's home directory.
+/// Folders-only and folders-first by construction (files are never selectable in
+/// the browser); entries are sorted case-insensitively by name. Hidden
+/// (dot-prefixed) entries are dropped unless `show_hidden`. Unreadable or
+/// nonexistent directories map to a `NotFound`/`Unauthorized` `ProtocolError` so
+/// the GUI can render an error row.
+fn list_directory(path: Option<&str>, show_hidden: bool) -> Result<Response, ProtocolError> {
+    // Canonicalize home once so the `home` field (Home control) agrees with the
+    // `path` field of a home-default listing — both resolve symlinks the same way.
+    let home = home_directory()?
+        .canonicalize()
+        .map_err(|err| internal(format!("cannot resolve home directory: {err}")))?;
+    let target = match path {
+        Some(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
+        _ => home.clone(),
+    };
+
+    // Resolve symlinks and `.`/`..` to an absolute path the GUI can navigate and
+    // AddProject without re-joining. A failed canonicalize is the not-found /
+    // unreadable case the browser renders as an error row.
+    let canonical = target.canonicalize().map_err(|err| {
+        let code = match err.kind() {
+            io::ErrorKind::NotFound => ErrorCode::NotFound,
+            io::ErrorKind::PermissionDenied => ErrorCode::Unauthorized,
+            _ => ErrorCode::InvalidRequest,
+        };
+        ProtocolError::new(
+            code,
+            format!("cannot open {}: {err}", target.display()),
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("not a directory: {}", canonical.display()),
+        ));
+    }
+
+    let read_dir = fs::read_dir(&canonical).map_err(|err| {
+        let code = match err.kind() {
+            io::ErrorKind::NotFound => ErrorCode::NotFound,
+            io::ErrorKind::PermissionDenied => ErrorCode::Unauthorized,
+            _ => ErrorCode::Internal,
+        };
+        ProtocolError::new(
+            code,
+            format!("cannot read {}: {err}", canonical.display()),
+        )
+    })?;
+
+    let mut entries: Vec<DirEntry> = Vec::new();
+    for entry in read_dir {
+        // Skip unreadable individual entries rather than failing the whole
+        // listing — the rest of the directory is still browsable.
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        // `file_type()` avoids a stat where possible; fall back to is_dir() for
+        // symlinks pointing at directories so a symlinked folder stays navigable.
+        let is_dir = match entry.file_type() {
+            Ok(ft) if ft.is_dir() => true,
+            Ok(ft) if ft.is_symlink() => entry.path().is_dir(),
+            _ => false,
+        };
+        if !is_dir {
+            continue;
+        }
+        let path = entry.path().to_string_lossy().into_owned();
+        entries.push(DirEntry { name, path });
+    }
+    entries.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let parent = canonical
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned());
+
+    Ok(Response::DirectoryListing {
+        path: canonical.to_string_lossy().into_owned(),
+        parent,
+        home: home.to_string_lossy().into_owned(),
+        entries,
+    })
 }
 
 fn add_project_from_root(
@@ -2503,7 +2796,245 @@ fn close_session(
     if kill_process {
         let _ = removed.pty.kill();
     }
+    // The session is gone: delete its per-session upload dir and drop any of its
+    // in-flight uploads. ADR 0014: "The remote Daemon owns upload cleanup and
+    // deletes that per-session directory when the Session closes."
+    cleanup_session_uploads(state, session_id);
     Ok(())
+}
+
+/// Delete a session's per-session upload dir and drop any of its in-flight uploads
+/// from the registry (issue #31). Called from every session-close path: explicit
+/// `CloseSession`, worktree/project removal, and the PTY-exit dispatcher. Partial
+/// files are closed (their handles dropped) before the dir is removed so Windows
+/// can delete them. Best-effort: a failed remove just leaves a stale dir, which
+/// the next same-session upload reuses anyway.
+fn cleanup_session_uploads(state: &Arc<Mutex<DaemonState>>, session_id: SessionId) {
+    let dir = {
+        let Ok(mut guard) = state.lock() else { return };
+        // Drop in-flight uploads for this session (closes their file handles).
+        let ids: Vec<UploadId> = guard
+            .uploads
+            .iter()
+            .filter(|(_, upload)| upload.session_id == session_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            guard.uploads.remove(&id);
+        }
+        session_upload_dir(&guard.config.uploads_root, session_id)
+    };
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The per-session upload directory: `<uploads_root>/<session-id>/`.
+fn session_upload_dir(uploads_root: &Path, session_id: SessionId) -> PathBuf {
+    uploads_root.join(session_id.to_string())
+}
+
+/// Begin a file-drop upload (issue #31). Validates the session, sanitizes the
+/// bare file name, creates the per-session dir, and reserves a collision-suffixed
+/// final name by creating (truncating) the file. Returns `(upload_id, final_name)`.
+fn begin_upload(
+    state: &Arc<Mutex<DaemonState>>,
+    client_id: u64,
+    session_id: SessionId,
+    file_name: &str,
+    _total_bytes: u64,
+) -> Result<(String, String), ProtocolError> {
+    let sanitized = sanitize_upload_name(file_name)?;
+    let dir = {
+        let guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        if !guard.sessions.contains_key(&session_id) {
+            return Err(ProtocolError::new(ErrorCode::NotFound, "session not found"));
+        }
+        session_upload_dir(&guard.config.uploads_root, session_id)
+    };
+    fs::create_dir_all(&dir)
+        .map_err(|err| internal(format!("could not create upload dir: {err}")))?;
+
+    // Reserve a non-colliding final name by atomically creating the file. Loop so a
+    // concurrent upload that reserved `file-1.txt` between our probe and create
+    // can't make two uploads share a path.
+    let (path, final_name) = reserve_upload_path(&dir, &sanitized)?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(|err| internal(format!("could not open upload file: {err}")))?;
+
+    let upload_id = uuid::Uuid::new_v4().to_string();
+    let mut guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    guard.uploads.insert(
+        upload_id.clone(),
+        ActiveUpload {
+            client_id,
+            session_id,
+            path,
+            file: Some(file),
+        },
+    );
+    Ok((upload_id, final_name))
+}
+
+/// Reserve a non-colliding path inside `dir` for `name`, creating the file with
+/// `create_new` so the reservation is atomic. Returns `(path, final_name)`.
+/// Collision suffixing inserts `-N` before the extension (splitting on the LAST
+/// dot): `file.txt` → `file-1.txt`; a dotfile `.env` → `.env-1` (no extension to
+/// split, since the leading dot isn't an extension separator).
+fn reserve_upload_path(dir: &Path, name: &str) -> Result<(PathBuf, String), ProtocolError> {
+    for attempt in 0..10_000 {
+        let candidate = if attempt == 0 {
+            name.to_string()
+        } else {
+            suffix_name(name, attempt)
+        };
+        let path = dir.join(&candidate);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok((path, candidate)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(internal(format!("could not reserve upload path: {err}")));
+            }
+        }
+    }
+    Err(internal("too many upload name collisions"))
+}
+
+/// Insert `-{n}` before the file extension. Splits on the LAST dot, but only when
+/// that dot is not the leading character (so `.env` is treated as having no
+/// extension and becomes `.env-1`, not `-1.env`).
+fn suffix_name(name: &str, n: usize) -> String {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 => format!("{}-{}{}", &name[..dot], n, &name[dot..]),
+        _ => format!("{name}-{n}"),
+    }
+}
+
+/// Sanitize a client-supplied upload file name. The GUI sends a bare name; the
+/// daemon enforces it: reject empties, `.`/`..`, and any path separator so a name
+/// can never escape the per-session dir.
+fn sanitize_upload_name(name: &str) -> Result<String, ProtocolError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('\0')
+    {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("invalid upload file name: {name:?}"),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Append one chunk's bytes to an in-flight upload. Enforces that the chunk comes
+/// from the client that began the upload.
+fn write_upload_chunk(
+    state: &Arc<Mutex<DaemonState>>,
+    client_id: u64,
+    upload_id: &str,
+    bytes: &[u8],
+) -> Result<(), ProtocolError> {
+    use io::Write as _;
+    let mut guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    let upload = guard
+        .uploads
+        .get_mut(upload_id)
+        .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "upload not found"))?;
+    if upload.client_id != client_id {
+        return Err(ProtocolError::new(
+            ErrorCode::Unauthorized,
+            "upload belongs to another connection",
+        ));
+    }
+    let file = upload
+        .file
+        .as_mut()
+        .ok_or_else(|| internal("upload file already closed"))?;
+    file.write_all(bytes)
+        .map_err(|err| internal(format!("could not write upload chunk: {err}")))?;
+    Ok(())
+}
+
+/// Finish an upload: flush/close the file and return its actual final absolute
+/// path for the GUI to insert. Removes it from the registry on success.
+fn finish_upload(
+    state: &Arc<Mutex<DaemonState>>,
+    client_id: u64,
+    upload_id: &str,
+) -> Result<String, ProtocolError> {
+    let mut guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+    let upload = guard
+        .uploads
+        .get(upload_id)
+        .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "upload not found"))?;
+    if upload.client_id != client_id {
+        return Err(ProtocolError::new(
+            ErrorCode::Unauthorized,
+            "upload belongs to another connection",
+        ));
+    }
+    let mut upload = guard.uploads.remove(upload_id).expect("checked above");
+    if let Some(file) = upload.file.take() {
+        file.sync_all()
+            .map_err(|err| internal(format!("could not flush upload: {err}")))?;
+    }
+    Ok(upload.path.to_string_lossy().into_owned())
+}
+
+/// Abort an in-flight upload: drop the file handle and delete the partial file.
+/// Returns an error only on a wrong-connection abort; an unknown upload is `Ok`.
+fn abort_upload(
+    state: &Arc<Mutex<DaemonState>>,
+    client_id: u64,
+    upload_id: &str,
+) -> Result<(), ProtocolError> {
+    let path = {
+        let mut guard = state.lock().map_err(|_| internal("state lock poisoned"))?;
+        match guard.uploads.get(upload_id) {
+            Some(upload) if upload.client_id != client_id => {
+                return Err(ProtocolError::new(
+                    ErrorCode::Unauthorized,
+                    "upload belongs to another connection",
+                ));
+            }
+            Some(_) => guard.uploads.remove(upload_id).map(|u| u.path),
+            None => None,
+        }
+    };
+    if let Some(path) = path {
+        let _ = fs::remove_file(&path);
+    }
+    Ok(())
+}
+
+/// Abort and delete every in-flight upload owned by a disconnecting client
+/// (issue #31). Uploads are connection-scoped: a dropped connection mid-upload
+/// leaves a partial that no one will finish, so we clean it up here.
+fn cleanup_client_uploads(state: &Arc<Mutex<DaemonState>>, client_id: u64) {
+    let paths = {
+        let Ok(mut guard) = state.lock() else { return };
+        let ids: Vec<UploadId> = guard
+            .uploads
+            .iter()
+            .filter(|(_, upload)| upload.client_id == client_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| guard.uploads.remove(&id).map(|u| u.path))
+            .collect::<Vec<_>>()
+    };
+    for path in paths {
+        let _ = fs::remove_file(&path);
+    }
 }
 
 fn rename_session(
@@ -3281,6 +3812,13 @@ fn spawn_pty_dispatcher(
                             if !shutting_down {
                                 let _ = state.store.delete_session(session_id);
                             }
+                        }
+                        // A session whose process exited while Hitch runs is truly
+                        // closed: delete its upload dir (issue #31). During a
+                        // graceful Quit the session is kept for layout restore, so
+                        // its uploads are left for the restored session to reuse.
+                        if !shutting_down {
+                            cleanup_session_uploads(&state, session_id);
                         }
                         let _ = broadcast_event(
                             &state,
@@ -5115,6 +5653,14 @@ fn default_managed_worktree_root() -> PathBuf {
     data_dir().join("worktrees")
 }
 
+/// Root of per-session file-drop upload dirs (issue #31). The ADR phrases this as
+/// `~/.hitch/uploads/<session-id>/`; we resolve it under the daemon's actual
+/// data dir so a dev-namespaced instance (`.hitch-dev`) keeps its uploads
+/// isolated rather than colliding in a literal `~/.hitch`.
+fn default_uploads_root() -> PathBuf {
+    data_dir().join("uploads")
+}
+
 fn default_hook_helper_path() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -5122,15 +5668,50 @@ fn default_hook_helper_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("hitch-hook"))
 }
 
+/// Resolve the `hitch-hook` helper that lives next to the daemon executable.
+///
+/// The hook is always adjacent to the daemon binary and named by transposing the
+/// daemon's name onto `hitch-hook`:
+/// - A Tauri sidecar daemon `hitch-daemon[-<target-triple>][.exe]` maps to
+///   `hitch-hook[-<target-triple>][.exe]` (the `hitch-daemon` prefix is swapped
+///   for `hitch-hook`, preserving any target-triple suffix and `.exe`). This is
+///   how the bundled sidecars are named.
+/// - A self-installed daemon symlink named `hitch` (or `hitch.exe`) — which is
+///   what `current_exe()` reports on macOS, where the symlink path is kept — maps
+///   to `hitch-hook` + the platform executable suffix
+///   ([`std::env::consts::EXE_SUFFIX`]: `""` on unix, `.exe` on Windows). The
+///   suffix comes from `EXE_SUFFIX`, not the daemon's own name, so a Windows
+///   daemon invoked as bare `hitch`/`hitch-daemon` still resolves an executable
+///   `hitch-hook.exe`.
 fn hook_helper_path_for_daemon_exe(exe: &Path) -> PathBuf {
-    let Some(parent) = exe.parent() else {
-        return PathBuf::from("hitch-hook");
-    };
-    let Some(file_name) = exe.file_name().and_then(|name| name.to_str()) else {
-        return parent.join("hitch-hook");
-    };
-    let suffix = file_name.strip_prefix("hitch-daemon").unwrap_or_default();
-    parent.join(format!("hitch-hook{suffix}"))
+    let hook_name = exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(hook_name_for_daemon_file_name)
+        .unwrap_or_else(|| format!("hitch-hook{}", std::env::consts::EXE_SUFFIX));
+    match exe.parent() {
+        Some(parent) => parent.join(hook_name),
+        None => PathBuf::from(hook_name),
+    }
+}
+
+/// Map a daemon binary *file name* to its adjacent hook file name.
+fn hook_name_for_daemon_file_name(file_name: &str) -> String {
+    // Sidecar form: swap the `hitch-daemon` prefix for `hitch-hook`, keeping any
+    // target-triple suffix and `.exe` exactly (e.g.
+    // `hitch-daemon-aarch64-apple-darwin` -> `hitch-hook-aarch64-apple-darwin`,
+    // `hitch-daemon.exe` -> `hitch-hook.exe`).
+    if let Some(rest) = file_name.strip_prefix("hitch-daemon") {
+        return format!("hitch-hook{rest}");
+    }
+    // Self-install symlink (`hitch` / `hitch.exe`) or any other name: keep the
+    // daemon's own `.exe` if it has one (a Windows binary invoked as bare
+    // `hitch.exe`), otherwise append the platform exe suffix ("" on unix). Either
+    // way the hook ends up executable on the host the daemon is running on.
+    if file_name.ends_with(".exe") {
+        return "hitch-hook.exe".to_string();
+    }
+    format!("hitch-hook{}", std::env::consts::EXE_SUFFIX)
 }
 
 fn store_error(err: hitch_store::StoreError) -> ProtocolError {
@@ -5201,6 +5782,58 @@ mod tests {
         assert_eq!(best_pr_for_branch(&prs, "feature").unwrap().number, 7);
         // A branch with no PR yields None rather than borrowing another's.
         assert!(best_pr_for_branch(&prs, "missing").is_none());
+    }
+
+    // Regression: two daemons against one socket path must never both run. A
+    // process holding live Sessions was orphaned because the second daemon bound
+    // the socket first (unlinking the live one's via `remove_stale_socket`) and
+    // only then checked the pidfile lock — too late. The lock is now the gate,
+    // acquired before the bind: a second acquirer must LOSE while the first holds
+    // it, which is what makes `run_daemon` refuse to start instead of stealing the
+    // socket. A loser must also leave the live pid intact (no truncate-before-lock).
+    #[cfg(unix)]
+    #[test]
+    fn second_daemon_loses_pidfile_lock_and_leaves_live_pid_intact() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-pidfile-gate-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("daemon.sock");
+        let pidfile = hitch_proto::transport::pidfile_path(&socket_path);
+
+        // First daemon wins the lock and records its pid.
+        let first = super::acquire_pidfile(&socket_path).unwrap();
+        assert!(first.is_some(), "first acquirer must win the lock");
+        let me = std::process::id().to_string();
+        assert_eq!(std::fs::read_to_string(&pidfile).unwrap().trim(), me);
+
+        // Second daemon on the same path loses the lock (the gate `run_daemon`
+        // turns into a refusal) and must not clobber the live owner's recorded pid.
+        let second = super::acquire_pidfile(&socket_path).unwrap();
+        assert!(
+            second.is_none(),
+            "second acquirer must lose the lock while the first holds it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pidfile).unwrap().trim(),
+            me,
+            "a losing acquirer must not clobber the live pid"
+        );
+
+        // Releasing the holder frees the path for a legitimate replacement.
+        drop(first);
+        let third = super::acquire_pidfile(&socket_path).unwrap();
+        assert!(
+            third.is_some(),
+            "the lock must be reacquirable once the holder drops"
+        );
+
+        drop(third);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5294,6 +5927,38 @@ mod tests {
     }
 
     #[test]
+    fn hook_helper_path_resolves_hitch_hook_with_exe_suffix() {
+        // Every daemon binary name the self-install / sidecar layout produces
+        // resolves an adjacent `hitch-hook` carrying the right executable
+        // extension. Building inputs in a synthetic dir keeps the assertion about
+        // the resolved *file name*, independent of cwd.
+        let exe_suffix = std::env::consts::EXE_SUFFIX;
+        let dir = std::path::Path::new("/synthetic/bin");
+        // `hitch`/`hitch-daemon` carry no extension, so the hook gets the
+        // platform exe suffix ("" on unix, ".exe" on Windows). An explicit
+        // `.exe` daemon name keeps its `.exe` hook on any host (Windows binary).
+        let cases = [
+            ("hitch", format!("hitch-hook{exe_suffix}")),
+            ("hitch-daemon", format!("hitch-hook{exe_suffix}")),
+            ("hitch.exe", "hitch-hook.exe".to_string()),
+            ("hitch-daemon.exe", "hitch-hook.exe".to_string()),
+        ];
+        for (daemon_name, expected_hook) in cases {
+            let resolved = super::hook_helper_path_for_daemon_exe(&dir.join(daemon_name));
+            assert_eq!(
+                resolved.parent(),
+                Some(dir),
+                "hook for {daemon_name} stays adjacent to the daemon exe"
+            );
+            assert_eq!(
+                resolved.file_name().and_then(|n| n.to_str()),
+                Some(expected_hook.as_str()),
+                "daemon {daemon_name} should resolve hook {expected_hook}"
+            );
+        }
+    }
+
+    #[test]
     fn output_before_replay_is_in_snapshot_and_not_redelivered_live() {
         // The race: a live Output is appended to the log before the client's
         // replay runs. It must show up in the replay snapshot exactly once and
@@ -5335,10 +6000,12 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
@@ -5428,10 +6095,12 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
@@ -5514,10 +6183,12 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hitch-hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
@@ -5607,10 +6278,12 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hitch-hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
@@ -5690,10 +6363,12 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hitch-hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
@@ -5753,10 +6428,12 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hitch-hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
@@ -6030,10 +6707,12 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
@@ -6121,10 +6800,12 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
@@ -6235,10 +6916,12 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root,
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
@@ -6346,10 +7029,12 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root,
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
@@ -6457,10 +7142,12 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: managed_root.clone(),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(std::sync::Mutex::new(super::DaemonState::new(
@@ -6522,10 +7209,12 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hitch-hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider: crate::drafts::DraftProviderConfig::from_env().unwrap(),
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));
@@ -7329,10 +8018,12 @@ mod tests {
             socket_path: dir.join("daemon.sock"),
             store_path: store_path.clone(),
             managed_root: dir.join("managed"),
+            uploads_root: dir.join("uploads"),
             hook_helper: dir.join("hook"),
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
             draft_provider,
+            exe_path: None,
         };
         let store = hitch_store::Store::open(&store_path).unwrap();
         let state = Arc::new(Mutex::new(super::DaemonState::new(store, config)));

@@ -6,7 +6,18 @@
   // sections include Editor, Drafts, and static About — no dead UI.
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
-  import { listDraftModels } from "$lib/daemon";
+  import {
+    cliInstall,
+    cliInstallStatus,
+    cliUninstall,
+    daemonScopesOrdered,
+    listDraftModels,
+    retrySshHost,
+    scopeStatusById,
+  } from "$lib/daemon";
+  import { sshHosts, testSshHost } from "$lib/sshHosts";
+  import { addSshHostOpen, removeSshHostTarget } from "$lib/overlays";
+  import type { CliInstallStatus, DaemonStatus, SshHost, SshTestResult } from "$lib/types";
   import { currentDesktopPlatform } from "$lib/desktopPlatform";
   import { bindings, comboKeys, type Binding, type BindingGroup } from "$lib/keymap";
   import { terminalKeyReference } from "$lib/terminalKeys";
@@ -46,6 +57,7 @@
     | "themes"
     | "drafts"
     | "git"
+    | "remote"
     | "notifications"
     | "keybindings"
     | "about";
@@ -208,6 +220,103 @@
     terminalFontFamily.set(value === DEFAULT_TERM_FONT_VALUE ? DEFAULT_TERM_FONT_FAMILY : value);
   }
 
+  // ---- Remote Hosts section (Feature A, ADR 0014) -----------------------
+  // The saved SSH Hosts as top-level scopes, filtered to remote (Local is never
+  // listed here). Reactive: a host add/remove and any live Daemon Status flip
+  // re-render through `daemonScopesOrdered` + `scopeStatusById`.
+  const sshHostScopes = $derived(
+    $daemonScopesOrdered.filter((scope) => scope.kind === "ssh-host"),
+  );
+
+  // The saved-host entry (carries the raw `target`) for a scope id, so a row can
+  // run Test/Retry/Remove against the same target the tree uses.
+  function hostFor(scopeId: string): SshHost | undefined {
+    return $sshHosts.find((h) => h.id === scopeId);
+  }
+
+  // Map a Daemon Status to the tree's status-dot class + display word, reusing the
+  // ProjectTree scope-dot vocabulary (running = ok, failed/unreachable = down,
+  // else pending) so the rows read identically to the tree.
+  function statusDotClass(status: DaemonStatus | undefined): "ok" | "down" | "pending" {
+    if (status === "running") return "ok";
+    if (status === "failed" || status === "unreachable") return "down";
+    return "pending";
+  }
+  function statusWord(status: DaemonStatus | undefined): string {
+    return status ?? "unknown";
+  }
+
+  // Per-host inline Test Connection state, keyed by scope id (mirrors the Add
+  // dialog: a classified result or an in-flight flag). A fresh test replaces the
+  // prior result for that host.
+  let hostTesting = $state<Record<string, boolean>>({});
+  let hostTestResult = $state<Record<string, SshTestResult | null>>({});
+
+  async function testHost(host: SshHost) {
+    hostTesting = { ...hostTesting, [host.id]: true };
+    hostTestResult = { ...hostTestResult, [host.id]: null };
+    try {
+      const result = await testSshHost(host.target);
+      hostTestResult = { ...hostTestResult, [host.id]: result };
+    } catch (err) {
+      hostTestResult = {
+        ...hostTestResult,
+        [host.id]: {
+          ok: false,
+          category: "network",
+          message: err instanceof Error ? err.message : String(err),
+        },
+      };
+    } finally {
+      hostTesting = { ...hostTesting, [host.id]: false };
+    }
+  }
+
+  // ---- This machine as a remote host (Feature B, ADR 0014 amendment) -----
+  // The local `hitch` CLI install status, refreshed on mount and after each
+  // Install/Repair/Uninstall. Drives the Install/Repair/Uninstall control + the
+  // manual-fallback copy for the conflict/unavailable cases.
+  let cliStatus = $state<CliInstallStatus | null>(null);
+  let cliBusy = $state(false);
+
+  async function refreshCliStatus() {
+    try {
+      cliStatus = await cliInstallStatus();
+    } catch {
+      cliStatus = null;
+    }
+  }
+  async function doCliInstall() {
+    cliBusy = true;
+    try {
+      cliStatus = await cliInstall();
+    } catch {
+      await refreshCliStatus();
+    } finally {
+      cliBusy = false;
+    }
+  }
+  async function doCliUninstall() {
+    cliBusy = true;
+    try {
+      cliStatus = await cliUninstall();
+    } catch {
+      await refreshCliStatus();
+    } finally {
+      cliBusy = false;
+    }
+  }
+
+  // The manual-fallback command for the conflict/unavailable cases, built from the
+  // resolved link path + target when known. The `ln -s` form is Unix-only; on
+  // Windows the status detail already carries the (copy-based) guidance, so we
+  // suppress the symlink command there.
+  const cliManualCommand = $derived(
+    platform !== "windows" && cliStatus?.target && cliStatus?.linkPath
+      ? `ln -s "${cliStatus.target}" "${cliStatus.linkPath}"`
+      : null,
+  );
+
   onMount(() => {
     // Empty stored value = System default; a value matching a known option
     // selects it; anything else (a custom app name or executable path)
@@ -242,6 +351,9 @@
       .then((fonts) => (fontOptions = fonts))
       .catch(() => (fontOptions = []))
       .finally(() => (fontsLoading = false));
+    // Fetch the local CLI install status for the Remote Hosts "this machine"
+    // control. Best-effort; a failure leaves the control hidden until retry.
+    void refreshCliStatus();
   });
 
   $effect(() => {
@@ -394,6 +506,13 @@
       </button>
       <button class="nav-row" class:active={section === "git"} onclick={() => (section = "git")}>
         Git
+      </button>
+      <button
+        class="nav-row"
+        class:active={section === "remote"}
+        onclick={() => (section = "remote")}
+      >
+        Remote Hosts
       </button>
       <button
         class="nav-row"
@@ -731,6 +850,158 @@
                 </span>
               {/snippet}
             </Toggle.Root>
+          </div>
+        </section>
+      {:else if section === "remote"}
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Remote Hosts</h2>
+            <p class="help">
+              An <b>SSH Host</b> is a saved OpenSSH target this app reaches over
+              <span class="mono">ssh &lt;target&gt; hitch daemon proxy</span>. Authentication uses
+              your OpenSSH config, ssh-agent, and known_hosts — Hitch stores only the target
+              string, never keys, passphrases, ports, or usernames.
+            </p>
+          </div>
+
+          <ul class="host-list">
+            {#each sshHostScopes as scope (scope.id)}
+              {@const host = hostFor(scope.id)}
+              {@const status = $scopeStatusById[scope.id]}
+              {@const down = status === "unreachable" || status === "failed"}
+              {@const result = hostTestResult[scope.id]}
+              <li class="host-row">
+                <div class="host-main">
+                  <span class="host-target mono">{scope.label}</span>
+                  <span class="host-status">
+                    <span class="scope-dot {statusDotClass(status)}" aria-hidden="true"></span>
+                    <span class="host-status-word">{statusWord(status)}</span>
+                  </span>
+                  {#if host}
+                    <div class="host-actions">
+                      <button
+                        class="btn"
+                        disabled={hostTesting[scope.id]}
+                        onclick={() => void testHost(host)}
+                      >
+                        {hostTesting[scope.id] ? "Testing…" : "Test"}
+                      </button>
+                      {#if down}
+                        <button class="btn" onclick={() => void retrySshHost(host.target)}>
+                          Retry now
+                        </button>
+                      {/if}
+                      <button class="btn" onclick={() => removeSshHostTarget.set(host)}>
+                        Remove
+                      </button>
+                    </div>
+                  {/if}
+                </div>
+                {#if result}
+                  {#if result.ok}
+                    <div class="test-box ok">
+                      <span class="dot" aria-hidden="true"></span>
+                      <div>{result.message}</div>
+                    </div>
+                  {:else}
+                    <div class="test-box bad">
+                      <span class="dot" aria-hidden="true"></span>
+                      <div>
+                        <div>{result.message}</div>
+                        {#if result.detail}<pre class="detail">{result.detail}</pre>{/if}
+                      </div>
+                    </div>
+                  {/if}
+                {/if}
+              </li>
+            {:else}
+              <li class="host-row empty">No remote hosts yet.</li>
+            {/each}
+          </ul>
+
+          <div class="row">
+            <button class="btn primary" onclick={() => addSshHostOpen.set(true)}>
+              Add SSH Host…
+            </button>
+          </div>
+
+          <!-- This machine as a remote host (Feature B): the local `hitch` CLI
+               install so another Hitch GUI can SSH into THIS machine. -->
+          <div class="subsection">
+            <div class="panel-head">
+              <h2 class="sub-h2">This machine as a remote host</h2>
+              {#if platform === "windows"}
+                <p class="help">
+                  To reach this machine from another Hitch on your network, it needs the
+                  <span class="mono">hitch</span> CLI. On Windows this is managed by the Hitch
+                  installer.
+                </p>
+              {:else}
+                <p class="help">
+                  To reach this machine from another Hitch on your network, it needs the
+                  <span class="mono">hitch</span> CLI. Hitch can install it for you by symlinking
+                  <span class="mono">~/.local/bin/hitch</span> — no changes to your shell config.
+                </p>
+              {/if}
+            </div>
+
+            {#if cliStatus}
+              <div class="cli-status">
+                <span
+                  class="scope-dot {cliStatus.state === 'installed'
+                    ? 'ok'
+                    : cliStatus.state === 'conflict'
+                      ? 'down'
+                      : 'pending'}"
+                  aria-hidden="true"
+                ></span>
+                <div class="cli-status-text">
+                  {#if cliStatus.state === "installed"}
+                    <div>Installed{cliStatus.linkPath ? ` at ${cliStatus.linkPath}` : ""}.</div>
+                  {:else if cliStatus.state === "not-installed"}
+                    <div>Not installed.</div>
+                  {:else if cliStatus.state === "conflict"}
+                    <div>Needs attention.</div>
+                    {#if cliStatus.detail}<div class="cli-warn">{cliStatus.detail}</div>{/if}
+                  {:else}
+                    <div>Unavailable.</div>
+                    {#if cliStatus.detail}<div class="cli-warn">{cliStatus.detail}</div>{/if}
+                  {/if}
+                </div>
+              </div>
+
+              {#if platform === "windows"}
+                <p class="help">
+                  Managed by the Hitch installer — reinstall to repair.
+                </p>
+              {:else if cliStatus.state === "unavailable"}
+                <!-- Dev build (no bundled daemon): status only, nothing to install. -->
+              {:else}
+                <div class="row">
+                  {#if cliStatus.state === "installed"}
+                    <button class="btn" disabled={cliBusy} onclick={() => void doCliInstall()}>
+                      {cliBusy ? "Working…" : "Repair"}
+                    </button>
+                    <button class="btn" disabled={cliBusy} onclick={() => void doCliUninstall()}>
+                      Uninstall
+                    </button>
+                  {:else if cliStatus.state === "not-installed"}
+                    <button class="btn primary" disabled={cliBusy} onclick={() => void doCliInstall()}>
+                      {cliBusy ? "Installing…" : "Install"}
+                    </button>
+                  {/if}
+                </div>
+
+                {#if cliStatus.state === "conflict"}
+                  <p class="help">
+                    Install it manually instead:
+                  </p>
+                  {#if cliManualCommand}
+                    <pre class="detail">{cliManualCommand}</pre>
+                  {/if}
+                {/if}
+              {/if}
+            {/if}
           </div>
         </section>
       {:else if section === "notifications"}
@@ -1207,5 +1478,157 @@
   .track.on .thumb {
     transform: translateX(16px);
     background: var(--iris-on);
+  }
+
+  /* ---- Remote Hosts ----
+     Host rows read like the keybindings list: hairline-bordered, paper-1 fill,
+     label left / status + actions right. The status dot reuses the tree's
+     scope-dot tokens so a host reads the same liveness here as in the sidebar. */
+  .host-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+  }
+  .host-row {
+    display: grid;
+    gap: 8px;
+    padding: 10px 12px;
+    background: var(--paper-1);
+  }
+  .host-row.empty {
+    color: var(--ink-3);
+    font-size: var(--r0);
+  }
+  .host-main {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .host-target {
+    font-size: var(--r1);
+    color: var(--ink-0);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .host-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: none;
+  }
+  .host-status-word {
+    font-size: var(--r0);
+    color: var(--ink-2);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .host-actions {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: none;
+  }
+
+  /* The same liveness-dot recipe the tree's scope rows use (ProjectTree): running
+     = ok (green glow), failed/unreachable = down (oxide), else pending (faint). */
+  .scope-dot {
+    width: 6px;
+    height: 6px;
+    flex: none;
+    border-radius: 50%;
+    background: var(--ink-3);
+  }
+  .scope-dot.ok {
+    background: var(--st-ok);
+    box-shadow: 0 0 0 2px var(--st-ok-glow);
+  }
+  .scope-dot.down {
+    background: var(--st-need);
+  }
+  .scope-dot.pending {
+    background: var(--ink-3);
+  }
+
+  /* Inline classified Test result, mirroring AddSshHostDialog's .test-box. */
+  .test-box {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid;
+    border-radius: 0;
+    font-size: var(--r0);
+    line-height: 1.5;
+  }
+  .test-box .dot {
+    width: 7px;
+    height: 7px;
+    flex: 0 0 7px;
+    margin-top: 4px;
+    border-radius: 50%;
+  }
+  .test-box.ok {
+    color: var(--ink-1);
+    background: var(--st-ok-glow);
+    border-color: var(--st-ok);
+  }
+  .test-box.ok .dot {
+    background: var(--st-ok);
+  }
+  .test-box.bad {
+    color: var(--st-need);
+    background: var(--st-need-wash);
+    border-color: var(--st-need-line);
+  }
+  .test-box.bad .dot {
+    background: var(--st-need);
+  }
+  .detail {
+    margin: 6px 0 0;
+    padding: 6px 8px;
+    background: var(--paper-3);
+    border: 1px solid var(--line);
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    color: var(--ink-2);
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 7.5em;
+    overflow: auto;
+  }
+
+  /* This-machine subsection: a quiet hairline divider above a nested heading. */
+  .subsection {
+    display: grid;
+    gap: 16px;
+    padding-top: 16px;
+    border-top: 1px solid var(--line);
+  }
+  .sub-h2 {
+    font-size: var(--r1) !important;
+  }
+  .cli-status {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: var(--r0);
+    color: var(--ink-1);
+  }
+  .cli-status .scope-dot {
+    margin-top: 4px;
+  }
+  .cli-status-text {
+    display: grid;
+    gap: 4px;
+  }
+  .cli-warn {
+    color: var(--st-need);
   }
 </style>

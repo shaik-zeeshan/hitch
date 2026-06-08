@@ -7,19 +7,29 @@
   // Throws surface inline; success dismisses.
   import { Dialog } from "bits-ui";
   import { open } from "@tauri-apps/plugin-dialog";
-  import { cloneProject } from "../daemon";
+  import { get } from "svelte/store";
+  import { cloneProject, daemonScopesOrdered, selectedScopeId } from "../daemon";
   import { cloneProjectOpen } from "../overlays";
+  import { LOCAL_SCOPE_ID, type DaemonScopeId } from "../types";
 
   let remoteUrl = $state("");
   let destination = $state("");
+  let scopeId = $state<DaemonScopeId>(LOCAL_SCOPE_ID);
   let submitting = $state(false);
   let errMsg = $state<string | null>(null);
+
+  // Target-daemon select (issue #28, ADR 0014): Local + connected hosts, default
+  // to the currently selected scope. Clone routes to that daemon; when remote, the
+  // destination is a remote path (text only — no native picker for remote paths).
+  const scopes = $derived($daemonScopesOrdered);
+  const isLocal = $derived(scopeId === LOCAL_SCOPE_ID);
 
   function onOpenChange(next: boolean) {
     cloneProjectOpen.set(next);
     if (next) {
       remoteUrl = "";
       destination = "";
+      scopeId = get(selectedScopeId);
       submitting = false;
       errMsg = null;
     }
@@ -44,7 +54,7 @@
     submitting = true;
     errMsg = null;
     try {
-      await cloneProject(remoteUrl, destination);
+      await cloneProject(remoteUrl, destination, null, scopeId);
       cloneProjectOpen.set(false);
     } catch (err) {
       errMsg = err instanceof Error ? err.message : String(err);
@@ -64,6 +74,14 @@
       </div>
       <div class="m-body">
         <label class="field">
+          <span>Target daemon</span>
+          <select class="base" bind:value={scopeId}>
+            {#each scopes as scope (scope.id)}
+              <option value={scope.id}>{scope.label}</option>
+            {/each}
+          </select>
+        </label>
+        <label class="field">
           <span>Remote URL</span>
           <!-- svelte-ignore a11y_autofocus -->
           <input
@@ -75,15 +93,19 @@
           />
         </label>
         <label class="field">
-          <span>Clone into</span>
+          <span>Clone into{#if !isLocal} (remote path){/if}</span>
           <div class="input-row">
             <input
               class="base"
               bind:value={destination}
-              placeholder="/path/to/clone-here"
+              placeholder={isLocal ? "/path/to/clone-here" : "/absolute/remote/path"}
               onkeydown={(e) => e.key === "Enter" && void submit()}
             />
-            <button type="button" class="browse" onclick={() => void browseDestination()}>Browse…</button>
+            <!-- Native picker only resolves LOCAL paths; a remote destination is
+                 typed (the GUI never maps remote paths onto local paths). -->
+            {#if isLocal}
+              <button type="button" class="browse" onclick={() => void browseDestination()}>Browse…</button>
+            {/if}
           </div>
         </label>
         {#if errMsg}<p class="m-error">{errMsg}</p>{/if}

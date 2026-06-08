@@ -132,7 +132,7 @@ import {
   draftProvider,
   railView,
 } from "./settings";
-import type { ChangedFile } from "./types";
+import { LOCAL_SCOPE_ID, type ChangedFile } from "./types";
 
 // Flush the StartJob promise chain (runJob -> daemonRequest -> invoke) so the
 // pending resolver is registered before we deliver the JobCompleted event.
@@ -1208,6 +1208,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: "commit-draft",
         worktreeId: "w-foreign",
+        scopeId: LOCAL_SCOPE_ID,
       },
       local: {
         id: "local",
@@ -1215,6 +1216,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: "pr-draft",
         worktreeId: "w-local",
+        scopeId: LOCAL_SCOPE_ID,
       },
       push: {
         id: "push",
@@ -1222,6 +1224,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: "push",
         worktreeId: "w-local",
+        scopeId: LOCAL_SCOPE_ID,
       },
       prStatus: {
         id: "prStatus",
@@ -1229,6 +1232,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: "pr-status",
         worktreeId: "w-pr-status",
+        scopeId: LOCAL_SCOPE_ID,
       },
     });
 
@@ -1287,6 +1291,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: "clone",
         worktreeId: null,
+        scopeId: LOCAL_SCOPE_ID,
       }),
     ).toBe(true);
     expect(
@@ -1296,6 +1301,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: "create-worktree",
         worktreeId: "w1",
+        scopeId: LOCAL_SCOPE_ID,
       }),
     ).toBe(true);
     expect(
@@ -1305,6 +1311,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: "push",
         worktreeId: "w1",
+        scopeId: LOCAL_SCOPE_ID,
       }),
     ).toBe(true);
     expect(
@@ -1314,6 +1321,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: "fetch",
         worktreeId: "w1",
+        scopeId: LOCAL_SCOPE_ID,
       }),
     ).toBe(true);
     expect(
@@ -1323,6 +1331,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: "pull",
         worktreeId: "w1",
+        scopeId: LOCAL_SCOPE_ID,
       }),
     ).toBe(true);
     expect(
@@ -1332,6 +1341,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: "create-pr",
         worktreeId: "w1",
+        scopeId: LOCAL_SCOPE_ID,
       }),
     ).toBe(true);
     expect(
@@ -1341,6 +1351,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: "pr-status",
         worktreeId: "w1",
+        scopeId: LOCAL_SCOPE_ID,
       }),
     ).toBe(false);
     expect(
@@ -1350,6 +1361,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: "draft-models",
         worktreeId: "w1",
+        scopeId: LOCAL_SCOPE_ID,
       }),
     ).toBe(true);
     expect(
@@ -1359,6 +1371,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: "commit-draft",
         worktreeId: "w1",
+        scopeId: LOCAL_SCOPE_ID,
       }),
     ).toBe(true);
     expect(
@@ -1368,6 +1381,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: "pr-draft",
         worktreeId: "w1",
+        scopeId: LOCAL_SCOPE_ID,
       }),
     ).toBe(true);
     expect(
@@ -1377,6 +1391,7 @@ describe("job store: StartJob -> JobCompleted", () => {
         message: null,
         kind: null,
         worktreeId: "w1",
+        scopeId: LOCAL_SCOPE_ID,
       }),
     ).toBe(false);
   });

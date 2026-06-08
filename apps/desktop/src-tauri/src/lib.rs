@@ -4,6 +4,9 @@
 //! socket connection, starts the daemon when needed, and relays `hitch-proto`
 //! requests/responses/events to Tauri IPC.
 
+mod cli_install;
+mod ssh;
+mod ssh_pool;
 mod window_chrome;
 
 use hitch_proto::transport::{connect_daemon as connect_transport, is_endpoint_busy, DaemonStream};
@@ -277,7 +280,7 @@ fn describe_handshake_failure(outcome: &Result<Response, String>) -> String {
 /// returns no pid), so it's what makes force-killing such a daemon possible — but
 /// a pidfile left by an unclean exit names a pid the OS may have since reused, and
 /// SIGKILLing that would hit an unrelated process. The daemon holds the lock for
-/// its whole lifetime (see `write_pidfile`), so a *free* lock means the writer is
+/// its whole lifetime (see `acquire_pidfile`), so a *free* lock means the writer is
 /// gone and the pid is unsafe to target. Returns `None` if the file is absent,
 /// unparsable, or stale (lock free).
 #[cfg(unix)]
@@ -575,7 +578,7 @@ fn wait_for_socket_release(path: &Path, timeout: Duration) -> Result<(), String>
 /// `new Uint8Array([...]).buffer`, large via the fetch-channel path), matching
 /// the JS side `new Channel<ArrayBuffer>()`.
 #[derive(Default)]
-struct OutputRouter {
+pub(crate) struct OutputRouter {
     channels: HashMap<SessionId, Channel<InvokeResponseBody>>,
     /// Bytes that arrived before the channel was registered, per session.
     staging: HashMap<SessionId, Vec<u8>>,
@@ -604,7 +607,7 @@ impl OutputRouter {
     /// by the JS ring reset that happens during fresh registration. Preserve
     /// bytes staged before the first SessionOpened for a brand-new session: a PTY
     /// can emit its first prompt before the daemon broadcasts SessionOpened.
-    fn prepare_fresh_registration(&mut self, session_id: SessionId) {
+    pub(crate) fn prepare_fresh_registration(&mut self, session_id: SessionId) {
         let already_opened = !self.opened_sessions.insert(session_id);
         self.channels.remove(&session_id);
         if already_opened {
@@ -616,7 +619,7 @@ impl OutputRouter {
     /// completes. Sending is best-effort: a dead webview channel should not tear
     /// down the daemon reader loop. If the channel has gone stale, remove it and
     /// stage the payload so the next registration can catch up.
-    fn send_or_stage(&mut self, session_id: SessionId, payload: Vec<u8>) {
+    pub(crate) fn send_or_stage(&mut self, session_id: SessionId, payload: Vec<u8>) {
         if let Some(channel) = self.channels.get(&session_id) {
             if channel
                 .send(InvokeResponseBody::Raw(payload.clone()))
@@ -632,7 +635,7 @@ impl OutputRouter {
 
     /// Register (or re-register) a webview channel and flush bytes staged during
     /// the registration gap.
-    fn register_channel(&mut self, session_id: SessionId, channel: Channel<InvokeResponseBody>) {
+    pub(crate) fn register_channel(&mut self, session_id: SessionId, channel: Channel<InvokeResponseBody>) {
         if let Some(staged) = self.staging.remove(&session_id) {
             if !staged.is_empty()
                 && channel
@@ -648,13 +651,13 @@ impl OutputRouter {
     }
 
     /// Drop a session's output channel and any bytes staged for it.
-    fn unregister_channel(&mut self, session_id: SessionId) {
+    pub(crate) fn unregister_channel(&mut self, session_id: SessionId) {
         self.channels.remove(&session_id);
         self.staging.remove(&session_id);
     }
 
     /// Forget all routing state for a session that the daemon has closed.
-    fn close_session(&mut self, session_id: SessionId) {
+    pub(crate) fn close_session(&mut self, session_id: SessionId) {
         self.unregister_channel(session_id);
         self.opened_sessions.remove(&session_id);
     }
@@ -1906,7 +1909,7 @@ fn reader_loop(
     }
 }
 
-fn read_control_message<R: BufRead>(reader: &mut R) -> io::Result<Option<ControlMessage>> {
+pub(crate) fn read_control_message<R: BufRead>(reader: &mut R) -> io::Result<Option<ControlMessage>> {
     let mut line = Vec::new();
     let len = reader.read_until(b'\n', &mut line)?;
     if len == 0 {
@@ -1923,13 +1926,29 @@ fn read_control_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Control
         .map_err(io::Error::other)
 }
 
-fn read_pty_payload<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
+pub(crate) fn read_pty_payload<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut prefix = [0_u8; 4];
     reader.read_exact(&mut prefix)?;
     let len = u32::from_be_bytes(prefix) as usize;
     let mut payload = vec![0_u8; len];
     reader.read_exact(&mut payload)?;
     Ok(payload)
+}
+
+/// Debug builds run the daemon out of the cargo target dir (see `spawn_daemon`),
+/// never a bundled sidecar beside the app exe, so there is no stable installable
+/// binary to symlink onto PATH. The CLI self-install (ADR 0014 amendment) reports
+/// `unavailable` ("expected in a dev build") on this `None`. An explicit
+/// `HITCH_DAEMON_PATH` is still honored so a dev can point it at a real binary.
+#[cfg(debug_assertions)]
+fn daemon_binary_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("HITCH_DAEMON_PATH") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 #[cfg(not(debug_assertions))]
@@ -2632,6 +2651,19 @@ fn open_path_with_default_viewer(path: &Path) -> Result<(), String> {
         .map_err(|err| format!("failed to open path with default viewer: {err}"))
 }
 
+/// Test an **SSH Host** target before saving it (issue #26, ADR 0014). Spawns
+/// `ssh -o BatchMode=yes <target> hitch daemon proxy`, attempts the Hitch Hello
+/// handshake on the subprocess stdio, then terminates it and returns a structured
+/// classified result. The blocking spawn/handshake runs off the UI thread. This
+/// is the CLIENT side of the remote attach; issue #27 reuses `ssh::run_test`'s
+/// handshake helper for the real persistent connection.
+#[tauri::command]
+async fn test_ssh_host(target: String) -> Result<ssh::SshTestResult, String> {
+    tauri::async_runtime::spawn_blocking(move || ssh::run_test(&target))
+        .await
+        .map_err(|err| format!("ssh test task failed: {err}"))
+}
+
 #[tauri::command]
 async fn open_in_editor(path: String, editor: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -2895,16 +2927,164 @@ async fn restart_daemon_command(
     .map_err(|err| format!("daemon restart task failed: {err}"))?
 }
 
+/// Current status of the local `hitch` CLI install (ADR 0014 amendment): is the
+/// `~/.local/bin/hitch` symlink present and ours, is the link dir on a
+/// non-interactive PATH, or is there a conflict / dev-build unavailability.
+/// Pure-ish: a symlink stat + a dotfile/`$PATH` scan, no mutation.
+#[tauri::command]
+fn cli_install_status() -> cli_install::CliInstallStatus {
+    cli_install::status(daemon_binary_path())
+}
+
+/// Install (or repair) the local `hitch` CLI: symlink both `~/.local/bin/hitch` →
+/// the bundled daemon and `~/.local/bin/hitch-hook` → the bundled hook (pure
+/// symlink, no shell rc edits), so `ssh <thismachine> hitch daemon proxy` works
+/// and remote agent hooks fire. Idempotent; all-or-nothing — never clobbers a
+/// foreign file at either link path. Returns the post-install status.
+#[tauri::command]
+fn cli_install() -> Result<cli_install::CliInstallStatus, String> {
+    cli_install::install(daemon_binary_path())
+}
+
+/// Uninstall the local `hitch` CLI: remove BOTH of OUR symlinks (`hitch` and
+/// `hitch-hook`, only if they're ours). Also writes the auto-install marker so
+/// first-launch auto-install respects the explicit uninstall and never
+/// re-installs behind the user's back. Returns the post-uninstall status.
+#[tauri::command]
+fn cli_uninstall() -> Result<cli_install::CliInstallStatus, String> {
+    // Record an explicit user opt-out so the startup auto-install gate skips.
+    let _ = write_cli_autoinstall_marker();
+    cli_install::uninstall(daemon_binary_path())
+}
+
+/// Marker file recording that first-launch auto-install has been attempted (or
+/// the user explicitly uninstalled). Lives in the daemon data root next to the
+/// daemon log, so it's per-machine GUI-local state. Its mere presence gates
+/// auto-install; we never re-run after the first attempt or after an uninstall.
+fn cli_autoinstall_marker_path() -> PathBuf {
+    hitch_proto::transport::default_data_dir().join("cli-autoinstall.done")
+}
+
+fn write_cli_autoinstall_marker() -> std::io::Result<()> {
+    let path = cli_autoinstall_marker_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, b"1")
+}
+
+/// Marker file recording that the one-time legacy-strip migration has run. Lives
+/// in the daemon data root next to the auto-install marker, so it's per-machine
+/// GUI-local state. Its mere presence gates the strip; we never re-run after the
+/// first sweep.
+fn cli_legacy_strip_marker_path() -> PathBuf {
+    hitch_proto::transport::default_data_dir().join("cli-legacy-strip.done")
+}
+
+fn write_cli_legacy_strip_marker() -> std::io::Result<()> {
+    let path = cli_legacy_strip_marker_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, b"1")
+}
+
+/// One-time legacy-strip migration (ADR 0014 amendment). The previous version of
+/// self-install wrote a managed PATH block into the user's shell rc files; the new
+/// pure-symlink install never does. This sweeps that legacy block back out ONCE,
+/// gated by a migration marker so it runs at most once. Idempotent and a no-op on
+/// clean machines (a block-less file is left byte-identical). Best-effort on a
+/// background thread so it never blocks or errors startup.
+fn maybe_strip_legacy_cli_blocks() {
+    thread::Builder::new()
+        .name("hitch-cli-legacy-strip".into())
+        .spawn(|| {
+            if cli_legacy_strip_marker_path().exists() {
+                return;
+            }
+            // Write the marker FIRST so a crash mid-sweep can't loop the attempt.
+            let _ = write_cli_legacy_strip_marker();
+            cli_install::strip_legacy_managed_blocks();
+        })
+        .ok();
+}
+
+/// First-launch CLI self-install (ADR 0014 amendment). Best-effort and gated so
+/// it runs at most once and respects the user:
+///   - skip entirely if the marker exists (already attempted, or user uninstalled),
+///   - only auto-install when status is `not-installed` (absent/ours-stale) — we
+///     never overwrite a `conflict`, and a clean `installed` needs nothing,
+///   - on `unavailable` (dev build / Windows) we still write the marker so we
+///     don't re-probe every launch, but we don't touch disk.
+/// Never blocks startup (runs on a background thread) and never errors the app.
+fn maybe_auto_install_cli() {
+    thread::Builder::new()
+        .name("hitch-cli-autoinstall".into())
+        .spawn(|| {
+            if cli_autoinstall_marker_path().exists() {
+                return;
+            }
+            let daemon = daemon_binary_path();
+            let status = cli_install::status(daemon.clone());
+            // Write the marker FIRST so a crash mid-install can't loop the attempt.
+            let _ = write_cli_autoinstall_marker();
+            if status.state == "not-installed" {
+                if let Err(err) = cli_install::install(daemon) {
+                    eprintln!("hitch: auto-install of CLI failed: {err}");
+                }
+            }
+        })
+        .ok();
+}
+
+/// True for any scope id that names a remote SSH Host daemon (`ssh:<target>`).
+/// The absent/`local` scope routes to the local daemon for zero regression.
+fn is_remote_scope(scope: Option<&str>) -> bool {
+    matches!(scope, Some(s) if s.starts_with("ssh:"))
+}
+
 #[tauri::command]
 async fn hitch_request(
     app: AppHandle,
     state: State<'_, HitchClient>,
+    ssh: State<'_, ssh_pool::SshConnections>,
     request: Request,
+    scope: Option<String>,
 ) -> Result<Response, String> {
+    // Route by scope: a remote `ssh:<target>` scope dispatches over the SSH stdio
+    // pool; the default/`local` scope keeps the exact local path (issue #27). The
+    // frontend omits `scope` for every local request, so the local flow is
+    // unchanged.
+    if is_remote_scope(scope.as_deref()) {
+        let pool = ssh.inner().clone();
+        let scope = scope.unwrap();
+        return tauri::async_runtime::spawn_blocking(move || {
+            pool.send_request(&scope, request, None)
+        })
+        .await
+        .map_err(|err| format!("remote daemon request task failed: {err}"))?;
+    }
     let client = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || client.send_request(&app, request))
         .await
         .map_err(|err| format!("daemon request task failed: {err}"))?
+}
+
+/// Reconcile the remote connection pool to the saved SSH Hosts (issue #27). The
+/// frontend invokes this on boot with every saved host and again on every host
+/// add/remove, so the pool always mirrors the persisted list: new hosts connect
+/// (with backoff), removed hosts disconnect their proxy and drop their state. The
+/// remote Daemon keeps running across a removal (ADR 0014).
+#[tauri::command]
+fn set_ssh_hosts(app: AppHandle, ssh: State<'_, ssh_pool::SshConnections>, targets: Vec<String>) {
+    ssh.inner().set_hosts(&app, targets);
+}
+
+/// Retry a host now: reset its backoff and reconnect immediately (the Retry Now
+/// affordance on an unreachable/failed host row, ADR 0014).
+#[tauri::command]
+fn retry_ssh_host(app: AppHandle, ssh: State<'_, ssh_pool::SshConnections>, target: String) {
+    ssh.inner().retry(&app, &target);
 }
 
 /// Fire-and-forget keystroke path (Slice 6, "input fast path"). The old
@@ -2922,15 +3102,57 @@ async fn hitch_request(
 #[tauri::command]
 fn send_session_input(
     state: State<'_, HitchClient>,
+    ssh: State<'_, ssh_pool::SshConnections>,
     session_id: SessionId,
     data: String,
+    scope: Option<String>,
 ) -> Result<Response, String> {
+    // Session ids are unique only per daemon, so input routes to the owning
+    // scope: a remote session's keystrokes go to its SSH connection, local
+    // sessions keep the ordered input lane (issue #27).
+    if is_remote_scope(scope.as_deref()) {
+        ssh.inner()
+            .send_session_input(&scope.unwrap(), session_id, data.into_bytes());
+        return Ok(Response::Ack);
+    }
     state
         .0
         .input_tx
         .send((session_id, data.into_bytes()))
         .map_err(|_| "input writer thread is gone".to_string())?;
     Ok(Response::Ack)
+}
+
+/// Upload dropped local files into a remote Session (issue #31, ADR 0014). Only
+/// remote scopes reach here — the frontend handles local drops by inserting paths
+/// directly (unchanged). Streams each file over the scope's SSH connection on a
+/// blocking task so it never blocks the IPC thread; the streaming itself uses the
+/// same per-scope request path other commands do, so chunks interleave with PTY
+/// traffic. Returns the per-file results plus the remote OS family for quoting.
+#[tauri::command]
+async fn upload_files_to_session(
+    app: AppHandle,
+    ssh: State<'_, ssh_pool::SshConnections>,
+    scope: String,
+    batch_id: String,
+    session_id: SessionId,
+    paths: Vec<String>,
+) -> Result<ssh_pool::UploadBatchResult, String> {
+    if !is_remote_scope(Some(scope.as_str())) {
+        return Err("upload_files_to_session is only for remote sessions".to_string());
+    }
+    let pool = ssh.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        pool.upload_files(&app, &scope, &batch_id, session_id, paths)
+    })
+    .await
+    .map_err(|err| format!("upload task failed: {err}"))?
+}
+
+/// Cancel an in-flight upload batch before its paths are inserted (issue #31).
+#[tauri::command]
+fn cancel_upload(ssh: State<'_, ssh_pool::SshConnections>, batch_id: String) {
+    ssh.inner().cancel_upload(&batch_id);
 }
 
 /// Register the webview's per-session output channel (ADR 0007). Any bytes that
@@ -2940,9 +3162,19 @@ fn send_session_input(
 #[tauri::command]
 fn register_session_output(
     state: State<'_, HitchClient>,
+    ssh: State<'_, ssh_pool::SshConnections>,
     session_id: SessionId,
     channel: Channel<InvokeResponseBody>,
+    scope: Option<String>,
 ) -> Result<(), String> {
+    // Per-session output channels are scope-aware: a remote session registers its
+    // channel on the owning SSH connection's router, local sessions on the local
+    // router (issue #27).
+    if is_remote_scope(scope.as_deref()) {
+        return ssh
+            .inner()
+            .register_session_output(&scope.unwrap(), session_id, channel);
+    }
     let mut router = state
         .0
         .output_router
@@ -2957,8 +3189,13 @@ fn register_session_output(
 #[tauri::command]
 fn unregister_session_output(
     state: State<'_, HitchClient>,
+    ssh: State<'_, ssh_pool::SshConnections>,
     session_id: SessionId,
+    scope: Option<String>,
 ) -> Result<(), String> {
+    if is_remote_scope(scope.as_deref()) {
+        return ssh.inner().unregister_session_output(&scope.unwrap(), session_id);
+    }
     let mut router = state
         .0
         .output_router
@@ -4396,6 +4633,10 @@ fn start_daemon_connection_on_launch(app: &tauri::App) {
 pub fn run() {
     tauri::Builder::default()
         .manage(HitchClient::new())
+        // The remote-daemon connection pool: one connection per saved SSH Host,
+        // keyed by `ssh:<target>` scope id (issue #27). The local daemon stays
+        // owned by `HitchClient` above; this pool never touches it.
+        .manage(ssh_pool::SshConnections::new())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -4422,6 +4663,16 @@ pub fn run() {
             }
             build_tray(app)?;
             start_daemon_connection_on_launch(app);
+            // First-launch self-install of the `hitch` CLI so this machine is
+            // reachable as an SSH remote host (ADR 0014 amendment). Gated to run
+            // at most once and never overwrite a conflict / explicit uninstall;
+            // best-effort on a background thread so it never blocks or errors
+            // startup.
+            maybe_auto_install_cli();
+            // One-time sweep of the legacy managed PATH block the old
+            // (dotfile-writing) self-install left in shell rc files. Gated by its
+            // own marker so it runs at most once; no-op on clean machines.
+            maybe_strip_legacy_cli_blocks();
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -4434,17 +4685,25 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             open_in_editor,
+            test_ssh_host,
             list_monospace_fonts,
             list_terminal_font_faces,
             read_font_face,
             connect_daemon,
             hitch_request,
+            set_ssh_hosts,
+            retry_ssh_host,
             send_session_input,
+            upload_files_to_session,
+            cancel_upload,
             register_session_output,
             unregister_session_output,
             get_daemon_status,
             get_daemon_log_tail,
             restart_daemon_command,
+            cli_install_status,
+            cli_install,
+            cli_uninstall,
             set_max_button_rect,
             set_window_theme
         ])

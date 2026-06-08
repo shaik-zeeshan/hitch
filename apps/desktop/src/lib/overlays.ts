@@ -5,7 +5,7 @@
 // prop-drilled, mirroring how components read daemon state directly.
 
 import { writable } from "svelte/store";
-import type { Project, Worktree } from "./types";
+import type { DaemonScopeId, Project, SshHost, Worktree } from "./types";
 
 // Command palette.
 export const commandOpen = writable(false);
@@ -17,6 +17,23 @@ export const addProjectOpen = writable(false);
 
 // Clone-remote dialog. Remote clone stays separate from local add-project.
 export const cloneProjectOpen = writable(false);
+
+// Remote folder browser dialog (issue #28, ADR 0014). Adding a Project inside an
+// SSH Host scope opens a folders-first directory browser backed by requests to
+// that host's Daemon. The store holds the INITIAL target scope id the dialog
+// opens at (`null` = closed). Opened from a host row's "Add project…" context
+// menu (locked to that host) and from the global add menu / palette (defaulting
+// to the selected scope, with a scope select). Local stays on the native picker.
+export const remoteBrowserScope = writable<DaemonScopeId | null>(null);
+
+// Add SSH Host dialog (issue #26). One required OpenSSH target field with a
+// Test Connection affordance; opened from the left-rail add menu and the command
+// palette. The dialog owns its own form state.
+export const addSshHostOpen = writable(false);
+
+// Remove SSH Host confirmation, scoped to its target host (null = closed).
+// Removing forgets only the GUI-local entry (ADR 0014).
+export const removeSshHostTarget = writable<SshHost | null>(null);
 
 // Create-worktree dialog, scoped to the project it creates under (null = closed).
 export const createWorktreeFor = writable<Project | null>(null);

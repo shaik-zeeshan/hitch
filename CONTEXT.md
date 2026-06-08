@@ -9,7 +9,7 @@ A workspace rooted at a directory on the machine where its owning **Daemon** run
 _Avoid_: Repo (a Project may not be a repo), Workspace, Remote Host Project (use **Remote Project** only when the GUI reaches the owning Daemon through SSH).
 
 **SSH Host**:
-A GUI-local saved OpenSSH target string through which the GUI can reach a Hitch **Daemon** running on that host; SSH auth remains non-interactive and owned by the user's OpenSSH config, ssh-agent, and known_hosts.
+A GUI-local saved OpenSSH target string through which the GUI can reach a Hitch **Daemon** running on that host; SSH auth remains non-interactive and owned by the user's OpenSSH config, ssh-agent, and known_hosts. A Hitch install makes its own machine reachable as one by self-installing the `hitch` CLI locally as a pure symlink (`~/.local/bin/hitch` → bundled `hitch-daemon`, plus `~/.local/bin/hitch-hook` for hook adjacency) with **no shell-rc edits**; the Hitch client then reaches that self-installed host with **zero config** by learning the daemon's absolute path from the `Hello` handshake and invoking it directly (Approach C). Making bare `ssh <host> hitch` work for a *human* against a self-installed host is out of scope; a *manual* host just needs a compatible `hitch` on its own PATH. This is local-only and never uploads binaries to a remote (ADR 0014 amendment).
 _Avoid_: Server (reserved as an avoided synonym for **Daemon**), Machine, Box.
 
 **Remote Project**:
@@ -29,7 +29,7 @@ The long-lived Hitch background process that owns every **Session**'s PTY, buffe
 _Avoid_: Server, Backend.
 
 **Daemon Status**:
-The liveness/health of one **Daemon** process as observed by the GUI, distinct from any one request/response. Values: *starting* (spawn/connect issued, endpoint not yet up), *running* (a healthy daemon is listening and this GUI is attached), *unreachable* (local endpoint or SSH Host cannot currently reach a live daemon), *failed* (spawn/connect/startup errored, carrying a captured reason). Remote Daemon Status auto-reconnects with backoff for enabled SSH Hosts; the remote tree may be stale while unreachable, then replayed on attach. A *failed* status always carries a human-readable reason sourced from the daemon/proxy path.
+The liveness/health of one **Daemon** process as observed by the GUI, distinct from any one request/response. Values: *starting* (spawn/connect issued, endpoint not yet up), *running* (a healthy daemon is listening and this GUI is attached), *unreachable* (local endpoint or SSH Host cannot currently reach a live daemon), *failed* (spawn/connect/startup errored, carrying a captured reason). Remote Daemon Status auto-reconnects with backoff for enabled SSH Hosts; that host's Project rows may be greyed as stale while unreachable, then replayed on attach. A *failed* status always carries a human-readable reason sourced from the daemon/proxy path.
 _Avoid_: Connection (that is the per-GUI socket link, a narrower thing), Health (too generic).
 
 **Agent**:
@@ -109,7 +109,7 @@ _Avoid_: Completed notification (a turn ends to *waiting*; nothing "completes"),
 - The **Composer** is the only GUI surface that triggers the **Draft Generator**; it observes the run as a **Job** and is the cancel affordance for it.
 - **Draft Instructions** are app-global settings carried per draft request; they shape the **Draft Generator**'s prompt but never own it.
 - A **Job** is owned by the **Daemon**, runs off the request loop, and reports its lifecycle via events; the GUI observes Jobs but never owns them. Fast git reads are not Jobs.
-- **Daemon Status** describes one Daemon process's liveness; it is broader than, and contains, any single GUI's connection state. In the multi-daemon tree each top-level local/SSH Host scope has its own Daemon Status.
+- **Daemon Status** describes one Daemon process's liveness; it is broader than, and contains, any single GUI's connection state. The multi-daemon tree is flat — there are no top-level local/SSH-Host scope rows; Projects from every attached Daemon hang directly off the tree root (Local Projects first, then each host's Projects grouped together, hosts alphabetical by target). A **Remote Project** carries its owning scope inline as a cloud glyph plus the dim SSH Host target on the Project row, and the host's Daemon Status (plus its Retry/Remove actions, on the Remote Project context menu) rides those rows; a Local Project shows no such badge.
 - A **Desktop Notification** derives from a live **Agent State** transition observed by the GUI; the **Daemon** stores and broadcasts state but never raises notifications. Codex's missing failure hook (known gap) means *error* notifications never fire for Codex.
 - **History** belongs to the right rail and shows exactly one **Worktree**'s log; a **Commit Tab** belongs to the center tab strip. Commit reads (log, commit diff) follow the fast synchronous git-read path, not **Jobs**.
 

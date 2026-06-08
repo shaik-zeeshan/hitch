@@ -62,8 +62,71 @@ use serde::{Deserialize, Serialize};
 /// failure carrying prior steps' results), and the `Request::ActiveJobs` /
 /// `Response::ActiveJobs` query a re-attaching GUI uses to restore button state
 /// from a worktree's in-flight chains. An old daemon at v23 has none of these,
-/// so a client's composite chain would never run.
-pub const PROTOCOL_VERSION: u16 = 24;
+/// so a client's composite chain would never run. v25 adds
+/// `Request::ListDirectory`/`Response::DirectoryListing` (the remote directory
+/// browser backing "Add Project inside an SSH Host scope", ADR 0014) — a fast
+/// synchronous filesystem read, not a Job, that lets the GUI navigate a remote
+/// daemon user's readable directories (folders-first, hidden-folder toggle) and
+/// type an absolute path before sending the existing AddProject/CloneProject to
+/// that remote daemon. An old daemon at v24 has neither request nor response.
+/// v26 adds the file-drop **upload** protocol (issue #31, ADR 0014): dropping
+/// local files onto a remote Session streams them over this same stream to the
+/// remote daemon, which writes them under `<data-dir>/uploads/<session-id>/` and
+/// returns the actual remote paths for the GUI to insert. The chunked exchange is
+/// `Request::BeginUpload` → `Response::UploadStarted`, repeated
+/// `Request::UploadChunk` (+ a length-prefixed PTY-style raw frame) → ack, then
+/// `Request::FinishUpload` → `Response::UploadFinished { remote_path }`, with
+/// `Request::AbortUpload` deleting a partial. Chunks are bounded (256 KiB) so
+/// they interleave with interactive PTY traffic. v26 also adds `os_family` to
+/// `Response::Hello` so the GUI quotes inserted remote paths for the remote
+/// platform (POSIX vs Windows). An old daemon at v25 has neither the upload
+/// messages nor the platform field.
+/// v27 adds `exe_path` (the daemon's startup `current_exe()` absolute path) to
+/// `Response::Hello` so the client can cache it and re-invoke the daemon binary
+/// directly on reconnect (approach C, ADR 0014 amendment), shell-free and
+/// PATH-free — identical resolution across OS without relying on the
+/// non-interactive `ssh host cmd` PATH. An old daemon at v26 omits it, so the
+/// field decodes to `None` and the client falls back to its candidate-path
+/// probe (the known Unix self-install location, then bare `hitch`).
+pub const PROTOCOL_VERSION: u16 = 27;
+
+/// Maximum bytes carried by one [`Request::UploadChunk`] frame (256 KiB). The
+/// upload stream is shared with interactive PTY traffic, so chunks are bounded
+/// well under [`crate::framing::MAX_PTY_FRAME_LEN`]: each chunk is one
+/// request/response turn, giving PTY frames a natural slot between chunks instead
+/// of letting one giant frame starve a live session.
+pub const UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Identifies one in-flight file upload, minted by the daemon in
+/// [`Response::UploadStarted`] and echoed by the client on every
+/// [`Request::UploadChunk`]/[`FinishUpload`]/[`AbortUpload`]. A plain string so
+/// the daemon picks the representation (it uses a uuid).
+pub type UploadId = String;
+
+/// The daemon host's OS family, carried on [`Response::Hello`] so the GUI can
+/// quote inserted remote upload paths for the right shell (issue #31). Only the
+/// POSIX/Windows split matters for path quoting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OsFamily {
+    Unix,
+    Windows,
+}
+
+impl OsFamily {
+    /// The family of the daemon currently running. Resolved at compile time from
+    /// the target so the daemon reports its own platform, not the GUI's.
+    pub fn current() -> Self {
+        #[cfg(windows)]
+        {
+            OsFamily::Windows
+        }
+        #[cfg(not(windows))]
+        {
+            OsFamily::Unix
+        }
+    }
+}
 
 /// Correlates a [`Request`] with a [`Response`] on the control plane.
 pub type RequestId = u64;
@@ -197,6 +260,19 @@ pub enum Request {
     },
     /// Forget a project and its Hitch-owned layout. Does not delete the project root.
     RemoveProject { project_id: ProjectId, force: bool },
+
+    /// List the directories under `path` on the daemon host so the GUI can render
+    /// a remote directory browser before sending AddProject/CloneProject to this
+    /// daemon (ADR 0014). `path: None` means the daemon user's home directory.
+    /// `show_hidden` controls whether dot-prefixed entries are included (off by
+    /// default in the browser). Replies with [`Response::DirectoryListing`]; an
+    /// unreadable or nonexistent directory returns a [`ProtocolError`]
+    /// (`NotFound`/`Unauthorized`) so the browser can render an error row. A fast
+    /// synchronous filesystem read, not a Job.
+    ListDirectory {
+        path: Option<String>,
+        show_hidden: bool,
+    },
 
     /// Return local and remote branches for a git-backed project.
     ListBranches { project_id: ProjectId },
@@ -408,6 +484,33 @@ pub enum Request {
     StartJob { request: JobRequest },
     /// Cancel a running Job, signalling its worker to kill any git/agent child.
     CancelJob { job_id: JobId },
+
+    /// Begin a file-drop **upload** into a remote Session (issue #31, ADR 0014).
+    /// The daemon validates the session exists, creates its per-session upload dir
+    /// `<data-dir>/uploads/<session-id>/`, resolves a collision-suffixed final
+    /// name AT BEGIN time (reserving it by creating the file), and replies with
+    /// [`Response::UploadStarted`]. `file_name` is a bare name — the daemon rejects
+    /// path separators and `..`. `total_bytes` is advisory for progress only.
+    BeginUpload {
+        session_id: SessionId,
+        file_name: String,
+        total_bytes: u64,
+    },
+    /// Announce that a raw PTY-style frame of `byte_count` upload bytes follows
+    /// this request, appended to the upload identified by `upload_id`. The daemon
+    /// replies [`Response::Ack`] per chunk (sequential, windowed by the GUI). The
+    /// frame uses the same length-prefixed framing as [`SendSessionInput`].
+    UploadChunk {
+        upload_id: UploadId,
+        byte_count: u32,
+    },
+    /// Finish an upload: the daemon flushes/closes the file and replies with
+    /// [`Response::UploadFinished`] carrying the ACTUAL final absolute remote path
+    /// (post collision-suffixing) for the GUI to insert at the prompt.
+    FinishUpload { upload_id: UploadId },
+    /// Abort an in-flight upload: the daemon deletes the partial file and replies
+    /// [`Response::Ack`]. Sent on user cancellation before paths are inserted.
+    AbortUpload { upload_id: UploadId },
 }
 
 impl From<JobRequest> for Request {
@@ -605,11 +708,37 @@ pub enum Response {
     Hello {
         protocol_version: u16,
         daemon_pid: u32,
+        /// The daemon host's OS family (issue #31), so the GUI quotes inserted
+        /// remote upload paths for the right shell. `#[serde(default)]` to Unix
+        /// keeps an old daemon's Hello (no field) decodable during rolling
+        /// upgrades; the version check already gates real upload use.
+        #[serde(default = "os_family_default")]
+        os_family: OsFamily,
+        /// The daemon's own executable path, captured from `current_exe()` at
+        /// startup (approach C, ADR 0014 amendment). The client caches it and
+        /// re-invokes this exact binary on reconnect — shell-free and PATH-free.
+        /// `#[serde(default)]` to `None` keeps an old daemon's Hello (no field)
+        /// decodable during rolling upgrades; the client then falls back to its
+        /// candidate-path probe.
+        #[serde(default)]
+        exe_path: Option<String>,
     },
     /// Command succeeded and has no body.
     Ack,
     Projects {
         projects: Vec<Project>,
+    },
+    /// A directory listing for the remote folder browser (reply to
+    /// [`Request::ListDirectory`]). `path` is the absolute directory that was
+    /// listed (the home directory when the request omitted a path), `parent` is
+    /// its parent directory or `None` at the filesystem root, `home` is the
+    /// daemon user's home directory (for the browser's Home control), and
+    /// `entries` are its child directories sorted case-insensitively by name.
+    DirectoryListing {
+        path: String,
+        parent: Option<String>,
+        home: String,
+        entries: Vec<DirEntry>,
     },
     Branches {
         branches: Vec<BranchSummary>,
@@ -703,10 +832,31 @@ pub enum Response {
     JobStarted {
         job_id: JobId,
     },
+    /// A file-drop upload was accepted (reply to [`Request::BeginUpload`], issue
+    /// #31). `upload_id` keys the following chunks/finish/abort; `final_name` is
+    /// the collision-suffixed name the daemon reserved (e.g. `file-1.txt`), echoed
+    /// for diagnostics — the GUI inserts the path from [`UploadFinished`].
+    UploadStarted {
+        upload_id: UploadId,
+        final_name: String,
+    },
+    /// An upload finished (reply to [`Request::FinishUpload`]). `remote_path` is
+    /// the ACTUAL final absolute path on the daemon host, post collision-suffixing,
+    /// for the GUI to quote and insert at the Session prompt.
+    UploadFinished {
+        remote_path: String,
+    },
     /// Command failed. Kept in-band so clients can correlate by request id.
     Error {
         error: ProtocolError,
     },
+}
+
+/// Default OS family for an old daemon's Hello that predates the field (Unix —
+/// the historical-only platform before Windows support). Real upload use is gated
+/// by the protocol-version check, so this only affects decoding a stale Hello.
+fn os_family_default() -> OsFamily {
+    OsFamily::Unix
 }
 
 /// Lifecycle of an async **Job** (`CONTEXT.md`). A Job is *queued*, then
@@ -904,6 +1054,17 @@ pub struct ActiveJobInfo {
     pub kind: CompositeJobKind,
     /// The step the chain is currently executing.
     pub step: CompositeStep,
+}
+
+/// One child directory in a [`Response::DirectoryListing`] (the remote folder
+/// browser's row data). The browser is folders-first and only folders are
+/// selectable, so the daemon lists directories only — files never appear. `path`
+/// is the absolute path of the entry so the GUI can navigate or AddProject it
+/// without re-joining paths (the GUI never maps remote paths onto local paths).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirEntry {
+    pub name: String,
+    pub path: String,
 }
 
 /// A branch name with remote flag for branch-picker UI.
@@ -1506,6 +1667,108 @@ mod tests {
         assert!(matches!(reparsed_clear, Request::ReportAgentState { .. }));
     }
 
+    #[test]
+    fn upload_messages_round_trip_as_contract() {
+        let (_, _, session_id) = ids();
+
+        let begin = Request::BeginUpload {
+            session_id,
+            file_name: "report.pdf".into(),
+            total_bytes: 2048,
+        };
+        let value: serde_json::Value = serde_json::to_value(&begin).unwrap();
+        assert_eq!(value["type"], "begin-upload");
+        assert_eq!(value["file_name"], "report.pdf");
+        assert_eq!(value["total_bytes"], 2048);
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(begin, back);
+
+        let chunk = Request::UploadChunk {
+            upload_id: "upload-1".into(),
+            byte_count: 4096,
+        };
+        let value: serde_json::Value = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(value["type"], "upload-chunk");
+        assert_eq!(value["byte_count"], 4096);
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(chunk, back);
+
+        let started = Response::UploadStarted {
+            upload_id: "upload-1".into(),
+            final_name: "file-1.txt".into(),
+        };
+        let value: serde_json::Value = serde_json::to_value(&started).unwrap();
+        assert_eq!(value["type"], "upload-started");
+        assert_eq!(value["final_name"], "file-1.txt");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(started, back);
+
+        let finished = Response::UploadFinished {
+            remote_path: "/home/dev/.hitch/uploads/abc/file-1.txt".into(),
+        };
+        let value: serde_json::Value = serde_json::to_value(&finished).unwrap();
+        assert_eq!(value["type"], "upload-finished");
+        assert_eq!(value["remote_path"], "/home/dev/.hitch/uploads/abc/file-1.txt");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(finished, back);
+    }
+
+    #[test]
+    fn hello_reports_os_family_and_defaults_to_unix_for_rolling_upgrades() {
+        let hello = Response::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_pid: 7,
+            os_family: OsFamily::Windows,
+            exe_path: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&hello).unwrap();
+        assert_eq!(value["os_family"], "windows");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(hello, back);
+
+        // An old daemon's Hello without the field decodes with os_family = unix.
+        let legacy = serde_json::json!({
+            "type": "hello",
+            "protocol_version": PROTOCOL_VERSION,
+            "daemon_pid": 7,
+        });
+        let back: Response = serde_json::from_value(legacy).unwrap();
+        let Response::Hello { os_family, .. } = back else {
+            panic!("expected hello");
+        };
+        assert_eq!(os_family, OsFamily::Unix);
+    }
+
+    #[test]
+    fn hello_carries_exe_path_and_decodes_without_it_for_rolling_upgrades() {
+        // A new daemon's Hello carrying its startup exe path round-trips and the
+        // path is readable for the client to cache (approach C, ADR 0014).
+        let hello = Response::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_pid: 7,
+            os_family: OsFamily::Unix,
+            exe_path: Some("/home/dev/.local/bin/hitch".into()),
+        };
+        let value: serde_json::Value = serde_json::to_value(&hello).unwrap();
+        assert_eq!(value["exe_path"], "/home/dev/.local/bin/hitch");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(hello, back);
+
+        // An old daemon at v26 omits `exe_path`; it must still decode (to `None`)
+        // so the client can fall back to its candidate-path probe.
+        let legacy = serde_json::json!({
+            "type": "hello",
+            "protocol_version": PROTOCOL_VERSION,
+            "daemon_pid": 7,
+            "os_family": "unix",
+        });
+        let back: Response = serde_json::from_value(legacy).unwrap();
+        let Response::Hello { exe_path, .. } = back else {
+            panic!("expected hello");
+        };
+        assert_eq!(exe_path, None);
+    }
+
     fn value_tag(request: &Request) -> String {
         serde_json::to_value(request).unwrap()["type"]
             .as_str()
@@ -1643,7 +1906,65 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 24);
+        assert_eq!(PROTOCOL_VERSION, 27);
+    }
+
+    #[test]
+    fn list_directory_request_and_directory_listing_response_round_trip_as_contract() {
+        // The remote folder browser request: `path: None` means the daemon user's
+        // home directory, `show_hidden` defaults off in the browser.
+        let request = Request::ListDirectory {
+            path: None,
+            show_hidden: false,
+        };
+        let value: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["type"], "list-directory");
+        assert!(value["path"].is_null());
+        assert_eq!(value["show_hidden"], false);
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(request, back);
+
+        let jump = Request::ListDirectory {
+            path: Some("/home/dev/code".into()),
+            show_hidden: true,
+        };
+        let value: serde_json::Value = serde_json::to_value(&jump).unwrap();
+        assert_eq!(value["path"], "/home/dev/code");
+        assert_eq!(value["show_hidden"], true);
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(jump, back);
+
+        // The listing reply carries the absolute path, its parent (null at the
+        // filesystem root), the home directory for the Home control, and
+        // folders-only entries with their absolute paths.
+        let response = Response::DirectoryListing {
+            path: "/home/dev".into(),
+            parent: Some("/home".into()),
+            home: "/home/dev".into(),
+            entries: vec![DirEntry {
+                name: "code".into(),
+                path: "/home/dev/code".into(),
+            }],
+        };
+        let value: serde_json::Value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "directory-listing");
+        assert_eq!(value["path"], "/home/dev");
+        assert_eq!(value["parent"], "/home");
+        assert_eq!(value["home"], "/home/dev");
+        assert_eq!(value["entries"][0]["name"], "code");
+        assert_eq!(value["entries"][0]["path"], "/home/dev/code");
+        let back: Response = serde_json::from_value(value).unwrap();
+        assert_eq!(response, back);
+
+        // The filesystem-root case carries a null parent.
+        let root = Response::DirectoryListing {
+            path: "/".into(),
+            parent: None,
+            home: "/home/dev".into(),
+            entries: vec![],
+        };
+        let value: serde_json::Value = serde_json::to_value(&root).unwrap();
+        assert!(value["parent"].is_null());
     }
 
     #[test]
@@ -2029,6 +2350,14 @@ mod tests {
                 project_id,
                 force: true,
             },
+            Request::ListDirectory {
+                path: Some("/home/dev/code".into()),
+                show_hidden: true,
+            },
+            Request::ListDirectory {
+                path: None,
+                show_hidden: false,
+            },
             Request::ListWorktrees { project_id },
             Request::CreateWorktree {
                 project_id,
@@ -2180,6 +2509,21 @@ mod tests {
             Request::CancelJob {
                 job_id: JobId::new(),
             },
+            Request::BeginUpload {
+                session_id,
+                file_name: "report.pdf".into(),
+                total_bytes: 1_048_576,
+            },
+            Request::UploadChunk {
+                upload_id: "upload-1".into(),
+                byte_count: 4096,
+            },
+            Request::FinishUpload {
+                upload_id: "upload-1".into(),
+            },
+            Request::AbortUpload {
+                upload_id: "upload-1".into(),
+            },
         ]
     }
 
@@ -2192,10 +2536,28 @@ mod tests {
             Response::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 daemon_pid: 42,
+                os_family: OsFamily::Unix,
+                exe_path: Some("/home/dev/.local/bin/hitch".into()),
+            },
+            Response::UploadStarted {
+                upload_id: "upload-1".into(),
+                final_name: "file-1.txt".into(),
+            },
+            Response::UploadFinished {
+                remote_path: "/home/dev/.hitch/uploads/abc/file-1.txt".into(),
             },
             Response::Ack,
             Response::Projects {
                 projects: vec![project],
+            },
+            Response::DirectoryListing {
+                path: "/home/dev".into(),
+                parent: Some("/home".into()),
+                home: "/home/dev".into(),
+                entries: vec![DirEntry {
+                    name: "code".into(),
+                    path: "/home/dev/code".into(),
+                }],
             },
             Response::Worktrees {
                 worktrees: vec![worktree],

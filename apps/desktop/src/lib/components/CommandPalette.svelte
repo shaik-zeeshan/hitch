@@ -9,23 +9,29 @@
   import {
     activeSessionId,
     agentStateByWorktree,
-    defaultBase,
     diffActive,
     gitBusy,
-    gitStatus,
     gitWorktreeId,
+    liveScopes,
     openSession,
     pickAndAddProject,
     projects,
+    scopeAttributionForProject,
+    scopeAttributionForWorktree,
+    scopeForParent,
+    scopeForProject,
     selectedParent,
     selectedProject,
     selectedProjectId,
     selectedWorktreeId,
+    selectedWorktreeIsMain,
     sessions,
     worktrees,
   } from "../daemon";
+  import { scopeMetadataPrefix } from "../scopeCopy";
   import {
     addProjectOpen,
+    addSshHostOpen,
     cloneProjectOpen,
     commandOpen,
     createPrOpen,
@@ -59,7 +65,19 @@
       ? $selectedProject
       : ($projects.find((p) => p.kind === "git-backed") ?? null),
   );
-  const canCreatePr = $derived(Boolean($gitWorktreeId && !$gitBusy && (!$defaultBase || $gitStatus?.branch !== $defaultBase)));
+  // Palette ACTIONS are daemon-backed, so an action whose target scope is stale
+  // (unreachable SSH Host, ADR 0014) is hidden — firing it would hit a dead daemon
+  // (issue #32). `worktreeProject`'s scope gates "New worktree…"; the selected
+  // parent's scope gates "Launch agent" + "Create PR". Reading `$liveScopes`
+  // recomputes these as hosts attach/detach. Local stays live, so local rows are
+  // unchanged.
+  const worktreeProjectLive = $derived(
+    worktreeProject ? $liveScopes.has(scopeForProject(worktreeProject.id)) : false,
+  );
+  const selectedParentLive = $derived(
+    $selectedParent ? $liveScopes.has(scopeForParent($selectedParent)) : false,
+  );
+  const canCreatePr = $derived(Boolean($gitWorktreeId && !$gitBusy && selectedParentLive && !$selectedWorktreeIsMain));
 
   function run(action: () => void) {
     commandOpen.set(false);
@@ -93,6 +111,23 @@
     }
     return `session in ${projectName(s.parent.id)}`;
   }
+
+  // Muted local/SSH Host scope metadata for a global-search result (ADR 0014):
+  // the host label (`prod`) for a remote Project/Worktree/Session, `null` for a
+  // Local result (no scope noise). Worktrees resolve through their own scope; a
+  // session through its parent. Reading `$worktrees`/`$projects` makes these
+  // recompute when remote scopes attach/detach.
+  function worktreeScopePrefix(w: Worktree): string | null {
+    void $worktrees;
+    return scopeMetadataPrefix(scopeAttributionForWorktree(w.id));
+  }
+  function sessionScopePrefix(s: Session): string | null {
+    void $worktrees;
+    void $projects;
+    return s.parent.kind === "worktree"
+      ? scopeMetadataPrefix(scopeAttributionForWorktree(s.parent.id))
+      : scopeMetadataPrefix(scopeAttributionForProject(s.parent.id));
+  }
 </script>
 
 <Dialog.Root bind:open={$commandOpen}>
@@ -113,10 +148,11 @@
               <Command.GroupItems>
                 {#each $worktrees as w (w.id)}
                   {@const state = $agentStateByWorktree[w.id]}
+                  {@const scopePrefix = worktreeScopePrefix(w)}
                   <Command.Item
                     class="p-item"
-                    value={`worktree ${w.branch} ${projectName(w.project_id)}`}
-                    keywords={[w.branch, projectName(w.project_id)]}
+                    value={`worktree ${scopePrefix ? `${scopePrefix} ` : ""}${w.branch} ${projectName(w.project_id)}`}
+                    keywords={[w.branch, projectName(w.project_id), ...(scopePrefix ? [scopePrefix] : [])]}
                     onSelect={() => run(() => jumpWorktree(w))}
                   >
                     <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
@@ -127,7 +163,7 @@
                       /><path d="M4 5.1v5.8M12 6.6C12 9.8 8.8 11 4.6 11" /></svg
                     >
                     <span class="pi-label"
-                      ><span class="mono">{w.branch}</span> <span class="ctx">· {projectName(w.project_id)}</span
+                      >{#if scopePrefix}<span class="scope-meta">{scopePrefix} ·</span> {/if}<span class="mono">{w.branch}</span> <span class="ctx">· {projectName(w.project_id)}</span
                       ></span
                     >
                     {#if state}{@const label = AGENT_LABEL[state]}{#if label}<span class="status {label.cls}">{label.label}</span>{/if}{/if}
@@ -135,16 +171,17 @@
                 {/each}
 
                 {#each $sessions as s (s.id)}
+                  {@const scopePrefix = sessionScopePrefix(s)}
                   <Command.Item
                     class="p-item"
-                    value={`session ${s.name} ${sessionContext(s)}`}
-                    keywords={[s.name]}
+                    value={`session ${scopePrefix ? `${scopePrefix} ` : ""}${s.name} ${sessionContext(s)}`}
+                    keywords={scopePrefix ? [s.name, scopePrefix] : [s.name]}
                     onSelect={() => run(() => jumpSession(s))}
                   >
                     <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
                       ><path d="M3 4l3.5 4L3 12M8 12h5" /></svg
                     >
-                    <span class="pi-label">{s.name} <span class="ctx">· {sessionContext(s)}</span></span>
+                    <span class="pi-label">{#if scopePrefix}<span class="scope-meta">{scopePrefix} ·</span> {/if}{s.name} <span class="ctx">· {sessionContext(s)}</span></span>
                   </Command.Item>
                 {/each}
               </Command.GroupItems>
@@ -153,7 +190,7 @@
             <Command.Group>
               <Command.GroupHeading class="p-group">Actions</Command.GroupHeading>
               <Command.GroupItems>
-                {#if worktreeProject}
+                {#if worktreeProject && worktreeProjectLive}
                   <Command.Item
                     class="p-item"
                     value="new worktree create branch"
@@ -165,7 +202,7 @@
                     <span class="pi-label">New worktree…</span>
                   </Command.Item>
                 {/if}
-                {#if $selectedParent}
+                {#if $selectedParent && selectedParentLive}
                   {#each LAUNCHABLE_AGENTS as a (a.kind)}
                     {@const Mark = a.icon}
                     <Command.Item
@@ -225,6 +262,16 @@
                     /></svg
                   >
                   <span class="pi-label">Clone remote repository…</span>
+                </Command.Item>
+                <Command.Item
+                  class="p-item"
+                  value="add ssh host remote daemon connection server"
+                  onSelect={() => run(() => addSshHostOpen.set(true))}
+                >
+                  <svg class="pi-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"
+                    ><rect x="2.5" y="2.5" width="11" height="4.5" /><rect x="2.5" y="9" width="11" height="4.5" /><path d="M5 4.75h0M5 11.25h0" /></svg
+                  >
+                  <span class="pi-label">Add SSH Host…</span>
                 </Command.Item>
                 <Command.Item
                   class="p-item"

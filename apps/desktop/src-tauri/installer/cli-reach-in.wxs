@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  cli-reach-in.wxs — Hitch Windows CLI reach-in (WiX / MSI path).
+
+  Wired from tauri.conf.json via bundle.windows.wix.fragmentPaths. The NSIS path
+  (installer/cli-reach-in.nsh) is the PRIMARY installer for this app; this WiX
+  fragment provides the equivalent for the MSI build.
+
+  It expresses the same two facts the NSIS hook does, both auto-reversed on
+  uninstall by the Windows Installer:
+
+    1. A per-user PATH append (<Environment Part="last" Action="set"
+       System="no">) pointing at the install dir, so a bare `hitch` resolves.
+       System="no" matches the currentUser install mode (HKCU, no elevation).
+
+    2. A `hitch.exe` CLI entrypoint in the install dir.
+       NOTE ON THE PAYLOAD: pure WiX cannot trivially copy one installed file to
+       a second name at install time, so rather than a fragile CopyFile custom
+       action we install the SAME bundled `hitch-daemon.exe` payload a SECOND
+       time, named `hitch.exe`. The hitch-daemon.exe and hitch-hook.exe sidecars
+       are already laid down adjacent by Tauri's externalBin, so hitch.exe ends
+       up next to its hook exactly as the NSIS copy does. (Path to the source
+       binary mirrors how Tauri stages externalBin payloads for the MSI; adjust
+       if the staging layout changes.)
+
+  Tauri's WiX template references a ComponentGroup named "Cli" if present, so the
+  group below is named to be picked up; if a given Tauri version does not auto-
+  reference it, the NSIS installer (primary) still carries the full behavior.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <!--
+      Anchor under the install directory. Tauri's main WiX template defines the
+      install folder as INSTALLDIR; we attach our component there.
+    -->
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="HitchCliReachIn" Guid="6b2f0a3e-2d4f-5b7a-9c1d-7e3f8a0b1c2d">
+        <!--
+          Per-user PATH append. Part="last" appends to the end; Action="set"
+          with Permanent implied-false means it is removed on uninstall.
+          System="no" -> HKCU environment (matches currentUser install).
+        -->
+        <Environment
+          Id="HitchPath"
+          Name="PATH"
+          Value="[INSTALLDIR]"
+          Part="last"
+          Action="set"
+          System="no" />
+
+        <!--
+          Install the daemon payload a second time as hitch.exe (see header note).
+          KeyPath on this file keeps the component well-formed. The Source points
+          at the staged externalBin daemon binary.
+        -->
+        <File
+          Id="HitchExe"
+          Name="hitch.exe"
+          Source="hitch-daemon.exe"
+          KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!--
+      Component group for Tauri's main template to reference. Keeping the PATH
+      edit and the hitch.exe payload in one component means they install and
+      uninstall together.
+    -->
+    <ComponentGroup Id="Cli">
+      <ComponentRef Id="HitchCliReachIn" />
+    </ComponentGroup>
+  </Fragment>
+</Wix>

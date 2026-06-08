@@ -33,18 +33,23 @@
     gitBusy,
     gitStatus,
     gitWorktreeId,
+    liveScopes,
     loadGitStatus,
     loadPrStatus,
     openPrInfo,
     prInfo,
     pull,
     push,
+    scopeAttributionForWorktree,
+    selectedScopeId,
+    selectedWorktreeIsMain,
     setFileStaged,
     setFilesStaged,
     startCommitAndPush,
     viewAllChanges,
     viewDiff,
   } from "../daemon";
+  import { discardAllConfirm, discardFileConfirm } from "../scopeCopy";
   import { autoErrorMessage, autoToastContent } from "../composerToast";
   import { worktreeToast } from "../appToast";
   import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
@@ -82,7 +87,13 @@
   const behind = $derived($gitStatus?.behind ?? 0);
   const additions = $derived($gitStatus?.additions ?? 0);
   const deletions = $derived($gitStatus?.deletions ?? 0);
-  const isDefaultBranch = $derived(Boolean($defaultBase && $gitStatus?.branch === $defaultBase));
+  // On the default branch there is nothing to open a PR *from*. `is_main` is the
+  // authoritative signal (daemon-version independent — old daemons collapse
+  // `defaultBase` to null on the main worktree); the branch-string compare is a
+  // belt-and-suspenders fallback.
+  const isDefaultBranch = $derived(
+    $selectedWorktreeIsMain || Boolean($defaultBase && $gitStatus?.branch === $defaultBase),
+  );
 
   const cancellableJob = $derived($cancellableJobForSelectedWorktree);
 
@@ -423,7 +434,13 @@
   const openPr = $derived($openPrInfo);
   const hasChanges = $derived(files.length > 0);
   const onDefault = $derived(isDefaultBranch);
-  const busy = $derived($gitBusy || autoRunning);
+  // The selected worktree's owning daemon scope is STALE when its SSH Host is
+  // unreachable/failed (issue #32, ADR 0014). Every mutating git action here is
+  // daemon-backed, so a stale scope blocks them by folding into `busy` (the single
+  // gate the primary action + dropdown rows already read). Local is always live
+  // while its daemon runs, so local behavior is unchanged.
+  const scopeStale = $derived(!$liveScopes.has($selectedScopeId));
+  const busy = $derived($gitBusy || autoRunning || scopeStale);
 
   function openCommit() {
     commitOpen.set(true);
@@ -571,14 +588,18 @@
     // A partially-staged file appears as two rows (staged + unstaged); count
     // distinct paths so the prompt matches what discard actually touches.
     const count = new Set(files.map((f) => f.path)).size;
-    if (window.confirm(`Discard all ${count} changed file${count === 1 ? "" : "s"}?`)) {
+    // Discard is destructive; a remote worktree's prompt names its SSH Host so it
+    // is never mistaken for a same-path local discard (issue #30, ADR 0014).
+    const attribution = scopeAttributionForWorktree($gitWorktreeId);
+    if (window.confirm(discardAllConfirm(count, attribution))) {
       void discardAllFiles();
     }
   }
 
   function confirmDiscardFile(path: string) {
     if ($gitBusy) return;
-    if (window.confirm(`Discard changes to ${path}?`)) {
+    const attribution = scopeAttributionForWorktree($gitWorktreeId);
+    if (window.confirm(discardFileConfirm(path, attribution))) {
       void discardFile(path);
     }
   }
@@ -715,7 +736,7 @@
         <button
           class="cancel"
           title="Cancel the running operation"
-          onclick={() => void cancelJob(cancellableJob.id)}
+          onclick={() => void cancelJob(cancellableJob.id, cancellableJob.scopeId)}
         >
           Cancel
         </button>

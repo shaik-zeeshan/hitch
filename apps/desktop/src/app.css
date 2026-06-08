@@ -377,6 +377,14 @@ html[data-theme="dark"] {
     color: var(--ink-1);
     font-weight: 600;
   }
+  /* Remote destructive attribution (issue #30): the SSH Host + remote path under a
+     remote remove dialog's title, so a path that also exists locally can't be
+     mistaken for local state (ADR 0014). Muted mono, one quiet line. */
+  .m-head .sub.remote-attr {
+    font-family: var(--mono);
+    color: var(--ink-2);
+    word-break: break-all;
+  }
   .m-body {
     padding: 14px 18px 16px;
     display: grid;
@@ -666,6 +674,17 @@ html[data-theme="dark"] {
   }
   .p-item .pi-label .ctx {
     color: var(--ink-2);
+  }
+  /* Leading local/SSH Host scope metadata on a remote Project/Worktree/Session
+     result (ADR 0014: `prod · project · branch`). Muted mono so it reads as
+     attribution, not the primary label; Local results omit it entirely. */
+  .p-item .pi-label .scope-meta {
+    font-family: var(--mono);
+    font-size: var(--r0);
+    color: var(--ink-3);
+  }
+  .p-item[data-selected] .pi-label .scope-meta {
+    color: var(--iris-ink);
   }
   .p-foot {
     display: flex;

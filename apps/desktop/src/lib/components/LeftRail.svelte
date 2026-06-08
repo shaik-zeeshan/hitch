@@ -12,9 +12,15 @@
   import Folder from "~icons/lucide/folder";
   import FileText from "~icons/lucide/file-text";
   import GitBranch from "~icons/lucide/git-branch";
+  import Server from "~icons/lucide/server";
   import ProjectTree from "./ProjectTree.svelte";
-  import { pickAndAddProject, sessions, worktrees } from "../daemon";
-  import { addProjectOpen, cloneProjectOpen } from "../overlays";
+  import { pickAndAddProject, selectedScopeId, sessions, worktrees } from "../daemon";
+  import {
+    addProjectOpen,
+    addSshHostOpen,
+    cloneProjectOpen,
+    remoteBrowserScope,
+  } from "../overlays";
 
   let { collapsed = false }: { collapsed?: boolean } = $props();
 
@@ -76,6 +82,17 @@
             <DropdownMenu.Item class="mi" onSelect={() => cloneProjectOpen.set(true)}>
               <GitBranch class="mi-ico icon" />
               Clone remote repository…
+            </DropdownMenu.Item>
+            <!-- Browse + add a project on a daemon (issue #28, ADR 0014). Opens
+                 the folder browser at the selected scope; its scope select lets
+                 the user pick Local or any connected SSH Host. -->
+            <DropdownMenu.Item class="mi" onSelect={() => remoteBrowserScope.set($selectedScopeId)}>
+              <Server class="mi-ico icon" />
+              Browse daemon folders…
+            </DropdownMenu.Item>
+            <DropdownMenu.Item class="mi" onSelect={() => addSshHostOpen.set(true)}>
+              <Server class="mi-ico icon" />
+              Add SSH Host…
             </DropdownMenu.Item>
           </DropdownMenu.Content>
         </DropdownMenu.Portal>

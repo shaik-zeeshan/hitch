@@ -10,6 +10,8 @@
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { get } from "svelte/store";
   import ChevronRight from "~icons/lucide/chevron-right";
+  import Cloud from "~icons/lucide/cloud";
+  import RotateCw from "~icons/lucide/rotate-cw";
   import Folder from "~icons/lucide/folder";
   import GitBranch from "~icons/lucide/git-branch";
   import GitPullRequest from "~icons/lucide/git-pull-request";
@@ -25,9 +27,13 @@
   import {
     agentActRollupByProject,
     agentStateByWorktree,
+    daemonScopesOrdered,
+    liveScopes,
     openSession,
     prByWorktree,
+    projectsByScope,
     projects,
+    retrySshHost,
     selectedProjectId,
     selectedWorktreeId,
     sessionAgents,
@@ -36,7 +42,13 @@
     worktrees,
   } from "../daemon";
   import { LAUNCHABLE_AGENTS, TAB_MARK, sessionTabKind } from "../sessionDisplay";
-  import { createWorktreeFor, removeProjectTarget, removeWorktreeTarget } from "../overlays";
+  import {
+    createWorktreeFor,
+    removeProjectTarget,
+    removeSshHostTarget,
+    removeWorktreeTarget,
+  } from "../overlays";
+  import { sshHosts } from "../sshHosts";
   import { focusedPane, matchBinding } from "../keymap";
   import {
     currentDesktopPlatform,
@@ -148,6 +160,8 @@
   // Per-project expand state; git projects start expanded so worktrees show.
   let collapsed = $state<Record<Id, boolean>>({});
 
+  const projectsForScope = (scopeId: Id): Project[] => $projectsByScope[scopeId] ?? [];
+
   const worktreesFor = (projectId: Id) =>
     $worktrees.filter((w) => w.project_id === projectId);
 
@@ -202,11 +216,15 @@
 
   const visibleRows = $derived.by<Row[]>(() => {
     const rows: Row[] = [];
-    for (const project of $projects) {
-      rows.push({ key: `proj:${project.id}`, kind: "project", project });
-      if (isExpanded(project)) {
-        for (const worktree of worktreesFor(project.id)) {
-          rows.push({ key: `wt:${worktree.id}`, kind: "worktree", worktree });
+    // Iterate scopes only to preserve project ORDER (Local first, hosts alpha);
+    // scopes no longer have their own visible/roving rows — the tree is flat.
+    for (const scope of $daemonScopesOrdered) {
+      for (const project of projectsForScope(scope.id)) {
+        rows.push({ key: `proj:${project.id}`, kind: "project", project });
+        if (isExpanded(project)) {
+          for (const worktree of worktreesFor(project.id)) {
+            rows.push({ key: `wt:${worktree.id}`, kind: "worktree", worktree });
+          }
         }
       }
     }
@@ -345,15 +363,33 @@
      command) routes bare-key bindings here. Forwards to a real row when the
      focus landed on the inert container/root rather than a row. -->
 <div class="tree" onfocusin={() => focusedPane.set("tree")}>
+  <!-- Flat project tree: scope/host parent rows are gone. We still iterate
+       $daemonScopesOrdered as the OUTER loop purely to keep project ORDER stable
+       (Local first, then each host's projects together, hosts alpha) and to carry
+       per-project REMOTE context (cloud + host suffix, host actions, liveness)
+       from the owning scope — but each scope renders its projects directly, with
+       no header and no expand/collapse gate. -->
   {#if $projects.length === 0}
     <p class="empty-copy">No projects yet. Add a local repo or folder to begin.</p>
   {/if}
 
-  {#each $projects as project (project.id)}
-    {@const rollup = $agentActRollupByProject[project.id]}
-    {@const expanded = isExpanded(project)}
-    {@const isGit = project.kind === "git-backed"}
-    <div class="proj">
+  {#each $daemonScopesOrdered as scope (scope.id)}
+    {@const scopeProjects = projectsForScope(scope.id)}
+    {@const isRemote = scope.kind === "ssh-host"}
+    {@const sshHost = isRemote ? $sshHosts.find((h) => h.id === scope.id) : null}
+    {@const host = sshHost?.target}
+    <!-- A scope is STALE (greyed, daemon actions disabled) whenever it is not
+         LIVE (`running`) — issue #32. Local mirrors the local daemon, so a healthy
+         Local reads live and nothing changes there. A remote project's row greys
+         and its daemon-backed context-menu items disable while stale; the host
+         actions (Retry, Remove) stay enabled (they're GUI-local). -->
+    {@const scopeLive = $liveScopes.has(scope.id)}
+    {@const scopeDown = scope.status === "unreachable" || scope.status === "failed"}
+    {#each scopeProjects as project (project.id)}
+        {@const rollup = $agentActRollupByProject[project.id]}
+        {@const expanded = isExpanded(project)}
+        {@const isGit = project.kind === "git-backed"}
+        <div class="proj" class:stale={!scopeLive}>
       <ContextMenu.Root>
         <ContextMenu.Trigger>
           {#snippet child({ props })}
@@ -391,6 +427,17 @@
 
               <span class="pname">{project.name}</span>
 
+              {#if isRemote && host}
+                <!-- Remote project marker (flat tree, no host parent row): a quiet
+                     cloud + the dim OpenSSH target, sitting immediately right of
+                     the name. Local projects render nothing here, so they look
+                     identical to before. -->
+                <span class="rhost" title={`Remote on ${host}`}>
+                  <Cloud class="rhost-ic icon" />
+                  <span class="rhost-target">{host}</span>
+                </span>
+              {/if}
+
               <span class="trailing">
                 {#if !expanded && rollup}
                   <span class="rollup">
@@ -402,7 +449,7 @@
                   <span class="pkind">{isGit ? "git" : "folder"}</span>
                 {/if}
 
-                {#if isGit}
+                {#if isGit && scopeLive}
                   <button
                     class="quick-add"
                     aria-label={`New worktree in ${project.name}`}
@@ -422,7 +469,9 @@
         <ContextMenu.Portal>
           <ContextMenu.Content class="menu">
             {#if isGit}
-              <ContextMenu.Item class="mi" onSelect={() => createWorktreeFor.set(project)}>
+              <!-- Daemon-backed: disabled while the owning scope is stale (issue
+                   #32) — a worktree can't be created on an unreachable host. -->
+              <ContextMenu.Item class="mi" disabled={!scopeLive} onSelect={() => createWorktreeFor.set(project)}>
                 <Plus class="mi-ico icon" />
                 New worktree…
               </ContextMenu.Item>
@@ -441,10 +490,30 @@
               Copy path
             </ContextMenu.Item>
             <ContextMenu.Separator class="m-sep" />
-            <ContextMenu.Item class="mi danger" onSelect={() => removeProjectTarget.set(project)}>
+            <!-- Daemon-backed: removing a project on a host is a remote op, so it
+                 is disabled while the scope is stale (issue #32). -->
+            <ContextMenu.Item class="mi danger" disabled={!scopeLive} onSelect={() => removeProjectTarget.set(project)}>
               <Trash2 class="mi-ico icon" />
               Remove project…
             </ContextMenu.Item>
+            {#if isRemote && sshHost}
+              <!-- Host actions live on the project context menu now that there is
+                   no host parent row. Retry (only when the host is down) and
+                   Remove host are GUI-local, so they stay enabled while stale.
+                   "Add project" is deliberately NOT here — that lives on the
+                   global "+" in LeftRail. -->
+              <ContextMenu.Separator class="m-sep" />
+              {#if scopeDown}
+                <ContextMenu.Item class="mi" onSelect={() => void retrySshHost(sshHost.target)}>
+                  <RotateCw class="mi-ico icon" />
+                  Retry {sshHost.target}
+                </ContextMenu.Item>
+              {/if}
+              <ContextMenu.Item class="mi danger" onSelect={() => removeSshHostTarget.set(sshHost)}>
+                <Trash2 class="mi-ico icon" />
+                Remove host…
+              </ContextMenu.Item>
+            {/if}
           </ContextMenu.Content>
         </ContextMenu.Portal>
       </ContextMenu.Root>
@@ -524,13 +593,17 @@
                 </ContextMenu.Trigger>
                 <ContextMenu.Portal>
                   <ContextMenu.Content class="menu">
-                    <ContextMenu.Item class="mi" onSelect={() => launch(worktree, null, "shell")}>
+                    <!-- Daemon-backed: launching a session spawns a PTY on the
+                         owning daemon, so these are disabled while the scope is
+                         stale (issue #32). The OS-path items (reveal/editor/copy)
+                         below stay enabled. -->
+                    <ContextMenu.Item class="mi" disabled={!scopeLive} onSelect={() => launch(worktree, null, "shell")}>
                       <TerminalIcon class="mi-ico icon" />
                       Open shell session<span class="mi-k">{shellShortcutLabel}</span>
                     </ContextMenu.Item>
                     {#each LAUNCHABLE_AGENTS as a (a.kind)}
                       {@const Mark = a.icon}
-                      <ContextMenu.Item class="mi" onSelect={() => launch(worktree, a.launchArgv, a.kind)}>
+                      <ContextMenu.Item class="mi" disabled={!scopeLive} onSelect={() => launch(worktree, a.launchArgv, a.kind)}>
                         <Mark class="mi-ico icon" />
                         Launch {a.title}
                       </ContextMenu.Item>
@@ -550,7 +623,9 @@
                     </ContextMenu.Item>
                     {#if worktree.is_hitch_managed && !worktree.is_main}
                       <ContextMenu.Separator class="m-sep" />
-                      <ContextMenu.Item class="mi danger" onSelect={() => removeWorktreeTarget.set(worktree)}>
+                      <!-- Daemon-backed remote op: disabled while the scope is
+                           stale (issue #32). -->
+                      <ContextMenu.Item class="mi danger" disabled={!scopeLive} onSelect={() => removeWorktreeTarget.set(worktree)}>
                         <Trash2 class="mi-ico icon" />
                         Remove worktree…
                       </ContextMenu.Item>
@@ -563,6 +638,7 @@
         </ul>
       {/if}
     </div>
+    {/each}
   {/each}
 </div>
 
@@ -576,6 +652,32 @@
     font-size: 0.6875rem;
     color: var(--ink-2);
     line-height: 1.5;
+  }
+
+  /* ---- stale scope subtree (issue #32, ADR 0014) ----
+     When an SSH Host is unreachable/failed (or mid-reconnect), its last known
+     tree stays visible but greys as stale UI and its daemon-backed actions are
+     disabled. Opacity is multiplicative through a stacking context (a child can
+     never be MORE opaque than its parent), so to keep attention readable we do
+     NOT dim the whole `.proj` container — we ease back only the quiet,
+     non-attention parts (names, icons, diffstat, facepile). The attention rollup
+     pill and the AWAITING/ERROR state word are deliberately left untouched at
+     full oxide so a stale host can still page the user (attention beats stale,
+     ADR 0014). Selection (.sel) keeps its own iris styling regardless. */
+  .proj.stale .pname,
+  .proj.stale .pkind,
+  .proj.stale .rhost-target,
+  .proj.stale .name,
+  .proj.stale .kindcue,
+  .proj.stale .mainsuf,
+  .proj.stale .diffn,
+  .proj.stale .prchip,
+  .proj.stale .pile,
+  .proj.stale :global(.folder),
+  .proj.stale :global(.rhost-ic),
+  .proj.stale :global(.branchic),
+  .proj.stale .tw {
+    opacity: 0.5;
   }
 
   /* ---- project row ---- */
@@ -654,11 +756,42 @@
   }
 
   .pname {
-    flex: 1;
+    /* flex:0 1 auto (not 1) so the name no longer eats all the row's free space:
+       the remote cloud+host badge can sit immediately to its right while the
+       `.trailing` cluster's margin-left:auto still pins the kind label / rollup /
+       quick-add to the far right. Local rows render nothing between the name and
+       the auto-margined trailing, so they are visually unchanged. */
+    flex: 0 1 auto;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* Remote project marker: a quiet dim cloud + OpenSSH target right after the
+     project name (the flat tree's replacement for the old host parent row). */
+  .rhost {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex: none;
+    min-width: 0;
+  }
+  .rhost :global(.rhost-ic) {
+    width: 12px;
+    height: 12px;
+    flex: 0 0 12px;
+    color: var(--ink-3);
+  }
+  .rhost-target {
+    font-family: var(--mono);
+    font-size: 0.625rem;
+    font-weight: 500;
+    color: var(--ink-3);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
   }
 
   .trailing {
