@@ -362,11 +362,20 @@ struct SshConnectionsInner {
 /// One file's result in an upload batch reported back to the frontend. `state`
 /// distinguishes a real upload from a per-file rejection (a dropped directory),
 /// so the frontend can toast the rejection copy and still insert the uploads.
+// Internally tagged on `type` with kebab-case variant names to match the
+// frontend contract (`fileDrop.ts` `UploadFileResult`) and the rest of the proto
+// (Response is `type`-tagged). The default externally-tagged form (`{"uploaded":
+// {…}}`) does NOT match and silently produced empty `uploaded`/`failed` arrays in
+// the GUI — uploaded files were never inserted (issue #31 regression).
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(tag = "type", rename_all = "kebab-case")]
 pub enum UploadFileResult {
     /// The file uploaded; `remote_path` is the actual remote path to insert.
-    Uploaded { name: String, remote_path: String },
+    Uploaded {
+        name: String,
+        #[serde(rename = "remotePath")]
+        remote_path: String,
+    },
     /// The path was a directory; recursive upload isn't supported (ADR 0014).
     RejectedDirectory { name: String },
     /// The path could not be read/stat'd locally; carries the error for a toast.
@@ -603,13 +612,9 @@ impl SshConnections {
         session_id: SessionId,
         paths: Vec<String>,
     ) -> Result<UploadBatchResult, String> {
-        eprintln!(
-            "[DEBUG-up10] upload_files scope={scope_id} batch={batch_id} session={session_id} paths={paths:?}"
-        );
-        let connection = self.connection(scope_id).ok_or_else(|| {
-            eprintln!("[DEBUG-up10] NO CONNECTION for scope {scope_id}");
-            format!("no remote daemon connection for scope {scope_id}")
-        })?;
+        let connection = self
+            .connection(scope_id)
+            .ok_or_else(|| format!("no remote daemon connection for scope {scope_id}"))?;
         let os_family = connection
             .os_family
             .lock()
@@ -653,9 +658,6 @@ impl SshConnections {
         if let Ok(mut map) = self.0.upload_cancels.lock() {
             map.remove(batch_id);
         }
-        eprintln!(
-            "[DEBUG-up10] upload_files DONE scope={scope_id} batch={batch_id} cancelled={cancelled} results={files:?}"
-        );
         Ok(UploadBatchResult {
             os_family: os_family.into(),
             cancelled,
@@ -1632,6 +1634,45 @@ fn emit_scope_status(app: &AppHandle, scope_id: &str, status: RemoteStatus, reas
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The GUI parses this batch by `f.type === "uploaded"` and reads `f.remotePath`
+    // (fileDrop.ts). Serde's default externally-tagged enum (`{"uploaded": {…}}`)
+    // with snake_case fields silently breaks that match: every variant filter comes
+    // up empty and uploaded files are never inserted. Pin the exact wire shape the
+    // frontend contract depends on so it can't regress again (issue #31).
+    #[test]
+    fn upload_batch_serializes_to_frontend_contract() {
+        let batch = UploadBatchResult {
+            os_family: RemoteOsFamily::Windows,
+            cancelled: false,
+            files: vec![
+                UploadFileResult::Uploaded {
+                    name: "a.txt".into(),
+                    remote_path: "C:\\up\\a.txt".into(),
+                },
+                UploadFileResult::RejectedDirectory {
+                    name: "src".into(),
+                },
+                UploadFileResult::Failed {
+                    name: "b.bin".into(),
+                    error: "boom".into(),
+                },
+            ],
+        };
+        let value = serde_json::to_value(&batch).expect("serialize batch");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "osFamily": "windows",
+                "cancelled": false,
+                "files": [
+                    { "type": "uploaded", "name": "a.txt", "remotePath": "C:\\up\\a.txt" },
+                    { "type": "rejected-directory", "name": "src" },
+                    { "type": "failed", "name": "b.bin", "error": "boom" },
+                ],
+            })
+        );
+    }
 
     #[test]
     fn backoff_schedule_matches_adr() {
