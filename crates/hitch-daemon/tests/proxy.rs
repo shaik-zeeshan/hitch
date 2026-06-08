@@ -1,7 +1,8 @@
 //! Integration tests for `hitch daemon proxy` — the SSH stdio bridge (issue #27,
 //! ADR 0014). The proxy is the daemon binary invoked as `hitch daemon proxy`; it
-//! resolves the host-local daemon endpoint (auto-starting one if absent) and
-//! bridges raw protocol bytes between its stdin/stdout and the daemon socket.
+//! resolves the host-local daemon endpoint, connects to it if a daemon is running
+//! (it never starts one), and bridges raw protocol bytes between its stdin/stdout
+//! and the daemon socket.
 //!
 //! These tests run the real proxy binary as a subprocess with piped stdio and
 //! drive the Hitch protocol Hello handshake (and a request round-trip) THROUGH
@@ -73,43 +74,32 @@ fn proxy_bridges_hello_and_ping_against_running_daemon() {
     daemon.wait_for_exit();
 }
 
-/// With NO daemon listening, the proxy auto-starts a detached daemon and bridges
-/// the Hello handshake to it. Exercises the auto-start path (`--detach` spawn,
-/// pid captured off stdout) end-to-end.
+/// With NO daemon listening, the proxy does NOT start one (ADR 0014): it fails
+/// fast, closes its stdout (the protocol stream) without emitting a Hello, exits
+/// non-zero, and leaves the socket endpoint free — the host is untouched.
 #[test]
-fn proxy_auto_starts_daemon_and_bridges_hello() {
-    let socket = test_socket_path("proxy-autostart");
-    let store = test_file_path("proxy-autostart-store", "sqlite");
-    let managed_root = test_dir_path("proxy-autostart-managed");
+fn proxy_fails_fast_without_starting_a_daemon() {
+    let socket = test_socket_path("proxy-no-daemon");
     // Ensure nothing is listening on the socket up front.
     assert!(
         connect_daemon(&socket).is_err(),
-        "test socket must be free before auto-start"
+        "test socket must be free for the no-daemon case"
     );
 
-    let mut proxy = ProxyProcess::spawn_with_paths(&socket, &store, &managed_root);
+    let mut proxy = ProxyProcess::spawn(&socket);
 
-    proxy.send_request(1, Request::Hello {
-        client_name: "proxy-autostart".into(),
-        protocol_version: PROTOCOL_VERSION,
-    });
-    let hello = proxy.read_response_for(1);
+    // The proxy connects-or-fails immediately; it never spawns a daemon, so it
+    // exits on its own without us closing stdin.
+    let status = proxy.wait_for_exit();
     assert!(
-        matches!(hello, Response::Hello { protocol_version, .. } if protocol_version == PROTOCOL_VERSION),
-        "expected matching Hello from auto-started daemon, got {hello:?}"
+        !status.success(),
+        "proxy must exit non-zero when no daemon is running, got {status}"
     );
-
-    // The proxy must have started a real daemon on the socket; shut it down
-    // through a direct connection so the test leaves nothing running.
-    proxy.shutdown();
-    let mut direct = connect_daemon(&socket).expect("auto-started daemon reachable");
-    direct
-        .send_control(&ControlMessage::request(1, Request::ShutdownDaemon))
-        .expect("send shutdown to auto-started daemon");
-    let _ = read_one_response(&mut direct, 1);
-    wait_for_socket_gone(&socket);
-    let _ = std::fs::remove_file(&store);
-    let _ = std::fs::remove_dir_all(&managed_root);
+    // The decisive assertion: nothing was started behind the proxy.
+    assert!(
+        connect_daemon(&socket).is_err(),
+        "proxy must not start a daemon — the endpoint must remain free"
+    );
 }
 
 // ---- proxy subprocess harness ---------------------------------------------
@@ -122,39 +112,39 @@ struct ProxyProcess {
 
 impl ProxyProcess {
     fn spawn(socket: &Path) -> Self {
-        Self::spawn_inner(socket, None)
-    }
-
-    fn spawn_with_paths(socket: &Path, store: &Path, managed_root: &Path) -> Self {
-        Self::spawn_inner(socket, Some((store, managed_root)))
-    }
-
-    fn spawn_inner(socket: &Path, auto_start_paths: Option<(&Path, &Path)>) -> Self {
-        let mut command = Command::new(daemon_bin());
-        command
+        let mut child = Command::new(daemon_bin())
             .arg("daemon")
             .arg("proxy")
-            // Point the proxy (and any daemon it auto-starts) at the test socket.
+            // Point the proxy at the test socket.
             .env("HITCH_SOCKET", socket)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Inherit stderr so proxy diagnostics show in test output.
-            .stderr(Stdio::inherit());
-        // For the auto-start path, steer the daemon the proxy spawns onto isolated
-        // store/managed-root paths via the proxy's env passthrough, so the test
-        // daemon never races a real daemon's store.
-        if let Some((store, managed_root)) = auto_start_paths {
-            command
-                .env("HITCH_STORE", store)
-                .env("HITCH_MANAGED_ROOT", managed_root);
-        }
-        let mut child = command.spawn().expect("spawn hitch daemon proxy");
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn hitch daemon proxy");
         let stdin = child.stdin.take().expect("proxy stdin");
         let stdout = BufReader::new(child.stdout.take().expect("proxy stdout"));
         Self {
             child,
             stdin,
             stdout,
+        }
+    }
+
+    /// Wait for the proxy to exit on its own (it does so immediately when no
+    /// daemon is listening) and return its exit status.
+    fn wait_for_exit(&mut self) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait proxy") {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "proxy did not exit on its own with no daemon running"
+            );
+            thread::sleep(Duration::from_millis(25));
         }
     }
 
@@ -290,16 +280,6 @@ fn wait_for_endpoint(socket: &Path) {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("daemon endpoint {} never came up", socket.display());
-}
-
-fn wait_for_socket_gone(socket: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if connect_daemon(socket).is_err() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
 }
 
 fn daemon_bin() -> PathBuf {

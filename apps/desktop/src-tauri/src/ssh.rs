@@ -289,8 +289,9 @@ pub fn classify(
             SshTestResult::failure(
                 FailureCategory::ProxyStartup,
                 format!(
-                    "Connected, but `hitch daemon proxy` did not start a Hitch protocol stream on {target}. \
-                     The remote hitch may be too old or failed to launch its daemon. Manual test: {manual}"
+                    "Connected, but `hitch daemon proxy` did not return a Hitch protocol stream on {target}. \
+                     No Hitch daemon is running there (the proxy does not start one) — launch Hitch or \
+                     `hitch daemon` on the remote — or the remote hitch is too old. Manual test: {manual}"
                 ),
                 tail,
             )

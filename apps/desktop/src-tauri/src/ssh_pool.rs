@@ -603,9 +603,13 @@ impl SshConnections {
         session_id: SessionId,
         paths: Vec<String>,
     ) -> Result<UploadBatchResult, String> {
-        let connection = self
-            .connection(scope_id)
-            .ok_or_else(|| format!("no remote daemon connection for scope {scope_id}"))?;
+        eprintln!(
+            "[DEBUG-up10] upload_files scope={scope_id} batch={batch_id} session={session_id} paths={paths:?}"
+        );
+        let connection = self.connection(scope_id).ok_or_else(|| {
+            eprintln!("[DEBUG-up10] NO CONNECTION for scope {scope_id}");
+            format!("no remote daemon connection for scope {scope_id}")
+        })?;
         let os_family = connection
             .os_family
             .lock()
@@ -649,6 +653,9 @@ impl SshConnections {
         if let Ok(mut map) = self.0.upload_cancels.lock() {
             map.remove(batch_id);
         }
+        eprintln!(
+            "[DEBUG-up10] upload_files DONE scope={scope_id} batch={batch_id} cancelled={cancelled} results={files:?}"
+        );
         Ok(UploadBatchResult {
             os_family: os_family.into(),
             cancelled,

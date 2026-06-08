@@ -205,6 +205,12 @@ async function uploadAndInsert(sessionId: Id, paths: string[]): Promise<void> {
     },
   );
 
+  console.log("[DEBUG-up10] invoke upload_files_to_session", {
+    scope,
+    batchId,
+    sessionId,
+    paths,
+  });
   let result: UploadBatchResult;
   try {
     result = await invoke<UploadBatchResult>("upload_files_to_session", {
@@ -214,15 +220,17 @@ async function uploadAndInsert(sessionId: Id, paths: string[]): Promise<void> {
       paths,
     });
   } catch (err) {
+    console.error("[DEBUG-up10] upload invoke REJECTED", err);
     unlisten();
     toast.dismiss(toastId);
     toast.error(
       `Upload to ${host} failed: ${err instanceof Error ? err.message : String(err)}`,
-      { duration: 5000 },
+      { duration: Infinity },
     );
     return;
   }
   unlisten();
+  console.log("[DEBUG-up10] upload result", JSON.stringify(result));
 
   const uploaded = result.files.filter(
     (f): f is Extract<UploadFileResult, { type: "uploaded" }> =>
@@ -264,7 +272,8 @@ async function uploadAndInsert(sessionId: Id, paths: string[]): Promise<void> {
 
   reportRejectedDirectories(dirs.length);
   for (const f of failed) {
-    toast.error(`Couldn't upload ${f.name}: ${f.error}`, { duration: 5000 });
+    console.error("[DEBUG-up10] file failed", f.name, f.error);
+    toast.error(`Couldn't upload ${f.name}: ${f.error}`, { duration: Infinity });
   }
 }
 
