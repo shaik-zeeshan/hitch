@@ -11,7 +11,7 @@
     "stop-dev-daemon": "node scripts/stop-dev-daemon.mjs",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "preview": "vite preview",
-    "test": "vitest run",
+    "test": "svelte-kit sync && vitest run",
     "tauri": "tauri"
   },
   "dependencies": {
