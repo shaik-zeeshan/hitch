@@ -225,12 +225,26 @@ pub fn classify(
     }
 
     // Missing remote `hitch`: ssh connected and ran, but the command was not found.
-    // Exit 127 is the conventional shell "command not found" code.
+    // Exit 127 is the conventional POSIX shell "command not found" code.
+    //
+    // Windows shells phrase a missing program/path differently (and don't use exit
+    // 127), so match their wording too:
+    //   cmd.exe:     'X' is not recognized as an internal or external command
+    //                The system cannot find the path specified.
+    //   PowerShell:  The term 'X' is not recognized as the name of a cmdlet …
+    // This matters for the real attach's candidate probe (`ssh_pool::connect_once`):
+    // it tries `~/.local/bin/hitch` first, and ONLY a MissingHitch classification
+    // falls through to the bare-`hitch` candidate. On a Windows remote (`hitch.exe`
+    // on the registry PATH, never at `~/.local/bin`), the known-location candidate
+    // must classify as MissingHitch or the attach never tries bare `hitch` and the
+    // host stays Unreachable even though Test Connection (bare `hitch`) succeeds.
     if exit_code == Some(127)
         || lower.contains("command not found")
         || lower.contains("hitch: not found")
         || lower.contains("no such file or directory")
         || (lower.contains("hitch") && lower.contains("not found"))
+        || lower.contains("is not recognized")
+        || lower.contains("the system cannot find")
     {
         return SshTestResult::failure(
             FailureCategory::MissingHitch,
@@ -548,6 +562,46 @@ mod tests {
         );
         assert_eq!(result.category, Some(FailureCategory::MissingHitch));
         assert!(result.message.contains("Install"));
+    }
+
+    #[test]
+    fn classify_windows_cmd_not_recognized_is_missing_hitch() {
+        // The known-location candidate `~/.local/bin/hitch` run via cmd.exe on a
+        // Windows remote: cmd reports "is not recognized as an internal or external
+        // command". Must classify as MissingHitch so the attach falls through to the
+        // bare-`hitch` (registry-PATH) candidate instead of giving up Unreachable.
+        let result = classify(
+            "pc@192.168.0.9",
+            Some(1),
+            "'~/.local/bin/hitch' is not recognized as an internal or external command,\r\noperable program or batch file.",
+            HandshakeOutcome::NoResponse,
+            false,
+        );
+        assert_eq!(result.category, Some(FailureCategory::MissingHitch));
+    }
+
+    #[test]
+    fn classify_windows_powershell_not_recognized_is_missing_hitch() {
+        let result = classify(
+            "pc@192.168.0.9",
+            Some(1),
+            "The term 'C:\\Users\\pc\\.local\\bin\\hitch' is not recognized as the name of a cmdlet, function, script file, or operable program.",
+            HandshakeOutcome::NoResponse,
+            false,
+        );
+        assert_eq!(result.category, Some(FailureCategory::MissingHitch));
+    }
+
+    #[test]
+    fn classify_windows_cannot_find_path_is_missing_hitch() {
+        let result = classify(
+            "pc@192.168.0.9",
+            Some(1),
+            "The system cannot find the path specified.",
+            HandshakeOutcome::NoResponse,
+            false,
+        );
+        assert_eq!(result.category, Some(FailureCategory::MissingHitch));
     }
 
     #[test]

@@ -178,12 +178,31 @@ pub fn candidate_sequence() -> Vec<ProxyCandidate> {
 }
 
 /// Decide whether a failed candidate should fall through to the next candidate
-/// or surface immediately. Per approach C, ONLY `MissingHitch` falls through
-/// (the binary genuinely wasn't at that location); `Auth`/`HostKey`/`Network`
-/// (and any other category) surface immediately — retrying those just doubles
-/// latency. `None` (no classified category, e.g. a spawn error) surfaces too.
+/// or surface immediately.
+///
+/// The candidate sequence exists to LOCATE a working `hitch` binary, so a failure
+/// that is specific to the program we invoked should fall through and try the next
+/// location:
+/// - `MissingHitch` — the binary genuinely wasn't at that location.
+/// - `ProxyStartup` — ssh connected and ran the command, but no/garbage Hello came
+///   back. This is the bucket a Windows remote lands in when the known-location
+///   candidate (`~/.local/bin/hitch`) isn't a runnable program there: the remote
+///   shell's "not found"/"not recognized" wording (cmd.exe, PowerShell) doesn't
+///   match the POSIX `MissingHitch` patterns, so we must NOT depend on classifying
+///   every shell's message — we fall through and let the bare-`hitch` (PATH/registry)
+///   candidate prove itself. Bare `hitch` is exactly what Test Connection runs, so
+///   if that succeeds the attach now succeeds too.
+///
+/// Host-level failures are identical for EVERY candidate (same host), so retrying
+/// them on the next candidate just doubles latency — they surface immediately:
+/// `Auth`/`HostKey`/`Network`, the terminal `ProtocolMismatch` (a real hitch that's
+/// the wrong version — report it, don't mask it), and `None` (no classified
+/// category, e.g. a local ssh spawn error).
 pub fn should_fall_through(category: Option<ssh::FailureCategory>) -> bool {
-    matches!(category, Some(ssh::FailureCategory::MissingHitch))
+    matches!(
+        category,
+        Some(ssh::FailureCategory::MissingHitch | ssh::FailureCategory::ProxyStartup)
+    )
 }
 
 /// Decide whether a cached `exe_path` that just failed should trigger
@@ -712,6 +731,11 @@ impl SshConnections {
                 }
                 Err(failure) => {
                     let fall_through = should_fall_through(failure.category);
+                    eprintln!(
+                        "hitch: [ssh-diag] {} candidate {candidate:?} failed (category={:?}, \
+                         fall_through={fall_through}): {}",
+                        connection.target, failure.category, failure.message
+                    );
                     last = Some(failure);
                     if !fall_through {
                         // Auth/HostKey/Network/etc: surface immediately rather than
@@ -987,6 +1011,12 @@ fn classify_remote(
     let _ = child.kill();
     let exit_code = child.wait().ok().and_then(|s| s.code());
     let result = ssh::classify(target, exit_code, stderr, outcome.clone(), false);
+    eprintln!(
+        "hitch: [ssh-diag] {target} connect failed — exit={exit_code:?} outcome={outcome:?} \
+         category={:?}\n  stderr: {}",
+        result.category,
+        stderr.trim()
+    );
     RemoteFailure {
         message: result.message,
         outcome: Some(outcome.clone()),
@@ -1516,19 +1546,25 @@ mod tests {
     }
 
     #[test]
-    fn fall_through_only_on_missing_hitch() {
-        // Known-path → bare fall-through happens ONLY for MissingHitch.
+    fn fall_through_on_program_specific_failures() {
+        // Known-path → bare fall-through happens for failures specific to the
+        // program we invoked: the binary wasn't there (MissingHitch) OR it ran but
+        // produced no Hitch stream (ProxyStartup — the bucket a Windows remote's
+        // "not recognized"/"not found" wording lands in for `~/.local/bin/hitch`).
         assert!(should_fall_through(Some(FailureCategory::MissingHitch)));
+        assert!(should_fall_through(Some(FailureCategory::ProxyStartup)));
     }
 
     #[test]
-    fn auth_host_key_network_surface_immediately_no_fall_through() {
-        // Retrying these on the next candidate just doubles latency.
+    fn host_level_failures_surface_immediately_no_fall_through() {
+        // Host-level failures are identical for every candidate, so retrying on the
+        // next candidate just doubles latency.
         assert!(!should_fall_through(Some(FailureCategory::Auth)));
         assert!(!should_fall_through(Some(FailureCategory::HostKey)));
         assert!(!should_fall_through(Some(FailureCategory::Network)));
+        // A reached-but-wrong-version hitch is terminal — report it, don't mask it
+        // by falling through.
         assert!(!should_fall_through(Some(FailureCategory::ProtocolMismatch)));
-        assert!(!should_fall_through(Some(FailureCategory::ProxyStartup)));
         // No classified category (spawn/encode error) also surfaces.
         assert!(!should_fall_through(None));
     }
@@ -1573,6 +1609,17 @@ mod tests {
         // Candidate 0 (known location) MissingHitch → fall through; candidate 1
         // (bare) succeeds.
         let outcome = walk_candidates(&[Some(FailureCategory::MissingHitch), None]);
+        assert_eq!(outcome, Ok(1));
+    }
+
+    #[test]
+    fn known_path_proxy_startup_then_bare_succeeds() {
+        // The real-world Windows case: `~/.local/bin/hitch` isn't a runnable program
+        // on the remote, so the candidate classifies as ProxyStartup (its shell's
+        // "not recognized"/"not found" wording doesn't match the POSIX MissingHitch
+        // patterns). It must fall through to bare `hitch` (on the registry PATH),
+        // which is what Test Connection runs and what succeeds.
+        let outcome = walk_candidates(&[Some(FailureCategory::ProxyStartup), None]);
         assert_eq!(outcome, Ok(1));
     }
 
