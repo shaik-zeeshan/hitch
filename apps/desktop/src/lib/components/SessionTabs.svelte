@@ -245,7 +245,10 @@
     cursor: pointer;
     background: transparent;
     white-space: nowrap;
+    /* Fixed-width tabs: every tab is the same size regardless of title length;
+       the title truncates inside rather than stretching the strip. */
     flex: none;
+    width: 180px;
     transition: color 0.15s ease-out;
   }
   .tab:hover {
@@ -278,6 +281,13 @@
   }
   .tab .name {
     font-family: var(--mono);
+    /* Fill the leftover tab width; truncate with an ellipsis. min-width:0 lets
+       a flex item shrink below its content size so the ellipsis kicks in. */
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .tabmark {
