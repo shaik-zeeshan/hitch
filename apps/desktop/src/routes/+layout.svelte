@@ -13,7 +13,6 @@
   //   - the daemon connection lifecycle (initDaemon is idempotent; see daemon.ts)
   //   - the platform shortcuts: command palette (Cmd/Ctrl+K) and settings
   //     toggle (Cmd/Ctrl+,)
-  //   - the WKWebView keep-alive heartbeat
   //   - the overlay surfaces (palette + dialogs) that any route may open
   //   - the 3-pane shell (TopNav · LeftRail · Center · RightRail) + rail state
   // Settings (and any future full-window route) renders via children() above
@@ -112,9 +111,6 @@
   const SHELL_HIDDEN_ROUTES = new Set(["/settings"]);
   const shellHidden = $derived(SHELL_HIDDEN_ROUTES.has(page.url.pathname));
 
-  // Heartbeat opacity for the keep-alive dot (see below). Toggled on a timer so
-  // the WebContent process always has scheduled work to flush.
-  let hbOpacity = $state(0.01);
   const desktopPlatform = currentDesktopPlatform();
 
 
@@ -360,18 +356,7 @@
     void initFileDrop().then((unlisten) => {
       unlistenDrop = unlisten;
     });
-    // Keep the macOS WKWebView from going dormant. When the page has no
-    // scheduled work (no terminal mounted, or the only terminal is unfocused so
-    // xterm's cursor-blink timer is paused), the webview stops flushing frames:
-    // clicks and store updates are processed but never painted, so the UI looks
-    // frozen until an external event (resize/refresh) wakes it. A low-frequency
-    // opacity toggle — the same trick xterm's blinking cursor relies on —
-    // guarantees a steady stream of frames so async updates always paint.
-    const heartbeat = setInterval(() => {
-      hbOpacity = hbOpacity === 0.01 ? 0.02 : 0.01;
-    }, 500);
     return () => {
-      clearInterval(heartbeat);
       unlistenDrop?.();
       disposeDaemon();
     };
@@ -414,8 +399,6 @@
 {#if desktopPlatform === "windows"}
   <WindowControls />
 {/if}
-
-<div class="wk-keepalive" aria-hidden="true" style="opacity:{hbOpacity}"></div>
 
 <CommandPalette />
 <AddProjectDialog />
@@ -472,17 +455,5 @@
   }
   .window.no-right .body {
     --w-right: 0px;
-  }
-
-  /* WKWebView keep-alive dot — an imperceptible 1px square whose opacity the
-     heartbeat toggles to force a repaint each tick. See onMount above. */
-  .wk-keepalive {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 1px;
-    height: 1px;
-    background: var(--iris);
-    pointer-events: none;
   }
 </style>

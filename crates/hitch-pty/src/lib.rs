@@ -709,7 +709,7 @@ fn command_name_for_pid(pid: libc::pid_t) -> Option<String> {
     }
     let path = std::str::from_utf8(&buf[..ret as usize]).ok()?;
     let executable = std::path::Path::new(path).file_name()?.to_string_lossy();
-    normalize_command_name(&executable, command_line_args_for_pid(pid).as_deref())
+    normalize_command_name(&executable, || command_line_args_for_pid(pid))
 }
 
 #[cfg(target_os = "linux")]
@@ -719,28 +719,40 @@ fn command_name_for_pid(pid: libc::pid_t) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    let args = command_line_args_for_pid(pid);
-    normalize_command_name(name, args.as_deref())
+    normalize_command_name(name, || command_line_args_for_pid(pid))
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
-fn normalize_command_name(executable: &str, args: Option<&[String]>) -> Option<String> {
+fn normalize_command_name(
+    executable: &str,
+    args: impl FnOnce() -> Option<Vec<String>>,
+) -> Option<String> {
     runtime_agent_command(executable, args)
         .map(str::to_string)
         .or_else(|| Some(executable.to_string()))
 }
 
+/// Resolve an agent CLI name only when the foreground process is a `node`
+/// runtime hosting one (claude/codex run as `node <cli.js>`). `args` is a
+/// closure, not a value, because fetching a process's argv is expensive (a
+/// double `KERN_PROCARGS2` sysctl on macOS, a `/proc` read on Linux) and the
+/// per-second poller would otherwise pay it for EVERY foreground process — vim,
+/// the shell, cargo — only to discard it here. Deferring the fetch behind the
+/// `node` check means the syscall runs only on the rare `node` tick.
 #[cfg_attr(not(unix), allow(dead_code))]
-fn runtime_agent_command(executable: &str, args: Option<&[String]>) -> Option<&'static str> {
+fn runtime_agent_command(
+    executable: &str,
+    args: impl FnOnce() -> Option<Vec<String>>,
+) -> Option<&'static str> {
     if !executable.eq_ignore_ascii_case("node") {
         return None;
     }
 
-    for arg in args? {
-        if path_basename_or_stem_eq(arg, "codex") {
+    for arg in args()? {
+        if path_basename_or_stem_eq(&arg, "codex") {
             return Some("codex");
         }
-        if path_basename_or_stem_eq(arg, "claude") || path_has_component(arg, "claude-code") {
+        if path_basename_or_stem_eq(&arg, "claude") || path_has_component(&arg, "claude-code") {
             return Some("claude");
         }
     }
@@ -1004,23 +1016,17 @@ mod tests {
     #[test]
     fn node_runtime_commands_report_agent_cli_names() {
         assert_eq!(
-            normalize_command_name(
-                "node",
-                Some(&[
-                    "node".into(),
-                    "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js".into(),
-                ]),
-            ),
+            normalize_command_name("node", || Some(vec![
+                "node".into(),
+                "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js".into(),
+            ])),
             Some("codex".into()),
         );
         assert_eq!(
-            normalize_command_name(
-                "node",
-                Some(&[
-                    "node".into(),
-                    "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js".into(),
-                ]),
-            ),
+            normalize_command_name("node", || Some(vec![
+                "node".into(),
+                "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js".into(),
+            ])),
             Some("claude".into()),
         );
     }
@@ -1028,7 +1034,7 @@ mod tests {
     #[test]
     fn ordinary_node_commands_still_report_node() {
         assert_eq!(
-            normalize_command_name("node", Some(&["node".into(), "server.js".into()])),
+            normalize_command_name("node", || Some(vec!["node".into(), "server.js".into()])),
             Some("node".into()),
         );
     }
@@ -1038,10 +1044,10 @@ mod tests {
         // A script whose name merely contains "claude-code" as a substring must
         // not be misreported as the Claude CLI.
         assert_eq!(
-            normalize_command_name(
-                "node",
-                Some(&["node".into(), "./scripts/claude-codegen.js".into()]),
-            ),
+            normalize_command_name("node", || Some(vec![
+                "node".into(),
+                "./scripts/claude-codegen.js".into(),
+            ])),
             Some("node".into()),
         );
     }

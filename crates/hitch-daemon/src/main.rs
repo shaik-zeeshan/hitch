@@ -36,6 +36,12 @@ const OUTPUT_ACTIVE_QUIET: Duration = Duration::from_secs(4);
 /// per-second daemon pollers.
 const OUTPUT_ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// How often the foreground-command poller probes each session (see
+/// [`spawn_command_poller`]). 2s rather than 1s: command-label freshness and the
+/// agent dirty-exit backstop tolerate it, and it halves the per-session idle
+/// probe floor.
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 use drafts::{CommitDraftInput, DraftProviderConfig, PullRequestDraftInput};
 use hitch_agent::HookInstallOptions;
 use hitch_core::{
@@ -44,9 +50,10 @@ use hitch_core::{
 };
 use hitch_git::{
     staged_diff, CommandControl, CreatePrRequest, CreateWorktreeRequest, DiffFileOptions,
-    DiffTarget, FileState, GitClient, GitRepository, StatusEntry, WorktreeCheckout,
+    DiffTarget, FileState, GitClient, GitRepository, StatusEntry, StatusSummary, WorktreeCheckout,
 };
 use hitch_process::{DrainOutcome, PipeReader, ProcessTree};
+use notify::{RecursiveMode, Watcher};
 use hitch_proto::{
     encode_control_message, encode_pty_frame,
     transport::{connect_daemon, DaemonListener, DaemonStream},
@@ -480,7 +487,7 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     // returns early. Don't spawn the per-second no-op there.
     #[cfg(unix)]
     spawn_command_poller(Arc::clone(&state), Arc::clone(&shutdown));
-    spawn_dirty_poller(Arc::clone(&state), Arc::clone(&shutdown));
+    spawn_dirty_watcher(Arc::clone(&state), Arc::clone(&shutdown));
     spawn_output_activity_poller(dispatch_tx.clone(), Arc::clone(&shutdown));
 
     // A dedicated thread parks in the blocking `accept()` and forwards each
@@ -3636,56 +3643,234 @@ fn status_entry_to_proto(
     }
 }
 
-/// Poll git worktrees once a second and broadcast dirty changes caused outside
-/// Hitch's own git buttons (editors, shells, agents). This keeps project-tree
-/// badges live without asking the GUI to full-status every worktree.
-fn spawn_dirty_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>) {
+/// Quiet window after the last filesystem event before a worktree is rescanned.
+/// Coalesces an editor's save burst (write temp, rename, chmod) into one scan.
+const DIRTY_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Floor on how often any one worktree is rescanned. A noisy working tree (a
+/// build writing into `target/`/`node_modules/`) fires a stream of events that
+/// libgit2 ignores anyway; this caps the wasted `status()` walks at one per
+/// interval per worktree. Idle worktrees produce zero events and zero scans —
+/// the whole point of moving off the old per-second poll.
+const DIRTY_MIN_RESCAN: Duration = Duration::from_millis(750);
+
+/// How often the watcher reconciles its watch set against the live worktree
+/// registry. Worktrees are added/removed by request handlers across many sites,
+/// so rather than thread a watch-registration call through each, the watcher
+/// re-derives the desired set on this cadence. The tick only diffs a small map
+/// and (re)arms watches when the set actually changed — it runs no git work — so
+/// it costs nothing comparable to the old per-second status walks, and it also
+/// lets us recover a watch the OS silently dropped.
+const DIRTY_RECONCILE: Duration = Duration::from_secs(2);
+
+/// Watch each worktree's filesystem and broadcast `WorktreeDirty` whenever its
+/// git status *content* changes — caused outside Hitch's own git buttons
+/// (editors, shells, agents). This replaces the old once-a-second `is_dirty`
+/// poll: at idle the thread is parked in `recv_timeout` and does no git work, so
+/// it removes the per-worktree status walk that ran every second 24/7.
+///
+/// Change detection compares the full [`StatusSummary`] (entries, per-side line
+/// counts, dirty flag, HEAD id) against the last seen one, so the GUI's Changes
+/// panel and tree line-stats stay live even while a worktree is *already* dirty
+/// and more files change — the case the old boolean-only poll missed and the
+/// frontend's own per-second `git-status` poll existed to cover. The frontend
+/// drops that poll and re-fetches on this event instead.
+fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>) {
     thread::Builder::new()
-        .name("hitch-dirty-poll".into())
+        .name("hitch-dirty-watch".into())
         .spawn(move || {
-            let mut last: HashMap<WorktreeId, bool> = HashMap::new();
+            let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+            let mut watcher = match notify::recommended_watcher(move |res| {
+                // The receiver lives for the whole thread; a send only fails once
+                // we are tearing down, in which case the event is irrelevant.
+                let _ = tx.send(res);
+            }) {
+                Ok(watcher) => watcher,
+                Err(err) => {
+                    eprintln!("hitch-daemon: failed to create fs watcher: {err}");
+                    return;
+                }
+            };
+
+            // Path currently armed per worktree (None of these is the *desired*
+            // set — that is re-derived from state on each reconcile).
+            let mut watched: HashMap<WorktreeId, PathBuf> = HashMap::new();
+            // Last status seen per worktree; the change-detection baseline.
+            let mut last: HashMap<WorktreeId, StatusSummary> = HashMap::new();
+            // Worktrees with a pending rescan, keyed to the time it may run.
+            let mut pending: HashMap<WorktreeId, Instant> = HashMap::new();
+            // Last rescan time per worktree, for the min-interval rate cap.
+            let mut last_scan: HashMap<WorktreeId, Instant> = HashMap::new();
+
+            reconcile_dirty_watches(&state, &mut watcher, &mut watched, &mut last);
+            let mut next_reconcile = Instant::now() + DIRTY_RECONCILE;
+
             while !shutdown.load(Ordering::SeqCst) {
-                let worktrees: Vec<(WorktreeId, PathBuf)> = match state.lock() {
-                    Ok(state) => state
-                        .worktrees
-                        .iter()
-                        .map(|(id, worktree)| (*id, worktree.path.clone()))
-                        .collect(),
-                    Err(_) => Vec::new(),
-                };
-                last.retain(|id, _| {
-                    worktrees
-                        .iter()
-                        .any(|(worktree_id, _)| worktree_id == id)
-                });
-                for (worktree_id, path) in worktrees {
-                    let Ok(dirty) = GitRepository::discover(&path).and_then(|repo| repo.is_dirty())
+                // Park until the next thing that needs doing: a pending rescan
+                // coming due, or the reconcile tick. Idle (no pending) means we
+                // wake only every DIRTY_RECONCILE to re-arm watches.
+                let now = Instant::now();
+                let mut wake = next_reconcile;
+                if let Some(soonest) = pending.values().min().copied() {
+                    wake = wake.min(soonest);
+                }
+                let timeout = wake
+                    .saturating_duration_since(now)
+                    .max(Duration::from_millis(10));
+
+                match rx.recv_timeout(timeout) {
+                    Ok(Ok(event)) => {
+                        // Map each changed path back to the worktree whose tree
+                        // contains it and arm a debounced rescan for it.
+                        for path in &event.paths {
+                            if let Some((id, _)) =
+                                watched.iter().find(|(_, root)| path.starts_with(root))
+                            {
+                                pending
+                                    .entry(*id)
+                                    .or_insert_with(|| Instant::now() + DIRTY_DEBOUNCE);
+                            }
+                        }
+                    }
+                    // A watch backend error is non-fatal: the next reconcile
+                    // re-arms from scratch. Keep looping.
+                    Ok(Err(err)) => eprintln!("hitch-daemon: fs watch error: {err}"),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+
+                // Run every rescan whose debounce has elapsed, honoring the
+                // per-worktree rate cap.
+                let now = Instant::now();
+                let due: Vec<WorktreeId> = pending
+                    .iter()
+                    .filter(|(_, at)| **at <= now)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in due {
+                    if let Some(prev) = last_scan.get(&id) {
+                        if now.duration_since(*prev) < DIRTY_MIN_RESCAN {
+                            // Too soon — defer this worktree to the rate floor.
+                            pending.insert(id, *prev + DIRTY_MIN_RESCAN);
+                            continue;
+                        }
+                    }
+                    pending.remove(&id);
+                    let Some(path) = watched.get(&id).cloned() else {
+                        continue;
+                    };
+                    last_scan.insert(id, now);
+                    let Ok(summary) =
+                        GitRepository::discover(&path).and_then(|repo| repo.status())
                     else {
                         continue;
                     };
-                    if matches!(last.insert(worktree_id, dirty), Some(previous) if previous != dirty) {
+                    // Broadcast only when the git-relevant content actually
+                    // changed: a write into a gitignored dir produces events but
+                    // an identical status, so the GUI stays quiet.
+                    let changed = last.get(&id) != Some(&summary);
+                    if changed {
+                        let dirty = summary.dirty;
+                        last.insert(id, summary);
                         let _ = broadcast_event(
                             &state,
-                            Event::WorktreeDirty { worktree_id, dirty },
+                            Event::WorktreeDirty {
+                                worktree_id: id,
+                                dirty,
+                            },
                         );
                     }
                 }
-                thread::sleep(Duration::from_secs(1));
+
+                if Instant::now() >= next_reconcile {
+                    reconcile_dirty_watches(&state, &mut watcher, &mut watched, &mut last);
+                    pending.retain(|id, _| watched.contains_key(id));
+                    last_scan.retain(|id, _| watched.contains_key(id));
+                    next_reconcile = Instant::now() + DIRTY_RECONCILE;
+                }
             }
         })
-        .expect("failed to spawn dirty poller thread");
+        .expect("failed to spawn dirty watcher thread");
 }
 
-/// Poll each live session's foreground command once a second and broadcast
-/// a SessionCommand event whenever it changes. Broadcasting only on change
-/// keeps idle terminals quiet. Agent-state exit detection is deliberately
-/// conservative: tools spawned by an agent can become the foreground process,
-/// so only returning to an interactive shell is treated as "agent gone".
+/// Bring the filesystem watch set in line with the live worktree registry: arm a
+/// recursive watch for every worktree that lacks one (or whose path moved),
+/// seeding its status baseline so the first real change is detected without a
+/// spurious broadcast; drop watches for worktrees that are gone.
+fn reconcile_dirty_watches(
+    state: &Arc<Mutex<DaemonState>>,
+    watcher: &mut notify::RecommendedWatcher,
+    watched: &mut HashMap<WorktreeId, PathBuf>,
+    last: &mut HashMap<WorktreeId, StatusSummary>,
+) {
+    let desired: HashMap<WorktreeId, PathBuf> = match state.lock() {
+        Ok(state) => state
+            .worktrees
+            .iter()
+            .map(|(id, worktree)| (*id, worktree.path.clone()))
+            .collect(),
+        Err(_) => return,
+    };
+
+    // Drop watches for worktrees that disappeared.
+    let gone: Vec<WorktreeId> = watched
+        .keys()
+        .filter(|id| !desired.contains_key(id))
+        .copied()
+        .collect();
+    for id in gone {
+        if let Some(path) = watched.remove(&id) {
+            let _ = watcher.unwatch(&path);
+        }
+        last.remove(&id);
+    }
+
+    // Arm new or moved worktrees.
+    for (id, path) in &desired {
+        if watched.get(id) == Some(path) {
+            continue;
+        }
+        if let Some(old) = watched.get(id) {
+            let _ = watcher.unwatch(old);
+        }
+        match watcher.watch(path, RecursiveMode::Recursive) {
+            Ok(()) => {
+                watched.insert(*id, path.clone());
+                // Seed the baseline so the first event compares against the
+                // status at arm-time rather than firing a startup broadcast.
+                if let Ok(summary) =
+                    GitRepository::discover(path).and_then(|repo| repo.status())
+                {
+                    last.insert(*id, summary);
+                }
+            }
+            Err(err) => {
+                // A worktree path that does not exist yet (mid-create) or is
+                // unreadable: leave it unwatched; the next reconcile retries.
+                eprintln!("hitch-daemon: failed to watch {}: {err}", path.display());
+                watched.remove(id);
+                last.remove(id);
+            }
+        }
+    }
+}
+
+/// Poll each live session's foreground command and broadcast a SessionCommand
+/// event whenever it changes. Broadcasting only on change keeps idle terminals
+/// quiet. Agent-state exit detection is deliberately conservative: tools spawned
+/// by an agent can become the foreground process, so only returning to an
+/// interactive shell is treated as "agent gone".
+///
+/// Cadence is [`COMMAND_POLL_INTERVAL`] (2s), not 1s: the foreground command and
+/// the agent-dirty-exit backstop drive only the command label and a stale-mark
+/// clear, neither of which needs sub-second freshness, and the per-session probe
+/// (a `tcgetpgrp` ioctl + `proc_pidpath`) is a fixed idle cost paid every tick
+/// for every session. Halving the rate halves that floor for free.
 ///
 /// Unix-only: ManagedPty::foreground_command() always returns `None` on Windows
 /// (ConPTY exposes no foreground process group — see hitch-pty and ADR 0011's
-/// "Windows note"), so this poller would be a per-second no-op there and is not
-/// spawned on non-Unix platforms.
+/// "Windows note"), so this poller would be a no-op there and is not spawned on
+/// non-Unix platforms.
 #[cfg(unix)]
 fn spawn_command_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>) {
     thread::Builder::new()
@@ -3728,7 +3913,7 @@ fn spawn_command_poller(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool
                         );
                     }
                 }
-                thread::sleep(Duration::from_millis(1000));
+                thread::sleep(COMMAND_POLL_INTERVAL);
             }
         })
         .expect("failed to spawn command poller thread");

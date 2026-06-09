@@ -1029,12 +1029,9 @@ async function forEachBounded<T>(
 }
 
 let statusRequestSeq = 0;
-let statusPollTimer: ReturnType<typeof setInterval> | null = null;
-let statusPollInFlight = false;
 let prPollTimer: ReturnType<typeof setInterval> | null = null;
 let prFocusHandler: (() => void) | null = null;
 
-const STATUS_POLL_MS = 1_000;
 // PR state changes on GitHub (e.g. draft → ready) are external, so poll for them
 // while connected. `gh pr list` is network-priced and PR state rarely flips, and
 // any change *we* cause is refreshed immediately by the post-git-op and focus
@@ -2936,7 +2933,6 @@ export function disposeDaemon(): void {
   // torn down; allow `initDaemon` to re-install it on the next boot.
   sshHostSyncSubscribed = false;
   snapshottedScopes.clear();
-  stopGitStatusPolling();
   stopPrStatusPolling();
   for (const sessionId of Array.from(channels.keys())) {
     closeSessionOutput(sessionId);
@@ -3164,28 +3160,6 @@ export async function loadProjectPrStatuses(
   } finally {
     projectPrInFlight.delete(projectId);
   }
-}
-
-function stopGitStatusPolling(): void {
-  if (statusPollTimer) clearInterval(statusPollTimer);
-  statusPollTimer = null;
-  statusPollInFlight = false;
-}
-
-function pollSelectedGitStatus(worktreeId: Id): void {
-  if (statusPollInFlight || get(connection) !== "ready" || get(gitBusy)) return;
-  if (get(gitWorktreeId) !== worktreeId) return;
-  statusPollInFlight = true;
-  void loadGitStatus(worktreeId)
-    .catch(() => {})
-    .finally(() => {
-      statusPollInFlight = false;
-    });
-}
-
-function startGitStatusPolling(worktreeId: Id): void {
-  stopGitStatusPolling();
-  statusPollTimer = setInterval(() => pollSelectedGitStatus(worktreeId), STATUS_POLL_MS);
 }
 
 // Refresh PR chips for every git-backed project. The periodic poll forces past
@@ -4492,15 +4466,16 @@ gitWorktreeId.subscribe(($id) => {
   commitLog.set(EMPTY_COMMIT_LOG);
   commitLogHeadId = null;
   commitLogSeq += 1;
-  stopGitStatusPolling();
   if ($id) {
+    // One-shot status fetch on selection; thereafter the daemon's filesystem
+    // watcher pushes `worktree-dirty` whenever the status content changes, and
+    // that handler re-fetches. No frontend per-second poll (battery work).
     void loadGitStatus($id).catch((err) => error.set(toMessage(err)));
     void loadPrStatus($id);
     // Restore any daemon-owned composite chain in flight for this worktree, so
     // switching INTO a worktree mid-chain shows the exact step (and keeps
     // following its events). The query is a fast in-memory read.
     void refreshActiveJobs($id);
-    startGitStatusPolling($id);
     if (get(railView) === "history") void loadCommitLog();
   }
 });
