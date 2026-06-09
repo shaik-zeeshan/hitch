@@ -9,6 +9,8 @@
   import { dirtyWorktrees, removeWorktree, scopeAttributionForWorktree, sessions } from "../daemon";
   import { removeWorktreeTarget } from "../overlays";
   import { removeWorktreeTitle, remotePathAttribution } from "../scopeCopy";
+  import { worktreeToast } from "../appToast";
+  import { autoErrorMessage } from "../composerToast";
 
   const target = $derived($removeWorktreeTarget);
   const dirty = $derived(target ? !!$dirtyWorktrees[target.id] : false);
@@ -36,37 +38,25 @@
     return `This worktree has ${list}. Removing it discards the working tree${kills}. Commits on the branch are kept.`;
   });
 
-  let submitting = $state(false);
-  let errMsg = $state<string | null>(null);
-
-  let openedFor = $state<string | null>(null);
-  $effect(() => {
-    if (target && target.id !== openedFor) {
-      openedFor = target.id;
-      submitting = false;
-      errMsg = null;
-    } else if (!target) {
-      openedFor = null;
-    }
-  });
-
   function onOpenChange(next: boolean) {
     if (!next) removeWorktreeTarget.set(null);
   }
 
-  async function confirm() {
+  // Removal is a non-blocking background task surfaced via a toast (loading →
+  // success/error), matching every other git action (see RightRail). Bind the
+  // toast to the worktree's identity BEFORE removal: worktreeToast() resolves the
+  // branch label at bind time, and removeWorktree() prunes the worktree from the
+  // store, so binding later would lose the label. The dialog closes immediately
+  // so the (possibly slow, remote-over-SSH) removal never blocks the user.
+  function confirm() {
     const w = target;
-    if (!w || submitting) return;
-    submitting = true;
-    errMsg = null;
-    try {
-      await removeWorktree(w.id, false, true);
-      removeWorktreeTarget.set(null);
-    } catch (err) {
-      errMsg = err instanceof Error ? err.message : String(err);
-    } finally {
-      submitting = false;
-    }
+    if (!w) return;
+    const t = worktreeToast(w.id);
+    const id = t.loading("Removing worktree…");
+    removeWorktreeTarget.set(null);
+    void removeWorktree(w.id, false, true)
+      .then(() => t.success("Worktree removed", { id }))
+      .catch((err) => t.error(autoErrorMessage(err), { id }));
   }
 </script>
 
@@ -103,13 +93,10 @@
             >Also delete the branch <span class="mono" style="color:var(--ink-2)">(only when merged)</span></span
           >
         </span>
-        {#if errMsg}<p class="m-error">{errMsg}</p>{/if}
       </div>
       <div class="m-foot">
         <Dialog.Close class="btn">Cancel</Dialog.Close>
-        <button class="btn danger-btn" disabled={submitting} onclick={() => void confirm()}>
-          {submitting ? "Removing…" : "Remove worktree"}
-        </button>
+        <button class="btn danger-btn" onclick={confirm}>Remove worktree</button>
       </div>
     </Dialog.Content>
   </Dialog.Portal>
