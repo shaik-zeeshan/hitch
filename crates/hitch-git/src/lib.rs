@@ -4343,8 +4343,18 @@ mod tests {
         let script = temp.path().join("git-releases-on-disarm");
         fs::write(
             &script,
+            // The backgrounded grandchild is reparented to init when the leader
+            // exits, so it outlives this process. The `[ $i -ge 6000 ]` cap makes
+            // it self-terminate after ~30s if the sentinel never appears — which
+            // happens whenever the test panics or is interrupted before disarm
+            // fires, since TempDir cleanup then deletes the sentinel path so it
+            // can NEVER be created. Without the cap such an orphan spin-polls at
+            // 200Hz FOREVER, leaking an immortal ~3%-CPU process per aborted run
+            // (we found 19 of these, ~60% of a core, surviving for days). 30s is
+            // far longer than the success path needs — the sentinel normally
+            // lands in milliseconds — so the cap never perturbs the assertion.
             format!(
-                "#!/bin/sh\nprintf 'done'\n( while [ ! -e {sentinel} ]; do sleep 0.005; done; printf 'released' ) &\n",
+                "#!/bin/sh\nprintf 'done'\n( i=0; while [ ! -e {sentinel} ]; do [ \"$i\" -ge 6000 ] && exit 0; sleep 0.005; i=$((i+1)); done; printf 'released' ) &\n",
                 sentinel = shell_quote(&sentinel),
             ),
         )
