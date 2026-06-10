@@ -3692,9 +3692,9 @@ fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>
                 }
             };
 
-            // Path currently armed per worktree (None of these is the *desired*
+            // Paths currently armed per worktree (none of these is the *desired*
             // set — that is re-derived from state on each reconcile).
-            let mut watched: HashMap<WorktreeId, PathBuf> = HashMap::new();
+            let mut watched: HashMap<WorktreeId, DirtyWatch> = HashMap::new();
             // Last status seen per worktree; the change-detection baseline.
             let mut last: HashMap<WorktreeId, StatusSummary> = HashMap::new();
             // Worktrees with a pending rescan, keyed to the time it may run.
@@ -3724,7 +3724,7 @@ fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>
                         // contains it and arm a debounced rescan for it.
                         for path in &event.paths {
                             if let Some((id, _)) =
-                                watched.iter().find(|(_, root)| path.starts_with(root))
+                                watched.iter().find(|(_, w)| w.contains(path))
                             {
                                 pending
                                     .entry(*id)
@@ -3756,7 +3756,7 @@ fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>
                         }
                     }
                     pending.remove(&id);
-                    let Some(path) = watched.get(&id).cloned() else {
+                    let Some(path) = watched.get(&id).map(|w| w.workdir.clone()) else {
                         continue;
                     };
                     last_scan.insert(id, now);
@@ -3793,14 +3793,46 @@ fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>
         .expect("failed to spawn dirty watcher thread");
 }
 
+/// The filesystem paths armed for one worktree. The `workdir` recursive watch
+/// catches edits to tracked/untracked files (the dirty signal). `git_dir` is the
+/// worktree's *external* git metadata dir — for a linked worktree this is the
+/// main repo's `.git/worktrees/<name>`, which lives outside the workdir, so a
+/// commit/ref-update/index write there produces no event under `workdir`. Without
+/// watching it the History view never refreshes after a commit until a manual
+/// reload. It is `None` for the main worktree, whose `.git` is already under the
+/// workdir watch — arming a second watch there would needlessly cover `objects/`.
+struct DirtyWatch {
+    workdir: PathBuf,
+    git_dir: Option<PathBuf>,
+}
+
+impl DirtyWatch {
+    /// True when `path` falls under either watched root, mapping a filesystem
+    /// event back to this worktree.
+    fn contains(&self, path: &Path) -> bool {
+        path.starts_with(&self.workdir)
+            || self.git_dir.as_ref().is_some_and(|g| path.starts_with(g))
+    }
+}
+
+/// The external git dir to additionally watch for a worktree at `workdir`, or
+/// `None` when the git dir already sits under the workdir (the main worktree).
+/// `status()` does not rewrite the index, so watching this dir introduces no
+/// self-triggering event loop.
+fn external_git_dir(workdir: &Path) -> Option<PathBuf> {
+    let git_dir = GitRepository::discover(workdir).ok()?.git_dir().ok()?;
+    (!git_dir.starts_with(workdir)).then_some(git_dir)
+}
+
 /// Bring the filesystem watch set in line with the live worktree registry: arm a
-/// recursive watch for every worktree that lacks one (or whose path moved),
-/// seeding its status baseline so the first real change is detected without a
-/// spurious broadcast; drop watches for worktrees that are gone.
+/// recursive watch for every worktree that lacks one (or whose path moved) — plus
+/// its external git dir when it has one — seeding the status baseline so the first
+/// real change is detected without a spurious broadcast; drop watches for
+/// worktrees that are gone.
 fn reconcile_dirty_watches(
     state: &Arc<Mutex<DaemonState>>,
     watcher: &mut notify::RecommendedWatcher,
-    watched: &mut HashMap<WorktreeId, PathBuf>,
+    watched: &mut HashMap<WorktreeId, DirtyWatch>,
     last: &mut HashMap<WorktreeId, StatusSummary>,
 ) {
     let desired: HashMap<WorktreeId, PathBuf> = match state.lock() {
@@ -3819,23 +3851,55 @@ fn reconcile_dirty_watches(
         .copied()
         .collect();
     for id in gone {
-        if let Some(path) = watched.remove(&id) {
-            let _ = watcher.unwatch(&path);
+        if let Some(w) = watched.remove(&id) {
+            let _ = watcher.unwatch(&w.workdir);
+            if let Some(git_dir) = &w.git_dir {
+                let _ = watcher.unwatch(git_dir);
+            }
         }
         last.remove(&id);
     }
 
     // Arm new or moved worktrees.
     for (id, path) in &desired {
-        if watched.get(id) == Some(path) {
+        if watched.get(id).map(|w| &w.workdir) == Some(path) {
             continue;
         }
         if let Some(old) = watched.get(id) {
-            let _ = watcher.unwatch(old);
+            let _ = watcher.unwatch(&old.workdir);
+            if let Some(git_dir) = &old.git_dir {
+                let _ = watcher.unwatch(git_dir);
+            }
         }
         match watcher.watch(path, RecursiveMode::Recursive) {
             Ok(()) => {
-                watched.insert(*id, path.clone());
+                // A linked worktree's commits land only in its external git dir,
+                // so watch it too. If that watch fails we tear the workdir watch
+                // back down and leave the worktree unwatched: the next reconcile
+                // retries the whole worktree, rather than silently running with a
+                // workdir-only watch that never sees commits. `external_git_dir`
+                // is computed only here at arm time, not every reconcile, so the
+                // idle reconcile tick stays free of git work.
+                let git_dir = external_git_dir(path);
+                if let Some(git_dir) = &git_dir {
+                    if let Err(err) = watcher.watch(git_dir, RecursiveMode::Recursive) {
+                        eprintln!(
+                            "hitch-daemon: failed to watch git dir {}: {err}",
+                            git_dir.display()
+                        );
+                        let _ = watcher.unwatch(path);
+                        watched.remove(id);
+                        last.remove(id);
+                        continue;
+                    }
+                }
+                watched.insert(
+                    *id,
+                    DirtyWatch {
+                        workdir: path.clone(),
+                        git_dir,
+                    },
+                );
                 // Seed the baseline so the first event compares against the
                 // status at arm-time rather than firing a startup broadcast.
                 if let Ok(summary) =
@@ -8690,5 +8754,116 @@ mod tests {
 
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Regression for the History-goes-stale-after-commit bug: a linked worktree's
+    // commit writes only to its external `.git/worktrees/<name>` dir, never under
+    // the workdir. The dirty watcher's recursive workdir watch therefore sees
+    // nothing; it must also watch the external git dir. This drives a real
+    // `notify` watcher armed exactly as `reconcile_dirty_watches` does and proves
+    // the commit's filesystem event arrives via the git-dir watch (so a
+    // workdir-only watch — the old behavior — would have missed it).
+    #[cfg(unix)]
+    #[test]
+    fn dirty_watcher_catches_commit_in_linked_worktree_via_git_dir() {
+        use notify::{RecursiveMode, Watcher};
+        use std::process::Command;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        fn git(cwd: &std::path::Path, args: &[&str]) {
+            let ok = Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hitch-daemon-dirty-watch-{nonce}"));
+        let main = dir.join("repo");
+        let linked = dir.join("linked");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "--initial-branch=main"]);
+        git(&main, &["config", "user.name", "Hitch Test"]);
+        git(&main, &["config", "user.email", "hitch@example.test"]);
+        std::fs::write(main.join("seed.txt"), "seed\n").unwrap();
+        git(&main, &["add", "seed.txt"]);
+        git(&main, &["commit", "-m", "seed"]);
+        git(
+            &main,
+            &["worktree", "add", "-b", "feature", linked.to_str().unwrap(), "HEAD"],
+        );
+
+        // The external git dir must exist and fall outside the workdir, else there
+        // is nothing extra to watch and the bug could not occur.
+        let git_dir = super::external_git_dir(&linked)
+            .expect("linked worktree must have an external git dir to watch");
+        assert!(!git_dir.starts_with(&linked));
+
+        let watch = super::DirtyWatch {
+            workdir: linked.clone(),
+            git_dir: Some(git_dir.clone()),
+        };
+
+        let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+        let mut watcher = notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        })
+        .unwrap();
+        watcher.watch(&linked, RecursiveMode::Recursive).unwrap();
+        watcher.watch(&git_dir, RecursiveMode::Recursive).unwrap();
+
+        // Let the watch settle and drain any arm-time backlog.
+        while rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
+
+        // Commit in the linked worktree — touches only the external git dir.
+        std::fs::write(linked.join("change.txt"), "hello\n").unwrap();
+        git(&linked, &["add", "change.txt"]);
+        // Staging writes change.txt under the workdir; drain so the asserted event
+        // can only be the commit's git-dir write.
+        while rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
+        git(&linked, &["commit", "-m", "second"]);
+
+        // Poll for an event the watcher maps to this worktree, and confirm at least
+        // one arrived from the git dir (not the workdir) — the signal a workdir-only
+        // watch would never have received.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_git_dir_event = false;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(Ok(event)) => {
+                    for path in &event.paths {
+                        assert!(
+                            watch.contains(path),
+                            "event path {} must map to the worktree",
+                            path.display()
+                        );
+                        if path.starts_with(&git_dir) {
+                            saw_git_dir_event = true;
+                        }
+                    }
+                    if saw_git_dir_event {
+                        break;
+                    }
+                }
+                Ok(Err(_)) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        drop(watcher);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            saw_git_dir_event,
+            "a commit in the linked worktree must produce a filesystem event under \
+             its external git dir, so the dirty watcher re-runs status()"
+        );
     }
 }

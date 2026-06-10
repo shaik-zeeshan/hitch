@@ -52,6 +52,17 @@ impl GitRepository {
         &self.root
     }
 
+    /// The git metadata directory backing this worktree. For the main worktree
+    /// this is `<root>/.git`; for a *linked* worktree (`git worktree add`) it is
+    /// the main repo's `.git/worktrees/<name>` directory, which lives **outside**
+    /// the workdir. A commit, ref update, or index write lands here — never in the
+    /// workdir — so a filesystem watch on the workdir alone never observes them.
+    /// Callers watching for git-state changes must watch this path too.
+    pub fn git_dir(&self) -> Result<PathBuf> {
+        let repo = Repository::open(&self.root)?;
+        Ok(repo.path().to_path_buf())
+    }
+
     /// Read status using libgit2.
     pub fn status(&self) -> Result<StatusSummary> {
         status(&self.root)
@@ -3599,6 +3610,57 @@ mod tests {
         assert_eq!((additions, deletions), (1, 1));
     }
 
+    // A linked worktree's git metadata lives in the main repo's
+    // `.git/worktrees/<name>` dir, OUTSIDE the workdir — so a commit (which only
+    // touches refs/HEAD/logs there) produces no filesystem event under the
+    // workdir. The dirty watcher watches the workdir recursively; without also
+    // watching this external git dir it never re-runs `status()` after a commit,
+    // and the GUI's History view goes stale until a manual refresh.
+    #[test]
+    fn git_dir_of_linked_worktree_is_outside_workdir() {
+        let fixture = RepoFixture::new();
+        run_real_git(
+            fixture.path(),
+            ["worktree", "add", "-b", "feature", "../linked-wt", "HEAD"],
+        );
+        let wt_root = fixture.path().parent().unwrap().join("linked-wt");
+
+        let repo = GitRepository::discover(&wt_root).unwrap();
+        let git_dir = repo.git_dir().unwrap();
+
+        assert!(
+            !git_dir.starts_with(repo.root()),
+            "linked worktree git dir {} must fall outside the workdir {} so callers \
+             know a separate watch is required",
+            git_dir.display(),
+            repo.root().display()
+        );
+
+        // A commit moves HEAD, and `status()` surfaces the new id — the signal the
+        // watcher must re-read once it sees the git-dir event.
+        let head_before = repo.status().unwrap().head_commit_id;
+        fixture.write_in("../linked-wt/new.txt", "hello\n");
+        run_real_git(&wt_root, ["add", "new.txt"]);
+        run_real_git(&wt_root, ["commit", "-m", "second"]);
+        let head_after = repo.status().unwrap().head_commit_id;
+        assert_ne!(head_before, head_after, "commit must move the HEAD id");
+    }
+
+    #[test]
+    fn git_dir_of_main_worktree_is_inside_workdir() {
+        // The main worktree's `.git` is already covered by a recursive workdir
+        // watch, so the daemon must NOT arm a redundant second watch for it.
+        let fixture = RepoFixture::new();
+        let repo = GitRepository::discover(fixture.path()).unwrap();
+        let git_dir = repo.git_dir().unwrap();
+        assert!(
+            git_dir.starts_with(repo.root()),
+            "main worktree git dir {} should live under the workdir {}",
+            git_dir.display(),
+            repo.root().display()
+        );
+    }
+
     fn head_sha(fixture: &RepoFixture) -> String {
         sha_of(fixture, "HEAD")
     }
@@ -4144,6 +4206,16 @@ mod tests {
 
         fn write(&self, relative: &str, contents: &str) {
             fs::write(self.path.join(relative), contents).unwrap();
+        }
+
+        /// Write a file at a path relative to the repo root, allowing `..` to
+        /// reach a sibling worktree created with `git worktree add ../name`.
+        fn write_in(&self, relative: &str, contents: &str) {
+            let target = self.path.join(relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(target, contents).unwrap();
         }
 
         fn git<const N: usize>(&self, args: [&str; N]) {
