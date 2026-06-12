@@ -448,7 +448,22 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     #[cfg(windows)]
     let pid_lock = None;
 
-    let listener = DaemonListener::bind(&config.socket_path)?;
+    // `Arc`, not a plain owner moved into the accept thread: the socket file is
+    // unlinked by `DaemonListener::drop`, so whoever holds the last reference
+    // decides *when* the rendezvous socket disappears. The accept thread exits at
+    // the very START of shutdown (its `accept()` is unparked, it breaks), but the
+    // pidfile lock — the singleton gate — is only released at the END, after
+    // `wait_for_jobs_to_finish`/`kill_all_sessions` (which can block for seconds
+    // draining a cancelled Job). If the listener were owned by that thread, the
+    // socket would vanish at thread exit while the lock stayed held through the
+    // drain — a window in which a relaunching app sees "socket absent" and spawns
+    // a replacement that then hits "another daemon already owns" and refuses to
+    // start (the exact split-brain restart failure). Holding a clone here keeps
+    // the socket present until `run_daemon` returns, so the socket and the lock
+    // disappear together: a relaunch lands on a still-present-but-unserviced
+    // endpoint, classifies it as a live-but-slow daemon (connect succeeds, Hello
+    // times out), and waits instead of double-spawning.
+    let listener = Arc::new(DaemonListener::bind(&config.socket_path)?);
     // The listener stays in blocking mode: a dedicated accept thread parks in
     // `accept()` so no poll gap exists in which a connect-write-close client is
     // dropped (see the accept thread below and ADR 0012). The old nonblocking
@@ -504,6 +519,10 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     // still poll (ADR 0012).
     let (accept_tx, accept_rx) = mpsc::channel::<DaemonStream>();
     let accept_shutdown = Arc::clone(&shutdown);
+    // Clone the listener into the accept thread; `run_daemon` keeps the original
+    // reference alive through the shutdown drain so the socket file outlives this
+    // thread (see the `Arc::new(DaemonListener::bind(...))` rationale above).
+    let accept_listener = Arc::clone(&listener);
     let accept_thread = thread::Builder::new()
         .name("hitch-accept".to_string())
         .spawn(move || {
@@ -516,7 +535,7 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
             const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
             let mut backoff = ACCEPT_BACKOFF_MIN;
             loop {
-                match listener.accept() {
+                match accept_listener.accept() {
                     Ok(stream) => {
                         backoff = ACCEPT_BACKOFF_MIN;
                         if accept_shutdown.load(Ordering::SeqCst) {
@@ -588,7 +607,15 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     cancel_active_jobs(&state);
     wait_for_jobs_to_finish(&state);
     kill_all_sessions(&state);
-    // Unix pidfile + socket are removed by `DaemonFileGuard` as it drops on return.
+    // `listener` (the `Arc<DaemonListener>` original) is intentionally still alive
+    // here: it has kept the socket file present through the drain above so the
+    // socket and the pidfile lock disappear together, not seconds apart. Let it
+    // drop by scope exit, NOT an explicit `drop()` — `_daemon_files` is declared
+    // after `listener`, so on return the guard drops first (releasing the lock and
+    // unlinking the pidfile + socket) and this `listener` reference drops second,
+    // its `DaemonListener::drop` re-unlinking the already-gone socket as a no-op.
+    // An explicit `drop(listener)` here would instead remove the socket just before
+    // the guard releases the lock, reopening the very window this fix closes.
     Ok(())
 }
 
