@@ -568,7 +568,13 @@
   >
     <div class="cmp-head" class:is-error={Boolean(prFailed)}>
       {#if prFailed}
-        <span class="label"><span class="err-mk">✗</span> {prFailed.step} failed — retry</span>
+        <button
+          class="label"
+          type="button"
+          title="Retry create pull request"
+          aria-label="Retry create pull request"
+          onclick={() => void confirmPr()}
+        ><span class="err-mk">✗</span> {prFailed.step} failed — retry</button>
       {:else if prInProgress}
         <span class="label on-iris">
           <ArrowUp class="btnic icon" />
@@ -584,17 +590,13 @@
       <button
         class="close"
         type="button"
-        title={prFailed ? "Retry" : prInProgress ? "Hands-off" : "Close"}
-        aria-label={prFailed ? "Retry create pull request" : "Close composer"}
+        title={prInProgress && !prFailed ? "Hands-off" : "Close"}
+        aria-label="Close composer"
         disabled={prInProgress && !prFailed}
         onclick={() => {
-          if (prFailed) {
-            void confirmPr();
-          } else if (!prInProgress) {
-            close();
-          }
+          if (!(prInProgress && !prFailed)) close();
         }}
-      >{prFailed ? "▾" : "×"}</button>
+      >×</button>
       {#if prInProgress && !prFailed}
         <div class="hairline"></div>
       {/if}
@@ -670,8 +672,23 @@
   <div class="composer auto">
     <div class="cmp-head" class:is-error={Boolean(autoFailed)}>
       {#if autoFailed}
-        <span class="label"><span class="err-mk">✗</span> {autoFailed.step} failed — retry</span>
-        <button class="close" type="button" title="Retry" aria-label="Retry commit and push" onclick={() => void retryAuto()}>▾</button>
+        <button
+          class="label"
+          type="button"
+          title="Retry commit and push"
+          aria-label="Retry commit and push"
+          onclick={() => void retryAuto()}
+        ><span class="err-mk">✗</span> {autoFailed.step} failed — retry</button>
+        <button
+          class="close"
+          type="button"
+          title="Dismiss"
+          aria-label="Dismiss failed chain"
+          onclick={() => {
+            const w = $gitWorktreeId;
+            if (w) clearCompositeChain(w);
+          }}
+        >×</button>
       {:else}
         <span class="label on-iris"><span class="iris-dot"></span> {autoStepLabel}</span>
         <button
