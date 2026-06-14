@@ -733,6 +733,14 @@ struct DaemonState {
     /// partial files (see `unregister_client`). A session closing deletes its whole
     /// upload dir and drops any of its in-flight uploads here.
     uploads: HashMap<UploadId, ActiveUpload>,
+    /// Background fallback for the latest forwarded `SSH_AUTH_SOCK` (ADR 0014).
+    /// Refreshed every time a proxy sends a `ConnEnv` prelude. Background ops
+    /// (auto-fetch, watchers) that have no originating connection sign through
+    /// this while a session is attached; after the proxy disconnects the socket
+    /// is dead and `BatchMode=yes` makes such ops fail fast rather than prompt on
+    /// the remote. `None` until the first proxy connects (and for a purely local
+    /// daemon), keeping today's plain env inheritance.
+    forwarded_ssh_auth_sock: Option<String>,
 }
 
 /// One in-flight file-drop upload (issue #31). Holds the open file handle the
@@ -765,6 +773,7 @@ impl DaemonState {
             broadcaster: OutputBroadcaster::default(),
             jobs: HashMap::new(),
             uploads: HashMap::new(),
+            forwarded_ssh_auth_sock: None,
         }
     }
 }
@@ -1018,6 +1027,14 @@ struct ClientSink {
     agent_state_live: AtomicBool,
     /// Snapshot-dependent events buffered while `agent_state_live` is closed.
     pending_agent_state_events: Mutex<Vec<Event>>,
+    /// This connection's forwarded `SSH_AUTH_SOCK` path, declared by the SSH
+    /// proxy's one-time `ConnEnv` prelude (ADR 0014, SSH agent forwarding).
+    /// `None` for a local (non-proxy) GUI, which never emits `ConnEnv` — those
+    /// git ops keep inheriting the daemon's env exactly as before. User-initiated
+    /// git on this connection signs through this socket; background ops fall back
+    /// to [`DaemonState::forwarded_ssh_auth_sock`]. `Mutex` for interior
+    /// mutability since the sink lives behind an `Arc`.
+    ssh_auth_sock: Mutex<Option<String>>,
 }
 
 fn restore_layout(
@@ -1104,6 +1121,7 @@ fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &DaemonStream) -> io
             pending_job_events: Mutex::new(Vec::new()),
             agent_state_live: AtomicBool::new(false),
             pending_agent_state_events: Mutex::new(Vec::new()),
+            ssh_auth_sock: Mutex::new(None),
         }),
     );
     Ok(client_id)
@@ -1159,6 +1177,25 @@ fn handle_client(
                 continue;
             }
         };
+
+        // The SSH proxy's one-time connection prelude (ADR 0014, agent
+        // forwarding): record this connection's forwarded `SSH_AUTH_SOCK` so
+        // user-initiated git on it signs through the local user's forwarded
+        // agent, and refresh the daemon-wide fallback so background ops can use
+        // the latest forwarded socket too. It is NOT a Request — never dispatch
+        // it. A local (non-proxy) GUI never sends it.
+        if let ControlMessage::ConnEnv { ssh_auth_sock } = &message {
+            if let Ok(mut state) = state.lock() {
+                if let Some(sink) = state.clients.get(&client_id) {
+                    if let Ok(mut slot) = sink.ssh_auth_sock.lock() {
+                        *slot = Some(ssh_auth_sock.clone());
+                    }
+                }
+                // Refresh the background fallback to the latest forwarded socket.
+                state.forwarded_ssh_auth_sock = Some(ssh_auth_sock.clone());
+            }
+            continue;
+        }
 
         let ControlMessage::Request { id, request } = message else {
             continue;
@@ -3569,6 +3606,26 @@ fn git_context(
     Ok((state.git.clone(), worktree.path.clone()))
 }
 
+/// Resolve the forwarded `SSH_AUTH_SOCK` to use for a git op originated by
+/// `client_id` (ADR 0014, SSH agent forwarding). Prefers this connection's own
+/// declared socket (a user-initiated push/pull/fetch), falling back to the
+/// daemon-wide latest forwarded socket (background ops with no originating
+/// connection). `None` when neither is set — a local daemon, or a remote daemon
+/// with no attached session — in which case git inherits the env exactly as
+/// before. The resolved `String` is captured into the Job closure by the caller
+/// so a mid-op disconnect doesn't lose it.
+fn resolve_ssh_auth_sock(state: &Arc<Mutex<DaemonState>>, client_id: u64) -> Option<String> {
+    let state = state.lock().ok()?;
+    if let Some(sink) = state.clients.get(&client_id) {
+        if let Ok(slot) = sink.ssh_auth_sock.lock() {
+            if let Some(sock) = slot.as_ref() {
+                return Some(sock.clone());
+            }
+        }
+    }
+    state.forwarded_ssh_auth_sock.clone()
+}
+
 fn refreshed_worktree_context(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
@@ -5020,8 +5077,10 @@ fn run_commit_and_push(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
     settings: Option<DraftGenerationSettings>,
+    ssh_auth_sock: Option<String>,
     control: &JobControl,
 ) -> Result<Response, ProtocolError> {
+    let ssh_auth_sock = ssh_auth_sock.map(OsString::from);
     // Each rung runs through `ctx.run_step` (enter -> work -> finish on Ok,
     // CompositeJobFailed on Err); `step!` collapses that to the runner's
     // terminal `Ok(response)`. Cancel checks stay between rungs.
@@ -5030,6 +5089,10 @@ fn run_commit_and_push(
         CompositeJobResult::default(),
         || {
             let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
+            // Inject the forwarded ssh-agent socket so the Pushing rung signs via
+            // the local user's agent (ADR 0014). The clone is reused by Staging/
+            // Committing too — harmless there (no network).
+            let git = git.with_ssh_auth_sock(ssh_auth_sock.clone());
             stage_for_commit_and_push(&git, &worktree.path)?;
             Ok((git, worktree))
         },
@@ -5087,8 +5150,10 @@ fn run_create_pr(
     worktree_id: WorktreeId,
     base: Option<String>,
     settings: Option<DraftGenerationSettings>,
+    ssh_auth_sock: Option<String>,
     control: &JobControl,
 ) -> Result<Response, ProtocolError> {
+    let ssh_auth_sock = ssh_auth_sock.map(OsString::from);
     // Validate the base BEFORE pushing: a missing base would otherwise only be
     // caught in Drafting, after the push had already run. Fail with the same
     // Drafting `CompositeJobFailed` (identical message) the chain would have
@@ -5111,6 +5176,7 @@ fn run_create_pr(
         CompositeJobResult::default(),
         || {
             let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
+            let git = git.with_ssh_auth_sock(ssh_auth_sock.clone());
             git.push_with_control(&worktree.path, "origin", &worktree.branch, true, control)
                 .map_err(git_error)?;
             Ok((git, worktree))
@@ -5322,33 +5388,46 @@ fn dispatch_job(
                 })
             },
         ),
-        JobRequest::Push { worktree_id } => start_job(
-            "hitch-push",
-            state,
-            client_id,
-            request_id,
-            Some("push"),
-            Some("Pushing…"),
-            move |state, control| do_push(state, worktree_id, control),
-        ),
-        JobRequest::Fetch { worktree_id } => start_job(
-            "hitch-fetch",
-            state,
-            client_id,
-            request_id,
-            Some("fetch"),
-            Some("Fetching…"),
-            move |state, control| do_fetch(state, worktree_id, control),
-        ),
-        JobRequest::Pull { worktree_id } => start_job(
-            "hitch-pull",
-            state,
-            client_id,
-            request_id,
-            Some("pull"),
-            Some("Pulling…"),
-            move |state, control| do_pull(state, worktree_id, control),
-        ),
+        JobRequest::Push { worktree_id } => {
+            // Resolve the forwarded ssh-agent socket at dispatch time and capture
+            // it into the Job closure by `move` (ADR 0014): a mid-op disconnect
+            // can't lose it. Prefers this connection's socket, else the daemon
+            // fallback; `None` keeps plain env inheritance for a local daemon.
+            let ssh_auth_sock = resolve_ssh_auth_sock(state, client_id);
+            start_job(
+                "hitch-push",
+                state,
+                client_id,
+                request_id,
+                Some("push"),
+                Some("Pushing…"),
+                move |state, control| do_push(state, worktree_id, ssh_auth_sock, control),
+            )
+        }
+        JobRequest::Fetch { worktree_id } => {
+            let ssh_auth_sock = resolve_ssh_auth_sock(state, client_id);
+            start_job(
+                "hitch-fetch",
+                state,
+                client_id,
+                request_id,
+                Some("fetch"),
+                Some("Fetching…"),
+                move |state, control| do_fetch(state, worktree_id, ssh_auth_sock, control),
+            )
+        }
+        JobRequest::Pull { worktree_id } => {
+            let ssh_auth_sock = resolve_ssh_auth_sock(state, client_id);
+            start_job(
+                "hitch-pull",
+                state,
+                client_id,
+                request_id,
+                Some("pull"),
+                Some("Pulling…"),
+                move |state, control| do_pull(state, worktree_id, ssh_auth_sock, control),
+            )
+        }
         JobRequest::PrStatus { worktree_id } => start_job(
             "hitch-pr-status",
             state,
@@ -5437,43 +5516,54 @@ fn dispatch_job(
         JobRequest::CommitAndPush {
             worktree_id,
             settings,
-        } => start_composite_job(
-            "hitch-commit-and-push",
-            state,
-            client_id,
-            request_id,
-            worktree_id,
-            CompositeJobKind::CommitAndPush,
-            CompositeStep::Staging,
-            move |ctx, state, control| {
-                run_commit_and_push(ctx, state, worktree_id, settings, control)
-            },
-        ),
+        } => {
+            // The commit-and-push chain also pushes from the remote daemon, so it
+            // needs the same forwarded ssh-agent socket (ADR 0014). Resolve and
+            // capture it now so a mid-chain disconnect can't lose it.
+            let ssh_auth_sock = resolve_ssh_auth_sock(state, client_id);
+            start_composite_job(
+                "hitch-commit-and-push",
+                state,
+                client_id,
+                request_id,
+                worktree_id,
+                CompositeJobKind::CommitAndPush,
+                CompositeStep::Staging,
+                move |ctx, state, control| {
+                    run_commit_and_push(ctx, state, worktree_id, settings, ssh_auth_sock, control)
+                },
+            )
+        }
         JobRequest::CreatePr {
             worktree_id,
             base,
             settings,
-        } => start_composite_job(
-            "hitch-create-pr-chain",
-            state,
-            client_id,
-            request_id,
-            worktree_id,
-            CompositeJobKind::CreatePr,
-            CompositeStep::Pushing,
-            move |ctx, state, control| {
-                run_create_pr(ctx, state, worktree_id, base, settings, control)
-            },
-        ),
+        } => {
+            let ssh_auth_sock = resolve_ssh_auth_sock(state, client_id);
+            start_composite_job(
+                "hitch-create-pr-chain",
+                state,
+                client_id,
+                request_id,
+                worktree_id,
+                CompositeJobKind::CreatePr,
+                CompositeStep::Pushing,
+                move |ctx, state, control| {
+                    run_create_pr(ctx, state, worktree_id, base, settings, ssh_auth_sock, control)
+                },
+            )
+        }
     }
 }
 
 fn do_push(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
+    ssh_auth_sock: Option<String>,
     control: &JobControl,
 ) -> Result<Response, ProtocolError> {
     let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
+    let git = git.with_ssh_auth_sock(ssh_auth_sock.map(OsString::from));
     git.push_with_control(&worktree.path, "origin", &worktree.branch, true, control)
         .map_err(git_error)?;
     Ok(Response::Ack)
@@ -5481,9 +5571,11 @@ fn do_push(
 fn do_fetch(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
+    ssh_auth_sock: Option<String>,
     control: &JobControl,
 ) -> Result<Response, ProtocolError> {
     let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
+    let git = git.with_ssh_auth_sock(ssh_auth_sock.map(OsString::from));
     git.fetch_with_control(&worktree.path, "origin", control)
         .map_err(git_error)?;
     Ok(Response::Ack)
@@ -5492,9 +5584,11 @@ fn do_fetch(
 fn do_pull(
     state: &Arc<Mutex<DaemonState>>,
     worktree_id: WorktreeId,
+    ssh_auth_sock: Option<String>,
     control: &JobControl,
 ) -> Result<Response, ProtocolError> {
     let (git, worktree) = refreshed_worktree_context(state, worktree_id)?;
+    let git = git.with_ssh_auth_sock(ssh_auth_sock.map(OsString::from));
     git.pull_with_control(&worktree.path, "origin", &worktree.branch, control)
         .map_err(git_error)?;
     Ok(Response::Ack)
@@ -6297,6 +6391,7 @@ mod tests {
             pending: Mutex::new(Vec::new()),
             pending_job_events: Mutex::new(Vec::new()),
             pending_agent_state_events: Mutex::new(Vec::new()),
+        ssh_auth_sock: Mutex::new(None),
         });
         {
             let mut guard = state.lock().unwrap();
@@ -6392,6 +6487,7 @@ mod tests {
             pending: Mutex::new(Vec::new()),
             pending_job_events: Mutex::new(Vec::new()),
             pending_agent_state_events: Mutex::new(Vec::new()),
+        ssh_auth_sock: Mutex::new(None),
         });
         {
             let mut guard = state.lock().unwrap();
@@ -7005,6 +7101,7 @@ mod tests {
             pending: Mutex::new(Vec::new()),
             pending_job_events: Mutex::new(Vec::new()),
             pending_agent_state_events: Mutex::new(Vec::new()),
+        ssh_auth_sock: Mutex::new(None),
         });
         let blocked = Arc::new(super::ClientSink {
             writer: Mutex::new(super::DaemonStream::new(peer_writer)),
@@ -7014,6 +7111,7 @@ mod tests {
             pending: Mutex::new(Vec::new()),
             pending_job_events: Mutex::new(Vec::new()),
             pending_agent_state_events: Mutex::new(Vec::new()),
+        ssh_auth_sock: Mutex::new(None),
         });
         {
             let mut guard = state.lock().unwrap();
@@ -7338,6 +7436,7 @@ mod tests {
             pending: Mutex::new(Vec::new()),
             pending_job_events: Mutex::new(Vec::new()),
             pending_agent_state_events: Mutex::new(Vec::new()),
+        ssh_auth_sock: Mutex::new(None),
         });
         {
             let mut guard = state.lock().unwrap();
@@ -8316,6 +8415,7 @@ mod tests {
             pending: Mutex::new(Vec::new()),
             pending_job_events: Mutex::new(Vec::new()),
             pending_agent_state_events: Mutex::new(Vec::new()),
+        ssh_auth_sock: Mutex::new(None),
         });
         {
             let mut guard = state.lock().unwrap();
@@ -8697,7 +8797,8 @@ mod tests {
         };
 
         let result =
-            super::run_commit_and_push(&ctx, &state, worktree_id, None, &control).unwrap_err();
+            super::run_commit_and_push(&ctx, &state, worktree_id, None, None, &control)
+                .unwrap_err();
         assert!(
             result.message.contains("cancelled"),
             "a cancelled chain stops before the next step: {}",

@@ -1671,7 +1671,8 @@ fn expect_transport_response(
                 }
                 ControlMessage::Event { .. }
                 | ControlMessage::Request { .. }
-                | ControlMessage::Response { .. } => {}
+                | ControlMessage::Response { .. }
+                | ControlMessage::ConnEnv { .. } => {}
             }
         }
     }
