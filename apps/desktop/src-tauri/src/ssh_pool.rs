@@ -1056,12 +1056,28 @@ impl SshConnections {
                 // The `ForwardAgent=yes` flag above is KEPT regardless (plan
                 // decision #9: toggle ON => BOTH paths, for rolling upgrade).
                 #[cfg(unix)]
-                if connection.forward_agent && ssh_agent_bridge::local_agent_socket().is_some() {
-                    write_remote_control(connection, &ControlMessage::SshAgentRelay);
-                    debug_log_pool(format_args!(
-                        "declared ssh-agent relay to {} (local agent reachable, toggle on)",
-                        connection.target
-                    ));
+                if connection.forward_agent {
+                    if let Some(socket) = ssh_agent_bridge::local_agent_socket() {
+                        write_remote_control(connection, &ControlMessage::SshAgentRelay);
+                        debug_log_pool(format_args!(
+                            "declared ssh-agent relay to {} (local agent {} reachable, toggle on)",
+                            connection.target,
+                            socket.display()
+                        ));
+                        // Self-diagnosis: a reachable agent with ZERO identities is
+                        // the #1 cause of an opaque remote "Permission denied
+                        // (publickey)" three machines away (agent locked, or the
+                        // wrong/empty SSH_AUTH_SOCK). Surface it once, here, instead.
+                        if ssh_agent_bridge::agent_identity_count(&socket) == Some(0) {
+                            eprintln!(
+                                "hitch: ssh-agent relay to {} resolved agent {} but it has 0 keys; \
+                                 remote git auth will fail. Unlock the agent, or check \
+                                 IdentityAgent/SSH_AUTH_SOCK points at the right one.",
+                                connection.target,
+                                socket.display()
+                            );
+                        }
+                    }
                 }
                 Ok(())
             }

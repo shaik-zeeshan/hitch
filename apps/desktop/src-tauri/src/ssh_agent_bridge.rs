@@ -31,47 +31,174 @@
 //! `ssh_pool::write_remote_control`).
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use hitch_proto::ControlMessage;
+
+/// Reserved-TLD sentinel destination handed to `ssh -G` to resolve the user's
+/// DEFAULT ssh-agent (their `Host *` / global `IdentityAgent`) rather than any
+/// specific git provider's `Host` block. `ssh -G` requires *a* destination but
+/// never connects; a `.invalid` host (RFC 2606) matches no real `Host` block, so
+/// the resolved `IdentityAgent` is the agent-app-agnostic global default — which
+/// is exactly the one the user's own `ssh`/`git` use for everything.
+const AGENT_PROBE_HOST: &str = "hitch-default-agent-probe.invalid";
 
 /// Resolve the local ssh-agent socket to bridge to. Used BOTH as the capability
 /// gate (is an agent reachable at all? — drives whether the GUI even declares the
 /// relay) and as the connect target when the daemon opens a channel.
 ///
-/// Resolution ladder:
-/// 1. `SSH_AUTH_SOCK` if set and non-empty (the OpenSSH/forwarded-agent default,
-///    and what `ssh-add` itself honors), else
-/// 2. the 1Password fixed socket `$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock`
-///    IF it exists — 1Password does NOT export `SSH_AUTH_SOCK` itself, so many
-///    Macs only have this path, else
-/// 3. `None` (no reachable agent; the relay is not declared and any stray
-///    `SshAgentOpen` is closed immediately).
+/// Resolves the agent **the way OpenSSH itself does** — so it works for any agent
+/// app (1Password, Bitwarden, Secretive, gpg-agent, a forwarded socket) and is
+/// immune to the macOS "GUI launched from the Dock loses the shell environment"
+/// trap that otherwise leaves `SSH_AUTH_SOCK` pointing at the empty system agent:
 ///
-/// `$HOME` is expanded via `HOME` because this crate has no `~` expander (the
-/// only precedent for reading agent env is the daemon proxy reading
-/// `SSH_AUTH_SOCK`).
+/// 1. The effective `IdentityAgent` from `ssh -G` (honors `Host *`/`Match`,
+///    `Include`, `~`-expansion and the `none`/`SSH_AUTH_SOCK` tokens):
+///    * an explicit socket path -> use it;
+///    * `none` -> the user disabled agent auth, return `None`;
+///    * `SSH_AUTH_SOCK` / unset -> defer to the environment (step 2).
+/// 2. `SSH_AUTH_SOCK` if set, non-empty, and NOT macOS's empty launchd system
+///    agent (a Dock-launched GUI inherits that in place of the user's real shell
+///    value — bridging it is the original bare-"Permission denied" bug).
+/// 3. Labeled fallback: the 1Password fixed socket if it exists — 1Password does
+///    NOT export `SSH_AUTH_SOCK` itself, so a no-config 1Password Mac has only
+///    this path. App-specific on purpose and intentionally LAST; every
+///    config/env-driven path above wins.
+///
+/// `None` => no reachable agent; the relay is not declared and any stray
+/// `SshAgentOpen` is closed immediately.
 pub fn local_agent_socket() -> Option<PathBuf> {
-    if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") {
-        if !sock.is_empty() {
+    resolve_local_agent(
+        ssh_config_identity_agent(),
+        std::env::var_os("SSH_AUTH_SOCK"),
+        one_password_fallback_socket(),
+    )
+}
+
+/// Pure resolution policy for [`local_agent_socket`], factored out so it is
+/// testable without spawning `ssh` or mutating process env. See that function's
+/// doc comment for the ladder.
+fn resolve_local_agent(
+    identity_agent: Option<String>,
+    ssh_auth_sock: Option<OsString>,
+    one_password_fallback: Option<PathBuf>,
+) -> Option<PathBuf> {
+    // 1. Honor ssh's own IdentityAgent resolution.
+    match identity_agent.as_deref().map(str::trim) {
+        // The user explicitly disabled agent auth — respect it, never fall back.
+        Some("none") => return None,
+        // The default / explicit token: defer to SSH_AUTH_SOCK below.
+        Some("SSH_AUTH_SOCK") | Some("") | None => {}
+        // An explicit socket path (ssh -G already ~-expanded it).
+        Some(path) => return Some(PathBuf::from(path)),
+    }
+
+    // 2. SSH_AUTH_SOCK from the environment — but never macOS's empty launchd
+    //    system agent, which a Dock-launched GUI inherits in place of the user's
+    //    real shell value.
+    if let Some(sock) = ssh_auth_sock {
+        if !sock.is_empty() && !is_macos_launchd_agent(Path::new(&sock)) {
             return Some(PathBuf::from(sock));
         }
     }
+
+    // 3. Labeled fallback.
+    one_password_fallback
+}
+
+/// Ask OpenSSH itself for the effective `IdentityAgent` via `ssh -G`, so we honor
+/// the user's full ssh config (Host/Match blocks, `Include`, `~`-expansion, the
+/// `none`/`SSH_AUTH_SOCK` tokens) with zero reimplementation and no app-specific
+/// knowledge. Returns the raw value (an absolute path, or the `none`/
+/// `SSH_AUTH_SOCK` token), or `None` if ssh is unavailable, fails, or emits no
+/// `identityagent` line (i.e. the OpenSSH default — treated as `SSH_AUTH_SOCK`).
+///
+/// `/usr/bin/ssh` is invoked by absolute path because a Dock-launched GUI has the
+/// minimal launchd PATH; `ssh -G` never connects, so a `.invalid` sentinel host
+/// is resolved offline and fast.
+fn ssh_config_identity_agent() -> Option<String> {
+    let output = std::process::Command::new("/usr/bin/ssh")
+        .arg("-G")
+        .arg(AGENT_PROBE_HOST)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        // `ssh -G` emits "keyword value" with lowercase keywords and no
+        // indentation; the value (a socket path) may itself contain spaces, so
+        // take the entire remainder after the keyword rather than splitting.
+        if let Some(value) = line.trim_start().strip_prefix("identityagent ") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The 1Password fixed agent socket if it exists. `$HOME` is expanded via `HOME`
+/// because this crate has no `~` expander.
+fn one_password_fallback_socket() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     if home.is_empty() {
         return None;
     }
     let mut path = PathBuf::from(home);
     path.push("Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock");
-    if path.exists() {
-        Some(path)
-    } else {
-        None
+    path.exists().then_some(path)
+}
+
+/// Whether `path` is macOS's per-session system ssh-agent
+/// (`…/com.apple.launchd.<rand>/Listeners`). A GUI launched from the Dock/Finder
+/// inherits this in `SSH_AUTH_SOCK`, but it is empty unless the user ran
+/// `ssh-add` into it — 1Password/Bitwarden/Secretive users never do — so it must
+/// not shadow the real agent. A macOS platform fact, not an agent-app heuristic.
+fn is_macos_launchd_agent(path: &Path) -> bool {
+    path.to_str()
+        .is_some_and(|s| s.contains("/com.apple.launchd.") && s.ends_with("/Listeners"))
+}
+
+/// One-shot `ssh-add -l` equivalent for self-diagnosis ONLY (never the hot path):
+/// connect to `socket`, send a single `SSH_AGENTC_REQUEST_IDENTITIES`, and parse
+/// the key count from the `SSH_AGENT_IDENTITIES_ANSWER`. Returns `Some(n)` on a
+/// well-formed answer, or `None` if the agent is unreachable or replies with
+/// anything else (e.g. `SSH_AGENT_FAILURE`). A reachable agent answering `Some(0)`
+/// is the #1 cause of an opaque remote `Permission denied (publickey)`.
+pub fn agent_identity_count(socket: &Path) -> Option<usize> {
+    let mut stream = UnixStream::connect(socket).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    // Request: uint32 len=1, byte type=11 (SSH_AGENTC_REQUEST_IDENTITIES).
+    stream.write_all(&[0, 0, 0, 1, 11]).ok()?;
+    stream.flush().ok()?;
+    // Answer header: uint32 len, byte type=12 (SSH_AGENT_IDENTITIES_ANSWER),
+    // uint32 nkeys. A shorter message (e.g. FAILURE, len=1) is "not an answer".
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).ok()?;
+    if u32::from_be_bytes(len_buf) < 5 {
+        return None;
     }
+    let mut type_and_count = [0u8; 5];
+    stream.read_exact(&mut type_and_count).ok()?;
+    if type_and_count[0] != 12 {
+        return None;
+    }
+    Some(u32::from_be_bytes([
+        type_and_count[1],
+        type_and_count[2],
+        type_and_count[3],
+        type_and_count[4],
+    ]) as usize)
 }
 
 /// A write-up sink: locks the remote connection writer and writes one control
@@ -325,19 +452,85 @@ fn debug_log(message: String) {
 mod tests {
     use super::*;
 
+    // A representative macOS Dock-launch SSH_AUTH_SOCK (the empty system agent).
+    const LAUNCHD_AGENT: &str = "/var/run/com.apple.launchd.9RLIbR5haR/Listeners";
+    const ONEPW: &str = "/Users/x/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock";
+
     #[test]
-    fn local_agent_socket_prefers_non_empty_ssh_auth_sock() {
-        // This test mutates process env, so keep it self-contained and restore.
-        let prev = std::env::var_os("SSH_AUTH_SOCK");
-        std::env::set_var("SSH_AUTH_SOCK", "/tmp/some-agent.sock");
+    fn identity_agent_path_wins_over_env_and_fallback() {
+        // An explicit `IdentityAgent <path>` is the user's deliberate choice and
+        // beats everything below it.
         assert_eq!(
-            local_agent_socket(),
-            Some(PathBuf::from("/tmp/some-agent.sock"))
+            resolve_local_agent(
+                Some("/tmp/op.sock".to_string()),
+                Some(OsString::from(LAUNCHD_AGENT)),
+                Some(PathBuf::from(ONEPW)),
+            ),
+            Some(PathBuf::from("/tmp/op.sock"))
         );
-        match prev {
-            Some(v) => std::env::set_var("SSH_AUTH_SOCK", v),
-            None => std::env::remove_var("SSH_AUTH_SOCK"),
+    }
+
+    #[test]
+    fn identity_agent_none_disables_the_relay() {
+        // `IdentityAgent none` means "no agent" — never fall back to env/1Password.
+        assert_eq!(
+            resolve_local_agent(
+                Some("none".to_string()),
+                Some(OsString::from("/tmp/some-agent.sock")),
+                Some(PathBuf::from(ONEPW)),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ssh_auth_sock_token_and_unset_defer_to_env() {
+        // Both the explicit `SSH_AUTH_SOCK` token and no identityagent line mean
+        // "use the environment".
+        for ident in [Some("SSH_AUTH_SOCK".to_string()), None] {
+            assert_eq!(
+                resolve_local_agent(ident, Some(OsString::from("/tmp/real.sock")), None),
+                Some(PathBuf::from("/tmp/real.sock"))
+            );
         }
+    }
+
+    #[test]
+    fn dock_launched_empty_launchd_agent_falls_through_to_fallback() {
+        // The regression: a Dock launch inherits the empty macOS system agent in
+        // SSH_AUTH_SOCK; it must not shadow the 1Password fallback.
+        assert_eq!(
+            resolve_local_agent(
+                None,
+                Some(OsString::from(LAUNCHD_AGENT)),
+                Some(PathBuf::from(ONEPW)),
+            ),
+            Some(PathBuf::from(ONEPW))
+        );
+        // ...and with no fallback either, there is simply no agent.
+        assert_eq!(
+            resolve_local_agent(None, Some(OsString::from(LAUNCHD_AGENT)), None),
+            None
+        );
+    }
+
+    #[test]
+    fn fallback_used_only_when_env_absent() {
+        assert_eq!(
+            resolve_local_agent(None, None, Some(PathBuf::from(ONEPW))),
+            Some(PathBuf::from(ONEPW))
+        );
+        assert_eq!(resolve_local_agent(None, None, None), None);
+    }
+
+    #[test]
+    fn detects_macos_launchd_system_agent() {
+        assert!(is_macos_launchd_agent(Path::new(LAUNCHD_AGENT)));
+        assert!(is_macos_launchd_agent(Path::new(
+            "/private/tmp/com.apple.launchd.AbC123/Listeners"
+        )));
+        assert!(!is_macos_launchd_agent(Path::new(ONEPW)));
+        assert!(!is_macos_launchd_agent(Path::new("/tmp/agent.sock")));
     }
 
     #[test]
