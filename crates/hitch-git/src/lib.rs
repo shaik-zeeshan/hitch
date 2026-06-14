@@ -2546,6 +2546,24 @@ fn command_failed(
     stdout: String,
     stderr: String,
 ) -> GitError {
+    // Opt-in observability (HITCH_DEBUG): every git/gh failure routes through
+    // here, but the error is only returned to the caller (and surfaced in the
+    // GUI), never written to the daemon log. Echo it to stderr — captured into
+    // `daemon.log` (ADR 0009) — so a remote failure's actual stderr is tailable
+    // alongside the resolved-env line, instead of needing a manual repro.
+    if non_empty_env("HITCH_DEBUG").is_some() {
+        eprintln!(
+            "hitch-git[debug]: command failed in {}: {} {} exited {:?}\nstderr: {}",
+            cwd.display(),
+            program.to_string_lossy(),
+            args.iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+            code,
+            stderr.trim(),
+        );
+    }
     GitError::CommandFailed {
         program: program.to_string_lossy().into_owned(),
         args: args
