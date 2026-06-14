@@ -2893,7 +2893,11 @@ export function forgetRemoteScope(scopeId: DaemonScopeId): void {
 // disconnect their proxy. Best-effort — a failed invoke (e.g. before the window
 // is ready) is retried on the next host change.
 function syncSshHostsToPool(hosts: SshHost[]): void {
-  void invoke("set_ssh_hosts", { targets: hosts.map((h) => h.target) }).catch(() => {});
+  // Pass each host's forwardAgent toggle so the Rust pool launches the proxy ssh
+  // with `-o ForwardAgent=yes` per-host (silly-ridge-27). Default on when unset.
+  void invoke("set_ssh_hosts", {
+    hosts: hosts.map((h) => ({ target: h.target, forwardAgent: h.forwardAgent !== false })),
+  }).catch(() => {});
 }
 
 // Retry a host now: reset its backoff in the Rust pool and reconnect immediately.

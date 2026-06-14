@@ -1905,6 +1905,11 @@ fn reader_loop(
             ControlMessage::Request { .. } => {
                 // The daemon should never send requests to the desktop client.
             }
+            ControlMessage::ConnEnv { .. } => {
+                // A proxy→daemon prelude (forwarded SSH_AUTH_SOCK, silly-ridge-27),
+                // carried only on the proxy's local socket. The desktop client sits
+                // upstream of the daemon and never receives it. Ignore.
+            }
         }
     }
 }
@@ -2658,8 +2663,14 @@ fn open_path_with_default_viewer(path: &Path) -> Result<(), String> {
 /// is the CLIENT side of the remote attach; issue #27 reuses `ssh::run_test`'s
 /// handshake helper for the real persistent connection.
 #[tauri::command]
-async fn test_ssh_host(target: String) -> Result<ssh::SshTestResult, String> {
-    tauri::async_runtime::spawn_blocking(move || ssh::run_test(&target))
+async fn test_ssh_host(
+    target: String,
+    forward_agent: Option<bool>,
+) -> Result<ssh::SshTestResult, String> {
+    // Default agent forwarding on when the caller omits the flag (silly-ridge-27),
+    // matching the per-host `forwardAgent` default.
+    let forward_agent = forward_agent.unwrap_or(true);
+    tauri::async_runtime::spawn_blocking(move || ssh::run_test(&target, forward_agent))
         .await
         .map_err(|err| format!("ssh test task failed: {err}"))
 }
@@ -3076,8 +3087,12 @@ async fn hitch_request(
 /// (with backoff), removed hosts disconnect their proxy and drop their state. The
 /// remote Daemon keeps running across a removal (ADR 0014).
 #[tauri::command]
-fn set_ssh_hosts(app: AppHandle, ssh: State<'_, ssh_pool::SshConnections>, targets: Vec<String>) {
-    ssh.inner().set_hosts(&app, targets);
+fn set_ssh_hosts(
+    app: AppHandle,
+    ssh: State<'_, ssh_pool::SshConnections>,
+    hosts: Vec<ssh_pool::SshHostConfig>,
+) {
+    ssh.inner().set_hosts(&app, hosts);
 }
 
 /// Retry a host now: reset its backoff and reconnect immediately (the Retry Now

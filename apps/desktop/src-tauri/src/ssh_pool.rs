@@ -56,7 +56,7 @@ use hitch_proto::{
     encode_control_message, encode_pty_frame, ControlMessage, Event, OsFamily, Request, RequestId,
     Response, PROTOCOL_VERSION, UPLOAD_CHUNK_BYTES,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter};
 
@@ -278,6 +278,10 @@ type RemoteWriter = ChildStdin;
 struct RemoteConnection {
     target: String,
     scope_id: String,
+    /// When set, the proxy ssh is launched with `-o ForwardAgent=yes` so the
+    /// persistent remote daemon can sign git operations through the local user's
+    /// forwarded ssh-agent (silly-ridge-27). Per-host, defaults on.
+    forward_agent: bool,
     next_request_id: AtomicU64,
     connected: AtomicBool,
     /// Bumped on each (re)connect so a stale reader/heartbeat from a superseded
@@ -312,10 +316,11 @@ struct RemoteConnection {
 }
 
 impl RemoteConnection {
-    fn new(target: String, scope_id: String) -> Self {
+    fn new(target: String, scope_id: String, forward_agent: bool) -> Self {
         Self {
             target,
             scope_id,
+            forward_agent,
             next_request_id: AtomicU64::new(1),
             connected: AtomicBool::new(false),
             generation: AtomicU64::new(0),
@@ -339,6 +344,21 @@ impl RemoteConnection {
                 .map(|w| w.is_some())
                 .unwrap_or(false)
     }
+}
+
+/// One saved SSH Host as it crosses from the frontend into the pool reconcile
+/// (`set_ssh_hosts`). Mirrors the frontend `SshHost` (camelCase over Tauri IPC):
+/// `forwardAgent` toggles `-o ForwardAgent=yes` on the proxy ssh per-host
+/// (silly-ridge-27). It defaults on when omitted so existing hosts just work.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SshHostConfig {
+    pub target: String,
+    #[serde(rename = "forwardAgent", default = "default_forward_agent")]
+    pub forward_agent: bool,
+}
+
+fn default_forward_agent() -> bool {
+    true
 }
 
 /// The remote connection pool: a managed Tauri state mapping each SSH Host scope
@@ -478,13 +498,16 @@ impl SshConnections {
     /// connection (and an initial connect attempt); removed hosts are
     /// disconnected and dropped. Idempotent: an unchanged host keeps its live
     /// connection. Called on app launch and on every host add/remove.
-    pub fn set_hosts(&self, app: &AppHandle, targets: Vec<String>) {
-        let wanted: HashMap<String, String> = targets
+    pub fn set_hosts(&self, app: &AppHandle, hosts: Vec<SshHostConfig>) {
+        // scope_id -> (normalized target, forward_agent). The forward-agent flag is
+        // per-host so a user can opt out of agent forwarding for a given host
+        // (silly-ridge-27).
+        let wanted: HashMap<String, (String, bool)> = hosts
             .into_iter()
-            .filter_map(|target| {
-                ssh::normalize_target(&target)
+            .filter_map(|host| {
+                ssh::normalize_target(&host.target)
                     .ok()
-                    .map(|t| (format!("ssh:{t}"), t))
+                    .map(|t| (format!("ssh:{t}"), (t, host.forward_agent)))
             })
             .collect();
 
@@ -492,7 +515,8 @@ impl SshConnections {
         // a stale hint behind (and the file can't grow without bound). Persist only
         // if something was actually pruned.
         {
-            let kept: std::collections::HashSet<&String> = wanted.values().collect();
+            let kept: std::collections::HashSet<&String> =
+                wanted.values().map(|(target, _)| target).collect();
             if let Ok(mut hints) = self.0.os_hints.lock() {
                 let before = hints.len();
                 hints.retain(|target, _| kept.contains(target));
@@ -520,7 +544,7 @@ impl SshConnections {
         }
 
         // Add + connect any newly-wanted scope.
-        for (scope_id, target) in wanted {
+        for (scope_id, (target, forward_agent)) in wanted {
             let already = self
                 .0
                 .connections
@@ -530,7 +554,7 @@ impl SshConnections {
             if already {
                 continue;
             }
-            let connection = Arc::new(RemoteConnection::new(target, scope_id.clone()));
+            let connection = Arc::new(RemoteConnection::new(target, scope_id.clone(), forward_agent));
             if let Ok(mut map) = self.0.connections.lock() {
                 map.insert(scope_id.clone(), connection.clone());
             }
@@ -887,9 +911,14 @@ impl SshConnections {
             .arg("-o")
             .arg("ServerAliveInterval=15")
             .arg("-o")
-            .arg("ServerAliveCountMax=3")
-            .arg("--")
-            .arg(&connection.target);
+            .arg("ServerAliveCountMax=3");
+        // Forward the local ssh-agent so the persistent remote daemon can sign
+        // git push/pull/fetch through it, with no prompt landing on the remote
+        // (silly-ridge-27). Gated per-host so a user can opt out.
+        if connection.forward_agent {
+            command.arg("-o").arg("ForwardAgent=yes");
+        }
+        command.arg("--").arg(&connection.target);
         // The candidate's remote argv (program + `daemon proxy`). The known-location
         // candidate passes `~/.local/bin/hitch` as a LITERAL arg — the remote login
         // shell expands `~`, not the local process.
@@ -1313,6 +1342,11 @@ fn remote_reader_loop(
             }
             ControlMessage::Request { .. } => {
                 // The daemon never sends requests to the client.
+            }
+            ControlMessage::ConnEnv { .. } => {
+                // A proxy→daemon prelude (forwarded SSH_AUTH_SOCK, silly-ridge-27).
+                // It travels only on the proxy's local socket toward the daemon; the
+                // GUI is upstream of the daemon and never receives it. Ignore.
             }
         }
     }
@@ -1927,7 +1961,7 @@ mod tests {
     fn read_remote_hello_skips_banner_noise_then_reads_hello() {
         // A chatty login shell prints a MOTD/banner and blank lines before the proxy
         // starts; the Hello must still be found rather than failing as Malformed.
-        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into()));
+        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into(), true));
         let mut buf = Vec::new();
         buf.extend_from_slice(b"Welcome to Ubuntu 22.04 LTS\n");
         buf.extend_from_slice(b"\n");
@@ -1945,7 +1979,7 @@ mod tests {
     #[test]
     fn read_remote_hello_records_os_family_and_exe_path() {
         // The Hello's os_family + exe_path feed the OS hint and the reconnect cache.
-        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into()));
+        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into(), true));
         let mut reader =
             std::io::Cursor::new(hello_frame(OsFamily::Windows, Some("C:/Tools/hitch.exe")));
         let _ = read_remote_hello(&mut reader, 3, &conn);
@@ -1960,7 +1994,7 @@ mod tests {
     fn read_remote_hello_gives_up_after_noise_budget() {
         // Pure non-JSON garbage past the budget fails fast as Malformed instead of
         // reading forever.
-        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into()));
+        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into(), true));
         let mut buf = Vec::new();
         for _ in 0..(MAX_HANDSHAKE_NOISE_LINES + 5) {
             buf.extend_from_slice(b"this is not protocol json\n");
@@ -1974,7 +2008,7 @@ mod tests {
 
     #[test]
     fn read_remote_hello_eof_is_no_response() {
-        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into()));
+        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into(), true));
         let mut reader = std::io::Cursor::new(Vec::new());
         assert_eq!(
             read_remote_hello(&mut reader, 1, &conn),

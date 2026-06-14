@@ -66,10 +66,10 @@ describe("addSshHost + persistence", () => {
     const { addSshHost, sshHosts } = await freshModule();
     const result = addSshHost("  prod ");
     expect(result.ok).toBe(true);
-    expect(get(sshHosts)).toEqual([{ id: "ssh:prod", target: "prod" }]);
+    expect(get(sshHosts)).toEqual([{ id: "ssh:prod", target: "prod", forwardAgent: true }]);
 
     const persisted = JSON.parse(store.get(SSH_HOSTS_KEY)!);
-    expect(persisted).toEqual([{ id: "ssh:prod", target: "prod" }]);
+    expect(persisted).toEqual([{ id: "ssh:prod", target: "prod", forwardAgent: true }]);
   });
 
   it("round-trips persisted hosts on reload", async () => {
@@ -123,7 +123,7 @@ describe("addSshHost + persistence", () => {
       ]),
     );
     const { sshHosts } = await freshModule();
-    expect(get(sshHosts)).toEqual([{ id: "ssh:ok", target: "ok" }]);
+    expect(get(sshHosts)).toEqual([{ id: "ssh:ok", target: "ok", forwardAgent: true }]);
   });
 });
 
@@ -134,7 +134,9 @@ describe("removeSshHost", () => {
     addSshHost("bravo");
     removeSshHost("ssh:alpha");
     expect(get(sshHosts).map((h) => h.target)).toEqual(["bravo"]);
-    expect(JSON.parse(store.get(SSH_HOSTS_KEY)!)).toEqual([{ id: "ssh:bravo", target: "bravo" }]);
+    expect(JSON.parse(store.get(SSH_HOSTS_KEY)!)).toEqual([
+      { id: "ssh:bravo", target: "bravo", forwardAgent: true },
+    ]);
   });
 });
 
@@ -162,7 +164,7 @@ describe("testSshHost", () => {
     invokeMock.mockResolvedValue({ ok: true, message: "Connected" });
     const { testSshHost } = await freshModule();
     const result = await testSshHost("  prod ");
-    expect(invokeMock).toHaveBeenCalledWith("test_ssh_host", { target: "prod" });
+    expect(invokeMock).toHaveBeenCalledWith("test_ssh_host", { target: "prod", forwardAgent: true });
     expect(result.ok).toBe(true);
   });
 

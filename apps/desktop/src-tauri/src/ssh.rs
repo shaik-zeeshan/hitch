@@ -319,7 +319,7 @@ fn stderr_tail(stderr: &str) -> Option<String> {
 /// Spawn `ssh … hitch daemon proxy`, attempt the Hello handshake on its stdio,
 /// terminate the subprocess, and classify the outcome. Blocking — callers run it
 /// off the UI thread (the Tauri command uses `spawn_blocking`).
-pub fn run_test(target: &str) -> SshTestResult {
+pub fn run_test(target: &str, forward_agent: bool) -> SshTestResult {
     let target = match normalize_target(target) {
         Ok(t) => t,
         Err(message) => {
@@ -332,7 +332,14 @@ pub fn run_test(target: &str) -> SshTestResult {
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
-        .arg(format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"))
+        .arg(format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"));
+    // Mirror the real persistent attach (ssh_pool): forward the local ssh-agent so
+    // the probe exercises the same transport the daemon git ops will use
+    // (silly-ridge-27). Gated on the per-host toggle.
+    if forward_agent {
+        command.arg("-o").arg("ForwardAgent=yes");
+    }
+    command
         // A leading `--` ends option processing so a target that somehow reached
         // here can never be parsed as an ssh option (defense in depth on top of
         // `normalize_target`'s leading-dash rejection).

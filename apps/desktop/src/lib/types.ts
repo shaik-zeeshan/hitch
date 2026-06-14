@@ -87,6 +87,10 @@ export type DaemonScope = {
 export type SshHost = {
   id: DaemonScopeId;
   target: string;
+  // Forward the local ssh-agent on the proxy ssh so the persistent remote daemon
+  // can sign git push/pull/fetch through it, with no prompt on the remote
+  // (silly-ridge-27). Defaults on; legacy hosts lacking the field are read as on.
+  forwardAgent?: boolean;
 };
 
 // The actionable failure categories the backend classifier returns for a failed

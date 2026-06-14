@@ -16,6 +16,9 @@
   import type { SshTestResult } from "../types";
 
   let target = $state("");
+  // Forward the local ssh-agent on the proxy ssh so the remote daemon's git ops
+  // sign through it (silly-ridge-27). Defaults on; persisted per-host on Save.
+  let forwardAgent = $state(true);
   let testing = $state(false);
   let testResult = $state<SshTestResult | null>(null);
   let errMsg = $state<string | null>(null);
@@ -24,6 +27,7 @@
     addSshHostOpen.set(next);
     if (next) {
       target = "";
+      forwardAgent = true;
       testing = false;
       testResult = null;
       errMsg = null;
@@ -55,7 +59,7 @@
     errMsg = null;
     testResult = null;
     try {
-      testResult = await testSshHost(valid.target);
+      testResult = await testSshHost(valid.target, forwardAgent);
     } catch (err) {
       // An unexpected IPC failure (the command itself errored) — show it as a
       // failed test rather than a thrown dialog error.
@@ -80,7 +84,7 @@
       errMsg = `“${valid.target}” is already saved.`;
       return;
     }
-    const result = addSshHost(valid.target);
+    const result = addSshHost(valid.target, forwardAgent);
     if (!result.ok) {
       errMsg = result.error;
       return;
@@ -114,6 +118,17 @@
           Hitch uses your OpenSSH config and ssh-agent. It stores only this target —
           no keys, passphrases, ports, or usernames.
         </p>
+
+        <label class="check">
+          <input type="checkbox" bind:checked={forwardAgent} />
+          <span>
+            <span class="check-title">Forward SSH agent</span>
+            <span class="check-sub"
+              >Lets the remote daemon sign git push/pull/fetch through your local
+              ssh-agent — no prompt on the remote.</span
+            >
+          </span>
+        </label>
 
         {#if testResult}
           {#if testResult.ok}
@@ -150,6 +165,34 @@
      vocabulary: a tinted hairline panel with a leading status dot. Success reads
      in the ok-green status hue; a classified failure reads in the oxide need hue.
      The dot carries color redundantly with the copy so it survives grayscale. */
+  /* Forward-agent toggle: a hairline checkbox row matching the dialog's quiet
+     field vocabulary. Title reads at the field weight; the sub-line is muted. */
+  .check {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-top: 10px;
+    cursor: pointer;
+  }
+  .check input {
+    margin-top: 2px;
+    flex: 0 0 auto;
+  }
+  .check span {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .check-title {
+    font-size: var(--r0);
+    color: var(--ink-1);
+  }
+  .check-sub {
+    font-size: 0.625rem;
+    color: var(--ink-2);
+    line-height: 1.4;
+  }
+
   .test-box {
     display: flex;
     align-items: flex-start;
