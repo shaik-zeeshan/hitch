@@ -10,6 +10,9 @@ description = "Hitch IPC wire contract: message enum, PTY framing, and socket tr
 hitch-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Base64 for the ssh-agent relay: raw agent wire bytes are binary, but the
+# control channel is newline-framed JSON, so SshAgentData carries them encoded.
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 interprocess = "2.4.2"

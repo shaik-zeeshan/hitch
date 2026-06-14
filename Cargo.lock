@@ -1742,6 +1742,7 @@ dependencies = [
 name = "hitch-proto"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "hitch-core",
  "interprocess",
  "serde",
