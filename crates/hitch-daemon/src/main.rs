@@ -9656,9 +9656,15 @@ mod tests {
 
         /// A control-frame reader for the GUI side of the relay over a `DaemonStream`.
         /// Owns the stream, a line decoder, AND a queue of already-decoded frames
-        /// (one read can return several frames at once). Cross-platform: the stream
-        /// is set non-blocking and polled to a wall-clock deadline, because Windows
-        /// named pipes don't support read timeouts.
+        /// (one read can return several frames at once).
+        ///
+        /// Reads are BLOCKING and cross-platform. Non-blocking is deliberately NOT
+        /// used: a Windows named-pipe non-blocking read returns `Ok(0)` when no data
+        /// is available yet (PIPE_NOWAIT), which is indistinguishable from a real
+        /// EOF, and Windows named pipes don't support read timeouts either. The relay
+        /// sends the expected frames synchronously, so a blocking read always returns;
+        /// a genuinely broken relay makes it hang and is caught by the test harness's
+        /// own timeout. `Ok(0)` therefore unambiguously means the sink peer closed.
         struct GuiReader {
             stream: DaemonStream,
             decoder: ControlLineDecoder,
@@ -9667,7 +9673,6 @@ mod tests {
 
         impl GuiReader {
             fn new(stream: DaemonStream) -> Self {
-                stream.set_nonblocking(true).unwrap();
                 Self {
                     stream,
                     decoder: ControlLineDecoder::new(),
@@ -9676,10 +9681,9 @@ mod tests {
             }
 
             /// Return the first queued/decoded frame for which `want` is `Some`,
-            /// polling the stream as needed up to a generous deadline. Non-matching
-            /// frames stay queued for a later call. Panics on EOF or deadline.
+            /// reading more (blocking) as needed. Non-matching frames stay queued for
+            /// a later call. Panics on EOF (the sink peer closed) or a read error.
             fn next_matching<T>(&mut self, mut want: impl FnMut(&ControlMessage) -> Option<T>) -> T {
-                let deadline = Instant::now() + Duration::from_secs(20);
                 let mut buf = [0u8; 8192];
                 loop {
                     while let Some(message) = self.queued.pop_front() {
@@ -9687,23 +9691,10 @@ mod tests {
                             return found;
                         }
                     }
-                    assert!(
-                        Instant::now() < deadline,
-                        "timed out waiting for the expected control frame"
-                    );
                     match self.stream.read(&mut buf) {
                         Ok(0) => panic!("gui sink closed before the expected frame"),
                         Ok(n) => self.queued.extend(self.decoder.push(&buf[..n]).unwrap()),
-                        Err(ref err)
-                            if matches!(
-                                err.kind(),
-                                std::io::ErrorKind::WouldBlock
-                                    | std::io::ErrorKind::TimedOut
-                                    | std::io::ErrorKind::Interrupted
-                            ) =>
-                        {
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
+                        Err(ref err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(err) => panic!("read gui control frame: {err}"),
                     }
                 }
