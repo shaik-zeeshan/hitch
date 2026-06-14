@@ -88,7 +88,14 @@ use serde::{Deserialize, Serialize};
 /// non-interactive `ssh host cmd` PATH. An old daemon at v26 omits it, so the
 /// field decodes to `None` and the client falls back to its candidate-path
 /// probe (the known Unix self-install location, then bare `hitch`).
-pub const PROTOCOL_VERSION: u16 = 27;
+/// v28 adds the `ConnEnv` control message the SSH proxy emits to declare its
+/// forwarded `SSH_AUTH_SOCK` (ADR 0014, agent forwarding). Because the proxy
+/// sends it as a connection prelude — ahead of the GUI's Hello, and a frame an
+/// older daemon can't parse — a persistent remote daemon MUST be restarted onto
+/// a v28 binary after upgrading; an unrestarted v27 daemon chokes on the unknown
+/// frame before it answers the Hello. Bumping the version makes the GUI reject
+/// any still-reachable older daemon as a clean protocol mismatch.
+pub const PROTOCOL_VERSION: u16 = 28;
 
 /// Maximum bytes carried by one [`Request::UploadChunk`] frame (256 KiB). The
 /// upload stream is shared with interactive PTY traffic, so chunks are bounded
@@ -1914,7 +1921,7 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 27);
+        assert_eq!(PROTOCOL_VERSION, 28);
     }
 
     #[test]
