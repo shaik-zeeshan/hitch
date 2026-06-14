@@ -1,0 +1,17 @@
+[package]
+name = "win-ssh-agent-pipe-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+# Standalone, deliberately NOT a workspace member: it is Windows-only and exists
+# to de-risk slice 7 of the ssh-agent relay plan before the Windows daemon code
+# path is built. Run it on a Windows box (see README.md). The root workspace
+# never compiles it, so the macOS-testable stages 1–6 are unaffected.
+
+[[bin]]
+name = "win-ssh-agent-pipe-spike"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+interprocess = "2.4.2"
+widestring = "1"
