@@ -2297,8 +2297,22 @@ impl CommandEnv<'_> {
             // forced bare `ssh` breaks agent auth that the user's configured ssh
             // handles fine (ADR 0014).
             command.env("GIT_TERMINAL_PROMPT", "0");
-            if let Some(ssh) = resolve_network_ssh_command(git_program, cwd) {
+            let resolved = resolve_network_ssh_command(git_program, cwd);
+            if let Some(ssh) = &resolved {
                 command.env("GIT_SSH_COMMAND", ssh);
+            }
+            // Opt-in observability (HITCH_DEBUG): a network git op runs inside the
+            // daemon, whose stderr is captured to `daemon.log` (ADR 0009), so this
+            // line lets you tail exactly which agent socket and ssh the op used
+            // instead of reproducing the failure by hand. Off by default — no PII
+            // leaks into the log unless asked for.
+            if non_empty_env("HITCH_DEBUG").is_some() {
+                eprintln!(
+                    "hitch-git[debug]: network git in {}: SSH_AUTH_SOCK={:?} GIT_SSH_COMMAND={:?}",
+                    cwd.display(),
+                    self.ssh_auth_sock.map(|sock| sock.as_os_str()),
+                    resolved.as_deref(),
+                );
             }
         }
     }
