@@ -1672,7 +1672,11 @@ fn expect_transport_response(
                 ControlMessage::Event { .. }
                 | ControlMessage::Request { .. }
                 | ControlMessage::Response { .. }
-                | ControlMessage::ConnEnv { .. } => {}
+                | ControlMessage::ConnEnv { .. }
+                | ControlMessage::SshAgentRelay
+                | ControlMessage::SshAgentOpen { .. }
+                | ControlMessage::SshAgentData { .. }
+                | ControlMessage::SshAgentClose { .. } => {}
             }
         }
     }
