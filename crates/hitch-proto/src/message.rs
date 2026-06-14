@@ -141,6 +141,14 @@ pub enum ControlMessage {
     Response { id: RequestId, response: Response },
     /// Server-push notification delivered to subscribed clients.
     Event { event: Event },
+    /// Connection-environment prelude emitted by the SSH **proxy** (ADR 0014)
+    /// before it begins its verbatim GUI↔daemon bridge. It carries the proxy
+    /// process's forwarded `SSH_AUTH_SOCK` path so the long-lived remote daemon
+    /// can sign git pushes via the *local* user's forwarded ssh-agent instead of
+    /// prompting on the remote. Serialized as `{"kind":"conn-env",...}`. Backward
+    /// compatible: the GUI never emits it, and an older/local (non-proxy) peer
+    /// never sees it — a local daemon's git keeps inheriting env exactly as before.
+    ConnEnv { ssh_auth_sock: String },
 }
 
 impl ControlMessage {
