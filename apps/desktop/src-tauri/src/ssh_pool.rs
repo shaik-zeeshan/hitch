@@ -61,6 +61,8 @@ use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter};
 
 use crate::ssh::{self, HandshakeOutcome};
+#[cfg(unix)]
+use crate::ssh_agent_bridge;
 use crate::{read_control_message, read_pty_payload, OutputRouter};
 
 /// Scope-tagged event payload emitted to the webview (`hitch-scope-event`).
@@ -313,6 +315,14 @@ struct RemoteConnection {
     shutting_down: AtomicBool,
     /// Set while a reconnect loop is in flight, so concurrent triggers collapse.
     reconnecting: AtomicBool,
+    /// Live ssh-agent relay channels for THIS connection (proto v29, slices 4+6).
+    /// When the per-host toggle is on AND a local agent is reachable, the GUI
+    /// declares the relay after the Hello; the remote daemon then opens a channel
+    /// per git child wanting to sign, and this registry bridges each to the local
+    /// agent. Invalidated (all channels closed) on disconnect/reconnect so a stale
+    /// frame from a superseded link finds nothing. Unix-only for now.
+    #[cfg(unix)]
+    relay: ssh_agent_bridge::SshAgentRelay,
 }
 
 impl RemoteConnection {
@@ -333,6 +343,8 @@ impl RemoteConnection {
             exe_path: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             reconnecting: AtomicBool::new(false),
+            #[cfg(unix)]
+            relay: ssh_agent_bridge::SshAgentRelay::new(),
         }
     }
 
@@ -590,6 +602,10 @@ impl SshConnections {
             if let Ok(mut writer) = connection.writer.lock() {
                 *writer = None;
             }
+            // Tear down any live ssh-agent relay channels so their dedicated
+            // reader threads (possibly blocked on a sign) unblock and exit.
+            #[cfg(unix)]
+            connection.relay.close_all();
             kill_child(&connection);
         }
         if let Ok(mut map) = self.0.connections.lock() {
@@ -1032,6 +1048,21 @@ impl SshConnections {
                 self.record_os_hint(&connection.target, learned);
                 self.start_reader(app, connection.clone(), reader, generation);
                 self.start_heartbeat(app, connection.clone(), generation);
+                // Declare the ssh-agent relay (proto v29, slices 4+6) once the
+                // writer is live: if the per-host toggle is on AND a local
+                // ssh-agent is actually reachable, send the `SshAgentRelay`
+                // prelude so the remote daemon will open a relay channel per git
+                // child instead of (only) leaning on the OS ForwardAgent fallback.
+                // The `ForwardAgent=yes` flag above is KEPT regardless (plan
+                // decision #9: toggle ON => BOTH paths, for rolling upgrade).
+                #[cfg(unix)]
+                if connection.forward_agent && ssh_agent_bridge::local_agent_socket().is_some() {
+                    write_remote_control(connection, &ControlMessage::SshAgentRelay);
+                    debug_log_pool(format_args!(
+                        "declared ssh-agent relay to {} (local agent reachable, toggle on)",
+                        connection.target
+                    ));
+                }
                 Ok(())
             }
             other => {
@@ -1105,6 +1136,12 @@ impl SshConnections {
         if let Ok(mut writer) = connection.writer.lock() {
             *writer = None;
         }
+        // Invalidate every live ssh-agent relay channel: shut their local-agent
+        // sockets so any thread blocked on a sign unblocks, and clear the registry
+        // so a stale frame from the superseded link finds nothing. A reconnect
+        // re-declares the relay and the daemon re-opens fresh channels.
+        #[cfg(unix)]
+        connection.relay.close_all();
         // Fail any in-flight requests so callers don't hang on a dead link.
         if let Ok(mut pending) = connection.pending.lock() {
             for (_, tx) in pending.drain() {
@@ -1348,6 +1385,50 @@ fn remote_reader_loop(
                 // It travels only on the proxy's local socket toward the daemon; the
                 // GUI is upstream of the daemon and never receives it. Ignore.
             }
+            // ssh-agent relay frames (proto v29, slices 4+6). The remote daemon
+            // drives these once the GUI declared the relay (`connect_attempt`).
+            #[cfg(unix)]
+            ControlMessage::SshAgentOpen { channel } => {
+                // A git child on the remote connected to its proxied SSH_AUTH_SOCK.
+                // Open a bridge to the LOCAL agent on a DEDICATED thread so a
+                // multi-second Touch ID sign never stalls this reader loop.
+                connection
+                    .relay
+                    .open(channel, relay_write_up(connection));
+            }
+            #[cfg(unix)]
+            ControlMessage::SshAgentData { channel, data } => {
+                // Inbound request bytes for the local agent. Decode defensively
+                // (the helper enforces the 256 KiB cap + base64 validity and never
+                // panics); on a bad frame, log + close the channel rather than
+                // forwarding garbage to the agent. The write itself returns
+                // immediately — the SIGN/response is read async on the channel's
+                // dedicated thread, so this never blocks on Touch ID.
+                match hitch_proto::decode_ssh_agent_data(&data) {
+                    Ok(bytes) => connection.relay.write(channel, &bytes),
+                    Err(err) => {
+                        debug_log_pool(format_args!(
+                            "ssh-agent relay: bad SshAgentData on channel {channel} from {}: {err}; closing",
+                            connection.target
+                        ));
+                        connection.relay.close(channel);
+                        write_remote_control(connection, &ControlMessage::SshAgentClose { channel });
+                    }
+                }
+            }
+            #[cfg(unix)]
+            ControlMessage::SshAgentClose { channel } => {
+                connection.relay.close(channel);
+            }
+            // The GUI declares the relay; the daemon never sends `SshAgentRelay`
+            // up. On non-Unix the relay is not built, so the Open/Data/Close
+            // frames are inert here too. Ignore defensively (keeps the match
+            // exhaustive across cfgs).
+            ControlMessage::SshAgentRelay => {}
+            #[cfg(not(unix))]
+            ControlMessage::SshAgentOpen { .. }
+            | ControlMessage::SshAgentData { .. }
+            | ControlMessage::SshAgentClose { .. } => {}
         }
     }
 }
@@ -1625,6 +1706,53 @@ fn write_remote_input(connection: &Arc<RemoteConnection>, session_id: SessionId,
         return;
     }
     let _ = writer.flush();
+}
+
+/// Write one control line (no PTY payload frame) to a remote connection,
+/// best-effort. Mirrors [`write_remote_input`] but for control-only messages
+/// (the ssh-agent relay prelude + relay data/close frames, proto v29). The
+/// writer `Mutex` is HELD across the whole write+flush so concurrent writers
+/// (the input drain, the relay reader threads) never interleave bytes on the
+/// shared child stdin. Re-locks per call, so a reconnect that swaps the writer is
+/// picked up naturally; a missing/dead writer just drops the frame. NEVER calls
+/// `handle_remote_lost` from here (deadlock note, `lib.rs::write_input_frame`):
+/// the reader/heartbeat own recovery.
+fn write_remote_control(connection: &Arc<RemoteConnection>, message: &ControlMessage) {
+    let Ok(control) = encode_control_message(message) else {
+        return;
+    };
+    let Ok(mut writer_guard) = connection.writer.lock() else {
+        return;
+    };
+    let Some(writer) = writer_guard.as_mut() else {
+        return;
+    };
+    if writer.write_all(&control).is_err() {
+        return;
+    }
+    let _ = writer.flush();
+}
+
+/// Build the cheaply-cloneable write-up sink the ssh-agent relay hands to each
+/// per-channel reader thread: it locks THIS connection's writer and writes one
+/// control line via [`write_remote_control`]. Holds only an `Arc` to the
+/// connection, so a reader thread that outlives a reconnect re-locks the
+/// (swapped) writer per write — the existing re-lock-per-write idiom.
+#[cfg(unix)]
+fn relay_write_up(connection: &Arc<RemoteConnection>) -> ssh_agent_bridge::WriteUp {
+    let connection = connection.clone();
+    Arc::new(move |message: ControlMessage| {
+        write_remote_control(&connection, &message);
+    })
+}
+
+/// Opt-in `HITCH_DEBUG` stderr log for the remote pool (mirrors the git crate's
+/// convention). Byte payloads are never logged — only relay lifecycle + failures.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn debug_log_pool(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("HITCH_DEBUG").is_some_and(|v| !v.is_empty()) {
+        eprintln!("[hitch ssh pool] {args}");
+    }
 }
 
 /// Kill a remote connection's SSH child if one is held.

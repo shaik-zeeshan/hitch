@@ -2892,9 +2892,14 @@ export function forgetRemoteScope(scopeId: DaemonScopeId): void {
 // mirrors the persisted hosts: new hosts connect (with backoff), removed hosts
 // disconnect their proxy. Best-effort — a failed invoke (e.g. before the window
 // is ready) is retried on the next host change.
-function syncSshHostsToPool(hosts: SshHost[]): void {
-  // Pass each host's forwardAgent toggle so the Rust pool launches the proxy ssh
-  // with `-o ForwardAgent=yes` per-host (silly-ridge-27). Default on when unset.
+// Exported for the sshAgentRelay vitest, which asserts the per-host forwardAgent
+// flag rides every `set_ssh_hosts` entry and is never emitted for the local
+// scope (the structural remote-only gate). NOT part of the public daemon API.
+export function syncSshHostsToPool(hosts: SshHost[]): void {
+  // Pass each host's forwardAgent toggle so the Rust pool can let the remote
+  // daemon sign git over the local ssh-agent per-host (silly-ridge-27). The Rust
+  // side (`ssh_pool::connect_attempt`) decides the mechanism and gates the actual
+  // ssh-agent relay on a reachable local agent. Default on when unset.
   void invoke("set_ssh_hosts", {
     hosts: hosts.map((h) => ({ target: h.target, forwardAgent: h.forwardAgent !== false })),
   }).catch(() => {});

@@ -6,6 +6,10 @@
 
 mod cli_install;
 mod ssh;
+// The local ssh-agent relay bridge (proto v29, slices 4+6) connects to the local
+// ssh-agent over a Unix socket; it is Unix-only for now (Windows is slice 7+8).
+#[cfg(unix)]
+mod ssh_agent_bridge;
 mod ssh_pool;
 mod window_chrome;
 
@@ -1910,7 +1914,29 @@ fn reader_loop(
                 // carried only on the proxy's local socket. The desktop client sits
                 // upstream of the daemon and never receives it. Ignore.
             }
+            // ssh-agent relay frames (proto v29, slices 4+6). The relay only ever
+            // runs over a REMOTE connection (the GUI never declares
+            // `SshAgentRelay` to the LOCAL daemon, so the local daemon never opens
+            // a relay channel). These arms are DEFENSIVE: log-and-ignore so the
+            // exhaustive match compiles and a misbehaving local daemon can't crash
+            // or stall the reader. The real driver is `ssh_pool::remote_reader_loop`.
+            ControlMessage::SshAgentRelay
+            | ControlMessage::SshAgentOpen { .. }
+            | ControlMessage::SshAgentData { .. }
+            | ControlMessage::SshAgentClose { .. } => {
+                debug_log_local(format_args!(
+                    "local daemon sent an unexpected ssh-agent relay frame; ignoring"
+                ));
+            }
         }
+    }
+}
+
+/// Opt-in `HITCH_DEBUG` stderr log for the local reader loop (mirrors the git
+/// crate's `HITCH_DEBUG` convention). Byte payloads are never logged.
+fn debug_log_local(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("HITCH_DEBUG").is_some_and(|v| !v.is_empty()) {
+        eprintln!("[hitch local reader] {args}");
     }
 }
 
