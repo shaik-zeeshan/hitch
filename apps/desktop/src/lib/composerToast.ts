@@ -43,6 +43,11 @@ export function autoToastContent(result: CommitAndPushResult): {
 // the oxide button via the chain store, so the toast only needs the gist.
 export function autoErrorMessage(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
+  // The toast can only show the first line capped at 80 chars, but a failed
+  // git op carries the full reason (e.g. the complete push/pull stderr) in the
+  // message. Log it in full to the devtools console so the user can read the
+  // whole thing a toast can't fit.
+  console.error("hitch: operation failed —", msg, err);
   const first = msg.split("\n")[0].trim();
   return first.length > 80 ? first.slice(0, 77) + "…" : first;
 }
