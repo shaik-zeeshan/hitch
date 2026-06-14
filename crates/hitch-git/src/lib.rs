@@ -2282,19 +2282,99 @@ struct CommandEnv<'a> {
 impl CommandEnv<'_> {
     /// Apply the configured env vars to a `Command` about to be spawned. Called
     /// for BOTH the control-less and cancellable spawn branches so injection is
-    /// identical regardless of how the child is run.
-    fn apply(&self, command: &mut Command) {
+    /// identical regardless of how the child is run. `git_program`/`cwd` let the
+    /// network path resolve the user's ssh choice (`core.sshCommand`).
+    fn apply(&self, command: &mut Command, git_program: &Path, cwd: &Path) {
         if let Some(sock) = self.ssh_auth_sock {
             command.env("SSH_AUTH_SOCK", sock);
         }
         if self.network {
-            // BatchMode=yes makes ssh fail rather than prompt; GIT_TERMINAL_PROMPT=0
-            // stops git's own credential prompt — together they guarantee a
-            // remote-run network op never blocks on input no one can provide.
-            command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+            // GIT_TERMINAL_PROMPT=0 stops git's own credential prompt so a
+            // remote-run op never blocks on input no one can provide. For ssh we
+            // keep it non-interactive (BatchMode) but must NOT clobber the user's
+            // chosen ssh binary: on Windows the bundled Git-for-Windows MSYS ssh
+            // can't reach a named-pipe agent (`\\.\pipe\…`, e.g. 1Password), so a
+            // forced bare `ssh` breaks agent auth that the user's configured ssh
+            // handles fine (ADR 0014).
             command.env("GIT_TERMINAL_PROMPT", "0");
+            if let Some(ssh) = resolve_network_ssh_command(git_program, cwd) {
+                command.env("GIT_SSH_COMMAND", ssh);
+            }
         }
     }
+}
+
+/// Resolve `GIT_SSH_COMMAND` for a network op so it stays non-interactive
+/// (BatchMode) WITHOUT overriding the user's chosen ssh. Honors, in order: an
+/// explicit `GIT_SSH_COMMAND` already in the env, `GIT_SSH` (left to git), the
+/// repo's `core.sshCommand`, then a platform default. `None` means "leave it
+/// unset" so git uses `GIT_SSH`/its own resolution. On Windows the default
+/// prefers the System32 OpenSSH because the bundled MSYS ssh can't talk to
+/// named-pipe agents (1Password's `\\.\pipe\…`).
+fn resolve_network_ssh_command(git_program: &Path, cwd: &Path) -> Option<OsString> {
+    if let Some(existing) = non_empty_env("GIT_SSH_COMMAND") {
+        return Some(with_batchmode(existing));
+    }
+    // `GIT_SSH` names a bare helper binary, not a command line — appending ssh
+    // flags to it is invalid, so defer entirely to git's own handling.
+    if non_empty_env("GIT_SSH").is_some() {
+        return None;
+    }
+    if let Some(configured) = core_ssh_command(git_program, cwd) {
+        return Some(with_batchmode(OsString::from(configured)));
+    }
+    Some(default_network_ssh_command())
+}
+
+/// `std::env::var_os` filtered to a present, non-empty value.
+fn non_empty_env(key: &str) -> Option<OsString> {
+    std::env::var_os(key).filter(|value| !value.is_empty())
+}
+
+/// Append `-o BatchMode=yes` to an ssh command unless it already pins BatchMode,
+/// keeping the user's binary and flags intact.
+fn with_batchmode(command: OsString) -> OsString {
+    if command.to_string_lossy().to_ascii_lowercase().contains("batchmode") {
+        return command;
+    }
+    let mut augmented = command;
+    augmented.push(" -o BatchMode=yes");
+    augmented
+}
+
+/// The repo/global `core.sshCommand`, if set. Read with a plain `git config`
+/// (not [`run_command`], to avoid recursion); failures/empties yield `None`.
+fn core_ssh_command(git_program: &Path, cwd: &Path) -> Option<String> {
+    let output = Command::new(git_program)
+        .current_dir(cwd)
+        .args(["config", "--get", "core.sshCommand"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Platform default ssh for a network op when nothing is configured. On Windows
+/// the System32 OpenSSH is preferred over a bare `ssh` (which resolves to the
+/// MSYS build that can't use named-pipe agents); falls back to `ssh` if absent.
+fn default_network_ssh_command() -> OsString {
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let system_ssh = system_root.join(r"System32\OpenSSH\ssh.exe");
+        if system_ssh.is_file() {
+            let mut cmd = OsString::from("\"");
+            cmd.push(system_ssh);
+            cmd.push("\" -o BatchMode=yes");
+            return cmd;
+        }
+    }
+    OsString::from("ssh -o BatchMode=yes")
 }
 
 fn run_command(
@@ -2307,7 +2387,7 @@ fn run_command(
     let Some(control) = control else {
         let mut command = Command::new(program);
         command.current_dir(cwd).args(&args);
-        env.apply(&mut command);
+        env.apply(&mut command, program, cwd);
         // Match the cancellable path's windowless behaviour: the control-less
         // branch never reaches `ProcessTree::spawn`, so without this a
         // console-attached caller (CLI, tests, a stale shim) would flash a console
@@ -2347,7 +2427,7 @@ fn run_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    env.apply(&mut command);
+    env.apply(&mut command, program, cwd);
     let (mut child, tree) = ProcessTree::spawn(&mut command)?;
     let registration = ProcessTreeRegistration::new(
         || control.set_process_tree(Some(tree.clone())),
@@ -4149,7 +4229,11 @@ mod tests {
 
         assert_eq!(url, "https://github.test/pr/1");
         let calls = fs::read_to_string(log).unwrap();
-        let mut lines = calls.lines();
+        // The network path probes `git config --get core.sshCommand` to honor the
+        // user's ssh choice; skip those to assert on the meaningful git/gh calls.
+        let mut lines = calls
+            .lines()
+            .filter(|line| !line.contains("config --get core.sshCommand"));
         assert_eq!(lines.next().unwrap().trim_end(), "git push -u origin main");
         let gh_call = lines.next().unwrap();
         assert!(gh_call.contains("gh pr create"));
@@ -4553,7 +4637,13 @@ mod tests {
 
         let temp = TempDir::new().unwrap();
         let script = temp.path().join("git-sleep");
-        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        // `config` (the network path's core.sshCommand probe) must return at once
+        // like real git; only the clone itself is the long-running child we cancel.
+        fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = config ]; then exit 1; fi\nsleep 30\n",
+        )
+        .unwrap();
         make_executable(&script);
 
         let control = std::sync::Arc::new(TestControl::new(false));
@@ -4583,7 +4673,13 @@ mod tests {
         use std::time::{Duration, Instant};
         let temp = TempDir::new().unwrap();
         let script = temp.path().join("git-sleep");
-        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        // `config` (the network path's core.sshCommand probe) must return at once
+        // like real git; only the clone itself is the long-running child we cancel.
+        fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = config ]; then exit 1; fi\nsleep 30\n",
+        )
+        .unwrap();
         make_executable(&script);
 
         let client = GitClient::with_programs(&script, &script);
