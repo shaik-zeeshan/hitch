@@ -230,6 +230,39 @@ impl DaemonListener {
     pub fn local_path(&self) -> &Path {
         &self.path
     }
+
+    /// The real OS address another process must use to reach this listener,
+    /// suitable to hand a child as `SSH_AUTH_SOCK`. Unlike [`local_path`], which
+    /// returns the stored *logical* path, this is always a connectable endpoint
+    /// string: the socket file path on Unix, or `\\.\pipe\hitch-<hash>` on
+    /// Windows (where the bound endpoint is a named pipe, not the logical path).
+    pub fn os_address(&self) -> String {
+        endpoint_os_address(&self.path)
+    }
+}
+
+/// Real OS address string for an endpoint bound at `path`, suitable to hand a
+/// child process as `SSH_AUTH_SOCK` (the ssh-agent relay's per-connection
+/// socket, ADR 0014 amendment).
+///
+/// On Unix the bound endpoint *is* a filesystem socket at `path` (that is what
+/// [`UnixListener::bind`] binds), so the address is the path string itself.
+#[cfg(unix)]
+pub fn endpoint_os_address(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Real OS address string for an endpoint bound at `path` (see the Unix variant).
+///
+/// On Windows the bound endpoint is a named pipe whose name is derived from the
+/// *logical* path by [`logical_socket_name`]; interprocess's `GenericNamespaced`
+/// namespace prefixes that name with `\\.\pipe\` at bind/connect time, so the
+/// connectable address is `\\.\pipe\hitch-<hash>`. Returning the logical path (as
+/// [`local_path`] does) would not be connectable. The hash stays in one place
+/// ([`logical_socket_name`]) so this is byte-for-byte what `bind` created.
+#[cfg(windows)]
+pub fn endpoint_os_address(path: &Path) -> String {
+    format!(r"\\.\pipe\{}", logical_socket_name(path))
 }
 
 impl Drop for DaemonListener {
@@ -659,6 +692,53 @@ mod tests {
         assert_ne!(
             logical_socket_name(Path::new(r"C:\Users\pc\AppData\Local\Hitch\daemon.sock")),
             logical_socket_name(Path::new(r"C:\Users\pc\AppData\Local\Hitch\other.sock")),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_os_address_is_the_socket_path_on_unix() {
+        // On Unix the bound endpoint IS the socket file, so the address handed to
+        // a child as SSH_AUTH_SOCK is the path string verbatim.
+        let path = Path::new("/tmp/hitch/agent/7.sock");
+        assert_eq!(endpoint_os_address(path), "/tmp/hitch/agent/7.sock");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn endpoint_os_address_is_the_named_pipe_on_windows() {
+        // On Windows the bound endpoint is a named pipe; the address must be the
+        // connectable `\\.\pipe\hitch-<hash>`, matching what `bind` created via
+        // `logical_socket_name`, and stable across equivalent path spellings.
+        let canonical = endpoint_os_address(Path::new(
+            r"C:\Users\pc\AppData\Local\Hitch\agent\7.sock",
+        ));
+        assert!(
+            canonical.starts_with(r"\\.\pipe\hitch-"),
+            "address {canonical:?} should be a hitch named pipe",
+        );
+        assert_eq!(
+            canonical,
+            format!(
+                r"\\.\pipe\{}",
+                logical_socket_name(Path::new(r"C:\Users\pc\AppData\Local\Hitch\agent\7.sock"))
+            ),
+            "address must reuse the same hash logical_socket_name/bind use",
+        );
+        for variant in [
+            r"c:\users\pc\appdata\local\hitch\agent\7.sock",
+            r"C:/Users/pc/AppData/Local/Hitch/agent/7.sock",
+        ] {
+            assert_eq!(
+                endpoint_os_address(Path::new(variant)),
+                canonical,
+                "spelling {variant:?} should resolve to the same pipe address",
+            );
+        }
+        // A genuinely different endpoint must produce a different address.
+        assert_ne!(
+            endpoint_os_address(Path::new(r"C:\Users\pc\AppData\Local\Hitch\agent\8.sock")),
+            canonical,
         );
     }
 
