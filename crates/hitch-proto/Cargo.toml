@@ -20,3 +20,8 @@ interprocess = "2.4.2"
 # the same 1.x line interprocess already depends on, so `U16CString` matches the
 # `&U16CStr` that `SecurityDescriptor::deserialize` expects.
 widestring = "1"
+# CancelIoEx + DisconnectNamedPipe, to force-unblock a relay pump thread parked in
+# ReadFile on a named-pipe handle AND break the pipe so the next read also fails
+# (ssh-agent relay teardown, ADR 0014 amendment). Pinned to the 0.60.2 line
+# hitch-process already uses to avoid a third windows-sys version.
+windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Pipes"] }

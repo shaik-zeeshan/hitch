@@ -17,11 +17,13 @@ use std::path::{Path, PathBuf};
 use interprocess::{
     local_socket::{
         prelude::*, GenericNamespaced, ListenerNonblockingMode, ListenerOptions,
-        Name as LocalSocketName,
+        Name as LocalSocketName, RecvHalf, SendHalf,
     },
     os::windows::{local_socket::ListenerOptionsExt, security_descriptor::SecurityDescriptor},
     TryClone as _,
 };
+#[cfg(windows)]
+use std::os::windows::io::{AsHandle, AsRawHandle};
 
 use crate::framing::{
     encode_control_message, encode_pty_frame, ControlLineDecoder, FrameError, PtyFrameDecoder,
@@ -419,6 +421,26 @@ impl DaemonStream {
     pub fn into_inner(self) -> UnixStream {
         self.stream
     }
+
+    /// Split this connected stream into a relay reader + writer pair (ADR 0014
+    /// amendment, ssh-agent relay). Both halves address the SAME underlying
+    /// connection: on Unix they are clones of one `UnixStream`; on Windows they are
+    /// the receive/send halves of one named-pipe stream, which share a single duplex
+    /// pipe handle (interprocess's `split` ref-clones it). Either half's
+    /// `force_close` therefore unblocks a read pending on the other. The control/PTY
+    /// decoders are discarded — a relay channel is a raw byte bridge.
+    pub fn into_relay_channel(self) -> io::Result<(RelayReader, RelayWriter)> {
+        #[cfg(unix)]
+        {
+            let writer = self.stream.try_clone()?;
+            Ok((RelayReader { stream: self.stream }, RelayWriter { stream: writer }))
+        }
+        #[cfg(windows)]
+        {
+            let (recv, send) = self.stream.split();
+            Ok((RelayReader { half: recv }, RelayWriter { half: send }))
+        }
+    }
 }
 
 impl Read for DaemonStream {
@@ -435,6 +457,142 @@ impl Write for DaemonStream {
     fn flush(&mut self) -> io::Result<()> {
         self.stream.flush()
     }
+}
+
+/// Read half of an ssh-agent relay channel (ADR 0014 amendment). The daemon's
+/// pump thread reads the git child's request bytes (git → daemon → GUI) from it.
+#[derive(Debug)]
+pub struct RelayReader {
+    #[cfg(unix)]
+    stream: UnixStream,
+    #[cfg(windows)]
+    half: RecvHalf,
+}
+
+impl RelayReader {
+    /// Unblock a thread blocked in [`Read::read`] on this reader. Unix:
+    /// `shutdown(Both)`. Windows: `CancelIoEx` + `DisconnectNamedPipe` on the pipe
+    /// handle the pending `ReadFile` is using. Idempotent / best-effort.
+    pub fn force_close(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        { shutdown_both(&self.stream) }
+        #[cfg(windows)]
+        { force_close_recv_half(&self.half) }
+    }
+}
+
+impl Read for RelayReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        { self.stream.read(buf) }
+        #[cfg(windows)]
+        { let mut r = &self.half; r.read(buf) }
+    }
+}
+
+/// Write half of an ssh-agent relay channel (ADR 0014 amendment). Inbound GUI
+/// reply bytes (GUI → daemon → git) are written to it. Held behind an `Arc` by the
+/// daemon and written through a shared `&RelayWriter`, so it impls `Write` for both
+/// `RelayWriter` and `&RelayWriter`.
+#[derive(Debug)]
+pub struct RelayWriter {
+    #[cfg(unix)]
+    stream: UnixStream,
+    #[cfg(windows)]
+    half: SendHalf,
+}
+
+impl RelayWriter {
+    /// Unblock a read pending on the paired [`RelayReader`] and signal teardown to
+    /// the git child. Unix: `shutdown(Both)` (peer reads EOF). Windows: `CancelIoEx`
+    /// + `DisconnectNamedPipe` on the shared pipe handle (same handle the reader's
+    /// `ReadFile` uses); the disconnect breaks the pipe so the git child sees the
+    /// connection end immediately, not only once both halves drop. Idempotent /
+    /// best-effort.
+    pub fn force_close(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        { shutdown_both(&self.stream) }
+        #[cfg(windows)]
+        { force_close_send_half(&self.half) }
+    }
+}
+
+impl Write for RelayWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        { self.stream.write(buf) }
+        #[cfg(windows)]
+        { let mut w = &self.half; w.write(buf) }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        { self.stream.flush() }
+        #[cfg(windows)]
+        { Ok(()) }
+    }
+}
+
+/// Write through a shared reference so the daemon can store the writer in an `Arc`
+/// and relay inbound chunks without cloning or holding the channel-map lock across
+/// the write.
+impl Write for &RelayWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        { let mut s = &self.stream; s.write(buf) }
+        #[cfg(windows)]
+        { let mut w = &self.half; w.write(buf) }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        { let mut s = &self.stream; s.flush() }
+        #[cfg(windows)]
+        { Ok(()) }
+    }
+}
+
+#[cfg(unix)]
+fn shutdown_both(stream: &UnixStream) -> io::Result<()> {
+    match stream.shutdown(std::net::Shutdown::Both) {
+        Ok(()) => Ok(()),
+        // Already shut down / peer gone — idempotent teardown is not an error.
+        Err(err) if err.kind() == io::ErrorKind::NotConnected => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(windows)]
+fn force_close_recv_half(half: &RecvHalf) -> io::Result<()> {
+    match half {
+        RecvHalf::NamedPipe(np) => force_close_pipe_handle(np.as_handle().as_raw_handle()),
+    }
+}
+
+#[cfg(windows)]
+fn force_close_send_half(half: &SendHalf) -> io::Result<()> {
+    match half {
+        SendHalf::NamedPipe(np) => force_close_pipe_handle(np.as_handle().as_raw_handle()),
+    }
+}
+
+/// Make a relay channel's named-pipe handle behave like a Unix `shutdown(Both)`:
+/// unblock any thread parked in `ReadFile` right now AND break the connection so
+/// the NEXT read also fails and the peer (git) sees the pipe end immediately —
+/// not only once both shared-handle halves finally drop. `CancelIoEx` only
+/// cancels I/O already pending in the kernel (not sticky), so on its own it misses
+/// the window where the relay pump is between reads; `DisconnectNamedPipe` is the
+/// sticky half and the true `shutdown(Both)` analog. Both are best-effort:
+/// `ERROR_NOT_FOUND` (nothing pending) and a disconnect on an already-broken or
+/// non-server handle are benign, so neither is treated as an error.
+#[cfg(windows)]
+fn force_close_pipe_handle(handle: std::os::windows::io::RawHandle) -> io::Result<()> {
+    // SAFETY: `handle` is borrowed from a half we still hold, so it is a live pipe
+    // handle for the duration of these calls, which only act on it. A null
+    // OVERLAPPED cancels every pending operation on the handle.
+    unsafe {
+        let _ = windows_sys::Win32::System::IO::CancelIoEx(handle as _, std::ptr::null());
+        let _ = windows_sys::Win32::System::Pipes::DisconnectNamedPipe(handle as _);
+    }
+    Ok(())
 }
 
 /// Transport-level error, wrapping I/O and framing failures.
@@ -565,7 +723,7 @@ mod tests {
     use super::*;
     use crate::message::{ControlMessage, Request, Response, PROTOCOL_VERSION};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn client_and_listener_exchange_control_message() {
@@ -740,6 +898,62 @@ mod tests {
             endpoint_os_address(Path::new(r"C:\Users\pc\AppData\Local\Hitch\agent\8.sock")),
             canonical,
         );
+    }
+
+    #[test]
+    fn relay_channel_round_trips_and_force_close_unblocks_reader() {
+        let path = test_socket_path();
+        let listener = DaemonListener::bind(&path).unwrap();
+        let accept = thread::spawn(move || {
+            let stream = listener.accept().unwrap();
+            stream.into_relay_channel().unwrap()
+            // `listener` drops here; the accepted connection persists via the halves.
+        });
+
+        let mut client = connect_daemon(&path).unwrap();
+        let (mut reader, writer) = accept.join().unwrap();
+
+        // git -> daemon: bytes arrive at the reader verbatim.
+        client.write_all(&[1, 2, 3, 4, 5]).unwrap();
+        client.flush().unwrap();
+        let mut got = [0u8; 5];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(got, [1, 2, 3, 4, 5]);
+
+        // daemon -> git: writer bytes reach the client verbatim (write through &writer,
+        // the path the daemon uses).
+        {
+            let mut w = &writer;
+            w.write_all(&[9, 8, 7]).unwrap();
+            w.flush().unwrap();
+        }
+        let mut back = [0u8; 3];
+        client.read_exact(&mut back).unwrap();
+        assert_eq!(back, [9, 8, 7]);
+
+        // A reader blocked on a pending read unblocks promptly after force_close.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let blocked = thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            let r = reader.read(&mut buf); // blocks: no more bytes are coming
+            let _ = tx.send(());
+            r
+        });
+        thread::sleep(Duration::from_millis(150));
+        writer.force_close().unwrap();
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("reader must unblock shortly after force_close");
+        match blocked.join().unwrap() {
+            // Unix shutdown -> clean EOF.
+            Ok(0) => {}
+            Ok(n) => panic!("unexpected {n} bytes after force_close"),
+            // Windows cancel / broken pipe is an acceptable "EOF" too.
+            Err(_) => {}
+        }
+
+        drop(client);
+        #[cfg(unix)]
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
