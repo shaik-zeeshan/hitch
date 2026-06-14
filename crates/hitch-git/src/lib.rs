@@ -173,6 +173,13 @@ pub struct DiscoveredWorktree {
 pub struct GitClient {
     git: PathBuf,
     gh: PathBuf,
+    /// Forwarded `SSH_AUTH_SOCK` to set on network git subprocesses (ADR 0014,
+    /// SSH agent forwarding). `None` means inherit the process env exactly as
+    /// before — the local-daemon path. The remote daemon sets this (per the
+    /// connecting proxy's `ConnEnv` prelude) on the client it clones for a
+    /// push/pull/fetch so git's ssh reaches the local user's forwarded agent
+    /// rather than prompting on the remote.
+    ssh_auth_sock: Option<OsString>,
 }
 /// Hooks a long-running `git`/`gh` child into a higher-level cancellation path.
 /// The daemon's Job registry implements this so `ShutdownDaemon`/`CancelJob`
@@ -187,6 +194,7 @@ impl Default for GitClient {
         Self {
             git: PathBuf::from("git"),
             gh: PathBuf::from("gh"),
+            ssh_auth_sock: None,
         }
     }
 }
@@ -198,7 +206,18 @@ impl GitClient {
         Self {
             git: git.into(),
             gh: gh.into(),
+            ssh_auth_sock: None,
         }
+    }
+
+    /// Return a clone of this client that injects `SSH_AUTH_SOCK` on network git
+    /// subprocesses (ADR 0014, SSH agent forwarding). The remote daemon calls
+    /// this on the client it built for a push/pull/fetch, passing the forwarded
+    /// socket declared by the connecting proxy's `ConnEnv` prelude. `None`
+    /// restores plain env inheritance (the local-daemon path).
+    pub fn with_ssh_auth_sock(mut self, ssh_auth_sock: Option<OsString>) -> Self {
+        self.ssh_auth_sock = ssh_auth_sock;
+        self
     }
 
     /// Stage whole files (`git add -- <paths...>`).
@@ -321,7 +340,7 @@ impl GitClient {
         remote_url: &str,
         destination: impl AsRef<Path>,
     ) -> Result<CommandOutput> {
-        self.run_git(
+        self.run_git_network(
             Path::new("."),
             vec![os("clone"), os(remote_url), path_os(destination.as_ref())],
         )
@@ -334,7 +353,7 @@ impl GitClient {
         destination: impl AsRef<Path>,
         control: &dyn CommandControl,
     ) -> Result<CommandOutput> {
-        self.run_git_with_control(
+        self.run_git_network_with_control(
             Path::new("."),
             vec![os("clone"), os(remote_url), path_os(destination.as_ref())],
             control,
@@ -354,7 +373,7 @@ impl GitClient {
             args.push(os("-u"));
         }
         args.extend([os(remote), os(branch)]);
-        self.run_git(repo_path.as_ref(), args)
+        self.run_git_network(repo_path.as_ref(), args)
     }
 
     /// Push a branch as a cancellable child process.
@@ -371,12 +390,12 @@ impl GitClient {
             args.push(os("-u"));
         }
         args.extend([os(remote), os(branch)]);
-        self.run_git_with_control(repo_path.as_ref(), args, control)
+        self.run_git_network_with_control(repo_path.as_ref(), args, control)
     }
 
     /// Fetch from a remote using the system git executable.
     pub fn fetch(&self, repo_path: impl AsRef<Path>, remote: &str) -> Result<CommandOutput> {
-        self.run_git(repo_path.as_ref(), vec![os("fetch"), os(remote)])
+        self.run_git_network(repo_path.as_ref(), vec![os("fetch"), os(remote)])
     }
 
     /// Fetch from a remote as a cancellable child process.
@@ -386,7 +405,11 @@ impl GitClient {
         remote: &str,
         control: &dyn CommandControl,
     ) -> Result<CommandOutput> {
-        self.run_git_with_control(repo_path.as_ref(), vec![os("fetch"), os(remote)], control)
+        self.run_git_network_with_control(
+            repo_path.as_ref(),
+            vec![os("fetch"), os(remote)],
+            control,
+        )
     }
 
     /// Pull a branch using the system git executable (relies on user's pull
@@ -397,7 +420,7 @@ impl GitClient {
         remote: &str,
         branch: &str,
     ) -> Result<CommandOutput> {
-        self.run_git(repo_path.as_ref(), vec![os("pull"), os(remote), os(branch)])
+        self.run_git_network(repo_path.as_ref(), vec![os("pull"), os(remote), os(branch)])
     }
 
     /// Pull a branch as a cancellable child process.
@@ -408,7 +431,7 @@ impl GitClient {
         branch: &str,
         control: &dyn CommandControl,
     ) -> Result<CommandOutput> {
-        self.run_git_with_control(
+        self.run_git_network_with_control(
             repo_path.as_ref(),
             vec![os("pull"), os(remote), os(branch)],
             control,
@@ -495,8 +518,28 @@ impl GitClient {
         pr_list_for_branches_with_client(self, repo_path.as_ref(), branches, Some(control))
     }
 
+    /// `SSH_AUTH_SOCK`-only env (no network flag) — for local git ops that may
+    /// still reach a remote indirectly but where we don't want to force the
+    /// non-interactive ssh/terminal behaviour.
+    fn auth_env(&self) -> CommandEnv<'_> {
+        CommandEnv {
+            ssh_auth_sock: self.ssh_auth_sock.as_ref(),
+            network: false,
+        }
+    }
+
+    /// `SSH_AUTH_SOCK` plus the non-interactive ssh/terminal env — for the
+    /// network ops (push/pull/fetch/clone) that must fail fast instead of
+    /// prompting on a remote daemon (ADR 0014).
+    fn network_env(&self) -> CommandEnv<'_> {
+        CommandEnv {
+            ssh_auth_sock: self.ssh_auth_sock.as_ref(),
+            network: true,
+        }
+    }
+
     fn run_git(&self, cwd: &Path, args: Vec<OsString>) -> Result<CommandOutput> {
-        run_command(&self.git, cwd, args, None)
+        run_command(&self.git, cwd, args, None, self.auth_env())
     }
 
     fn run_git_with_control(
@@ -505,11 +548,28 @@ impl GitClient {
         args: Vec<OsString>,
         control: &dyn CommandControl,
     ) -> Result<CommandOutput> {
-        run_command(&self.git, cwd, args, Some(control))
+        run_command(&self.git, cwd, args, Some(control), self.auth_env())
+    }
+
+    /// Like [`run_git`] but for a **network** op (push/pull/fetch/clone): also
+    /// sets `GIT_SSH_COMMAND`/`GIT_TERMINAL_PROMPT` so the op fails fast rather
+    /// than hanging on a prompt on a remote daemon (ADR 0014).
+    fn run_git_network(&self, cwd: &Path, args: Vec<OsString>) -> Result<CommandOutput> {
+        run_command(&self.git, cwd, args, None, self.network_env())
+    }
+
+    /// Cancellable [`run_git_network`].
+    fn run_git_network_with_control(
+        &self,
+        cwd: &Path,
+        args: Vec<OsString>,
+        control: &dyn CommandControl,
+    ) -> Result<CommandOutput> {
+        run_command(&self.git, cwd, args, Some(control), self.network_env())
     }
 
     fn run_gh(&self, cwd: &Path, args: Vec<OsString>) -> Result<CommandOutput> {
-        run_command(&self.gh, cwd, args, None)
+        run_command(&self.gh, cwd, args, None, self.auth_env())
     }
 
     fn run_gh_with_control(
@@ -518,7 +578,7 @@ impl GitClient {
         args: Vec<OsString>,
         control: &dyn CommandControl,
     ) -> Result<CommandOutput> {
-        run_command(&self.gh, cwd, args, Some(control))
+        run_command(&self.gh, cwd, args, Some(control), self.auth_env())
     }
 }
 
@@ -2203,15 +2263,51 @@ fn branch_target_oid(branch: &git2::Branch<'_>) -> Result<Oid> {
 /// promptly.
 const READER_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
+/// Environment injected onto a spawned git/gh subprocess (ADR 0014, SSH agent
+/// forwarding). Threaded from the [`GitClient`] through the `run_*` helpers into
+/// [`run_command`]. The defaults (empty) reproduce today's plain env inheritance,
+/// so non-network git ops and the local daemon are unchanged.
+#[derive(Debug, Clone, Copy, Default)]
+struct CommandEnv<'a> {
+    /// Forwarded `SSH_AUTH_SOCK` to set so git's ssh reaches the local user's
+    /// forwarded agent. `None` inherits the process env.
+    ssh_auth_sock: Option<&'a OsString>,
+    /// Whether this is a network op (push/pull/fetch/clone). When set, the
+    /// non-interactive ssh/terminal env is applied so anything the agent can't
+    /// satisfy fails fast instead of hanging on a prompt the remote user can't
+    /// answer. Never applied to local-only git (status/diff/commit/…).
+    network: bool,
+}
+
+impl CommandEnv<'_> {
+    /// Apply the configured env vars to a `Command` about to be spawned. Called
+    /// for BOTH the control-less and cancellable spawn branches so injection is
+    /// identical regardless of how the child is run.
+    fn apply(&self, command: &mut Command) {
+        if let Some(sock) = self.ssh_auth_sock {
+            command.env("SSH_AUTH_SOCK", sock);
+        }
+        if self.network {
+            // BatchMode=yes makes ssh fail rather than prompt; GIT_TERMINAL_PROMPT=0
+            // stops git's own credential prompt — together they guarantee a
+            // remote-run network op never blocks on input no one can provide.
+            command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+            command.env("GIT_TERMINAL_PROMPT", "0");
+        }
+    }
+}
+
 fn run_command(
     program: &Path,
     cwd: &Path,
     args: Vec<OsString>,
     control: Option<&dyn CommandControl>,
+    env: CommandEnv<'_>,
 ) -> Result<CommandOutput> {
     let Some(control) = control else {
         let mut command = Command::new(program);
         command.current_dir(cwd).args(&args);
+        env.apply(&mut command);
         // Match the cancellable path's windowless behaviour: the control-less
         // branch never reaches `ProcessTree::spawn`, so without this a
         // console-attached caller (CLI, tests, a stale shim) would flash a console
@@ -2251,6 +2347,7 @@ fn run_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    env.apply(&mut command);
     let (mut child, tree) = ProcessTree::spawn(&mut command)?;
     let registration = ProcessTreeRegistration::new(
         || control.set_process_tree(Some(tree.clone())),
@@ -4318,7 +4415,7 @@ mod tests {
         make_executable(&script);
 
         let control = TestControl::new(true);
-        let output = run_command(&script, temp.path(), Vec::new(), Some(&control)).unwrap();
+        let output = run_command(&script, temp.path(), Vec::new(), Some(&control), CommandEnv::default()).unwrap();
 
         assert_eq!(output.stdout, "done");
         assert_eq!(output.stderr, "");
@@ -4356,7 +4453,7 @@ mod tests {
         // (the `None` path uses `Command::output`, which never has this hazard).
         let control = TestControl::new(false);
         let started = Instant::now();
-        let output = run_command(&script, temp.path(), Vec::new(), Some(&control)).unwrap();
+        let output = run_command(&script, temp.path(), Vec::new(), Some(&control), CommandEnv::default()).unwrap();
         let elapsed = started.elapsed();
 
         assert_eq!(output.stdout, "done");
@@ -4436,7 +4533,7 @@ mod tests {
         let control = SignalOnDisarm {
             sentinel: sentinel.clone(),
         };
-        let output = run_command(&script, temp.path(), Vec::new(), Some(&control)).unwrap();
+        let output = run_command(&script, temp.path(), Vec::new(), Some(&control), CommandEnv::default()).unwrap();
 
         assert_eq!(
             output.stdout, "donereleased",
@@ -4467,7 +4564,7 @@ mod tests {
         });
 
         let err =
-            run_command(&script, temp.path(), Vec::new(), Some(control.as_ref())).unwrap_err();
+            run_command(&script, temp.path(), Vec::new(), Some(control.as_ref()), CommandEnv::default()).unwrap_err();
         trigger.join().unwrap();
 
         match err {
