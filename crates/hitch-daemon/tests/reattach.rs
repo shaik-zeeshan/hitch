@@ -17,6 +17,10 @@ use hitch_proto::{
     JobRequest, JobStatus, PullRequestDraft, WorktreeCreateMode,
 };
 use hitch_proto::{ControlMessage, ErrorCode, KnownAgent, Request, Response, PROTOCOL_VERSION};
+// Used only by the `#[cfg(windows)]` draft-provider job test below; the cross-platform
+// import block above never referenced it, so it bit-rotted out of scope on Windows.
+#[cfg(windows)]
+use hitch_proto::DraftProvider;
 
 #[test]
 fn daemon_transport_answers_hello_ping_and_shutdown() {
@@ -301,7 +305,7 @@ fn windows_agent_state_reports_store_broadcast_replay_and_clear_by_session_id() 
         Event::AgentState {
             session_id: Some(session.id),
             worktree_id: Some(worktree.id),
-            agent: KnownAgent::Codex,
+            agent: Some(KnownAgent::Codex),
             state: Some(hitch_core::AgentState::Running),
             detail: Some("working from Windows cwd".into()),
         }
@@ -338,7 +342,7 @@ fn windows_agent_state_reports_store_broadcast_replay_and_clear_by_session_id() 
         Event::AgentState {
             session_id: Some(session.id),
             worktree_id: Some(worktree.id),
-            agent: KnownAgent::Codex,
+            agent: Some(KnownAgent::Codex),
             state: None,
             detail: None,
         }
