@@ -2366,17 +2366,35 @@ fn resolve_network_ssh_command(git_program: &Path, cwd: &Path) -> Option<OsStrin
 /// line so we can append `-o BatchMode=yes` (`GIT_SSH_COMMAND` wins over
 /// `GIT_SSH`). Only a single, whitespace-free token is a valid bare helper; a
 /// value carrying its own arguments isn't, so it returns `None` and the caller
-/// defers to git. The path is shell-quoted because `GIT_SSH_COMMAND` is run via
-/// `/bin/sh -c` and the binary path can contain spaces.
+/// defers to git. The path is POSIX-shell-quoted because `GIT_SSH_COMMAND` is run
+/// via `/bin/sh -c` and the binary path can contain spaces (and, in principle,
+/// `$`/backticks/quotes a double-quote wrap wouldn't protect).
 fn git_ssh_as_command(git_ssh: &OsStr) -> Option<OsString> {
     let text = git_ssh.to_str()?;
     if text.split_whitespace().count() != 1 {
         return None;
     }
-    let mut command = OsString::from("\"");
-    command.push(git_ssh);
-    command.push("\"");
-    Some(command)
+    Some(OsString::from(posix_sh_quote(text)))
+}
+
+/// Single-quote a value so it survives `/bin/sh -c` (and the MSYS sh that runs a
+/// Windows `GIT_SSH_COMMAND`) intact. Inside single quotes the shell treats every
+/// character literally — `$`, backticks, spaces, double-quotes — so the only
+/// escaping needed is for an embedded single quote, which is closed, an escaped
+/// literal `'` is emitted, then the quote re-opened (`'\''`). A plain path with no
+/// special characters round-trips to `'path'`, which `sh` strips back to `path`.
+fn posix_sh_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// `std::env::var_os` filtered to a present, non-empty value.
@@ -2445,9 +2463,19 @@ fn default_network_ssh_command() -> OsString {
             .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
         let system_ssh = system_root.join(r"System32\OpenSSH\ssh.exe");
         if system_ssh.is_file() {
-            let mut cmd = OsString::from("\"");
-            cmd.push(system_ssh);
-            cmd.push("\" -o BatchMode=yes");
+            // `GIT_SSH_COMMAND` is parsed by the (MSYS) shell, so POSIX-quote the
+            // path; fall back to a double-quote wrap only for a non-UTF8 path that
+            // can't be quoted as a `str` (System32 paths are ASCII in practice).
+            let mut cmd = match system_ssh.to_str() {
+                Some(path) => OsString::from(posix_sh_quote(path)),
+                None => {
+                    let mut wrapped = OsString::from("\"");
+                    wrapped.push(&system_ssh);
+                    wrapped.push("\"");
+                    wrapped
+                }
+            };
+            cmd.push(" -o BatchMode=yes");
             return cmd;
         }
     }
@@ -2611,9 +2639,12 @@ fn redact_arg(arg: &str) -> Cow<'_, str> {
     let Some((scheme, rest)) = arg.split_once("://") else {
         return Cow::Borrowed(arg);
     };
-    // Userinfo, if present, ends at the first `@` and must come before the path.
+    // Userinfo, if present, ends at the LAST `@` within the authority (before the
+    // path) — per RFC 3986, and git accepts passwords containing `@`. Searching
+    // for the first `@` would split mid-password and leak the tail (e.g. the
+    // `@ss` of `p@ss`).
     let authority_end = rest.find('/').unwrap_or(rest.len());
-    let Some(at) = rest[..authority_end].find('@') else {
+    let Some(at) = rest[..authority_end].rfind('@') else {
         return Cow::Borrowed(arg);
     };
     let (userinfo, host) = rest.split_at(at);
@@ -2623,6 +2654,52 @@ fn redact_arg(arg: &str) -> Cow<'_, str> {
         }
         // `user@host` with no password — nothing secret to mask.
         None => Cow::Borrowed(arg),
+    }
+}
+
+/// Redact `user:password@` credentials from any `scheme://…@…` URL embedded in a
+/// free-form, possibly multi-line string before it is echoed to the HITCH_DEBUG
+/// log. git/gh echo credentialed remote URLs mid-sentence on failure
+/// (`fatal: … 'https://user:tok@host/repo'`), so the raw stderr can otherwise
+/// persist the token in `daemon.log`. Splits on whitespace and trims surrounding
+/// punctuation/quotes off each candidate so the embedded URL is recognised and
+/// run through [`redact_arg`]. Borrows when nothing needed masking.
+fn redact_credentials_in_text(text: &str) -> Cow<'_, str> {
+    // Quick out: no scheme separator means no credentialed URL to mask.
+    if !text.contains("://") {
+        return Cow::Borrowed(text);
+    }
+    // Punctuation/quotes that commonly wrap a URL in a git message; trimmed off a
+    // token before redaction and re-attached afterwards so surrounding text is
+    // preserved verbatim.
+    const WRAP: &[char] = &['\'', '"', '`', '(', ')', '<', '>', ',', '.', ';', ':'];
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    for (i, token) in text.split_whitespace().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let after_lead = token.trim_start_matches(WRAP);
+        let lead = &token[..token.len() - after_lead.len()];
+        let core = after_lead.trim_end_matches(WRAP);
+        let trail = &after_lead[core.len()..];
+        match redact_arg(core) {
+            Cow::Owned(redacted) => {
+                changed = true;
+                out.push_str(lead);
+                out.push_str(&redacted);
+                out.push_str(trail);
+            }
+            Cow::Borrowed(_) => out.push_str(token),
+        }
+    }
+    // `split_whitespace` collapses runs/edges of whitespace; only adopt the
+    // rebuilt string when a credential was actually masked, otherwise keep the
+    // original (with its exact whitespace and newlines) untouched.
+    if changed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -2649,7 +2726,9 @@ fn command_failed(
                 .collect::<Vec<_>>()
                 .join(" "),
             code,
-            stderr.trim(),
+            // git/gh echo credentialed URLs in their failure stderr; redact any
+            // before they land in the on-disk daemon.log.
+            redact_credentials_in_text(stderr.trim()),
         );
     }
     GitError::CommandFailed {
@@ -4937,7 +5016,7 @@ mod tests {
 
         assert_eq!(
             resolved.as_deref(),
-            Some(OsStr::new("\"/usr/bin/ssh\" -o BatchMode=yes")),
+            Some(OsStr::new("'/usr/bin/ssh' -o BatchMode=yes")),
             "a bare GIT_SSH binary should be promoted with BatchMode"
         );
     }
@@ -4992,7 +5071,52 @@ mod tests {
             redact_arg("https://github.com/acme/repo@v1.git"),
             "https://github.com/acme/repo@v1.git"
         );
+        // A password containing `@` must be redacted in full — userinfo ends at
+        // the LAST `@` in the authority, so no `@`-tail of the secret leaks.
+        assert_eq!(
+            redact_arg("https://user:p@ss@github.com/repo"),
+            "https://user:***REDACTED***@github.com/repo"
+        );
         // Non-URL args pass through untouched.
         assert_eq!(redact_arg("push"), "push");
+    }
+
+    #[test]
+    fn redact_credentials_in_text_masks_embedded_urls() {
+        // A credentialed URL embedded mid-sentence in failure stderr (the shape
+        // git/gh emit) must have its password masked before it hits daemon.log.
+        assert_eq!(
+            redact_credentials_in_text(
+                "fatal: unable to access 'https://user:ghp_tok@github.com/acme/repo.git/': 403"
+            ),
+            "fatal: unable to access 'https://user:***REDACTED***@github.com/acme/repo.git/': 403"
+        );
+        // A password containing `@` is fully redacted here too.
+        assert_eq!(
+            redact_credentials_in_text("remote: https://user:p@ss@host/repo failed"),
+            "remote: https://user:***REDACTED***@host/repo failed"
+        );
+        // Text without any credentialed URL is returned untouched (borrowed).
+        assert!(matches!(
+            redact_credentials_in_text("fatal: repository not found"),
+            Cow::Borrowed(_)
+        ));
+        // A userinfo-less URL has nothing secret and stays readable.
+        assert_eq!(
+            redact_credentials_in_text("cloning https://github.com/acme/repo.git now"),
+            "cloning https://github.com/acme/repo.git now"
+        );
+    }
+
+    #[test]
+    fn posix_sh_quote_protects_special_chars() {
+        // Plain path round-trips inside single quotes (sh strips them back).
+        assert_eq!(posix_sh_quote("/usr/bin/ssh"), "'/usr/bin/ssh'");
+        // Space, `$`, and an embedded single quote are all neutralised; the lone
+        // quote is closed, escaped (`'\''`), then re-opened.
+        assert_eq!(
+            posix_sh_quote("/opt/my ssh/$x/o'brien"),
+            "'/opt/my ssh/$x/o'\\''brien'"
+        );
     }
 }
