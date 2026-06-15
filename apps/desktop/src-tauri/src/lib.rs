@@ -8,7 +8,6 @@ mod cli_install;
 mod ssh;
 // The local ssh-agent relay bridge (proto v29, slices 4+6) connects to the local
 // ssh-agent over a Unix socket; it is Unix-only for now (Windows is slice 7+8).
-#[cfg(unix)]
 mod ssh_agent_bridge;
 mod ssh_pool;
 mod window_chrome;
