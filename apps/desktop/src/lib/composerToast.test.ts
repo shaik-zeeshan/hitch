@@ -38,4 +38,13 @@ describe("autoErrorMessage", () => {
     const long = "x".repeat(100);
     expect(autoErrorMessage(new Error(long))).toBe("x".repeat(77) + "…");
   });
+
+  it("truncates on a grapheme boundary, never splitting a surrogate pair", () => {
+    // A run of emoji (each a surrogate pair) longer than the cap. A naive
+    // slice(0, 77) would cut a code unit and leave a lone surrogate; the result
+    // must contain no unpaired surrogate (U+D800–U+DFFF) before the ellipsis.
+    const out = autoErrorMessage(new Error("😀".repeat(90)));
+    expect(out.endsWith("…")).toBe(true);
+    expect(/[\uD800-\uDFFF]/.test(out.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, ""))).toBe(false);
+  });
 });

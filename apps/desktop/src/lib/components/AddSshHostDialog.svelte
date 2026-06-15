@@ -35,8 +35,10 @@
   }
 
   // A fresh edit invalidates the last test result and any save error, so stale
-  // green/red copy never lingers under a changed target.
-  function onInput() {
+  // green/red copy never lingers under a changed target. Flipping forward-agent is
+  // a test-affecting change too (it picks the proxy transport the probe exercises),
+  // so toggling the checkbox invalidates the cached result the same way.
+  function invalidateTest() {
     testResult = null;
     errMsg = null;
   }
@@ -108,7 +110,7 @@
           <input
             class="base"
             bind:value={target}
-            oninput={onInput}
+            oninput={invalidateTest}
             placeholder="user@example.com or host-alias"
             autofocus
             onkeydown={(e) => e.key === "Enter" && void save()}
@@ -120,7 +122,7 @@
         </p>
 
         <label class="check">
-          <input type="checkbox" bind:checked={forwardAgent} />
+          <input type="checkbox" bind:checked={forwardAgent} onchange={invalidateTest} />
           <span>
             <span class="check-title">Forward SSH agent</span>
             <span class="check-sub"

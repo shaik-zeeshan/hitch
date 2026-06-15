@@ -49,7 +49,23 @@ export function autoToastContent(result: CommitAndPushResult): {
 export function autoErrorMessage(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
   const first = msg.split("\n")[0].trim();
-  return first.length > 80 ? first.slice(0, 77) + "…" : first;
+  return truncateGraphemes(first, 80);
+}
+
+// Truncate to at most `limit` visible characters, counting and cutting on grapheme
+// boundaries so a multi-code-unit emoji / surrogate pair is never split mid-glyph.
+// Keeps the prior semantics: at or under the limit passes through untouched; over
+// it, the first `limit - 3` graphemes plus the ellipsis stand in for the rest.
+function truncateGraphemes(str: string, limit: number): string {
+  // Intl.Segmenter (grapheme mode) groups surrogate pairs and combining marks into
+  // single units; the Tauri webview is modern Chromium/WebKit, so it's available.
+  // Array.from (code points) is the surrogate-pair-safe fallback for any runtime
+  // without it.
+  const units =
+    typeof Intl !== "undefined" && "Segmenter" in Intl
+      ? Array.from(new Intl.Segmenter().segment(str), (s) => s.segment)
+      : Array.from(str);
+  return units.length > limit ? units.slice(0, limit - 3).join("") + "…" : str;
 }
 
 // Log a failed operation in full to the devtools console with an op-specific

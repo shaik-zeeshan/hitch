@@ -128,8 +128,11 @@ export function addSshHost(
 // from it) are immutable — only `forwardAgent` may be flipped on a saved host, so
 // the user can opt a host in/out of ssh-agent forwarding without delete+re-add
 // (silly-ridge-27). The write goes through `sshHosts.update`, so the existing
-// `sshHosts.subscribe → syncSshHostsToPool` reconcile re-pushes the new toggle to
-// the Rust pool automatically.
+// `sshHosts.subscribe → syncSshHostsToPool` reconcile re-pushes the host list (with
+// the new flag) via `set_ssh_hosts`. Because forwardAgent is fixed at connect time
+// (it picks the proxy ssh transport), the Rust pool tears the host's existing proxy
+// down and respawns it so the new setting takes effect on the next connection — an
+// already-attached host is reconnected, not silently left on the old transport.
 export function updateSshHost(id: DaemonScopeId, patch: { forwardAgent: boolean }): void {
   sshHosts.update((hosts) =>
     hosts.map((h) => (h.id === id ? { ...h, forwardAgent: patch.forwardAgent } : h)),

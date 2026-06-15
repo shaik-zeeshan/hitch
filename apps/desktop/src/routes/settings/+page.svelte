@@ -256,7 +256,10 @@
     hostTesting = { ...hostTesting, [host.id]: true };
     hostTestResult = { ...hostTestResult, [host.id]: null };
     try {
-      const result = await testSshHost(host.target);
+      // Thread the host's saved forwardAgent so Test probes the same transport the
+      // real attach uses — an opted-OUT host is probed without agent forwarding,
+      // not as if it were forwarding (silly-ridge-27).
+      const result = await testSshHost(host.target, host.forwardAgent);
       hostTestResult = { ...hostTestResult, [host.id]: result };
     } catch (err) {
       hostTestResult = {
