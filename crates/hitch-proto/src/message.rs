@@ -103,7 +103,14 @@ use serde::{Deserialize, Serialize};
 /// agent — reaching where OS `ForwardAgent` (the v28 `ConnEnv` path) cannot. The
 /// same restart lesson applies: a persistent remote daemon MUST be restarted onto
 /// a v29 binary or it chokes on the unknown frames before answering Hello.
-pub const PROTOCOL_VERSION: u16 = 29;
+/// v30 adds [`ControlMessage::ClientActive`] (ADR 0014 amendment): a GUI →
+/// daemon focus-gain ping the GUI sends when it becomes the foreground app, so
+/// the daemon can refresh its "driving client" — the most-recently-active
+/// relay-capable connection it routes ssh-agent signing to (presence routing for
+/// terminal & Agent-run git). Parameterless; the client_id is known from the
+/// connection. An old daemon at v29 has no such message, so a still-reachable
+/// older daemon is rejected as a clean protocol mismatch.
+pub const PROTOCOL_VERSION: u16 = 30;
 
 /// Maximum bytes carried by one [`Request::UploadChunk`] frame (256 KiB). The
 /// upload stream is shared with interactive PTY traffic, so chunks are bounded
@@ -196,6 +203,10 @@ pub enum ControlMessage {
     /// closed (daemon → GUI) or the local agent connection closed (GUI → daemon).
     /// Serialized as `{"kind":"ssh-agent-close",...}`.
     SshAgentClose { channel: u64 },
+    /// GUI → daemon focus-gain ping: this GUI is now the foreground app and should
+    /// become the driving client for ssh-agent relay routing. Parameterless — the
+    /// client_id is known from the connection. (v30, ADR 0014 amendment)
+    ClientActive,
 }
 
 impl ControlMessage {
@@ -2028,7 +2039,7 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 29);
+        assert_eq!(PROTOCOL_VERSION, 30);
     }
 
     #[test]
@@ -2883,6 +2894,7 @@ mod tests {
             ControlMessage::SshAgentOpen { channel: 7 },
             ControlMessage::ssh_agent_data(7, b"\x00\x01\x02ssh-agent bytes\xff"),
             ControlMessage::SshAgentClose { channel: 7 },
+            ControlMessage::ClientActive,
         ]
     }
 
