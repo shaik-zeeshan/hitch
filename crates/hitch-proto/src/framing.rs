@@ -11,11 +11,28 @@ use crate::message::ControlMessage;
 pub const MAX_PTY_FRAME_LEN: usize = 16 * 1024 * 1024;
 const LEN_PREFIX_BYTES: usize = 4;
 
+/// Safety cap for one newline-delimited control line: 512 KiB.
+///
+/// Control frames are JSON `ControlMessage`s — small handshakes, requests, and
+/// responses, never bulk data (PTY output and ssh-agent payloads ride their own
+/// length-prefixed planes). 512 KiB is orders of magnitude above any legitimate
+/// control line yet bounds the buffer a peer can force us to accumulate.
+///
+/// Without this cap, [`ControlLineDecoder::push`] would buffer bytes until it saw
+/// a `\n`: a compromised or MITM'd remote daemon could stream gigabytes with no
+/// newline and drive the process to OOM. The bound is enforced *incrementally*
+/// (mirroring [`PtyFrameDecoder`]'s `MAX_PTY_FRAME_LEN` check) so the offending
+/// peer is cut off long before the allocation grows large.
+pub const MAX_CONTROL_LINE_LEN: usize = 512 * 1024;
+
 /// Errors produced by framing encoders/decoders.
 #[derive(Debug)]
 pub enum FrameError {
     /// The frame length exceeds the configured maximum.
     FrameTooLarge { len: usize, max: usize },
+    /// An incomplete control line (no newline yet) exceeds the configured
+    /// maximum, indicating a peer streaming an unbounded newline-less line.
+    ControlLineTooLarge { len: usize, max: usize },
     /// The length prefix would not fit into the on-wire u32.
     LengthOverflow { len: usize },
     /// A JSON control frame failed to serialize or deserialize.
@@ -30,6 +47,9 @@ impl fmt::Display for FrameError {
         match self {
             Self::FrameTooLarge { len, max } => {
                 write!(f, "PTY frame length {len} exceeds maximum {max}")
+            }
+            Self::ControlLineTooLarge { len, max } => {
+                write!(f, "control line length {len} exceeds maximum {max}")
             }
             Self::LengthOverflow { len } => write!(f, "PTY frame length {len} exceeds u32::MAX"),
             Self::Json(err) => fmt::Display::fmt(err, f),
@@ -88,6 +108,18 @@ impl ControlLineDecoder {
                 continue;
             }
             messages.push(serde_json::from_slice(line)?);
+        }
+
+        // Whatever remains is an incomplete line (no newline yet). Bound it so a
+        // peer cannot stream an unbounded newline-less line and OOM us — the
+        // incremental analog of `PtyFrameDecoder`'s `MAX_PTY_FRAME_LEN` check.
+        // Completed lines drained above, so this only trips on a single oversized
+        // partial line; the counter resets naturally as the buffer drains.
+        if self.buffer.len() > MAX_CONTROL_LINE_LEN {
+            return Err(FrameError::ControlLineTooLarge {
+                len: self.buffer.len(),
+                max: MAX_CONTROL_LINE_LEN,
+            });
         }
 
         Ok(messages)
@@ -256,6 +288,43 @@ mod tests {
 
         let frames = decoder.push(&combined[6..]).unwrap();
         assert_eq!(frames, vec![b"abc".to_vec(), b"defgh".to_vec()]);
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+
+    #[test]
+    fn control_decoder_rejects_unbounded_newline_less_line() {
+        // A peer streaming a newline-less line must be cut off once the buffered
+        // partial line exceeds the cap, instead of growing the buffer unboundedly
+        // (OOM DoS). Feed just over the cap with no `\n`.
+        let mut decoder = ControlLineDecoder::new();
+        let flood = vec![b'x'; MAX_CONTROL_LINE_LEN + 1];
+        let err = decoder.push(&flood).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrameError::ControlLineTooLarge { len, max }
+                    if len == MAX_CONTROL_LINE_LEN + 1 && max == MAX_CONTROL_LINE_LEN
+            ),
+            "expected ControlLineTooLarge, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn control_decoder_accepts_a_normal_line_after_the_cap_exists() {
+        // The cap must not regress ordinary decoding: a well-formed line (well
+        // under the cap) still decodes, and the buffer drains back to empty so the
+        // length counter resets between lines.
+        let message = ControlMessage::request(
+            1,
+            Request::Hello {
+                client_name: "ok".into(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+        );
+        let encoded = encode_control_message(&message).unwrap();
+        let mut decoder = ControlLineDecoder::new();
+        let messages = decoder.push(&encoded).unwrap();
+        assert_eq!(messages, vec![message]);
         assert_eq!(decoder.buffered_len(), 0);
     }
 

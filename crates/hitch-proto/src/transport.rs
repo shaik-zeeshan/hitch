@@ -190,7 +190,15 @@ impl DaemonListener {
         #[cfg(unix)]
         let listener = {
             remove_stale_socket(&path)?;
-            UnixListener::bind(&path)?
+            let listener = UnixListener::bind(&path)?;
+            // Defense-in-depth (L3): the socket lives in $TMPDIR and so far relied
+            // on TMPDIR + umask defaults for access control. Pin the socket file to
+            // 0600 (owner read/write only) in-code so a permissive umask can't
+            // leave it group/world-accessible — the Unix analog of the Windows
+            // owner-only pipe DACL above. Best-effort: a metadata/permission error
+            // must not fail the bind, but is unexpected enough to surface.
+            harden_socket_permissions(&path)?;
+            listener
         };
         #[cfg(windows)]
         let listener = ListenerOptions::new()
@@ -445,6 +453,12 @@ impl DaemonStream {
         }
         #[cfg(windows)]
         {
+            // Windows named pipes have no `set_write_timeout`; the inbound
+            // GUI->git write is instead bounded by `RelayWriter::write_with_deadline`
+            // (a CancelIoEx watchdog). The daemon's writer must call that method
+            // rather than a plain `write_all` for the no-stall guarantee to hold.
+            // TODO(win-e2e): exercise the watchdog deadline against a non-draining
+            // pipe peer on host `pc` (the deadline path has no CI coverage here).
             let (recv, send) = self.stream.split();
             Ok((RelayReader { half: recv }, RelayWriter { half: send }))
         }
@@ -513,6 +527,12 @@ pub fn connect_external(path: &Path) -> io::Result<(RelayReader, RelayWriter)> {
         // handle into recv/send halves (same as `into_relay_channel`), so either
         // half's `force_close` (CancelIoEx + DisconnectNamedPipe) unblocks the
         // other.
+        // As in `into_relay_channel`, Windows pipes have no write timeout; the
+        // agent->? write is bounded by `RelayWriter::write_with_deadline`
+        // (CancelIoEx watchdog), which the bridge must use in place of a plain
+        // `write_all`.
+        // TODO(win-e2e): exercise the watchdog deadline against a non-draining
+        // pipe peer on host `pc` (no CI coverage for the deadline path here).
         let name = path.to_fs_name::<GenericFilePath>()?;
         let stream = LocalSocketStream::connect(name)?;
         let (recv, send) = stream.split();
@@ -571,8 +591,12 @@ impl Read for RelayReader {
 /// on a wedged git child and closes the channel (ADR 0014 amendment). Generous
 /// enough to never trip on a healthy child (an ssh-agent reply is a few hundred
 /// bytes), short enough that one stuck child cannot stall the control plane
-/// indefinitely. Unix only — Windows named pipes do not support write timeouts.
-#[cfg(unix)]
+/// indefinitely.
+///
+/// On Unix this is applied with `set_write_timeout`. On Windows named pipes have
+/// no native write timeout, so the bound is enforced with a `CancelIoEx`
+/// watchdog (see [`RelayWriter::write_with_deadline`]) — the constant is shared
+/// across both platforms so the no-stall guarantee holds everywhere.
 const RELAY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Write half of an ssh-agent relay channel (ADR 0014 amendment). Inbound GUI
@@ -599,6 +623,89 @@ impl RelayWriter {
         { shutdown_both(&self.stream) }
         #[cfg(windows)]
         { force_close_send_half(&self.half) }
+    }
+
+    /// Write `buf` in full under a [`RELAY_WRITE_TIMEOUT`] deadline, so a peer
+    /// that stops draining the pipe cannot stall the writing thread — and thus
+    /// the connection's control plane — forever (ADR 0014 amendment, the
+    /// cross-platform half of the no-stall guarantee).
+    ///
+    /// On Unix the deadline is the `set_write_timeout` configured when the
+    /// channel was split (see [`DaemonStream::into_relay_channel`] /
+    /// [`connect_external`]), so this is a plain `write_all`: a wedged peer
+    /// surfaces as `WouldBlock`/`TimedOut`, which the daemon treats as "close
+    /// this channel".
+    ///
+    /// On Windows named pipes have no native write timeout, so the bound is
+    /// enforced with a `CancelIoEx` watchdog: a timer thread cancels any pending
+    /// `WriteFile` on the shared pipe handle once the deadline elapses, turning a
+    /// wedged write into a promptly-returning cancelled error. The watchdog is
+    /// disarmed the instant the write returns (success or error) so a healthy
+    /// write is never disturbed. The handle is borrowed from the half we still
+    /// hold, so it stays live for the duration of the call.
+    pub fn write_with_deadline(&self, buf: &[u8]) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let mut s = &self.stream;
+            s.write_all(buf)
+        }
+        #[cfg(windows)]
+        {
+            let raw = send_half_raw_handle(&self.half);
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // SAFETY: `raw` is borrowed from `self.half`, which outlives this
+            // call (we join the watchdog before returning), so the handle stays
+            // valid for any `CancelIoEx` the watchdog may issue.
+            let handle = PipeHandle(raw);
+            let watchdog = {
+                let done = std::sync::Arc::clone(&done);
+                std::thread::spawn(move || {
+                    let handle = handle; // move the wrapper across the boundary
+                    let deadline = std::time::Instant::now() + RELAY_WRITE_TIMEOUT;
+                    // Poll the done flag so a completed write disarms the watchdog
+                    // immediately instead of always waiting the full timeout.
+                    while std::time::Instant::now() < deadline {
+                        if done.load(std::sync::atomic::Ordering::Acquire) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    if !done.load(std::sync::atomic::Ordering::Acquire) {
+                        // Deadline blew: cancel the pending WriteFile. A null
+                        // OVERLAPPED cancels every pending op on the handle;
+                        // ERROR_NOT_FOUND (nothing pending) is benign.
+                        unsafe {
+                            let _ = windows_sys::Win32::System::IO::CancelIoEx(
+                                handle.0 as _,
+                                std::ptr::null(),
+                            );
+                        }
+                    }
+                })
+            };
+            let mut w = &self.half;
+            let result = w.write_all(buf);
+            done.store(true, std::sync::atomic::Ordering::Release);
+            let _ = watchdog.join();
+            result
+        }
+    }
+}
+
+/// A raw named-pipe handle made `Send` so it can be moved into the `CancelIoEx`
+/// watchdog thread. Safe because the watchdog only ever calls `CancelIoEx` on it
+/// and is joined before [`RelayWriter::write_with_deadline`] returns, so the
+/// handle the borrow came from is still alive for the whole lifetime of the copy.
+#[cfg(windows)]
+struct PipeHandle(std::os::windows::io::RawHandle);
+
+#[cfg(windows)]
+unsafe impl Send for PipeHandle {}
+
+#[cfg(windows)]
+fn send_half_raw_handle(half: &SendHalf) -> std::os::windows::io::RawHandle {
+    match half {
+        SendHalf::NamedPipe(np) => np.as_handle().as_raw_handle(),
     }
 }
 
@@ -779,6 +886,22 @@ fn normalize_socket_spelling(path: &Path) -> String {
         .map(|ch| if ch == '/' { '\\' } else { ch })
         .collect::<String>()
         .to_lowercase()
+}
+
+/// Restrict the daemon control socket to its owning user (mode 0600) after bind
+/// (L3 defense-in-depth). The socket sits in `$TMPDIR`, which the daemon does not
+/// create here, so only the socket file's mode is tightened — not the directory.
+///
+/// L3: a peer-credential check at accept time (SO_PEERCRED on Linux,
+/// `getpeereid` on the BSDs/macOS) would harden this further by rejecting any
+/// connection not from the same uid even if the file mode were somehow loosened.
+/// It is left as future hardening: it needs a per-platform syscall (no std API)
+/// and 0600 already denies other users `connect(2)` on the socket inode.
+#[cfg(unix)]
+fn harden_socket_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = fs::Permissions::from_mode(0o600);
+    fs::set_permissions(path, perms)
 }
 
 #[cfg(unix)]
@@ -1038,6 +1161,41 @@ mod tests {
 
         drop(client);
         #[cfg(unix)]
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_control_socket_is_owner_only_0600() {
+        // L3: the daemon control socket must be mode 0600 after bind, regardless
+        // of the ambient umask, so no other local user can connect(2) to it.
+        use std::os::unix::fs::PermissionsExt;
+        let path = test_socket_path();
+        let listener = DaemonListener::bind(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "control socket should be 0600, got {mode:o}");
+        drop(listener);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_with_deadline_delivers_bytes_on_a_draining_peer() {
+        // On a healthy (draining) peer, the bounded write must behave like a
+        // normal `write_all`: the bytes arrive intact and the call returns Ok.
+        let path = test_socket_path();
+        let listener = DaemonListener::bind(&path).unwrap();
+        let accept = thread::spawn(move || listener.accept().unwrap().into_relay_channel().unwrap());
+
+        let mut client = connect_daemon(&path).unwrap();
+        let (_reader, writer) = accept.join().unwrap();
+
+        writer.write_with_deadline(&[4, 5, 6, 7]).unwrap();
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).unwrap();
+        assert_eq!(back, [4, 5, 6, 7]);
+
+        drop(client);
         let _ = fs::remove_file(&path);
     }
 
