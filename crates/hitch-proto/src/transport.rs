@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use interprocess::{
     local_socket::{
-        prelude::*, GenericNamespaced, ListenerNonblockingMode, ListenerOptions,
+        prelude::*, GenericFilePath, GenericNamespaced, ListenerNonblockingMode, ListenerOptions,
         Name as LocalSocketName, RecvHalf, SendHalf,
     },
     os::windows::{local_socket::ListenerOptionsExt, security_descriptor::SecurityDescriptor},
@@ -448,6 +448,75 @@ impl DaemonStream {
             let (recv, send) = self.stream.split();
             Ok((RelayReader { half: recv }, RelayWriter { half: send }))
         }
+    }
+}
+
+/// Connect to an **external** byte endpoint at the **literal** `path` and return
+/// the same splittable [`RelayReader`]/[`RelayWriter`] halves that
+/// [`DaemonStream::into_relay_channel`] yields (ADR 0014 live-origin amendment).
+///
+/// "External" means an endpoint Hitch does **not** own — specifically the local
+/// ssh-agent socket (1Password, OpenSSH, gpg-agent, …) on the machine the daemon
+/// runs on. This is the co-located direct-bridge path: when the driving GUI is
+/// *local* (it shares a host with the daemon and advertised a resolved
+/// `SSH_AUTH_SOCK` via `ClientLocal`), the daemon connects straight to the agent
+/// itself rather than tunneling agent traffic over a `SshAgentOpen` channel to a
+/// relay-capable GUI. The bytes are forwarded raw, so the agent never learns it
+/// is talking to anything but a normal client.
+///
+/// ## Literal-path / no-hash contract (hazard H2)
+///
+/// The `path` here is an **agent address owned by another program**, e.g.
+/// `\\.\pipe\openssh-ssh-agent` on Windows or `/private/tmp/com.apple…/Listeners`
+/// on macOS. It is **NOT** a Hitch endpoint, so it must be connected to
+/// **verbatim**. This function therefore deliberately does **not** route through
+/// [`logical_socket_name`] / [`endpoint_os_address`] / `windows_socket_name`,
+/// every one of which FNV-hashes the spelling into Hitch's *own* `hitch-<hash>`
+/// namespace — pointing those at an agent pipe would dial a non-existent
+/// Hitch-namespaced pipe and never reach the agent. On Windows we convert the
+/// full `\\.\pipe\…` path with interprocess's filesystem-path name type
+/// (`to_fs_name::<GenericFilePath>()`), the literal-path counterpart of the
+/// namespaced `to_ns_name::<GenericNamespaced>()` used for Hitch's own endpoints.
+///
+/// ## Windows validation
+///
+/// The Windows arm cannot be compiled or unit-tested in this repo's CI (no
+/// Windows target here). It is written to mirror the existing `#[cfg(windows)]`
+/// relay code in this file and the named-pipe spike at
+/// `spikes/win-ssh-agent-pipe/`, and is validated **live on host `pc`**, not in
+/// CI (see the `win-relay-implementation-facts` notes).
+pub fn connect_external(path: &Path) -> io::Result<(RelayReader, RelayWriter)> {
+    #[cfg(unix)]
+    {
+        // Mirror the Unix arm of `DaemonStream::into_relay_channel` exactly: the
+        // git→agent pump and the agent→git pump address the SAME underlying
+        // connection through two clones, so either half's `force_close`
+        // (shutdown(Both)) unblocks a read pending on the other.
+        let stream = UnixStream::connect(path)?;
+        let writer = stream.try_clone()?;
+        // Bound the agent→? write the same way the inbound relay write is bounded
+        // (see `into_relay_channel`): a wedged peer that stops draining cannot
+        // stall the pump thread forever — it degrades to a recoverable timeout the
+        // bridge treats as "tear this bridge down". Best-effort; fall back to the
+        // unbounded default if the platform rejects the option.
+        let _ = writer.set_write_timeout(Some(RELAY_WRITE_TIMEOUT));
+        Ok((RelayReader { stream }, RelayWriter { stream: writer }))
+    }
+    #[cfg(windows)]
+    {
+        // Connect to the LITERAL agent pipe path (hazard H2): use interprocess's
+        // filesystem-path name conversion (`to_fs_name::<GenericFilePath>()`) so a
+        // full `\\.\pipe\openssh-ssh-agent` address is used byte-for-byte. Do NOT
+        // use `windows_socket_name`/`logical_socket_name`/`endpoint_os_address`:
+        // those FNV-hash the path into Hitch's `hitch-<hash>` namespace and would
+        // never reach the agent. `.split()` ref-clones the single duplex pipe
+        // handle into recv/send halves (same as `into_relay_channel`), so either
+        // half's `force_close` (CancelIoEx + DisconnectNamedPipe) unblocks the
+        // other.
+        let name = path.to_fs_name::<GenericFilePath>()?;
+        let stream = LocalSocketStream::connect(name)?;
+        let (recv, send) = stream.split();
+        Ok((RelayReader { half: recv }, RelayWriter { half: send }))
     }
 }
 

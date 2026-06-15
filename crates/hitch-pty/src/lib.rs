@@ -71,6 +71,12 @@ pub struct PtySpawnConfig {
     pub command: Option<Vec<String>>,
     pub size: TerminalSize,
     pub scrollback_capacity: usize,
+    /// Extra environment variables injected into the spawned child, applied
+    /// after the built-in vars (`TERM`, `HITCH_SESSION_ID`) so a caller can
+    /// override them. General-purpose: the daemon uses this to inject the
+    /// stable ssh-agent relay socket (`SSH_AUTH_SOCK`), and a future
+    /// local-agent resolver will reuse the same hook.
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl PtySpawnConfig {
@@ -81,6 +87,7 @@ impl PtySpawnConfig {
             command: None,
             size: TerminalSize::default(),
             scrollback_capacity: DEFAULT_SCROLLBACK_CAPACITY,
+            extra_env: Vec::new(),
         }
     }
 
@@ -96,6 +103,14 @@ impl PtySpawnConfig {
 
     pub fn scrollback_capacity(mut self, capacity: usize) -> Self {
         self.scrollback_capacity = capacity;
+        self
+    }
+
+    /// Inject extra environment variables into the spawned child. Applied after
+    /// the built-in vars (`TERM`, `HITCH_SESSION_ID`) so a caller can override
+    /// them.
+    pub fn extra_env(mut self, extra_env: Vec<(String, String)>) -> Self {
+        self.extra_env = extra_env;
         self
     }
 }
@@ -150,6 +165,7 @@ impl ManagedPty {
             &config.session_id,
             &config.command,
             &config.cwd,
+            &config.extra_env,
         ))?;
         #[cfg(windows)]
         let (child, job) = {
@@ -391,6 +407,7 @@ fn build_command(
     session_id: &SessionId,
     command: &Option<Vec<String>>,
     cwd: &Path,
+    extra_env: &[(String, String)],
 ) -> CommandBuilder {
     let uses_powershell_cwd = command
         .as_ref()
@@ -407,6 +424,10 @@ fn build_command(
     };
     builder.env("TERM", "xterm-256color");
     builder.env(SESSION_ID_ENV, session_id.to_string());
+    // Applied last so a caller can override the built-in vars above.
+    for (key, value) in extra_env {
+        builder.env(key, value);
+    }
     set_command_cwd(&mut builder, cwd);
     configure_powershell_display_cwd(&mut builder, cwd, uses_powershell_cwd);
     builder
@@ -1075,7 +1096,7 @@ mod tests {
     fn powershell_command_builder_preserves_verbatim_extended_cwd() {
         let cwd = Path::new(r"\\?\C:\Code\hitch");
         let command = Some(vec!["powershell.exe".into(), "-NoProfile".into()]);
-        let builder = build_command(&SessionId::new(), &command, cwd);
+        let builder = build_command(&SessionId::new(), &command, cwd, &[]);
 
         assert_eq!(
             builder.get_cwd().map(|cwd| cwd.as_os_str()),
@@ -1146,7 +1167,7 @@ mod tests {
             "-EncodedCommand".into(),
             "ZQBjAGgAbwAgAGgAaQA=".into(),
         ]);
-        let builder = build_command(&SessionId::new(), &command, cwd);
+        let builder = build_command(&SessionId::new(), &command, cwd, &[]);
 
         let argv: Vec<String> = builder
             .get_argv()
@@ -1177,7 +1198,7 @@ mod tests {
             "-ec".into(),
             "ZQBjAGgAbwAgAGgAaQA=".into(),
         ]);
-        let builder = build_command(&SessionId::new(), &command, cwd);
+        let builder = build_command(&SessionId::new(), &command, cwd, &[]);
 
         assert!(
             !builder.get_argv().iter().any(|arg| arg
@@ -1261,6 +1282,34 @@ mod tests {
         let output = collect_output(&rx, Duration::from_secs(3));
         assert!(String::from_utf8_lossy(&output).contains(&session_id.to_string()));
         assert!(String::from_utf8_lossy(&pty.scrollback()).contains(&session_id.to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawned_pty_injects_extra_env() {
+        // The daemon injects the stable ssh-agent relay socket via `extra_env`;
+        // prove a configured extra var reaches the spawned child's environment.
+        let (tx, rx) = mpsc::channel();
+        let session_id = SessionId::new();
+        let pty = ManagedPty::spawn(
+            PtySpawnConfig::new(session_id, std::env::current_dir().unwrap())
+                .command(Some(vec![
+                    "/bin/sh".into(),
+                    "-lc".into(),
+                    "printf %s \"$HITCH_PTY_EXTRA_ENV_TEST\"".into(),
+                ]))
+                .extra_env(vec![(
+                    "HITCH_PTY_EXTRA_ENV_TEST".into(),
+                    "relay-sock-value".into(),
+                )])
+                .scrollback_capacity(1024),
+            tx,
+        )
+        .unwrap();
+
+        let output = collect_output(&rx, Duration::from_secs(3));
+        assert!(String::from_utf8_lossy(&output).contains("relay-sock-value"));
+        assert!(String::from_utf8_lossy(&pty.scrollback()).contains("relay-sock-value"));
     }
 
     #[cfg(unix)]

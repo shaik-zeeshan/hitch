@@ -103,7 +103,24 @@ use serde::{Deserialize, Serialize};
 /// agent — reaching where OS `ForwardAgent` (the v28 `ConnEnv` path) cannot. The
 /// same restart lesson applies: a persistent remote daemon MUST be restarted onto
 /// a v29 binary or it chokes on the unknown frames before answering Hello.
-pub const PROTOCOL_VERSION: u16 = 29;
+/// v30 adds [`ControlMessage::ClientActive`] (ADR 0014 amendment): a GUI →
+/// daemon focus-gain ping the GUI sends when it becomes the foreground app, so
+/// the daemon can refresh its "driving client" — the most-recently-active
+/// relay-capable connection it routes ssh-agent signing to (presence routing for
+/// terminal & Agent-run git). Parameterless; the client_id is known from the
+/// connection. An old daemon at v29 has no such message, so a still-reachable
+/// older daemon is rejected as a clean protocol mismatch.
+/// v31 adds [`ControlMessage::ClientLocal`] (ADR 0014 amendment): a GUI → local
+/// daemon prelude carrying the local GUI's own resolved local-agent socket path.
+/// Its presence ⇔ "a local GUI with a signable agent is connected" — sent only
+/// when an agent resolved — so the co-located daemon stores it, bridges git
+/// directly to that agent (no relay tunnel needed; the daemon is co-located with
+/// the agent), and it widens driving-client eligibility. GUI → daemon only; the
+/// GUI never receives one. The same restart lesson applies: a persistent remote
+/// daemon MUST be restarted onto a v31 binary or it chokes on the unknown frame
+/// before answering Hello; the GUI rejects a still-reachable older daemon as a
+/// clean protocol mismatch.
+pub const PROTOCOL_VERSION: u16 = 31;
 
 /// Maximum bytes carried by one [`Request::UploadChunk`] frame (256 KiB). The
 /// upload stream is shared with interactive PTY traffic, so chunks are bounded
@@ -196,6 +213,20 @@ pub enum ControlMessage {
     /// closed (daemon → GUI) or the local agent connection closed (GUI → daemon).
     /// Serialized as `{"kind":"ssh-agent-close",...}`.
     SshAgentClose { channel: u64 },
+    /// GUI → daemon focus-gain ping: this GUI is now the foreground app and should
+    /// become the driving client for ssh-agent relay routing. Parameterless — the
+    /// client_id is known from the connection. (v30, ADR 0014 amendment)
+    ClientActive,
+    /// GUI → local daemon prelude (v31, ADR 0014 amendment): the *local* GUI
+    /// announces its OWN resolved local ssh-agent socket path so the co-located
+    /// daemon can bridge git directly to that agent. Its presence ⇔ "a local GUI
+    /// with a signable agent is connected" — the GUI sends it only when an agent
+    /// resolved — so it widens driving-client eligibility. The daemon stores the
+    /// path and signs git ops against it directly: no relay tunnel is needed
+    /// because the daemon is co-located with the agent (contrast the remote
+    /// [`ControlMessage::SshAgentRelay`] path). GUI → daemon only; the GUI never
+    /// receives one. Serialized as `{"kind":"client-local",...}`.
+    ClientLocal { ssh_auth_sock: String },
 }
 
 impl ControlMessage {
@@ -2028,7 +2059,7 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 29);
+        assert_eq!(PROTOCOL_VERSION, 31);
     }
 
     #[test]
@@ -2883,6 +2914,10 @@ mod tests {
             ControlMessage::SshAgentOpen { channel: 7 },
             ControlMessage::ssh_agent_data(7, b"\x00\x01\x02ssh-agent bytes\xff"),
             ControlMessage::SshAgentClose { channel: 7 },
+            ControlMessage::ClientActive,
+            ControlMessage::ClientLocal {
+                ssh_auth_sock: "/tmp/agent.sock".into(),
+            },
         ]
     }
 
@@ -2907,6 +2942,18 @@ mod tests {
         assert_eq!(json, r#"{"kind":"ssh-agent-relay"}"#);
         let back: ControlMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ControlMessage::SshAgentRelay);
+    }
+
+    #[test]
+    fn client_local_round_trips_carrying_the_local_agent_path() {
+        let message = ControlMessage::ClientLocal {
+            ssh_auth_sock: "/tmp/agent.sock".into(),
+        };
+        let value: serde_json::Value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value["kind"], "client-local");
+        assert_eq!(value["ssh_auth_sock"], "/tmp/agent.sock");
+        let back: ControlMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(message, back);
     }
 
     #[test]

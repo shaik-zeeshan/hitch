@@ -1680,7 +1680,14 @@ fn expect_transport_response(
                 | ControlMessage::SshAgentRelay
                 | ControlMessage::SshAgentOpen { .. }
                 | ControlMessage::SshAgentData { .. }
-                | ControlMessage::SshAgentClose { .. } => {}
+                | ControlMessage::SshAgentClose { .. }
+                // `ClientActive` is a GUI -> daemon presence ping with no payload
+                // (proto v30, ADR 0014 amendment). `ClientLocal` is a local GUI's
+                // local-agent-socket prelude (proto v31, ADR 0014 amendment). Like
+                // the other non-Response control messages above they are ignored
+                // while scanning for a response in the reattach/replay path.
+                | ControlMessage::ClientActive
+                | ControlMessage::ClientLocal { .. } => {}
             }
         }
     }

@@ -627,6 +627,44 @@ impl SshConnections {
         }
     }
 
+    /// OS focus-gain ping: this GUI just became the foreground app, so tell every
+    /// connected relay-capable remote daemon it is now the driving client for
+    /// ssh-agent relay routing (proto v30 `ControlMessage::ClientActive`, ADR 0014
+    /// amendment). Event-driven — called only from the window focus handler, never
+    /// polled. Best-effort: a ping that can't be delivered (writer gone, link torn
+    /// down) is silently dropped by `write_remote_control`.
+    ///
+    /// Gating mirrors the relay serve path (`remote_reader_loop`'s `SshAgentOpen`):
+    /// only connections where forwarding is on AND the GUI actually declared the
+    /// relay (`relay_declared`) are pinged, so a host the user never relays for is
+    /// never told this GUI is driving. `relay_declared` is `#[cfg(unix)]`, so the
+    /// whole sweep is Unix-only; on non-Unix there is no relay to refresh.
+    #[cfg(unix)]
+    pub fn notify_focused(&self) {
+        let connections: Vec<Arc<RemoteConnection>> = match self.0.connections.lock() {
+            Ok(map) => map.values().cloned().collect(),
+            Err(_) => return,
+        };
+        for connection in &connections {
+            if connection.forward_agent
+                && connection.relay_declared.load(Ordering::SeqCst)
+                && connection.is_connected()
+            {
+                debug_log_pool(format_args!(
+                    "focus-gain: pinging ClientActive to {}",
+                    connection.target
+                ));
+                write_remote_control(connection, &ControlMessage::ClientActive);
+            }
+        }
+    }
+
+    /// No relay exists off-Unix (the ssh-agent relay is `cfg(unix)`), so a focus
+    /// ping has no driving-client to refresh. Kept as a no-op so the cross-platform
+    /// window focus handler can call it unconditionally.
+    #[cfg(not(unix))]
+    pub fn notify_focused(&self) {}
+
     /// Dispatch a request to a remote scope and block for its response. Mirrors
     /// the local `dispatch_request` but over the SSH child's stdin.
     pub fn send_request(
@@ -1490,6 +1528,20 @@ fn remote_reader_loop(
             // frames are inert here too. Ignore defensively (keeps the match
             // exhaustive across cfgs).
             ControlMessage::SshAgentRelay => {}
+            // `ClientActive` (proto v30) is a GUI → daemon focus-gain ping: the GUI
+            // only ever SENDS it (see `notify_focused`), never receives it. Ignore
+            // an unexpected inbound one defensively so the match stays exhaustive.
+            ControlMessage::ClientActive => {
+                debug_log_pool(format_args!(
+                    "ignoring unexpected inbound ClientActive from {}",
+                    connection.target
+                ));
+            }
+            // `ClientLocal` (proto v31, ADR 0014 amendment) is a GUI → LOCAL-daemon
+            // announce: the GUI sends it only to its co-located daemon, never to a
+            // remote one, so a remote daemon never sends it up this proxy stream.
+            // Ignore defensively to keep the match exhaustive.
+            ControlMessage::ClientLocal { .. } => {}
             #[cfg(not(unix))]
             ControlMessage::SshAgentOpen { .. }
             | ControlMessage::SshAgentData { .. }
