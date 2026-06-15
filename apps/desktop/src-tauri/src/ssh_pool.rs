@@ -1537,6 +1537,11 @@ fn remote_reader_loop(
                     connection.target
                 ));
             }
+            // `ClientLocal` (proto v31, ADR 0014 amendment) is a GUI → LOCAL-daemon
+            // announce: the GUI sends it only to its co-located daemon, never to a
+            // remote one, so a remote daemon never sends it up this proxy stream.
+            // Ignore defensively to keep the match exhaustive.
+            ControlMessage::ClientLocal { .. } => {}
             #[cfg(not(unix))]
             ControlMessage::SshAgentOpen { .. }
             | ControlMessage::SshAgentData { .. }

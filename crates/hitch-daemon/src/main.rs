@@ -1095,6 +1095,15 @@ struct ClientSink {
     /// forwarded `SSH_AUTH_SOCK` path. `false` for a plain local GUI or a v28
     /// proxy that only sends `ConnEnv`.
     relay_capable: AtomicBool,
+    /// Set by this connection's [`ControlMessage::ClientLocal`] prelude (ADR 0014
+    /// amendment, proto v31) to the local GUI's OWN resolved local ssh-agent
+    /// socket path. `Some` ⇔ a co-located local GUI with a signable agent is
+    /// connected; the accept-loop bridges a git child's signing directly to this
+    /// path (the daemon is co-located with the agent, so no relay round-trip is
+    /// needed), and it widens driving-client eligibility. `None` for a remote
+    /// relay GUI or a proxy. `Mutex` for interior mutability since the sink lives
+    /// behind an `Arc`.
+    local_agent_sock: Mutex<Option<String>>,
     /// Set true (under the state lock) by [`unregister_client`] the instant this
     /// sink is removed from `clients`. Read by the relay's per-accept routing
     /// (ADR 0014 amendment, 2026-06-15): a stale [`DaemonState::driving_client`]
@@ -1191,6 +1200,7 @@ fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &DaemonStream) -> io
             pending_agent_state_events: Mutex::new(Vec::new()),
             ssh_auth_sock: Mutex::new(None),
             relay_capable: AtomicBool::new(false),
+            local_agent_sock: Mutex::new(None),
             disconnected: AtomicBool::new(false),
         }),
     );
@@ -1211,11 +1221,12 @@ fn unregister_client(state: &Arc<Mutex<DaemonState>>, client_id: u64) {
     // force-close primitive must not run under the state lock — it touches the
     // relay's own `channels` lock).
     //
-    // `driving_client` re-pointing keeps the invariant "a relay-capable GUI is
+    // `driving_client` re-pointing keeps the invariant "an eligible GUI is
     // connected ⟺ `driving_client.is_some()`" that rung 1 of `resolve_ssh_auth_sock`
-    // relies on. If other relay-capable clients remain, point at one of them rather
-    // than clearing to `None` (the multi-GUI machine-switch case); only clear when
-    // the departing client was the last relay-capable connection.
+    // relies on. If other eligible clients remain (relay-capable OR local-with-agent),
+    // point at one of them rather than clearing to `None` (the multi-GUI
+    // machine-switch case); only clear when the departing client was the last
+    // eligible connection.
     let relay = if let Ok(mut state) = state.lock() {
         if let Some(sink) = state.clients.get(&client_id) {
             sink.disconnected.store(true, Ordering::SeqCst);
@@ -1223,12 +1234,18 @@ fn unregister_client(state: &Arc<Mutex<DaemonState>>, client_id: u64) {
         state.clients.remove(&client_id);
         state.broadcaster.forget_client(client_id);
         if state.driving_client == Some(client_id) {
-            // Re-point to any other still-connected relay-capable client, else None.
+            // Re-point to any other still-connected eligible client (relay-capable
+            // OR local-with-agent), else None.
             state.driving_client = state
                 .clients
                 .iter()
                 .find(|(_, sink)| {
-                    sink.relay_capable.load(Ordering::SeqCst)
+                    (sink.relay_capable.load(Ordering::SeqCst)
+                        || sink
+                            .local_agent_sock
+                            .lock()
+                            .map(|s| s.is_some())
+                            .unwrap_or(false))
                         && !sink.disconnected.load(Ordering::SeqCst)
                 })
                 .map(|(id, _)| *id);
@@ -1248,20 +1265,27 @@ fn unregister_client(state: &Arc<Mutex<DaemonState>>, client_id: u64) {
 /// driving from — and the relay's per-accept router signs git's requests on it.
 ///
 /// Set `driving_client = Some(client_id)` **iff** the client is present in
-/// `clients` AND its sink is `relay_capable`. A non-relay-capable client (a plain
-/// local GUI, a v28 proxy that only sends `ConnEnv`) must NEVER become the driving
-/// client — it can't answer ssh-agent frames, so routing a signing to it would
-/// strand the git child. An unknown `client_id` is a no-op.
+/// `clients` AND its sink is eligible to drive: either `relay_capable` (a remote
+/// relay GUI that answers ssh-agent frames over the control channel) OR it has a
+/// `local_agent_sock` (a co-located local GUI with a signable agent — ADR 0014
+/// amendment, proto v31 — that the accept-loop can bridge to directly). A client
+/// that is neither (a v28 proxy that only sends `ConnEnv`, a local GUI with no
+/// signable agent) must NEVER become the driving client — routing a signing to it
+/// would strand the git child. An unknown `client_id` is a no-op.
 ///
 /// Cheap and event-driven: it is called inline under the state lock from every
 /// refresh source (connect prelude, PTY input, git-button op, focus-gain ping) —
 /// there is no poller or timer (that would re-introduce the idle-wakeup floor).
 fn refresh_driving_client(state: &mut DaemonState, client_id: u64) {
-    let relay_capable = state
-        .clients
-        .get(&client_id)
-        .is_some_and(|sink| sink.relay_capable.load(Ordering::SeqCst));
-    if relay_capable {
+    let eligible = state.clients.get(&client_id).is_some_and(|sink| {
+        sink.relay_capable.load(Ordering::SeqCst)
+            || sink
+                .local_agent_sock
+                .lock()
+                .map(|s| s.is_some())
+                .unwrap_or(false)
+    });
+    if eligible {
         state.driving_client = Some(client_id);
     }
 }
@@ -1349,6 +1373,31 @@ fn handle_client(
             if ssh_agent_debug_enabled() {
                 eprintln!(
                     "hitch-daemon: ssh-agent relay announced by client {client_id} (driving)"
+                );
+            }
+            continue;
+        }
+
+        // The local GUI's prelude (ADR 0014 amendment, proto v31): the local
+        // analog of `SshAgentRelay`. This connection is a co-located local GUI
+        // announcing its OWN resolved local ssh-agent socket path. Record it on
+        // the sink (its presence ⇔ a local GUI with a signable agent is connected)
+        // and make this the driving GUI — same gated path as every other refresh
+        // source, now eligible because the sink has a local agent path. The
+        // accept-loop bridges a git child's signing directly to this path rather
+        // than relaying over the control channel. Not a Request — never dispatch it.
+        if let ControlMessage::ClientLocal { ssh_auth_sock } = &message {
+            if let Ok(mut state) = state.lock() {
+                if let Some(sink) = state.clients.get(&client_id) {
+                    if let Ok(mut slot) = sink.local_agent_sock.lock() {
+                        *slot = Some(ssh_auth_sock.clone());
+                    }
+                }
+                refresh_driving_client(&mut state, client_id);
+            }
+            if ssh_agent_debug_enabled() {
+                eprintln!(
+                    "hitch-daemon: local agent announced by client {client_id} (driving)"
                 );
             }
             continue;
@@ -1604,8 +1653,7 @@ fn handle_request<R: Read>(
             cols,
             rows,
         } => {
-            let session =
-                open_session(state, client_id, parent, name, command, cols, rows, &channels.pty_tx)?;
+            let session = open_session(state, parent, name, command, cols, rows, &channels.pty_tx)?;
             let replay = session_opened_replay(state, session.id)?;
             send_response(
                 state,
@@ -2805,7 +2853,6 @@ fn remove_worktree(
 
 fn open_session(
     state: &Arc<Mutex<DaemonState>>,
-    client_id: u64,
     parent: SessionParent,
     name: String,
     command: Option<Vec<String>>,
@@ -2833,15 +2880,16 @@ fn open_session(
     } else {
         TerminalSize::new(cols, rows)
     };
-    // Inject `SSH_AUTH_SOCK` = the stable relay socket so git run in THIS terminal (or
-    // by an Agent inside it) signs on the driving machine (ADR 0014 amendment,
-    // 2026-06-15 stable-socket amendment, Slice 6) — but ONLY when the opening client
-    // is relay-capable (per-origin amendment): a terminal opened by a local GUI on the
-    // Daemon's own machine inherits the env so its git signs with the local agent. The
-    // helper reads the flag + bound socket under a brief lock and DROPS it before we
-    // build the config, so the state lock is not held across the spawn. Empty on a
-    // local / non-relay-serving Daemon → terminals inherit env exactly as today.
-    let extra_env = relay_pty_env(state, client_id);
+    // On a relay-serving Daemon, inject `SSH_AUTH_SOCK` = the stable relay socket so
+    // git run in THIS terminal (or by an Agent inside it) signs on the driving
+    // machine (ADR 0014 amendment, 2026-06-15 stable-socket amendment, Slice 6). The
+    // injected env is opener-agnostic — a PTY is a shared Daemon resource and which
+    // machine signs is decided live per git-connect at the relay's accept time, never
+    // frozen here at spawn. The helper reads the bound socket under a brief lock and
+    // DROPS it before we build the config, so the state lock is not held across the
+    // spawn. Empty on a local / non-relay-serving Daemon → terminals inherit env
+    // exactly as today.
+    let extra_env = relay_pty_env(state);
     let pty = ManagedPty::spawn(
         PtySpawnConfig::new(session.id, cwd)
             .command(command)
@@ -3836,23 +3884,33 @@ fn git_context(
 
 /// Resolve the `SSH_AUTH_SOCK` to use for a git op originated by `client_id`
 /// (ADR 0014, SSH agent forwarding + the relay amendment; 2026-06-15 stable-socket
-/// amendment). The ladder, highest rung first:
-///   1. **Stable relay** — the op's **originating** client (`client_id`) is itself
-///      relay-capable AND a driving GUI is present ([`DaemonState::driving_client`]
-///      is `Some`): ensure the ONE Daemon-stable relay socket exists and return its
-///      path. Per-origin (2026-06-15 per-origin amendment): a git op started by a
-///      non-relay client — a local GUI on the Daemon's own machine — must NOT be
-///      forced onto a remote GUI's agent just because that remote GUI is driving;
-///      it falls through to its own local env. *Which* relay GUI actually signs is
+/// amendment + live-origin amendment, proto v31). The ladder follows the clicker —
+/// "remote relay clicker → relay; local clicker → its own agent; neither → existing
+/// ladder". Highest rung first:
+///   1. **Remote relay clicker** — the op's **originating** client (`client_id`) is
+///      itself relay-capable AND a driving GUI is present
+///      ([`DaemonState::driving_client`] is `Some`): ensure the ONE Daemon-stable
+///      relay socket exists and return its path. *Which* relay GUI actually signs is
 ///      still decided later, at accept time, by the relay's per-accept presence
 ///      routing. The accept loop is live before we return, so git can connect
 ///      synchronously.
-///   2. **ConnEnv** — this connection forwarded a `SSH_AUTH_SOCK` (the v28 proxy
+///   2. **Local clicker** — the originating client's sink carries a
+///      `local_agent_sock` (a co-located local GUI on the Daemon's own machine that
+///      announced its OWN ssh-agent via `ClientLocal`): return that path **literally,
+///      unchanged**. git connects straight to the local agent — no relay, no bridge,
+///      no hashing.
+///   3. **ConnEnv** — this connection forwarded a `SSH_AUTH_SOCK` (the v28 proxy
 ///      rolling-upgrade rung): return it unchanged.
-///   3. **Background ConnEnv fallback** — the daemon-wide latest forwarded socket
+///   4. **Background ConnEnv fallback** — the daemon-wide latest forwarded socket
 ///      (rolling-upgrade).
-///   4. `None` — a local daemon, or a remote daemon with no relay-capable client
+///   5. `None` — a local daemon, or a remote daemon with no relay-capable client
 ///      and no forwarded socket — git inherits the env exactly as before.
+///
+/// Keeping rung 1's per-origin `relay_capable` gate (rather than a client-agnostic
+/// `driving.is_some()`) is what makes the "neither → existing ladder" guarantee hold:
+/// a v28 proxy op (not relay-capable, no local agent) falls through to its own
+/// ConnEnv/forwarded rung rather than being forced onto a remote GUI's relay just
+/// because that GUI is driving.
 ///
 /// The resolved `String` is captured into the Job closure by the caller so a
 /// mid-op disconnect doesn't lose it.
@@ -3862,21 +3920,25 @@ fn resolve_ssh_auth_sock(state: &Arc<Mutex<DaemonState>>, client_id: u64) -> Opt
     // the driving GUI is resolved at accept time, not here. The per-origin gate keeps
     // a non-relay client's op (a local GUI on the Daemon's own machine) off the remote
     // GUI's agent — it falls through to its own local env. Read the gate inputs (and
-    // rung-2/3 sources) under one brief lock, then ensure the socket with the lock
-    // dropped.
-    let (relay_origin, conn_env_sock, forwarded) = {
+    // the rung-2 local agent, rung-3/4 sources) under one brief lock, then ensure the
+    // socket with the lock dropped.
+    let (relay_origin, local_agent_sock, conn_env_sock, forwarded) = {
         let guard = state.lock().ok()?;
         let relay_origin = guard.driving_client.is_some()
             && guard
                 .clients
                 .get(&client_id)
                 .is_some_and(|sink| sink.relay_capable.load(Ordering::SeqCst));
+        let local_agent_sock = guard
+            .clients
+            .get(&client_id)
+            .and_then(|sink| sink.local_agent_sock.lock().ok().and_then(|slot| slot.clone()));
         let conn_env_sock = guard
             .clients
             .get(&client_id)
             .and_then(|sink| sink.ssh_auth_sock.lock().ok().and_then(|slot| slot.clone()));
         let forwarded = guard.forwarded_ssh_auth_sock.clone();
-        (relay_origin, conn_env_sock, forwarded)
+        (relay_origin, local_agent_sock, conn_env_sock, forwarded)
     };
 
     if relay_origin {
@@ -3890,7 +3952,19 @@ fn resolve_ssh_auth_sock(state: &Arc<Mutex<DaemonState>>, client_id: u64) -> Opt
         }
     }
 
-    // Rung 2: this connection's forwarded ConnEnv socket (v28 proxy, rolling-upgrade).
+    // Rung 2: a local clicker — the originating client announced its OWN local
+    // ssh-agent via `ClientLocal`. Return it literally; git connects straight to the
+    // local agent (no relay, no bridge, no hashing).
+    if let Some(sock) = local_agent_sock {
+        if ssh_agent_debug_enabled() {
+            eprintln!(
+                "hitch-daemon: resolve_ssh_auth_sock client {client_id} rung=local sock={sock}"
+            );
+        }
+        return Some(sock);
+    }
+
+    // Rung 3: this connection's forwarded ConnEnv socket (v28 proxy, rolling-upgrade).
     if let Some(sock) = conn_env_sock {
         if ssh_agent_debug_enabled() {
             eprintln!(
@@ -3900,7 +3974,7 @@ fn resolve_ssh_auth_sock(state: &Arc<Mutex<DaemonState>>, client_id: u64) -> Opt
         return Some(sock);
     }
 
-    // Rung 3: the daemon-wide latest forwarded socket (rolling-upgrade; else None:
+    // Rung 4: the daemon-wide latest forwarded socket (rolling-upgrade; else None:
     // env inherited).
     if ssh_agent_debug_enabled() {
         match forwarded.as_ref() {
@@ -3995,41 +4069,28 @@ fn ensure_relay_socket(state: &Arc<Mutex<DaemonState>>) -> Option<String> {
 }
 
 /// Compute the relay `extra_env` to inject into a PTY at spawn (ADR 0014 amendment,
-/// 2026-06-15 stable-socket amendment, Slice 6; per-origin amendment 2026-06-15).
-/// Return `[("SSH_AUTH_SOCK", <stable socket's connectable OS address>)]` — so git the
-/// user runs in the terminal (or an Agent runs for them) signs through the relay and
-/// Touch ID pops on the driving machine — **only when both** (a) the stable relay
-/// socket is bound on [`DaemonState::relay`] AND (b) the GUI that opened this terminal
-/// (`client_id`) is itself **relay-capable**. Otherwise return `[]` so the terminal
-/// inherits the env exactly as today.
+/// 2026-06-15 stable-socket amendment, Slice 6; live-origin amendment, proto v31).
+/// When the Daemon is **relay-serving** — the one stable relay socket is bound on
+/// [`DaemonState::relay`] — return `[("SSH_AUTH_SOCK", <stable socket's connectable OS
+/// address>)]` so any git the user runs in the terminal (or an Agent runs for them)
+/// signs through the relay. On a non-relay-serving Daemon (local, or the relay was
+/// never bound) return `[]` — terminals inherit env exactly as today.
 ///
-/// The per-origin gate is the fix for the co-located GUI case: a Daemon can serve a
-/// remote relay-capable GUI (e.g. a Mac driving this box over SSH) *and* a local GUI
-/// on the Daemon's own machine (e.g. a Windows GUI, which is never relay-capable —
-/// the relay-serve path is `cfg(unix)`). Without the gate, the relay socket was
-/// injected daemon-wide, so a terminal opened by the *local* user was hijacked onto
-/// the remote GUI's agent (Touch ID popped on the wrong machine). Gating on the
-/// opening client means the local user's terminals use the local machine's own agent
-/// while the remote GUI's terminals still relay.
+/// The injected env is **opener-agnostic**: a PTY is a shared Daemon resource, and
+/// either co-located GUI can drive it later. So which machine *signs* is NOT frozen at
+/// spawn from whoever opened the terminal — it is decided **live, per git-connect**,
+/// at the relay's accept time: when git connects, the relay routes that one signing to
+/// the currently-driving GUI (remote → tunnel back over SSH; local → direct bridge to
+/// the local agent). Pinning the env to the opener would mis-route every later op once
+/// the driver switched machines.
 ///
-/// This is the pure, testable injection *decision*: it only reads the opening client's
-/// relay-capable flag and the bound socket's path under a brief lock and returns owned
-/// strings, so the caller does NOT hold the state lock across the PTY spawn.
-/// Deliberately does NOT set `BatchMode` / `GIT_TERMINAL_PROMPT=0` — terminal PTYs
-/// stay interactive so a human can answer a host-key or passphrase prompt.
-fn relay_pty_env(state: &Arc<Mutex<DaemonState>>, client_id: u64) -> Vec<(String, String)> {
+/// This is the pure, testable injection *decision*: it only reads the bound socket's
+/// path under a brief lock and returns owned strings, so the caller does NOT hold the
+/// state lock across the PTY spawn. Deliberately does NOT set `BatchMode` /
+/// `GIT_TERMINAL_PROMPT=0` — terminal PTYs stay interactive so a human can answer a
+/// host-key or passphrase prompt at the terminal.
+fn relay_pty_env(state: &Arc<Mutex<DaemonState>>) -> Vec<(String, String)> {
     let sock = state.lock().ok().and_then(|guard| {
-        // Per-origin gate: only a terminal opened by a relay-capable (remote) GUI
-        // rides the relay. A terminal opened by a non-relay client — a local GUI on
-        // the Daemon's own machine — inherits the env so its git signs with the local
-        // machine's agent.
-        let relay_capable = guard
-            .clients
-            .get(&client_id)
-            .is_some_and(|sink| sink.relay_capable.load(Ordering::SeqCst));
-        if !relay_capable {
-            return None;
-        }
         guard.relay.lock().ok().and_then(|slot| {
             slot.as_ref()
                 .map(|relay| hitch_proto::transport::endpoint_os_address(&relay.socket_path))
@@ -6681,14 +6742,27 @@ impl SshAgentRelay {
     }
 
     /// Own the listener and accept git children until `shutdown` (Daemon shutdown).
-    /// Routing is resolved PER-ACCEPT: read [`DaemonState::driving_client`]; if no
-    /// usable driving GUI is connected, the stream is accepted then immediately
-    /// dropped → git gets EOF → fails fast. Otherwise the channel is bound to the
-    /// driving GUI resolved at accept time (read half to a pump thread, write half
-    /// + owner stored for inbound GUI replies). `teardown` wakes a blocked
-    /// `accept()` with a throwaway self-connect, after which the `shutdown` check
-    /// breaks the loop.
+    /// Routing is resolved PER-ACCEPT: read [`DaemonState::driving_client`] and the
+    /// driving sink's MODE ([`RoutedDriver`]). If no usable driving GUI is
+    /// connected, the stream is accepted then immediately dropped → git gets EOF →
+    /// fails fast. A relay-capable driver TUNNELS (read half to a pump thread, write
+    /// half + owner stored for inbound GUI replies, `SshAgentOpen` to the GUI). A
+    /// co-located local driver (only a resolved `local_agent_sock`, ADR 0014
+    /// live-origin amendment) is handed to [`Self::spawn_local_agent_bridge`], which
+    /// bridges git straight to the agent with no channel and no GUI dependency.
+    /// `teardown` wakes a blocked `accept()` with a throwaway self-connect, after
+    /// which the `shutdown` check breaks the loop.
     fn accept_loop(self: Arc<Self>, listener: DaemonListener, state: Arc<Mutex<DaemonState>>) {
+        // The driving GUI resolved for an accept carries its routing MODE so the
+        // single `state.lock()` above can decide tunnel-vs-bridge once and the loop
+        // body branches on it with no second lock. `Relay` keeps the existing
+        // tunnel (owner sink + channel + `SshAgentOpen`); `Local` is the co-located
+        // direct bridge that captures only the agent path — GUI-independent by
+        // design (decision D6).
+        enum RoutedDriver {
+            Relay { owner: u64, sink: Arc<ClientSink> },
+            Local { path: String },
+        }
         // Exponential backoff for the error path, mirroring the main daemon accept
         // loop: a persistent `accept()` failure (e.g. fd/handle exhaustion —
         // EMFILE/ENFILE, which the relay itself contributes to via per-child threads
@@ -6726,21 +6800,40 @@ impl SshAgentRelay {
             }
 
             // PRESENCE ROUTING (per-accept). Resolve the driving GUI fresh for THIS
-            // git child. Lock state, read `driving_client`, and clone the owner sink
+            // git child, carrying its MODE in `RoutedDriver`. Lock state, read
+            // `driving_client`, decide Relay vs Local vs none under that one lock,
+            // and clone the owner sink (Relay) or the agent path (Local) out of it
             // — then DROP the state lock before touching `channels` (lock-ordering
             // discipline: never hold state while acquiring `channels`). A channel is
-            // bound to the GUI resolved here for its whole lifetime; a later flip of
-            // `driving_client` does not re-route an in-flight signing.
+            // bound to the mode/GUI resolved here for its whole lifetime; a later
+            // flip of `driving_client` does not re-route an in-flight signing.
+            //
+            // Mode resolution order for the driving sink (skip if `disconnected`):
+            //   relay_capable                  -> Relay  (tunnel to a remote GUI)
+            //   else local_agent_sock = Some(p) -> Local  (co-located direct bridge,
+            //                                              ADR 0014 live-origin)
+            //   else                            -> none   (fail-fast)
             let routed = {
                 match state.lock() {
                     Ok(guard) => guard.driving_client.and_then(|driver| {
                         guard.clients.get(&driver).and_then(|sink| {
-                            // The driving GUI must be a live, relay-capable, still-
-                            // connected sink. A stale `driving_client` that fails any
-                            // of these falls through to fail-fast.
-                            let usable = sink.relay_capable.load(Ordering::SeqCst)
-                                && !sink.disconnected.load(Ordering::SeqCst);
-                            usable.then(|| (driver, Arc::clone(sink)))
+                            // A stale `driving_client` whose sink is already
+                            // disconnected falls through to fail-fast.
+                            if sink.disconnected.load(Ordering::SeqCst) {
+                                return None;
+                            }
+                            if sink.relay_capable.load(Ordering::SeqCst) {
+                                Some(RoutedDriver::Relay {
+                                    owner: driver,
+                                    sink: Arc::clone(sink),
+                                })
+                            } else {
+                                sink.local_agent_sock
+                                    .lock()
+                                    .ok()
+                                    .and_then(|slot| slot.clone())
+                                    .map(|path| RoutedDriver::Local { path })
+                            }
                         })
                     }),
                     Err(_) => None,
@@ -6748,14 +6841,25 @@ impl SshAgentRelay {
             };
 
             let (owner, sink) = match routed {
-                Some(routed) => {
+                Some(RoutedDriver::Relay { owner, sink }) => {
                     if ssh_agent_debug_enabled() {
                         eprintln!(
-                            "hitch-daemon: ssh-agent relay accept -> driving_client={}",
-                            routed.0
+                            "hitch-daemon: ssh-agent relay accept -> driving_client={owner} (relay tunnel)"
                         );
                     }
-                    routed
+                    (owner, sink)
+                }
+                Some(RoutedDriver::Local { path }) => {
+                    // Co-located local GUI drove: the agent lives on THIS machine, so
+                    // bridge the git stream straight to it (no SshAgentOpen, no
+                    // channel, no GUI dependency — decision D6).
+                    if ssh_agent_debug_enabled() {
+                        eprintln!(
+                            "hitch-daemon: ssh-agent relay accept -> local direct bridge -> {path}"
+                        );
+                    }
+                    Self::spawn_local_agent_bridge(stream, path);
+                    continue;
                 }
                 None => {
                     // No usable driving GUI: accept then immediately drop the stream
@@ -6897,6 +7001,138 @@ impl SshAgentRelay {
         // is harmless but pointless.
         if was_open {
             let _ = write_control_to_sink(&sink, &ControlMessage::SshAgentClose { channel });
+        }
+    }
+
+    /// Bridge a git child straight to the LOCAL ssh-agent — the co-located
+    /// direct-bridge path (ADR 0014 live-origin amendment, decisions D2/D6).
+    ///
+    /// When the driving GUI is *local* (it shares this host with the daemon and
+    /// advertised a resolved `SSH_AUTH_SOCK` via `ClientLocal`), the agent lives on
+    /// the Daemon's own machine, so the Daemon connects to the agent ITSELF rather
+    /// than tunneling agent traffic over a `SshAgentOpen` channel to a relay-capable
+    /// GUI. Two pump threads splice the git stream and the agent stream byte-for-byte
+    /// in both directions; the agent never learns it is talking to anything but a
+    /// normal client.
+    ///
+    /// **GUI-independent by design (D6).** This bridge captures only the agent PATH,
+    /// not a [`ClientSink`]. It registers NO channel and holds NO channel id, so it
+    /// has no entry in the relay's channel map and no dependency on the driving GUI.
+    /// It therefore survives a mid-sign disconnect of the local GUI that started it,
+    /// and is torn down ONLY by git or agent EOF (closing the session/terminal kills
+    /// the git child, which gives the agent-side pump EOF and unwinds both threads).
+    /// Because there is no registry entry, Daemon shutdown does not force-close it;
+    /// it relies on git dying to end it — exactly matching the tunnel pump's
+    /// lifecycle, where a channel likewise lives until its git child goes away.
+    fn spawn_local_agent_bridge(git: DaemonStream, agent_path: String) {
+        let debug = ssh_agent_debug_enabled();
+        // Split the git side into the same force_close-able halves the tunnel uses.
+        let (mut git_reader, git_writer) = match git.into_relay_channel() {
+            Ok(pair) => pair,
+            Err(err) => {
+                if debug {
+                    eprintln!("hitch-daemon: ssh-agent local bridge could not split git stream: {err}");
+                }
+                return;
+            }
+        };
+        // Connect to the LITERAL agent socket/pipe (hazard H2: NOT hashed into
+        // Hitch's namespace — `connect_external` connects verbatim).
+        let (mut agent_reader, agent_writer) =
+            match hitch_proto::transport::connect_external(Path::new(&agent_path)) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    if debug {
+                        eprintln!(
+                            "hitch-daemon: ssh-agent local bridge connect to {agent_path} failed: {err}"
+                        );
+                    }
+                    // Fail-fast: give the git child EOF so it errors out promptly
+                    // instead of hanging on a never-answered agent request.
+                    let _ = git_writer.force_close();
+                    return;
+                }
+            };
+
+        // Share each writer behind an `Arc` so BOTH pump threads can force_close
+        // BOTH writers on teardown (cross-unblocking the other thread's blocked
+        // read), and so each pump can write through `&*writer` (the `Write for
+        // &RelayWriter` impl) without owning it.
+        let git_writer = Arc::new(git_writer);
+        let agent_writer = Arc::new(agent_writer);
+
+        // git -> agent pump.
+        let g2a_git_writer = Arc::clone(&git_writer);
+        let g2a_agent_writer = Arc::clone(&agent_writer);
+        let g2a = thread::Builder::new()
+            .name("ssh-agent-local-bridge-g2a".to_string())
+            .spawn(move || {
+                let mut buf = [0u8; 16 * 1024];
+                loop {
+                    match git_reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let mut w = &*g2a_agent_writer;
+                            if w.write_all(&buf[..n]).is_err() || w.flush().is_err() {
+                                break;
+                            }
+                        }
+                        Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                // Either direction ending tears the whole bridge down: force_close
+                // BOTH writers so the peer reads EOF and the OTHER pump's blocked
+                // read unblocks. Best-effort / idempotent.
+                let _ = g2a_git_writer.force_close();
+                let _ = g2a_agent_writer.force_close();
+                if debug {
+                    eprintln!("hitch-daemon: ssh-agent local bridge git->agent pump ended");
+                }
+            });
+        if let Err(err) = g2a {
+            if debug {
+                eprintln!("hitch-daemon: ssh-agent local bridge g2a spawn failed: {err}");
+            }
+            let _ = git_writer.force_close();
+            let _ = agent_writer.force_close();
+            return;
+        }
+
+        // agent -> git pump.
+        let a2g_git_writer = Arc::clone(&git_writer);
+        let a2g_agent_writer = Arc::clone(&agent_writer);
+        let a2g = thread::Builder::new()
+            .name("ssh-agent-local-bridge-a2g".to_string())
+            .spawn(move || {
+                let mut buf = [0u8; 16 * 1024];
+                loop {
+                    match agent_reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let mut w = &*a2g_git_writer;
+                            if w.write_all(&buf[..n]).is_err() || w.flush().is_err() {
+                                break;
+                            }
+                        }
+                        Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                let _ = a2g_git_writer.force_close();
+                let _ = a2g_agent_writer.force_close();
+                if debug {
+                    eprintln!("hitch-daemon: ssh-agent local bridge agent->git pump ended");
+                }
+            });
+        if let Err(err) = a2g {
+            if debug {
+                eprintln!("hitch-daemon: ssh-agent local bridge a2g spawn failed: {err}");
+            }
+            // The g2a thread is already running; force_close both writers so it
+            // unwinds too (its blocked read on git unblocks, the agent side EOFs).
+            let _ = git_writer.force_close();
+            let _ = agent_writer.force_close();
         }
     }
 
@@ -7407,6 +7643,7 @@ mod tests {
             pending_agent_state_events: Mutex::new(Vec::new()),
         ssh_auth_sock: Mutex::new(None),
         relay_capable: AtomicBool::new(false),
+        local_agent_sock: Mutex::new(None),
         disconnected: AtomicBool::new(false),
         });
         {
@@ -7505,6 +7742,7 @@ mod tests {
             pending_agent_state_events: Mutex::new(Vec::new()),
         ssh_auth_sock: Mutex::new(None),
         relay_capable: AtomicBool::new(false),
+        local_agent_sock: Mutex::new(None),
         disconnected: AtomicBool::new(false),
         });
         {
@@ -8121,6 +8359,7 @@ mod tests {
             pending_agent_state_events: Mutex::new(Vec::new()),
         ssh_auth_sock: Mutex::new(None),
         relay_capable: AtomicBool::new(false),
+        local_agent_sock: Mutex::new(None),
         disconnected: AtomicBool::new(false),
         });
         let blocked = Arc::new(super::ClientSink {
@@ -8133,6 +8372,7 @@ mod tests {
             pending_agent_state_events: Mutex::new(Vec::new()),
         ssh_auth_sock: Mutex::new(None),
         relay_capable: AtomicBool::new(false),
+        local_agent_sock: Mutex::new(None),
         disconnected: AtomicBool::new(false),
         });
         {
@@ -8460,6 +8700,7 @@ mod tests {
             pending_agent_state_events: Mutex::new(Vec::new()),
         ssh_auth_sock: Mutex::new(None),
         relay_capable: AtomicBool::new(false),
+        local_agent_sock: Mutex::new(None),
         disconnected: AtomicBool::new(false),
         });
         {
@@ -8629,11 +8870,8 @@ mod tests {
         // Keep the receiver alive so the PTY reader thread's sends don't error;
         // the tests never need to consume it.
         let (pty_tx, pty_rx) = std::sync::mpsc::channel();
-        // client_id 0: no registered client → not relay-capable → no relay env, which
-        // is correct for this agent-state test (it isn't exercising the relay).
         let session = super::open_session(
             &state,
-            0,
             SessionParent::Project(project_id),
             "shell".into(),
             None,
@@ -9444,6 +9682,7 @@ mod tests {
             pending_agent_state_events: Mutex::new(Vec::new()),
         ssh_auth_sock: Mutex::new(None),
         relay_capable: AtomicBool::new(false),
+        local_agent_sock: Mutex::new(None),
         disconnected: AtomicBool::new(false),
         });
         {
@@ -10152,6 +10391,7 @@ mod tests {
                 pending_agent_state_events: Mutex::new(Vec::new()),
                 ssh_auth_sock: Mutex::new(None),
                 relay_capable: AtomicBool::new(relay_capable),
+                local_agent_sock: Mutex::new(None),
                 disconnected: AtomicBool::new(false),
             });
             FakeGui { sink, gui_reader }
@@ -10651,6 +10891,243 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir_root);
         }
 
+        /// A minimal stand-in for the LOCAL ssh-agent that the co-located direct
+        /// bridge (`spawn_local_agent_bridge` → `transport::connect_external`)
+        /// connects to. It binds a real endpoint at a `temp_sock` path and, on a
+        /// background thread, accepts ONE connection and ECHOES every byte back until
+        /// EOF (or until `reply_once` is set, in which case it closes after the first
+        /// chunk to model an agent that hangs up — exercising the agent-EOF teardown).
+        ///
+        /// Cross-platform via `DaemonListener`/`connect_external`: on Unix the bound
+        /// endpoint IS the literal socket file `connect_external` dials with
+        /// `UnixStream::connect(path)`. The Windows named-pipe bridge is NOT
+        /// exercised here — it is validated live on host `pc` (see the
+        /// `win-relay-implementation-facts` notes and `connect_external`'s doc) — so
+        /// these tests are the cross-platform `DaemonListener`/`connect_external`
+        /// proof of the byte bridge, not a Windows pipe test.
+        struct FakeLocalAgent {
+            path: PathBuf,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl FakeLocalAgent {
+            /// Echo bytes back forever (until the bridge tears the connection down).
+            fn echo() -> Self {
+                Self::spawn(false)
+            }
+
+            /// Echo exactly one chunk, then close — models an agent that answers and
+            /// hangs up, so the git side must read EOF.
+            fn echo_once_then_close() -> Self {
+                Self::spawn(true)
+            }
+
+            fn spawn(reply_once: bool) -> Self {
+                let path = temp_sock("agt");
+                let listener = DaemonListener::bind(&path).expect("fake agent binds");
+                let handle = std::thread::Builder::new()
+                    .name("fake-local-agent".to_string())
+                    .spawn(move || {
+                        // `listener` is moved in and dropped at thread end (Unix
+                        // unlinks its socket file then); the accepted connection
+                        // persists for the loop's duration.
+                        let mut conn = match listener.accept() {
+                            Ok(conn) => conn,
+                            Err(_) => return,
+                        };
+                        let mut buf = [0u8; 16 * 1024];
+                        loop {
+                            match conn.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    if conn.write_all(&buf[..n]).is_err() || conn.flush().is_err() {
+                                        break;
+                                    }
+                                    if reply_once {
+                                        break; // drop `conn` -> git side reads EOF
+                                    }
+                                }
+                                Err(ref err)
+                                    if err.kind() == std::io::ErrorKind::Interrupted =>
+                                {
+                                    continue
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    })
+                    .expect("spawn fake agent thread");
+                Self {
+                    path,
+                    handle: Some(handle),
+                }
+            }
+        }
+
+        impl Drop for FakeLocalAgent {
+            fn drop(&mut self) {
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+                #[cfg(unix)]
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+
+        /// LOCAL DIRECT BRIDGE (ADR 0014 live-origin, D2/D6): with the driving client
+        /// a CO-LOCATED LOCAL GUI (not relay-capable, but carrying a resolved
+        /// `local_agent_sock`), a git connect is bridged straight to the local agent
+        /// — NOT tunneled. Because `FakeLocalAgent` echoes, git reads back the SAME
+        /// bytes it wrote, and NO `SshAgentOpen`/channel is ever involved.
+        #[test]
+        fn local_driver_bridges_git_through_the_local_agent() {
+            let agent = FakeLocalAgent::echo();
+            let (state, dir_root) = test_state();
+            // A NON-relay-capable GUI whose only signing capability is its resolved
+            // local agent path: the rung-2 co-located local driver.
+            let local = fake_gui_with(false);
+            *local.sink.local_agent_sock.lock().unwrap() =
+                Some(agent.path.to_string_lossy().into_owned());
+            insert_gui(&state, 1, &local);
+            set_driving(&state, Some(1));
+
+            let path = temp_sock("rl");
+            let relay = SshAgentRelay::bind_at(path.clone(), Arc::clone(&state)).unwrap();
+
+            let mut git = connect_daemon(&path).expect("git connects to relay");
+
+            // git -> daemon -> agent -> daemon -> git: arbitrary non-UTF8 bytes must
+            // round-trip through the echoing agent verbatim.
+            let request = [0u8, 1, 2, 3, 255, b'a', b'b', 17, 0, 200];
+            git.write_all(&request).unwrap();
+            git.flush().unwrap();
+            let mut echoed = [0u8; 10];
+            git.read_exact(&mut echoed)
+                .expect("git reads the agent's echo back");
+            assert_eq!(
+                echoed, request,
+                "the local bridge must round-trip git<->agent bytes verbatim"
+            );
+
+            // The direct bridge registers NO channel: the relay's channel map stays
+            // empty and the GUI sink never received an `SshAgentOpen` (no tunnel).
+            assert!(
+                relay.channels.lock().unwrap().is_empty(),
+                "the local direct bridge registers no relay channel"
+            );
+
+            relay.teardown();
+            drop(git);
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&path);
+            drop(state);
+            drop(agent);
+            let _ = std::fs::remove_dir_all(&dir_root);
+        }
+
+        /// GUI-INDEPENDENCE (decision D6): the bridge captures the agent PATH, not the
+        /// sink, so it survives the driving local GUI disconnecting mid-session.
+        /// Establish the bridge + one round-trip, `unregister_client` the local GUI
+        /// (which clears `driving_client` and marks the sink disconnected), then do
+        /// ANOTHER round-trip — it must STILL work.
+        #[test]
+        fn local_bridge_survives_owner_disconnect() {
+            use super::super::unregister_client;
+
+            let agent = FakeLocalAgent::echo();
+            let (state, dir_root) = test_state();
+            let local = fake_gui_with(false);
+            *local.sink.local_agent_sock.lock().unwrap() =
+                Some(agent.path.to_string_lossy().into_owned());
+            insert_gui(&state, 1, &local);
+            set_driving(&state, Some(1));
+
+            let path = temp_sock("rl");
+            let relay = SshAgentRelay::bind_at(path.clone(), Arc::clone(&state)).unwrap();
+
+            let mut git = connect_daemon(&path).expect("git connects to relay");
+
+            // First round-trip establishes the bridge.
+            let first = [10u8, 20, 30, 40];
+            git.write_all(&first).unwrap();
+            git.flush().unwrap();
+            let mut got_first = [0u8; 4];
+            git.read_exact(&mut got_first).expect("first echo");
+            assert_eq!(got_first, first);
+
+            // The driving local GUI disconnects mid-session. This clears
+            // `driving_client` and marks the sink disconnected — but the running
+            // bridge holds only the captured path, so it is unaffected.
+            unregister_client(&state, 1);
+            assert_eq!(
+                state.lock().unwrap().driving_client,
+                None,
+                "the sole local driver disconnecting clears driving_client"
+            );
+
+            // Second round-trip on the SAME git connection still works.
+            let second = [99u8, 88, 77, 66, 55];
+            git.write_all(&second).unwrap();
+            git.flush().unwrap();
+            let mut got_second = [0u8; 5];
+            git.read_exact(&mut got_second)
+                .expect("bridge still echoes after the owner GUI disconnected");
+            assert_eq!(
+                got_second, second,
+                "the bridge survives a mid-session owner disconnect (captured path, not sink)"
+            );
+
+            relay.teardown();
+            drop(git);
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&path);
+            drop(state);
+            drop(agent);
+            let _ = std::fs::remove_dir_all(&dir_root);
+        }
+
+        /// AGENT-EOF TEARDOWN: when the local agent answers once and hangs up, the
+        /// agent->git pump reads EOF and force_closes the git writer, so the git
+        /// child also reads EOF (the bridge is torn down by either side's EOF).
+        #[test]
+        fn local_bridge_tears_down_on_agent_eof() {
+            let agent = FakeLocalAgent::echo_once_then_close();
+            let (state, dir_root) = test_state();
+            let local = fake_gui_with(false);
+            *local.sink.local_agent_sock.lock().unwrap() =
+                Some(agent.path.to_string_lossy().into_owned());
+            insert_gui(&state, 1, &local);
+            set_driving(&state, Some(1));
+
+            let path = temp_sock("rl");
+            let relay = SshAgentRelay::bind_at(path.clone(), Arc::clone(&state)).unwrap();
+
+            let mut git = connect_daemon(&path).expect("git connects to relay");
+
+            // One request -> the agent echoes it once and closes its connection.
+            let request = [1u8, 2, 3, 4];
+            git.write_all(&request).unwrap();
+            git.flush().unwrap();
+            let mut echoed = [0u8; 4];
+            git.read_exact(&mut echoed).expect("git reads the one echo");
+            assert_eq!(echoed, request);
+
+            // The agent hung up, so the next git read must see EOF: the agent->git
+            // pump hit EOF and force_closed the git writer.
+            let result = read_within(git, Duration::from_secs(5));
+            assert!(
+                is_git_eof(&result),
+                "git must read EOF after the agent hangs up, got {result:?}"
+            );
+
+            relay.teardown();
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&path);
+            drop(state);
+            drop(agent);
+            let _ = std::fs::remove_dir_all(&dir_root);
+        }
+
         /// FORCED CLOSE: after the pump has relayed at least one request (so it is
         /// back in its read loop — the between-reads window the CancelIoEx-only path
         /// could miss on Windows), `close_channel` must unblock the pump and end the
@@ -11032,49 +11509,78 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir_root);
         }
 
-        /// `relay_pty_env` (the PTY injection decision, Slice 6 + per-origin
-        /// amendment): injects `[("SSH_AUTH_SOCK", <stable socket path>)]` ONLY when
-        /// the relay is bound AND the opening client is relay-capable. A terminal
-        /// opened by a non-relay client (a local GUI on the Daemon's own machine) gets
-        /// `[]` so its git signs with the local machine's agent — even while a remote
-        /// relay GUI is serving the same Daemon.
+        /// LOCAL eligibility (ADR 0014 amendment, proto v31): a co-located local GUI
+        /// announces its OWN local ssh-agent socket via `ClientLocal`, recorded on the
+        /// sink's `local_agent_sock`. It is NOT relay-capable, yet it must be eligible
+        /// to drive — the accept-loop can bridge a git child to its agent directly. So
+        /// `refresh_driving_client` makes it the driver, and when it disconnects
+        /// `unregister_client` re-points `driving_client` to a remaining eligible
+        /// client (relay-capable OR local-with-agent).
         #[test]
-        fn relay_pty_env_injects_only_for_relay_capable_origin() {
+        fn local_agent_client_is_eligible_to_drive() {
+            use super::super::{refresh_driving_client, unregister_client};
+
+            let (state, dir_root) = test_state();
+
+            // A local GUI: not relay-capable, but it announced a local agent socket.
+            let local = fake_gui_with(false);
+            *local.sink.local_agent_sock.lock().unwrap() =
+                Some("/tmp/local-agent.sock".to_string());
+            // A relay-capable remote GUI sharing the same Daemon.
+            let remote = fake_gui_with(true);
+            insert_gui(&state, 10, &local);
+            insert_gui(&state, 20, &remote);
+
+            // The local-with-agent client refreshes to become the driver even though
+            // it is not relay-capable.
+            {
+                let mut guard = state.lock().unwrap();
+                refresh_driving_client(&mut guard, 10);
+            }
+            assert_eq!(
+                state.lock().unwrap().driving_client,
+                Some(10),
+                "a local GUI with a signable agent is eligible to drive"
+            );
+
+            // When the local driver disconnects, driving_client re-points to the
+            // remaining eligible client (here the relay-capable remote), not None.
+            unregister_client(&state, 10);
+            assert_eq!(
+                state.lock().unwrap().driving_client,
+                Some(20),
+                "driving_client re-points to a remaining eligible client"
+            );
+
+            drop(state);
+            let _ = std::fs::remove_dir_all(&dir_root);
+        }
+
+        /// `relay_pty_env` (the PTY injection decision, Slice 6 + live-origin
+        /// amendment): the injected env is **opener-agnostic** — it injects
+        /// `[("SSH_AUTH_SOCK", <stable socket path>)]` whenever the relay is bound,
+        /// regardless of which client opened the terminal, and `[]` when it is not.
+        /// Which machine signs is decided live per git-connect at accept time, not
+        /// frozen here at spawn — so there is no per-client argument.
+        #[test]
+        fn relay_pty_env_injects_whenever_the_relay_is_bound() {
             use super::super::{ensure_relay_socket, relay_pty_env};
 
             let _real_path = lock_real_relay_path();
             let (state, dir_root) = test_state();
-            let remote = fake_gui_with(true); // a relay-capable (remote) GUI
-            let local = fake_gui_with(false); // a local GUI: never relay-capable
-            insert_gui(&state, 1, &remote);
-            insert_gui(&state, 2, &local);
 
-            // Not relay-serving yet: no injection, even for the relay-capable client.
+            // Not relay-serving yet: no injection.
             assert!(
-                relay_pty_env(&state, 1).is_empty(),
+                relay_pty_env(&state).is_empty(),
                 "a non-relay-serving Daemon injects nothing"
             );
 
-            // Bind the stable relay. Now a terminal opened by the relay-capable client
-            // rides the relay…
+            // Bind the stable relay; now every terminal carries its connectable path.
             let stable = ensure_relay_socket(&state).expect("the stable relay binds");
             assert_eq!(
-                relay_pty_env(&state, 1),
+                relay_pty_env(&state),
                 vec![("SSH_AUTH_SOCK".to_string(), stable.clone())],
-                "a terminal opened by a relay-capable client injects the stable socket"
-            );
-
-            // …but a terminal opened by the LOCAL (non-relay) client does NOT — it
-            // inherits the env so its git uses the local machine's own agent. This is
-            // the co-located-GUI fix.
-            assert!(
-                relay_pty_env(&state, 2).is_empty(),
-                "a terminal opened by a non-relay client must not ride the relay"
-            );
-            // An unknown client id is treated as non-relay (no injection).
-            assert!(
-                relay_pty_env(&state, 999).is_empty(),
-                "an unknown opening client injects nothing"
+                "a relay-serving Daemon injects SSH_AUTH_SOCK = the stable socket"
             );
 
             if let Some(relay) = state.lock().unwrap().relay.lock().unwrap().take() {
@@ -11084,28 +11590,33 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir_root);
         }
 
-        /// PER-ORIGIN RESOLVE (the button/job path, 2026-06-15 per-origin amendment):
-        /// even when a relay-capable GUI is driving, a git op ORIGINATED by a
-        /// non-relay client (a local GUI on the Daemon's own machine) must NOT resolve
-        /// to the relay — it falls through to its own local env. The relay-capable
-        /// originator still gets the relay. Without the per-origin gate the local op
-        /// was hijacked onto the remote GUI's agent (Touch ID on the wrong machine).
+        /// LIVE-ORIGIN RESOLVE (the button/job path, §5 oracle, proto v31): the resolve
+        /// ladder follows the clicker. A remote relay clicker (relay-capable, driving)
+        /// resolves to the stable relay socket; a local clicker (a `ClientLocal`
+        /// announcer) resolves to its OWN literal `local_agent_sock` — not the relay —
+        /// even while the remote GUI is the `driving_client`; and a "neither" client
+        /// (not relay-capable, no local agent, no ConnEnv, no forwarded) resolves to
+        /// `None` via the existing ladder, even while a relay GUI drives.
         #[test]
-        fn resolve_skips_relay_for_non_relay_origin_even_when_a_gui_drives() {
+        fn resolve_ssh_auth_sock_follows_the_clicker() {
             use super::super::resolve_ssh_auth_sock;
 
             let _real_path = lock_real_relay_path();
             let (state, dir_root) = test_state();
             let remote = fake_gui_with(true); // relay-capable remote GUI (the driver)
-            let local = fake_gui_with(false); // local GUI on the Daemon's own machine
+            let local = fake_gui_with(false); // a local clicker on the Daemon's machine
+            *local.sink.local_agent_sock.lock().unwrap() =
+                Some("/tmp/local-agent.sock".to_string());
+            let neither = fake_gui_with(false); // not relay-capable, no local agent
             insert_gui(&state, 1, &remote);
             insert_gui(&state, 2, &local);
-            // The remote GUI is driving (the only relay-capable connection).
+            insert_gui(&state, 3, &neither);
+            // The remote relay GUI is driving the Daemon.
             set_driving(&state, Some(1));
 
-            // The driver's own op resolves to the relay socket.
+            // (1) The remote relay clicker resolves to the stable relay socket.
             let remote_op = resolve_ssh_auth_sock(&state, 1)
-                .expect("a relay-capable originator resolves to the relay");
+                .expect("a relay-capable, driving clicker resolves to the relay");
             let stable = state
                 .lock()
                 .unwrap()
@@ -11114,16 +11625,28 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .map(|relay| hitch_proto::transport::endpoint_os_address(&relay.socket_path))
-                .expect("the driver's resolve bound the stable relay");
-            assert_eq!(remote_op, stable, "the relay-capable originator gets the relay");
+                .expect("the remote clicker's resolve bound the stable relay");
+            assert_eq!(
+                remote_op, stable,
+                "a remote relay clicker resolves to the stable relay socket"
+            );
 
-            // The LOCAL client's op, with NO ConnEnv and NO forwarded fallback, must
-            // resolve to None (env inherited → local agent) despite the remote GUI
-            // driving. This is the assertion that fails without the per-origin gate.
+            // (2) The local clicker resolves to its OWN literal agent path — not the
+            // relay — even though the remote GUI is the driving_client.
             let local_op = resolve_ssh_auth_sock(&state, 2);
             assert_eq!(
-                local_op, None,
-                "a non-relay originator must not be routed to the driving GUI's relay"
+                local_op,
+                Some("/tmp/local-agent.sock".to_string()),
+                "a local clicker resolves to its literal local_agent_sock, not the relay"
+            );
+
+            // (3) The "neither" client — not relay-capable, no local agent, no ConnEnv,
+            // no forwarded — resolves to None via the existing ladder, despite a relay
+            // GUI driving.
+            let neither_op = resolve_ssh_auth_sock(&state, 3);
+            assert_eq!(
+                neither_op, None,
+                "a non-relay, non-local op falls through the existing ladder to None"
             );
 
             if let Some(relay) = state.lock().unwrap().relay.lock().unwrap().take() {

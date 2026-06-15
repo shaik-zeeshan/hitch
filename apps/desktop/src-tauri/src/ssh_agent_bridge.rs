@@ -30,15 +30,23 @@
 //! the remote connection writer and writes one control line; see
 //! `ssh_pool::write_remote_control`).
 
+#[cfg(unix)]
 use std::collections::HashMap;
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::thread;
 use std::time::Duration;
 
+#[cfg(unix)]
 use hitch_proto::ControlMessage;
 
 /// Reserved-TLD sentinel destination handed to `ssh -G` to resolve the user's
@@ -53,6 +61,7 @@ const AGENT_PROBE_HOST: &str = "hitch-default-agent-probe.invalid";
 /// control-reader's call into [`SshAgentRelay::write`], so a wedged agent socket
 /// must not block it forever; a timed-out write tears the channel down (mirrors
 /// the connect-failed policy).
+#[cfg(unix)]
 const LOCAL_AGENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Cap on request bytes buffered while a channel is still connecting to the local
@@ -60,6 +69,7 @@ const LOCAL_AGENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// so the connect-window buffer is tiny in practice; this bound stops a hostile or
 /// runaway daemon from growing it without limit. On overflow the channel is closed
 /// (mirrors the connect-failed policy).
+#[cfg(unix)]
 const MAX_CONNECTING_BUFFER: usize = 256 * 1024;
 
 /// Resolve the local ssh-agent socket to bridge to. Used BOTH as the capability
@@ -86,6 +96,12 @@ const MAX_CONNECTING_BUFFER: usize = 256 * 1024;
 ///
 /// `None` => no reachable agent; the relay is not declared and any stray
 /// `SshAgentOpen` is closed immediately.
+///
+/// Cross-platform: the Unix arm runs the ladder above; the Windows arm mirrors it
+/// for Windows agents (OpenSSH-for-Windows / 1Password-for-Windows named pipe) so
+/// a co-located local GUI on Windows announces its agent too (ADR 0014 amendment,
+/// silly-ridge-27 — the local analog of the remote `SshAgentRelay` declaration).
+#[cfg(unix)]
 pub fn local_agent_socket() -> Option<PathBuf> {
     resolve_local_agent(
         ssh_config_identity_agent(),
@@ -94,22 +110,37 @@ pub fn local_agent_socket() -> Option<PathBuf> {
     )
 }
 
-/// Pure resolution policy for [`local_agent_socket`], factored out so it is
+/// Windows resolver for [`local_agent_socket`]: same LADDER as Unix, adapted to
+/// Windows agents. UNVALIDATED off-host — written against the repo's existing
+/// `#[cfg(windows)]` idioms (`USERPROFILE` in `cli_install.rs`, the named-pipe
+/// path literal style in `hitch-proto`'s `transport.rs`) and validated live on the
+/// Windows host. The macOS build never compiles this arm.
+#[cfg(windows)]
+pub fn local_agent_socket() -> Option<PathBuf> {
+    resolve_local_agent_windows(
+        windows_ssh_config_identity_agent(),
+        std::env::var_os("SSH_AUTH_SOCK"),
+        windows_default_agent_pipe(),
+    )
+}
+
+/// Pure resolution policy for [`local_agent_socket`] on Unix, factored out so it is
 /// testable without spawning `ssh` or mutating process env. See that function's
 /// doc comment for the ladder.
+#[cfg(unix)]
 fn resolve_local_agent(
     identity_agent: Option<String>,
     ssh_auth_sock: Option<OsString>,
     one_password_fallback: Option<PathBuf>,
 ) -> Option<PathBuf> {
     // 1. Honor ssh's own IdentityAgent resolution.
-    match identity_agent.as_deref().map(str::trim) {
+    match classify_identity_agent(identity_agent.as_deref()) {
         // The user explicitly disabled agent auth — respect it, never fall back.
-        Some("none") => return None,
+        IdentityAgent::Disabled => return None,
         // The default / explicit token: defer to SSH_AUTH_SOCK below.
-        Some("SSH_AUTH_SOCK") | Some("") | None => {}
+        IdentityAgent::DeferToEnv => {}
         // An explicit socket path (ssh -G already ~-expanded it).
-        Some(path) => return Some(PathBuf::from(path)),
+        IdentityAgent::Path(path) => return Some(PathBuf::from(path)),
     }
 
     // 2. SSH_AUTH_SOCK from the environment — but never macOS's empty launchd
@@ -125,30 +156,71 @@ fn resolve_local_agent(
     one_password_fallback
 }
 
-/// Ask OpenSSH itself for the effective `IdentityAgent` via `ssh -G`, so we honor
-/// the user's full ssh config (Host/Match blocks, `Include`, `~`-expansion, the
-/// `none`/`SSH_AUTH_SOCK` tokens) with zero reimplementation and no app-specific
-/// knowledge. Returns the raw value (an absolute path, or the `none`/
-/// `SSH_AUTH_SOCK` token), or `None` if ssh is unavailable, fails, or emits no
-/// `identityagent` line (i.e. the OpenSSH default — treated as `SSH_AUTH_SOCK`).
-///
-/// `/usr/bin/ssh` is invoked by absolute path because a Dock-launched GUI has the
-/// minimal launchd PATH; `ssh -G` never connects, so a `.invalid` sentinel host
-/// is resolved offline and fast.
-fn ssh_config_identity_agent() -> Option<String> {
-    let output = std::process::Command::new("/usr/bin/ssh")
-        .arg("-G")
-        .arg(AGENT_PROBE_HOST)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// Pure resolution policy for [`local_agent_socket`] on Windows, factored out so it
+/// is testable without spawning `ssh.exe` or mutating process env. Mirrors the Unix
+/// ladder rung-for-rung, except the env rung has NO launchd guard (a Windows
+/// platform fact) and the labeled fallback is the OpenSSH-compatible named pipe
+/// rather than the 1Password fixed Unix socket.
+#[cfg(windows)]
+fn resolve_local_agent_windows(
+    identity_agent: Option<String>,
+    ssh_auth_sock: Option<OsString>,
+    default_agent_pipe: Option<PathBuf>,
+) -> Option<PathBuf> {
+    // 1. Honor ssh's own IdentityAgent resolution (ssh.exe -G).
+    match classify_identity_agent(identity_agent.as_deref()) {
+        IdentityAgent::Disabled => return None,
+        IdentityAgent::DeferToEnv => {}
+        IdentityAgent::Path(path) => return Some(PathBuf::from(path)),
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // 2. SSH_AUTH_SOCK from the environment if set & non-empty. No launchd guard on
+    //    Windows (that empty-system-agent trap is a macOS-only platform fact).
+    if let Some(sock) = ssh_auth_sock {
+        if !sock.is_empty() {
+            return Some(PathBuf::from(sock));
+        }
+    }
+
+    // 3. Labeled fallback: the OpenSSH-for-Windows default agent named pipe
+    //    (1Password-for-Windows serves the OpenSSH-compatible pipe at this same
+    //    path), if it exists.
+    default_agent_pipe
+}
+
+/// The classification of an `IdentityAgent` value from `ssh -G`, shared by both
+/// platform resolvers so the `none` / `SSH_AUTH_SOCK` / explicit-path semantics
+/// stay identical across Unix and Windows.
+enum IdentityAgent {
+    /// `IdentityAgent none` — the user disabled agent auth; never fall back.
+    Disabled,
+    /// The `SSH_AUTH_SOCK` token, the empty value, or no `identityagent` line —
+    /// defer to the environment rung.
+    DeferToEnv,
+    /// An explicit socket / pipe path (ssh -G already ~-expanded it).
+    Path(String),
+}
+
+/// Map the raw `IdentityAgent` value to its [`IdentityAgent`] meaning. Pure and
+/// cfg-agnostic so both platform resolvers share one source of truth for the
+/// `none` / `SSH_AUTH_SOCK` / explicit-path tokens.
+fn classify_identity_agent(identity_agent: Option<&str>) -> IdentityAgent {
+    match identity_agent.map(str::trim) {
+        Some("none") => IdentityAgent::Disabled,
+        Some("SSH_AUTH_SOCK") | Some("") | None => IdentityAgent::DeferToEnv,
+        Some(path) => IdentityAgent::Path(path.to_string()),
+    }
+}
+
+/// Parse the effective `IdentityAgent` out of `ssh -G` stdout. `ssh -G` emits
+/// "keyword value" with lowercase keywords and no indentation; the value (a socket
+/// path) may itself contain spaces, so take the entire remainder after the keyword
+/// rather than splitting. Returns the raw value (a path, or the `none`/
+/// `SSH_AUTH_SOCK` token), or `None` if there is no non-empty `identityagent` line
+/// (the OpenSSH default — treated as `SSH_AUTH_SOCK`). Cfg-agnostic so both the
+/// Unix and Windows `ssh -G` arms reuse one parser.
+fn parse_identity_agent_line(stdout: &str) -> Option<String> {
     for line in stdout.lines() {
-        // `ssh -G` emits "keyword value" with lowercase keywords and no
-        // indentation; the value (a socket path) may itself contain spaces, so
-        // take the entire remainder after the keyword rather than splitting.
         if let Some(value) = line.trim_start().strip_prefix("identityagent ") {
             let value = value.trim();
             if !value.is_empty() {
@@ -159,8 +231,50 @@ fn ssh_config_identity_agent() -> Option<String> {
     None
 }
 
+/// Ask OpenSSH itself for the effective `IdentityAgent` via `ssh -G`, so we honor
+/// the user's full ssh config (Host/Match blocks, `Include`, `~`-expansion, the
+/// `none`/`SSH_AUTH_SOCK` tokens) with zero reimplementation and no app-specific
+/// knowledge. Returns the raw value (an absolute path, or the `none`/
+/// `SSH_AUTH_SOCK` token), or `None` if ssh is unavailable, fails, or emits no
+/// `identityagent` line (i.e. the OpenSSH default — treated as `SSH_AUTH_SOCK`).
+///
+/// `/usr/bin/ssh` is invoked by absolute path because a Dock-launched GUI has the
+/// minimal launchd PATH; `ssh -G` never connects, so a `.invalid` sentinel host
+/// is resolved offline and fast.
+#[cfg(unix)]
+fn ssh_config_identity_agent() -> Option<String> {
+    let output = std::process::Command::new("/usr/bin/ssh")
+        .arg("-G")
+        .arg(AGENT_PROBE_HOST)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_identity_agent_line(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Windows analog of [`ssh_config_identity_agent`]: ask OpenSSH-for-Windows for the
+/// effective `IdentityAgent` via `ssh.exe -G`. Invoked by bare name (`ssh`, found
+/// on PATH as `ssh.exe`) rather than the Unix absolute `/usr/bin/ssh`, since the
+/// Windows OpenSSH client lives under `System32\OpenSSH` and is on PATH. Same
+/// offline `.invalid` sentinel host, same line parser.
+#[cfg(windows)]
+fn windows_ssh_config_identity_agent() -> Option<String> {
+    let output = std::process::Command::new("ssh")
+        .arg("-G")
+        .arg(AGENT_PROBE_HOST)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_identity_agent_line(&String::from_utf8_lossy(&output.stdout))
+}
+
 /// The 1Password fixed agent socket if it exists. `$HOME` is expanded via `HOME`
 /// because this crate has no `~` expander.
+#[cfg(unix)]
 fn one_password_fallback_socket() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     if home.is_empty() {
@@ -171,11 +285,25 @@ fn one_password_fallback_socket() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
+/// The OpenSSH-for-Windows default agent named pipe if it currently exists. This is
+/// the labeled Windows fallback — the analog of the 1Password fixed socket on Unix:
+/// OpenSSH-for-Windows's `ssh-agent` service and 1Password-for-Windows both serve an
+/// OpenSSH-compatible agent at this same well-known pipe path, so probing its
+/// existence is the no-config "is an agent reachable at all?" signal. The path is a
+/// fixed literal (matching the named-pipe literal style in `hitch-proto`'s
+/// `transport.rs`); `%USERPROFILE%` is not needed for this rung.
+#[cfg(windows)]
+fn windows_default_agent_pipe() -> Option<PathBuf> {
+    let pipe = PathBuf::from(r"\\.\pipe\openssh-ssh-agent");
+    pipe.exists().then_some(pipe)
+}
+
 /// Whether `path` is macOS's per-session system ssh-agent
 /// (`…/com.apple.launchd.<rand>/Listeners`). A GUI launched from the Dock/Finder
 /// inherits this in `SSH_AUTH_SOCK`, but it is empty unless the user ran
 /// `ssh-add` into it — 1Password/Bitwarden/Secretive users never do — so it must
 /// not shadow the real agent. A macOS platform fact, not an agent-app heuristic.
+#[cfg(unix)]
 fn is_macos_launchd_agent(path: &Path) -> bool {
     path.to_str()
         .is_some_and(|s| s.contains("/com.apple.launchd.") && s.ends_with("/Listeners"))
@@ -187,6 +315,7 @@ fn is_macos_launchd_agent(path: &Path) -> bool {
 /// well-formed answer, or `None` if the agent is unreachable or replies with
 /// anything else (e.g. `SSH_AGENT_FAILURE`). A reachable agent answering `Some(0)`
 /// is the #1 cause of an opaque remote `Permission denied (publickey)`.
+#[cfg(unix)]
 pub fn agent_identity_count(socket: &Path) -> Option<usize> {
     let mut stream = UnixStream::connect(socket).ok()?;
     // This probe runs synchronously on the connect/reconnect worker thread after
@@ -224,6 +353,7 @@ pub fn agent_identity_count(socket: &Path) -> Option<usize> {
 /// re-lock-per-write idiom (`write_remote_input`). Returns nothing: a write to a
 /// dead/swapped writer is best-effort and silently dropped, never re-entering
 /// teardown (deadlock note in `lib.rs::write_input_frame`).
+#[cfg(unix)]
 pub type WriteUp = Arc<dyn Fn(ControlMessage) + Send + Sync>;
 
 /// One bridged channel's state in the registry.
@@ -233,6 +363,7 @@ pub type WriteUp = Arc<dyn Fn(ControlMessage) + Send + Sync>;
 /// (so a wedged agent can never stall the control-reader loop). Inbound request
 /// bytes that arrive in that connect window are buffered here — under the registry
 /// lock — and flushed in order once connected, so no request is lost.
+#[cfg(unix)]
 enum ChannelHandle {
     /// Connecting on the dedicated thread; request bytes buffer here meanwhile.
     Connecting { buffered: Vec<u8> },
@@ -242,6 +373,7 @@ enum ChannelHandle {
     Connected { agent_write: UnixStream },
 }
 
+#[cfg(unix)]
 impl ChannelHandle {
     /// Shut the local-agent socket down (Connected) so a reader thread parked on a
     /// pending sign returns at once. A Connecting handle has no socket yet — its
@@ -257,11 +389,13 @@ impl ChannelHandle {
 /// daemon-assigned channel id. Owned by the `RemoteConnection` (one relay per
 /// remote daemon). Cloneable `Arc` handle so the reader loop and the per-channel
 /// reader threads share it.
+#[cfg(unix)]
 #[derive(Clone, Default)]
 pub struct SshAgentRelay {
     channels: Arc<Mutex<HashMap<u64, ChannelHandle>>>,
 }
 
+#[cfg(unix)]
 impl SshAgentRelay {
     pub fn new() -> Self {
         Self::default()
@@ -487,13 +621,14 @@ impl SshAgentRelay {
 /// Opt-in observability gated on `HITCH_DEBUG` (mirrors the git crate's
 /// convention), to stderr. The byte payloads themselves are NEVER logged — only
 /// channel lifecycle and failures.
+#[cfg(unix)]
 fn debug_log(message: String) {
     if std::env::var_os("HITCH_DEBUG").is_some_and(|v| !v.is_empty()) {
         eprintln!("[hitch ssh-agent relay] {message}");
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -595,5 +730,92 @@ mod tests {
         let relay = SshAgentRelay::new();
         relay.close_all();
         relay.close_all();
+    }
+}
+
+// Pure-policy tests for the Windows resolver. They mirror the Unix test style but
+// will only ever RUN on a Windows host (the macOS build never compiles this arm).
+// UNVALIDATED off-host — kept here so the Windows policy is checked in CI on the
+// Windows runner alongside the live host validation.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    // The OpenSSH-for-Windows / 1Password-for-Windows default agent pipe.
+    const DEFAULT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
+    // A representative explicit named-pipe IdentityAgent a user might configure.
+    const EXPLICIT_PIPE: &str = r"\\.\pipe\my-custom-agent";
+
+    #[test]
+    fn identity_agent_path_wins_over_env_and_fallback() {
+        // An explicit `IdentityAgent <pipe>` is the user's deliberate choice and
+        // beats everything below it.
+        assert_eq!(
+            resolve_local_agent_windows(
+                Some(EXPLICIT_PIPE.to_string()),
+                Some(OsString::from(r"\\.\pipe\some-env-agent")),
+                Some(PathBuf::from(DEFAULT_PIPE)),
+            ),
+            Some(PathBuf::from(EXPLICIT_PIPE))
+        );
+    }
+
+    #[test]
+    fn identity_agent_none_disables_the_relay() {
+        // `IdentityAgent none` means "no agent" — never fall back to env/pipe.
+        assert_eq!(
+            resolve_local_agent_windows(
+                Some("none".to_string()),
+                Some(OsString::from(r"\\.\pipe\some-env-agent")),
+                Some(PathBuf::from(DEFAULT_PIPE)),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ssh_auth_sock_token_and_unset_defer_to_env() {
+        // Both the explicit `SSH_AUTH_SOCK` token and no identityagent line mean
+        // "use the environment". No launchd guard on Windows: the env value is
+        // taken verbatim when set & non-empty.
+        for ident in [Some("SSH_AUTH_SOCK".to_string()), None] {
+            assert_eq!(
+                resolve_local_agent_windows(
+                    ident,
+                    Some(OsString::from(r"\\.\pipe\real-agent")),
+                    None,
+                ),
+                Some(PathBuf::from(r"\\.\pipe\real-agent"))
+            );
+        }
+    }
+
+    #[test]
+    fn empty_env_falls_through_to_default_pipe() {
+        // An empty `SSH_AUTH_SOCK` must not shadow the labeled default-pipe
+        // fallback (mirrors the Unix dock-launch fall-through, minus the launchd
+        // guard which has no Windows analog).
+        assert_eq!(
+            resolve_local_agent_windows(
+                None,
+                Some(OsString::from("")),
+                Some(PathBuf::from(DEFAULT_PIPE)),
+            ),
+            Some(PathBuf::from(DEFAULT_PIPE))
+        );
+        // ...and with no fallback pipe either, there is simply no agent.
+        assert_eq!(
+            resolve_local_agent_windows(None, Some(OsString::from("")), None),
+            None
+        );
+    }
+
+    #[test]
+    fn default_pipe_used_only_when_env_absent() {
+        assert_eq!(
+            resolve_local_agent_windows(None, None, Some(PathBuf::from(DEFAULT_PIPE))),
+            Some(PathBuf::from(DEFAULT_PIPE))
+        );
+        assert_eq!(resolve_local_agent_windows(None, None, None), None);
     }
 }
