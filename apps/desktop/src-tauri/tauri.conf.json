@@ -16,7 +16,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "app",
+    "targets": ["app", "nsis"],
     "externalBin": ["binaries/hitch-daemon", "binaries/hitch-hook"],
     "publisher": "Hitch",
     "category": "DeveloperTool",
