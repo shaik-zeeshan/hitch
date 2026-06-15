@@ -1,4 +1,4 @@
-//! Local ssh-agent relay bridge (proto v29, plan slices 4 + 6).
+//! Local ssh-agent relay bridge (proto v31, ADR 0014 amendment). CROSS-PLATFORM.
 //!
 //! On a REMOTE connection whose per-host toggle is on, the GUI declares a relay
 //! by sending [`ControlMessage::SshAgentRelay`] to the remote daemon right after
@@ -12,6 +12,20 @@
 //! * local agent reply bytes -> [`ControlMessage::SshAgentData`] back up,
 //! * [`ControlMessage::SshAgentClose`] / EOF tears the channel down.
 //!
+//! ## Cross-platform (silly-ridge-27)
+//!
+//! The bridge connects to the local agent through `hitch_proto::transport`'s
+//! cross-platform [`connect_external`] primitive, which yields a
+//! [`RelayReader`]/[`RelayWriter`] pair addressing ONE underlying connection on
+//! both platforms: a `UnixStream` (clones) on Unix, the recv/send halves of one
+//! named-pipe stream (interprocess ref-clones the duplex handle) on Windows. So a
+//! local GUI on Windows driving a remote Unix daemon serves the relay too: on
+//! Windows the agent address is a named pipe (`\\.\pipe\openssh-ssh-agent` by
+//! default, resolved from `ssh -G IdentityAgent`/`SSH_AUTH_SOCK` exactly as on
+//! Unix — see [`local_agent_socket`]). The Windows pipe path is validated live on
+//! the host, not in macOS CI (no Windows target here).
+//! TODO(win-e2e): validate on pc@192.168.0.9.
+//!
 //! ## Naming (CONTEXT.md, mandatory)
 //!
 //! The relayed thing is the **SSH agent**, NEVER the AI Agent. Every type/thread
@@ -20,33 +34,33 @@
 //! ## Touch ID must not stall the control reader (the whole point)
 //!
 //! A 1Password sign can block for seconds behind a Touch ID prompt. So the
-//! per-channel bridge owns the local-agent `UnixStream` on a **dedicated
+//! per-channel bridge owns the local-agent connection on a **dedicated
 //! `std::thread`** (no tokio in this crate): the inbound write half is written
-//! to from the reader loop and returns immediately (a `write_all` to the agent
-//! socket does not block on the sign), while a separate dedicated reader thread
-//! `read`s the agent's reply — which is where the multi-second Touch ID wait
-//! lands — entirely off the control-reader loop. The reply bytes are sent back
-//! up via a cheaply-cloneable write-up callback the caller supplies (it locks
-//! the remote connection writer and writes one control line; see
-//! `ssh_pool::write_remote_control`).
+//! to from the reader loop and returns under a bounded deadline (a
+//! `write_with_deadline` to the agent does not block on the sign), while a
+//! separate dedicated reader thread `read`s the agent's reply — which is where
+//! the multi-second Touch ID wait lands — entirely off the control-reader loop.
+//! The reply bytes are sent back up via a cheaply-cloneable write-up callback the
+//! caller supplies (it locks the remote connection writer and writes one control
+//! line; see `ssh_pool::write_remote_control`).
+//!
+//! ## Never hold the registry lock across blocking agent I/O (GB1)
+//!
+//! [`SshAgentRelay::write`] takes the registry mutex only long enough to CLONE the
+//! channel's shared `Arc<RelayWriter>` (or buffer into a Connecting slot), then
+//! DROPS the lock before the bounded `write_with_deadline` to the agent. A 1Password
+//! sign that briefly back-pressures the agent socket therefore can never stall the
+//! reader loop's access to OTHER channels' slots.
 
-#[cfg(unix)]
 use std::collections::HashMap;
 use std::ffi::OsString;
-#[cfg(unix)]
-use std::io::{self, Read, Write};
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
-#[cfg(unix)]
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-#[cfg(unix)]
 use std::thread;
 use std::time::Duration;
 
-#[cfg(unix)]
+use hitch_proto::transport::{connect_external, RelayReader, RelayWriter};
 use hitch_proto::ControlMessage;
 
 /// Reserved-TLD sentinel destination handed to `ssh -G` to resolve the user's
@@ -57,19 +71,18 @@ use hitch_proto::ControlMessage;
 /// is exactly the one the user's own `ssh`/`git` use for everything.
 const AGENT_PROBE_HOST: &str = "hitch-default-agent-probe.invalid";
 
-/// Write timeout on the bridged local-agent socket. The inbound write runs on the
-/// control-reader's call into [`SshAgentRelay::write`], so a wedged agent socket
-/// must not block it forever; a timed-out write tears the channel down (mirrors
-/// the connect-failed policy).
-#[cfg(unix)]
-const LOCAL_AGENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the channel thread waits for the connect to the local agent before
+/// giving up and closing the channel (GB2, never-stall contract). The connect
+/// runs on the channel's own dedicated thread (never the reader loop), but a
+/// wedged agent server — a stale `SSH_AUTH_SOCK`/pipe pointing at a hung process —
+/// must not pin that thread forever either. A healthy agent connects in µs.
+const LOCAL_AGENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Cap on request bytes buffered while a channel is still connecting to the local
 /// agent. A well-behaved ssh client sends a small request and waits for the reply,
 /// so the connect-window buffer is tiny in practice; this bound stops a hostile or
 /// runaway daemon from growing it without limit. On overflow the channel is closed
 /// (mirrors the connect-failed policy).
-#[cfg(unix)]
 const MAX_CONNECTING_BUFFER: usize = 256 * 1024;
 
 /// Resolve the local ssh-agent socket to bridge to. Used BOTH as the capability
@@ -115,6 +128,7 @@ pub fn local_agent_socket() -> Option<PathBuf> {
 /// `#[cfg(windows)]` idioms (`USERPROFILE` in `cli_install.rs`, the named-pipe
 /// path literal style in `hitch-proto`'s `transport.rs`) and validated live on the
 /// Windows host. The macOS build never compiles this arm.
+/// TODO(win-e2e): validate on pc@192.168.0.9.
 #[cfg(windows)]
 pub fn local_agent_socket() -> Option<PathBuf> {
     resolve_local_agent_windows(
@@ -259,6 +273,7 @@ fn ssh_config_identity_agent() -> Option<String> {
 /// on PATH as `ssh.exe`) rather than the Unix absolute `/usr/bin/ssh`, since the
 /// Windows OpenSSH client lives under `System32\OpenSSH` and is on PATH. Same
 /// offline `.invalid` sentinel host, same line parser.
+/// TODO(win-e2e): validate on pc@192.168.0.9.
 #[cfg(windows)]
 fn windows_ssh_config_identity_agent() -> Option<String> {
     let output = std::process::Command::new("ssh")
@@ -292,6 +307,7 @@ fn one_password_fallback_socket() -> Option<PathBuf> {
 /// existence is the no-config "is an agent reachable at all?" signal. The path is a
 /// fixed literal (matching the named-pipe literal style in `hitch-proto`'s
 /// `transport.rs`); `%USERPROFILE%` is not needed for this rung.
+/// TODO(win-e2e): validate on pc@192.168.0.9.
 #[cfg(windows)]
 fn windows_default_agent_pipe() -> Option<PathBuf> {
     let pipe = PathBuf::from(r"\\.\pipe\openssh-ssh-agent");
@@ -315,26 +331,27 @@ fn is_macos_launchd_agent(path: &Path) -> bool {
 /// well-formed answer, or `None` if the agent is unreachable or replies with
 /// anything else (e.g. `SSH_AGENT_FAILURE`). A reachable agent answering `Some(0)`
 /// is the #1 cause of an opaque remote `Permission denied (publickey)`.
-#[cfg(unix)]
+///
+/// Bounded by [`LOCAL_AGENT_CONNECT_TIMEOUT`] (GB2): the connect runs on a worker
+/// joined under that deadline, and the request/response is read under the relay
+/// write-deadline, so a wedged agent never pins the connect/reconnect worker
+/// thread for more than the timeout. Cross-platform via [`connect_external`].
 pub fn agent_identity_count(socket: &Path) -> Option<usize> {
-    let mut stream = UnixStream::connect(socket).ok()?;
+    let (mut reader, writer) = connect_external_bounded(socket)?;
     // This probe runs synchronously on the connect/reconnect worker thread after
     // declaring the relay, so keep it short: a healthy agent answers in µs, and a
     // wedged one should not delay that host's `Running` status by seconds.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     // Request: uint32 len=1, byte type=11 (SSH_AGENTC_REQUEST_IDENTITIES).
-    stream.write_all(&[0, 0, 0, 1, 11]).ok()?;
-    stream.flush().ok()?;
+    writer.write_with_deadline(&[0, 0, 0, 1, 11]).ok()?;
     // Answer header: uint32 len, byte type=12 (SSH_AGENT_IDENTITIES_ANSWER),
     // uint32 nkeys. A shorter message (e.g. FAILURE, len=1) is "not an answer".
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).ok()?;
+    read_exact_bounded(&mut reader, &mut len_buf)?;
     if u32::from_be_bytes(len_buf) < 5 {
         return None;
     }
     let mut type_and_count = [0u8; 5];
-    stream.read_exact(&mut type_and_count).ok()?;
+    read_exact_bounded(&mut reader, &mut type_and_count)?;
     if type_and_count[0] != 12 {
         return None;
     }
@@ -346,6 +363,42 @@ pub fn agent_identity_count(socket: &Path) -> Option<usize> {
     ]) as usize)
 }
 
+/// `Read::read_exact` that maps any error (incl. a closed/short agent) to `None`,
+/// so the self-diagnosis probe degrades to "couldn't determine key count" rather
+/// than panicking or surfacing an error. The agent answers a single small reply
+/// promptly; a wedged one is bounded by the connect deadline upstream.
+fn read_exact_bounded(reader: &mut RelayReader, buf: &mut [u8]) -> Option<()> {
+    reader.read_exact(buf).ok()
+}
+
+/// Connect to the local agent under a bounded deadline (GB2). [`connect_external`]
+/// itself does a blocking connect with no timeout; a healthy agent connects in µs,
+/// but a stale `SSH_AUTH_SOCK`/pipe pointing at a hung server could otherwise block
+/// forever. We run the connect on a short-lived worker and join it under
+/// [`LOCAL_AGENT_CONNECT_TIMEOUT`]: on timeout we abandon the worker (it owns the
+/// half-open connect; it unwinds when the OS eventually errors or completes) and
+/// return `None`, which the caller treats as "agent unreachable, close the
+/// channel". Cross-platform: `connect_external` is the cross-platform primitive.
+fn connect_external_bounded(socket: &Path) -> Option<(RelayReader, RelayWriter)> {
+    let socket = socket.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // The worker is detached on timeout; name it so a stuck connect is identifiable
+    // in a thread dump. A send on a dropped receiver (we already timed out) is a
+    // benign `Err` the worker ignores.
+    let _ = thread::Builder::new()
+        .name("hitch-ssh-agent-connect".to_string())
+        .spawn(move || {
+            let result = connect_external(&socket);
+            let _ = tx.send(result);
+        });
+    match rx.recv_timeout(LOCAL_AGENT_CONNECT_TIMEOUT) {
+        Ok(Ok(pair)) => Some(pair),
+        // Connect errored (no such agent / refused) or the worker hit the deadline
+        // and we gave up waiting: no usable connection.
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
 /// A write-up sink: locks the remote connection writer and writes one control
 /// line (no PTY payload frame). Cheaply cloneable (it is an `Arc<dyn Fn>`), so a
 /// per-channel reader thread that outlives a reconnect can keep one and re-lock
@@ -353,7 +406,6 @@ pub fn agent_identity_count(socket: &Path) -> Option<usize> {
 /// re-lock-per-write idiom (`write_remote_input`). Returns nothing: a write to a
 /// dead/swapped writer is best-effort and silently dropped, never re-entering
 /// teardown (deadlock note in `lib.rs::write_input_frame`).
-#[cfg(unix)]
 pub type WriteUp = Arc<dyn Fn(ControlMessage) + Send + Sync>;
 
 /// One bridged channel's state in the registry.
@@ -363,24 +415,43 @@ pub type WriteUp = Arc<dyn Fn(ControlMessage) + Send + Sync>;
 /// (so a wedged agent can never stall the control-reader loop). Inbound request
 /// bytes that arrive in that connect window are buffered here — under the registry
 /// lock — and flushed in order once connected, so no request is lost.
-#[cfg(unix)]
+///
+/// The connected write half is held behind an `Arc` so [`SshAgentRelay::write`]
+/// can CLONE it out under the registry lock and then DROP the lock before the
+/// bounded `write_with_deadline` to the agent (GB1 — never hold the lock across
+/// blocking agent I/O).
 enum ChannelHandle {
     /// Connecting on the dedicated thread; request bytes buffer here meanwhile.
-    Connecting { buffered: Vec<u8> },
-    /// Connected: the local-agent write half. Inbound bytes are written through.
-    /// The read half is owned by the channel's dedicated reader thread, so a
-    /// write here never blocks on a sign.
-    Connected { agent_write: UnixStream },
+    /// `generation` distinguishes THIS open from any later reuse of the same
+    /// channel id (GB3): the connecting thread only transitions the slot it owns.
+    Connecting { generation: u64, buffered: Vec<u8> },
+    /// Connected: the local-agent write half (shared `Arc`). Inbound bytes are
+    /// written through it OUTSIDE the registry lock. The read half is owned by the
+    /// channel's dedicated reader thread, so a write here never blocks on a sign
+    /// beyond the bounded deadline.
+    Connected {
+        generation: u64,
+        agent_write: Arc<RelayWriter>,
+    },
 }
 
-#[cfg(unix)]
 impl ChannelHandle {
-    /// Shut the local-agent socket down (Connected) so a reader thread parked on a
-    /// pending sign returns at once. A Connecting handle has no socket yet — its
-    /// thread aborts when it finds the registry slot gone.
+    /// This handle's open-generation (GB3): set when the slot was first inserted
+    /// and carried across the Connecting -> Connected transition, so the channel
+    /// thread can verify the slot is still ITS open and not a later reuse.
+    fn generation(&self) -> u64 {
+        match self {
+            ChannelHandle::Connecting { generation, .. }
+            | ChannelHandle::Connected { generation, .. } => *generation,
+        }
+    }
+
+    /// Shut the local-agent connection down (Connected) so a reader thread parked
+    /// on a pending sign returns at once. A Connecting handle has no connection
+    /// yet — its thread aborts when it finds the registry slot gone or superseded.
     fn shutdown(self) {
-        if let ChannelHandle::Connected { agent_write } = self {
-            let _ = agent_write.shutdown(std::net::Shutdown::Both);
+        if let ChannelHandle::Connected { agent_write, .. } = self {
+            let _ = agent_write.force_close();
         }
     }
 }
@@ -389,16 +460,37 @@ impl ChannelHandle {
 /// daemon-assigned channel id. Owned by the `RemoteConnection` (one relay per
 /// remote daemon). Cloneable `Arc` handle so the reader loop and the per-channel
 /// reader threads share it.
-#[cfg(unix)]
+///
+/// `next_generation` (GB3) is a monotonic counter stamped on every [`open`]: the
+/// daemon's channel ids are SUPPOSED to be monotonic & never reused, but the GUI
+/// does not enforce that invariant on the wire. If a reused id arrives while a
+/// stale thread for the prior open is still alive, the generation guard makes the
+/// stale thread refuse to touch (or hijack) the newer slot.
 #[derive(Clone, Default)]
 pub struct SshAgentRelay {
-    channels: Arc<Mutex<HashMap<u64, ChannelHandle>>>,
+    inner: Arc<SshAgentRelayInner>,
 }
 
-#[cfg(unix)]
+#[derive(Default)]
+struct SshAgentRelayInner {
+    channels: Mutex<HashMap<u64, ChannelHandle>>,
+    next_generation: std::sync::atomic::AtomicU64,
+}
+
 impl SshAgentRelay {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn channels(&self) -> &Mutex<HashMap<u64, ChannelHandle>> {
+        &self.inner.channels
+    }
+
+    /// Allocate the next monotonic open-generation (GB3).
+    fn next_generation(&self) -> u64 {
+        self.inner
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Open a bridge for `channel`. Registers the channel SYNCHRONOUSLY (so an
@@ -409,16 +501,37 @@ impl SshAgentRelay {
     /// `SSH_AUTH_SOCK` pointing at a hung server could otherwise stall the loop
     /// that drains the daemon→GUI stream, back-pressure the daemon's pump thread
     /// onto the shared `ClientSink` writer, and freeze every terminal on the
-    /// connection. So even `UnixStream::connect` runs on the spawned thread.
+    /// connection. So even the connect runs on the spawned thread.
+    ///
+    /// GB3: if the channel id is ALREADY in the registry (the daemon reused an id
+    /// while a stale thread for the prior open is still alive), the OLD handle is
+    /// closed BEFORE the new slot is inserted, and the new slot carries a fresh
+    /// generation so the stale thread can never hijack it.
     ///
     /// If no local agent is reachable, or the connect fails, the thread emits an
     /// [`ControlMessage::SshAgentClose`] up so the daemon tears its side down
     /// rather than hanging.
     pub fn open(&self, channel: u64, write_up: WriteUp) {
+        let generation = self.next_generation();
         // Register a Connecting slot up front so `write()` can buffer inbound
-        // request bytes before the connect completes.
-        if let Ok(mut channels) = self.channels.lock() {
-            channels.insert(channel, ChannelHandle::Connecting { buffered: Vec::new() });
+        // request bytes before the connect completes. If a stale handle for a
+        // reused id is still present, close it first (GB3) so its socket is shut
+        // and its thread unblocks, rather than letting two opens race the slot.
+        if let Ok(mut channels) = self.channels().lock() {
+            if let Some(stale) = channels.remove(&channel) {
+                debug_log(format!(
+                    "ssh-agent relay: channel {channel} reused while a prior open was live; \
+                     closing the stale handle before reopening"
+                ));
+                stale.shutdown();
+            }
+            channels.insert(
+                channel,
+                ChannelHandle::Connecting {
+                    generation,
+                    buffered: Vec::new(),
+                },
+            );
         }
 
         // Clone the cheap `Arc` write-up sink so the spawn-failure branch still
@@ -427,12 +540,12 @@ impl SshAgentRelay {
         let thread_write_up = write_up.clone();
         let spawned = thread::Builder::new()
             .name(format!("hitch-ssh-agent-relay-{channel}"))
-            .spawn(move || registry.run_channel(channel, thread_write_up));
+            .spawn(move || registry.run_channel(channel, generation, thread_write_up));
         if let Err(err) = spawned {
             debug_log(format!(
                 "ssh-agent relay: failed to spawn channel thread for {channel}: {err}; closing"
             ));
-            self.close_local(channel);
+            self.close_local(channel, generation);
             write_up(ControlMessage::SshAgentClose { channel });
         }
     }
@@ -441,72 +554,93 @@ impl SshAgentRelay {
     /// connect is here, off the reader loop), flush any bytes buffered during the
     /// connect window, then pump agent reply bytes up — where the multi-second
     /// Touch ID sign wait lands — until EOF.
-    fn run_channel(&self, channel: u64, write_up: WriteUp) {
+    ///
+    /// `generation` (GB3) identifies THIS open. Every registry mutation this thread
+    /// makes is conditioned on the slot still carrying `generation`, so a reused
+    /// channel id whose new open has a newer generation is never disturbed.
+    fn run_channel(&self, channel: u64, generation: u64, write_up: WriteUp) {
         let socket = match local_agent_socket() {
             Some(socket) => socket,
             None => {
                 debug_log(format!(
                     "ssh-agent relay: SshAgentOpen channel {channel} but no local agent reachable; closing"
                 ));
-                self.close_local(channel);
+                self.close_local(channel, generation);
                 write_up(ControlMessage::SshAgentClose { channel });
                 return;
             }
         };
-        let stream = match UnixStream::connect(&socket) {
-            Ok(stream) => stream,
-            Err(err) => {
+        // Bounded connect (GB2): a wedged agent server cannot pin this thread
+        // forever. Cross-platform via `connect_external`.
+        let (read_half, write_half) = match connect_external_bounded(&socket) {
+            Some(pair) => pair,
+            None => {
                 debug_log(format!(
-                    "ssh-agent relay: connect to local agent {} failed for channel {channel}: {err}; closing",
+                    "ssh-agent relay: connect to local agent {} failed/timed out for channel {channel}; closing",
                     socket.display()
                 ));
-                self.close_local(channel);
+                self.close_local(channel, generation);
                 write_up(ControlMessage::SshAgentClose { channel });
                 return;
             }
         };
-        let mut read_half = match stream.try_clone() {
-            Ok(read_half) => read_half,
-            Err(err) => {
-                debug_log(format!(
-                    "ssh-agent relay: try_clone local agent stream failed for channel {channel}: {err}; closing"
-                ));
-                self.close_local(channel);
-                write_up(ControlMessage::SshAgentClose { channel });
-                return;
-            }
-        };
+        let write_half = Arc::new(write_half);
 
-        // Transition Connecting -> Connected under the registry lock: drain the
-        // bytes buffered during the connect window (in order) to the agent, then
-        // store the write half so later `write()`s go straight through. If the
-        // slot is gone (a `close`/`close_all` raced the connect), abort — the
-        // closer owns teardown and `write_up` may already be dead.
-        {
-            let mut write_half = stream;
-            // Bound the inbound write to the local agent: it runs on the control
-            // reader's call into `write()`, so a wedged agent socket must not block
-            // it forever (mirrors the read/write timeout in `agent_identity_count`).
-            let _ = write_half.set_write_timeout(Some(LOCAL_AGENT_WRITE_TIMEOUT));
-            let mut channels = match self.channels.lock() {
-                Ok(channels) => channels,
-                Err(_) => return,
-            };
-            match channels.remove(&channel) {
-                Some(ChannelHandle::Connecting { buffered }) => {
-                    if !buffered.is_empty() {
-                        let _ = write_half.write_all(&buffered).and_then(|()| write_half.flush());
+        // Transition Connecting -> Connected, draining the bytes buffered during
+        // the connect window (in order) to the agent FIRST. The blocking flush to
+        // the agent happens OUTSIDE the registry lock (GB1), but the `Connecting`
+        // slot STAYS in the map throughout the drain, so a concurrent `close` /
+        // `close_all` / `write` is never lost: `write` keeps appending to the slot's
+        // buffer, and a `close` removes the slot (which this loop detects and aborts
+        // on). The loop ends only when, under the lock, the buffer is empty — then it
+        // swaps the slot to `Connected` atomically, so no inbound byte can slip in
+        // between the last flush and the swap. Every step is conditioned on the slot
+        // still carrying THIS `generation` (GB3): a reused id whose newer open
+        // replaced the slot is never disturbed.
+        loop {
+            // Phase 1 (under lock): take the pending buffer out of OUR slot, or
+            // finish the transition if it is empty. Leave a `Connecting` slot with
+            // an empty buffer in place while we flush, so `write`/`close` still find
+            // it. Bail if the slot is gone or now belongs to a newer generation.
+            let to_flush = {
+                let mut channels = match self.channels().lock() {
+                    Ok(channels) => channels,
+                    Err(_) => return,
+                };
+                match channels.get_mut(&channel) {
+                    Some(ChannelHandle::Connecting {
+                        generation: slot_gen,
+                        buffered,
+                    }) if *slot_gen == generation => {
+                        if buffered.is_empty() {
+                            // No more pending bytes: atomically swap to Connected and
+                            // leave the lock — `write()` now goes straight through.
+                            channels.insert(
+                                channel,
+                                ChannelHandle::Connected {
+                                    generation,
+                                    agent_write: Arc::clone(&write_half),
+                                },
+                            );
+                            break;
+                        }
+                        // Take the pending bytes, leaving the (empty) Connecting slot
+                        // in place so concurrent writes keep landing in it.
+                        std::mem::take(buffered)
                     }
-                    channels.insert(channel, ChannelHandle::Connected { agent_write: write_half });
+                    // Slot gone (closed) or superseded by a newer open (reused id):
+                    // not ours — abort and let the owner tear down.
+                    _ => return,
                 }
-                // Closed mid-connect (a `close`/`close_all` took the slot): drop
-                // our streams and stop. `Connected` is impossible — only this
-                // thread transitions — but if seen, restore it untouched.
-                Some(other) => {
-                    channels.insert(channel, other);
-                    return;
-                }
-                None => return,
+            };
+            // Phase 2 (lock dropped): bounded blocking flush to the agent (GB1/GB2).
+            if write_half.write_with_deadline(&to_flush).is_err() {
+                debug_log(format!(
+                    "ssh-agent relay: flushing connect-window buffer to local agent failed for channel {channel}; closing"
+                ));
+                self.close_local(channel, generation);
+                write_up(ControlMessage::SshAgentClose { channel });
+                return;
             }
         }
         debug_log(format!(
@@ -514,6 +648,7 @@ impl SshAgentRelay {
             socket.display()
         ));
 
+        let mut read_half = read_half;
         let mut buf = [0_u8; 8192];
         loop {
             match read_half.read(&mut buf) {
@@ -531,17 +666,17 @@ impl SshAgentRelay {
             }
         }
         // Reader done: drop our write half and tell the daemon we're EOF.
-        self.close_local(channel);
+        self.close_local(channel, generation);
         write_up(ControlMessage::SshAgentClose { channel });
     }
 
     /// Write inbound request bytes (from the daemon) to the channel. If the
     /// channel is still connecting, the bytes are BUFFERED (flushed in order once
     /// connected, bounded by [`MAX_CONNECTING_BUFFER`]); if connected, they are
-    /// written straight to the local-agent write half. Returns immediately — the
-    /// SIGN/response is read on the channel's dedicated thread, so this never
-    /// blocks on Touch ID. A write to a torn-down/unknown channel is silently
-    /// ignored.
+    /// written to the local-agent write half UNDER A BOUNDED DEADLINE and OUTSIDE
+    /// the registry lock (GB1). Returns after the bounded write — the SIGN/response
+    /// is read on the channel's dedicated thread, so this never blocks on Touch ID.
+    /// A write to a torn-down/unknown channel is silently ignored.
     ///
     /// Returns `true` when this call dropped the channel (a dead agent socket, or
     /// the connect-window buffer overflowed): the caller should then emit an
@@ -549,38 +684,48 @@ impl SshAgentRelay {
     /// connecting channel that overflowed has no reader thread yet to emit it.
     #[must_use]
     pub fn write(&self, channel: u64, bytes: &[u8]) -> bool {
-        let mut channels = match self.channels.lock() {
-            Ok(channels) => channels,
-            Err(_) => return false,
-        };
-        let Some(handle) = channels.get_mut(&channel) else {
-            return false;
-        };
-        match handle {
-            ChannelHandle::Connecting { buffered } => {
-                if buffered.len().saturating_add(bytes.len()) > MAX_CONNECTING_BUFFER {
-                    // A runaway/hostile daemon is flooding the connect window; drop
-                    // the channel. The connecting thread aborts when it finds the
-                    // slot gone, so we must tell the daemon to close its side.
-                    debug_log(format!(
-                        "ssh-agent relay: connect-window buffer for channel {channel} \
-                         exceeded {MAX_CONNECTING_BUFFER} bytes; closing"
-                    ));
-                    channels.remove(&channel);
-                    return true;
+        // Phase 1 (under the lock): either buffer into a Connecting slot, or CLONE
+        // the shared Connected write half out. NEVER do blocking agent I/O here.
+        let agent_write = {
+            let mut channels = match self.channels().lock() {
+                Ok(channels) => channels,
+                Err(_) => return false,
+            };
+            let Some(handle) = channels.get_mut(&channel) else {
+                return false;
+            };
+            match handle {
+                ChannelHandle::Connecting { buffered, .. } => {
+                    if buffered.len().saturating_add(bytes.len()) > MAX_CONNECTING_BUFFER {
+                        // A runaway/hostile daemon is flooding the connect window;
+                        // drop the channel. The connecting thread aborts when it
+                        // finds the slot gone, so we must tell the daemon to close.
+                        debug_log(format!(
+                            "ssh-agent relay: connect-window buffer for channel {channel} \
+                             exceeded {MAX_CONNECTING_BUFFER} bytes; closing"
+                        ));
+                        channels.remove(&channel);
+                        return true;
+                    }
+                    buffered.extend_from_slice(bytes);
+                    return false;
                 }
-                buffered.extend_from_slice(bytes);
-                false
+                ChannelHandle::Connected { agent_write, .. } => Arc::clone(agent_write),
             }
-            ChannelHandle::Connected { agent_write } => {
-                if agent_write.write_all(bytes).is_err() || agent_write.flush().is_err() {
-                    // The local agent socket is dead; drop the channel. The reader
-                    // thread will also observe EOF/err and emit SshAgentClose up.
-                    channels.remove(&channel);
-                }
-                false
+        };
+
+        // Phase 2 (lock dropped): bounded blocking write to the agent (GB1).
+        if agent_write.write_with_deadline(bytes).is_err() {
+            // The local agent socket is dead / wedged past the deadline; drop the
+            // channel. The reader thread will also observe EOF/err and emit
+            // SshAgentClose up, so we don't need to here (return false).
+            if let Ok(mut channels) = self.channels().lock() {
+                channels.remove(&channel);
             }
+            // Proactively unblock any reader parked on the dead connection.
+            let _ = agent_write.force_close();
         }
+        false
     }
 
     /// Close one channel: if connected, shut its local-agent socket down (so a
@@ -597,7 +742,7 @@ impl SshAgentRelay {
     /// invalidated so a stale `SshAgentData` after a reconnect finds nothing, and
     /// any reader thread parked on a sign is unblocked by the socket shutdown.
     pub fn close_all(&self) {
-        let drained: Vec<ChannelHandle> = match self.channels.lock() {
+        let drained: Vec<ChannelHandle> = match self.channels().lock() {
             Ok(mut channels) => channels.drain().map(|(_, handle)| handle).collect(),
             Err(_) => return,
         };
@@ -608,20 +753,24 @@ impl SshAgentRelay {
 
     /// Remove a channel's handle from the registry WITHOUT shutting the socket
     /// down (the reader thread already saw EOF/err, so its read half is done and
-    /// its write half is the only thing left to drop).
-    fn close_local(&self, channel: u64) {
-        let _ = self.take(channel);
+    /// its write half is the only thing left to drop). GB3: only removes the slot
+    /// if it still carries `generation`, so a reused id's newer open is untouched.
+    fn close_local(&self, channel: u64, generation: u64) {
+        if let Ok(mut channels) = self.channels().lock() {
+            if channels.get(&channel).map(|h| h.generation()) == Some(generation) {
+                channels.remove(&channel);
+            }
+        }
     }
 
     fn take(&self, channel: u64) -> Option<ChannelHandle> {
-        self.channels.lock().ok().and_then(|mut c| c.remove(&channel))
+        self.channels().lock().ok().and_then(|mut c| c.remove(&channel))
     }
 }
 
 /// Opt-in observability gated on `HITCH_DEBUG` (mirrors the git crate's
 /// convention), to stderr. The byte payloads themselves are NEVER logged — only
 /// channel lifecycle and failures.
-#[cfg(unix)]
 fn debug_log(message: String) {
     if std::env::var_os("HITCH_DEBUG").is_some_and(|v| !v.is_empty()) {
         eprintln!("[hitch ssh-agent relay] {message}");
@@ -730,6 +879,80 @@ mod tests {
         let relay = SshAgentRelay::new();
         relay.close_all();
         relay.close_all();
+    }
+
+    #[test]
+    fn connecting_channel_buffers_inbound_bytes_up_to_cap() {
+        // A channel still connecting to the agent buffers inbound request bytes
+        // (it has no write half yet). Under the cap this returns false (kept);
+        // overflowing the cap returns true (dropped, caller must close).
+        let relay = SshAgentRelay::new();
+        // Manually register a Connecting slot (mirrors what `open` does before its
+        // thread runs) so we exercise `write`'s buffering branch without spawning
+        // the thread / needing a live agent.
+        let generation = relay.next_generation();
+        relay.channels().lock().unwrap().insert(
+            7,
+            ChannelHandle::Connecting {
+                generation,
+                buffered: Vec::new(),
+            },
+        );
+        // Under the cap: buffered, kept.
+        assert!(!relay.write(7, &vec![0u8; 1024]));
+        // Push it just over the cap in one shot: dropped, caller must close.
+        assert!(relay.write(7, &vec![0u8; MAX_CONNECTING_BUFFER]));
+        // The slot is now gone (dropped on overflow).
+        assert!(!relay.channels().lock().unwrap().contains_key(&7));
+    }
+
+    #[test]
+    fn reused_channel_id_closes_stale_handle_before_reopen() {
+        // GB3: if `open` is called for a channel id that already has a live slot
+        // (the daemon reused an id while a stale thread is still around), the old
+        // handle is removed and a fresh generation is installed, so the stale
+        // thread can never hijack the newer slot. We register a Connecting slot,
+        // then re-open the same id and assert the generation advanced.
+        let relay = SshAgentRelay::new();
+        let stale_generation = relay.next_generation();
+        relay.channels().lock().unwrap().insert(
+            3,
+            ChannelHandle::Connecting {
+                generation: stale_generation,
+                buffered: Vec::new(),
+            },
+        );
+        let write_up: WriteUp = Arc::new(|_msg| {});
+        relay.open(3, write_up);
+        // The slot now exists with a generation strictly greater than the stale one
+        // (the new open allocated a fresh generation and replaced the slot).
+        let channels = relay.channels().lock().unwrap();
+        let handle = channels.get(&3).expect("reopened slot present");
+        assert!(
+            handle.generation() > stale_generation,
+            "reopen must carry a newer generation than the stale handle"
+        );
+    }
+
+    #[test]
+    fn close_local_only_removes_matching_generation() {
+        // GB3: `close_local` for a stale generation must NOT remove a newer open's
+        // slot. Install a slot at generation g2, then call close_local with an
+        // older g1 — the slot must survive.
+        let relay = SshAgentRelay::new();
+        let g1 = relay.next_generation();
+        let g2 = relay.next_generation();
+        relay.channels().lock().unwrap().insert(
+            5,
+            ChannelHandle::Connecting {
+                generation: g2,
+                buffered: Vec::new(),
+            },
+        );
+        relay.close_local(5, g1); // stale generation — must be a no-op
+        assert!(relay.channels().lock().unwrap().contains_key(&5));
+        relay.close_local(5, g2); // matching generation — removes it
+        assert!(!relay.channels().lock().unwrap().contains_key(&5));
     }
 }
 
