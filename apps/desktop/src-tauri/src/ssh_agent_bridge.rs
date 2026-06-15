@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -48,6 +48,19 @@ use hitch_proto::ControlMessage;
 /// the resolved `IdentityAgent` is the agent-app-agnostic global default — which
 /// is exactly the one the user's own `ssh`/`git` use for everything.
 const AGENT_PROBE_HOST: &str = "hitch-default-agent-probe.invalid";
+
+/// Write timeout on the bridged local-agent socket. The inbound write runs on the
+/// control-reader's call into [`SshAgentRelay::write`], so a wedged agent socket
+/// must not block it forever; a timed-out write tears the channel down (mirrors
+/// the connect-failed policy).
+const LOCAL_AGENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cap on request bytes buffered while a channel is still connecting to the local
+/// agent. A well-behaved ssh client sends a small request and waits for the reply,
+/// so the connect-window buffer is tiny in practice; this bound stops a hostile or
+/// runaway daemon from growing it without limit. On overflow the channel is closed
+/// (mirrors the connect-failed policy).
+const MAX_CONNECTING_BUFFER: usize = 256 * 1024;
 
 /// Resolve the local ssh-agent socket to bridge to. Used BOTH as the capability
 /// gate (is an agent reachable at all? — drives whether the GUI even declares the
@@ -176,8 +189,11 @@ fn is_macos_launchd_agent(path: &Path) -> bool {
 /// is the #1 cause of an opaque remote `Permission denied (publickey)`.
 pub fn agent_identity_count(socket: &Path) -> Option<usize> {
     let mut stream = UnixStream::connect(socket).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    // This probe runs synchronously on the connect/reconnect worker thread after
+    // declaring the relay, so keep it short: a healthy agent answers in µs, and a
+    // wedged one should not delay that host's `Running` status by seconds.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     // Request: uint32 len=1, byte type=11 (SSH_AGENTC_REQUEST_IDENTITIES).
     stream.write_all(&[0, 0, 0, 1, 11]).ok()?;
     stream.flush().ok()?;
@@ -334,6 +350,10 @@ impl SshAgentRelay {
         // closer owns teardown and `write_up` may already be dead.
         {
             let mut write_half = stream;
+            // Bound the inbound write to the local agent: it runs on the control
+            // reader's call into `write()`, so a wedged agent socket must not block
+            // it forever (mirrors the read/write timeout in `agent_identity_count`).
+            let _ = write_half.set_write_timeout(Some(LOCAL_AGENT_WRITE_TIMEOUT));
             let mut channels = match self.channels.lock() {
                 Ok(channels) => channels,
                 Err(_) => return,
@@ -365,6 +385,9 @@ impl SshAgentRelay {
             match read_half.read(&mut buf) {
                 Ok(0) => break, // agent closed (EOF)
                 Ok(n) => write_up(ControlMessage::ssh_agent_data(channel, &buf[..n])),
+                // A signal interrupted the blocking read — not a real error; retry
+                // (mirrors the daemon pump, which also retries `Interrupted`).
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => {
                     debug_log(format!(
                         "ssh-agent relay: channel {channel} read error: {err}; closing"
@@ -380,26 +403,48 @@ impl SshAgentRelay {
 
     /// Write inbound request bytes (from the daemon) to the channel. If the
     /// channel is still connecting, the bytes are BUFFERED (flushed in order once
-    /// connected); if connected, they are written straight to the local-agent
-    /// write half. Returns immediately — the SIGN/response is read on the
-    /// channel's dedicated thread, so this never blocks on Touch ID. A write to a
-    /// torn-down/unknown channel is silently ignored.
-    pub fn write(&self, channel: u64, bytes: &[u8]) {
+    /// connected, bounded by [`MAX_CONNECTING_BUFFER`]); if connected, they are
+    /// written straight to the local-agent write half. Returns immediately — the
+    /// SIGN/response is read on the channel's dedicated thread, so this never
+    /// blocks on Touch ID. A write to a torn-down/unknown channel is silently
+    /// ignored.
+    ///
+    /// Returns `true` when this call dropped the channel (a dead agent socket, or
+    /// the connect-window buffer overflowed): the caller should then emit an
+    /// [`ControlMessage::SshAgentClose`] up so the daemon tears its side down. A
+    /// connecting channel that overflowed has no reader thread yet to emit it.
+    #[must_use]
+    pub fn write(&self, channel: u64, bytes: &[u8]) -> bool {
         let mut channels = match self.channels.lock() {
             Ok(channels) => channels,
-            Err(_) => return,
+            Err(_) => return false,
         };
         let Some(handle) = channels.get_mut(&channel) else {
-            return;
+            return false;
         };
         match handle {
-            ChannelHandle::Connecting { buffered } => buffered.extend_from_slice(bytes),
+            ChannelHandle::Connecting { buffered } => {
+                if buffered.len().saturating_add(bytes.len()) > MAX_CONNECTING_BUFFER {
+                    // A runaway/hostile daemon is flooding the connect window; drop
+                    // the channel. The connecting thread aborts when it finds the
+                    // slot gone, so we must tell the daemon to close its side.
+                    debug_log(format!(
+                        "ssh-agent relay: connect-window buffer for channel {channel} \
+                         exceeded {MAX_CONNECTING_BUFFER} bytes; closing"
+                    ));
+                    channels.remove(&channel);
+                    return true;
+                }
+                buffered.extend_from_slice(bytes);
+                false
+            }
             ChannelHandle::Connected { agent_write } => {
                 if agent_write.write_all(bytes).is_err() || agent_write.flush().is_err() {
                     // The local agent socket is dead; drop the channel. The reader
                     // thread will also observe EOF/err and emit SshAgentClose up.
                     channels.remove(&channel);
                 }
+                false
             }
         }
     }
@@ -539,7 +584,7 @@ mod tests {
         // (e.g. a stale frame after a reconnect invalidated the registry) is
         // silently ignored.
         let relay = SshAgentRelay::new();
-        relay.write(99, b"\x00\x01\x02");
+        assert!(!relay.write(99, b"\x00\x01\x02"));
         relay.close(99); // also a no-op
     }
 

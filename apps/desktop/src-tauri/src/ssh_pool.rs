@@ -315,6 +315,14 @@ struct RemoteConnection {
     shutting_down: AtomicBool,
     /// Set while a reconnect loop is in flight, so concurrent triggers collapse.
     reconnecting: AtomicBool,
+    /// Set true the instant the GUI actually sends `SshAgentRelay` to this remote
+    /// daemon (so a local agent WAS resolved and forwarding is on); cleared on
+    /// every reconnect/teardown. The inbound `SshAgentOpen` serve path gates on
+    /// BOTH this and `forward_agent`, so a compromised/curious remote daemon can
+    /// never make the GUI bridge to the local agent for a host the user never
+    /// declared a relay for. Unix-only (the relay is `cfg(unix)`).
+    #[cfg(unix)]
+    relay_declared: AtomicBool,
     /// Live ssh-agent relay channels for THIS connection (proto v29, slices 4+6).
     /// When the per-host toggle is on AND a local agent is reachable, the GUI
     /// declares the relay after the Hello; the remote daemon then opens a channel
@@ -343,6 +351,8 @@ impl RemoteConnection {
             exe_path: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             reconnecting: AtomicBool::new(false),
+            #[cfg(unix)]
+            relay_declared: AtomicBool::new(false),
             #[cfg(unix)]
             relay: ssh_agent_bridge::SshAgentRelay::new(),
         }
@@ -603,9 +613,13 @@ impl SshConnections {
                 *writer = None;
             }
             // Tear down any live ssh-agent relay channels so their dedicated
-            // reader threads (possibly blocked on a sign) unblock and exit.
+            // reader threads (possibly blocked on a sign) unblock and exit, and
+            // de-authorize the serve path until a fresh connect re-declares it.
             #[cfg(unix)]
-            connection.relay.close_all();
+            {
+                connection.relay_declared.store(false, Ordering::SeqCst);
+                connection.relay.close_all();
+            }
             kill_child(&connection);
         }
         if let Ok(mut map) = self.0.connections.lock() {
@@ -1059,6 +1073,10 @@ impl SshConnections {
                 if connection.forward_agent {
                     if let Some(socket) = ssh_agent_bridge::local_agent_socket() {
                         write_remote_control(connection, &ControlMessage::SshAgentRelay);
+                        // We actually declared the relay (forwarding on AND a local
+                        // agent resolved): authorize the serve path to honor inbound
+                        // `SshAgentOpen` from this daemon.
+                        connection.relay_declared.store(true, Ordering::SeqCst);
                         debug_log_pool(format_args!(
                             "declared ssh-agent relay to {} (local agent {} reachable, toggle on)",
                             connection.target,
@@ -1157,7 +1175,10 @@ impl SshConnections {
         // so a stale frame from the superseded link finds nothing. A reconnect
         // re-declares the relay and the daemon re-opens fresh channels.
         #[cfg(unix)]
-        connection.relay.close_all();
+        {
+            connection.relay_declared.store(false, Ordering::SeqCst);
+            connection.relay.close_all();
+        }
         // Fail any in-flight requests so callers don't hang on a dead link.
         if let Ok(mut pending) = connection.pending.lock() {
             for (_, tx) in pending.drain() {
@@ -1406,11 +1427,28 @@ fn remote_reader_loop(
             #[cfg(unix)]
             ControlMessage::SshAgentOpen { channel } => {
                 // A git child on the remote connected to its proxied SSH_AUTH_SOCK.
-                // Open a bridge to the LOCAL agent on a DEDICATED thread so a
-                // multi-second Touch ID sign never stalls this reader loop.
-                connection
-                    .relay
-                    .open(channel, relay_write_up(connection));
+                // The serve side is authoritative about the per-host toggle: only
+                // bridge to the local agent when forwarding is on for this host AND
+                // the GUI actually declared the relay (a local agent was resolved).
+                // Otherwise a compromised/curious daemon could unilaterally drive
+                // the local agent as a signing oracle for a host the user opted out
+                // of — refuse and let the daemon tear its side down.
+                if connection.forward_agent
+                    && connection.relay_declared.load(Ordering::SeqCst)
+                {
+                    // Open a bridge to the LOCAL agent on a DEDICATED thread so a
+                    // multi-second Touch ID sign never stalls this reader loop.
+                    connection.relay.open(channel, relay_write_up(connection));
+                } else {
+                    debug_log_pool(format_args!(
+                        "ssh-agent relay: refusing SshAgentOpen on channel {channel} from {} \
+                         (forward_agent={}, relay_declared={}); closing",
+                        connection.target,
+                        connection.forward_agent,
+                        connection.relay_declared.load(Ordering::SeqCst),
+                    ));
+                    write_remote_control(connection, &ControlMessage::SshAgentClose { channel });
+                }
             }
             #[cfg(unix)]
             ControlMessage::SshAgentData { channel, data } => {
@@ -1421,7 +1459,18 @@ fn remote_reader_loop(
                 // immediately — the SIGN/response is read async on the channel's
                 // dedicated thread, so this never blocks on Touch ID.
                 match hitch_proto::decode_ssh_agent_data(&data) {
-                    Ok(bytes) => connection.relay.write(channel, &bytes),
+                    Ok(bytes) => {
+                        // `write` returns true when it had to drop the channel (a
+                        // dead local-agent socket, or the connect-window buffer
+                        // overflowed) with no reader thread to emit the close — so
+                        // tell the daemon to tear its side down.
+                        if connection.relay.write(channel, &bytes) {
+                            write_remote_control(
+                                connection,
+                                &ControlMessage::SshAgentClose { channel },
+                            );
+                        }
+                    }
                     Err(err) => {
                         debug_log_pool(format_args!(
                             "ssh-agent relay: bad SshAgentData on channel {channel} from {}: {err}; closing",
