@@ -117,6 +117,11 @@
   let atBottom = true;
   let scrollDisposable: IDisposable | null = null;
   let writeDisposable: IDisposable | null = null;
+  // OSC 52 clipboard handler. xterm has no built-in OSC 52 support, so without
+  // this a program running in the PTY (e.g. Claude Code over SSH on a remote
+  // host) that copies via `ESC ] 52 ; c ; <base64> ST` is silently dropped and
+  // nothing reaches the system clipboard.
+  let clipboardDisposable: IDisposable | null = null;
 
   // Bottom = the viewport's top line is at (or past) the last page's top line.
   // Scrolled up means viewportY < baseY.
@@ -551,6 +556,30 @@
     searchAddon = new SearchAddon();
     term.loadAddon(searchAddon);
 
+    // OSC 52 clipboard write. The PTY payload is `Pc ; Pd` where Pc is the
+    // target selection (c=clipboard, p=primary, …) and Pd is base64 data. We
+    // honour writes only: a copy from inside the PTY (e.g. Claude Code on a
+    // remote host) lands on the local system clipboard. Read requests (`Pd`
+    // == "?") are deliberately ignored — answering one would leak the local
+    // clipboard back to whatever is running in the terminal, including remote
+    // hosts. Returning true marks the sequence handled so xterm doesn't print it.
+    clipboardDisposable = term.parser.registerOscHandler(52, (payload) => {
+      const sep = payload.indexOf(";");
+      if (sep === -1) return true;
+      const data = payload.slice(sep + 1);
+      if (data === "?" || data === "") return true; // read query / clear: ignore
+      try {
+        // atob yields a binary string (one char per byte); reinterpret those
+        // bytes as UTF-8 so multibyte glyphs survive the round-trip.
+        const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+        const text = new TextDecoder().decode(bytes);
+        void navigator.clipboard.writeText(text);
+      } catch {
+        // Malformed base64 — drop it rather than throw inside the parser.
+      }
+      return true;
+    });
+
     // "New output ↓" nudge wiring. On scroll, recompute whether the viewport is
     // pinned to the bottom; the moment the user returns to the bottom (by
     // scrolling, or via the pill), the nudge clears itself. On a parsed write,
@@ -678,8 +707,10 @@
     // Drop the scroll / write listeners feeding the "new output" nudge.
     scrollDisposable?.dispose();
     writeDisposable?.dispose();
+    clipboardDisposable?.dispose();
     scrollDisposable = null;
     writeDisposable = null;
+    clipboardDisposable = null;
     // Dispose addons before the terminal. Guarded so unmount never throws.
     // WebGL first so its GPU context is released even if a later dispose throws.
     // Then drop this terminal from the warm budget AFTER disposing our own addon
