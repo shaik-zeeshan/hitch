@@ -1,15 +1,27 @@
-# Windows ssh-agent named-pipe de-risk spike (relay plan, slice 7)
+# Windows ssh-agent named-pipe de-risk spike (relay plan)
 
-This standalone binary answers the one open question gating the **Windows** code
-path of the Hitch ssh-agent relay (proto v29, ADR 0014 amendment):
+> **Resolved — reference/historical, not a blocker.** This spike came back
+> **GREEN** and the Windows relay code path it gated has since been implemented
+> in the product: the daemon hosts its ssh-agent relay socket as an owner-only
+> named pipe through `DaemonListener::bind` and advertises `endpoint_os_address`
+> as `SSH_AUTH_SOCK` identically on Unix and Windows (no `hitch-git` change), and
+> the co-located Windows GUI bridge to the local OS agent lives in
+> `apps/desktop/src-tauri/src/ssh_agent_bridge.rs`. The ssh-agent relay is now
+> **cross-platform** (the Unix path is validated; the Windows build compiles and
+> unit-tests pass, with hardware Touch ID / Windows Hello end-to-end validation
+> still pending on the `pc` Windows host). This binary is kept only as the
+> reference de-risk artifact for the decision below.
+
+This standalone binary answered the one open question that originally gated the
+**Windows** code path of the Hitch ssh-agent relay (ADR 0014 amendment):
 
 > Does Win32-OpenSSH's `ssh.exe` / `ssh-add.exe` honor `SSH_AUTH_SOCK` when it
 > points at a **named pipe** `\\.\pipe\…`?
 
-The macOS/Linux stages (proto v29, the transport address helper, the daemon
-ssh-agent server, the GUI relay endpoint, the toggle) do **not** depend on this —
-they are already built and testable on Unix. This spike only decides *how the
-Windows daemon injects the relay socket*.
+The macOS/Linux stages (the proto control messages, the transport address helper,
+the daemon ssh-agent server, the GUI relay endpoint, the toggle) never depended
+on this — they were already built and testable on Unix. This spike only decided
+*how the Windows daemon injects the relay socket*.
 
 ## Run it (on the Windows host)
 
