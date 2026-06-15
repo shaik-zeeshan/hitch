@@ -6,6 +6,9 @@
 
 mod cli_install;
 mod ssh;
+// The local ssh-agent relay bridge (proto v29, slices 4+6) connects to the local
+// ssh-agent over a Unix socket; it is Unix-only for now (Windows is slice 7+8).
+mod ssh_agent_bridge;
 mod ssh_pool;
 mod window_chrome;
 
@@ -1295,7 +1298,40 @@ impl HitchClient {
         let generation = self.0.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.start_reader(app.clone(), reader, generation);
         self.start_heartbeat(app.clone(), generation);
+
+        // Announce this GUI's OWN resolved local ssh-agent to the LOCAL daemon
+        // (proto v31, ADR 0014 amendment). This is the LOCAL analog of the remote
+        // `SshAgentRelay` declaration `ssh_pool::connect_attempt` sends to a remote
+        // daemon: when the GUI is co-located with its daemon (e.g. the Windows GUI
+        // on the daemon's own machine), the daemon can bridge git DIRECTLY to that
+        // agent — no relay tunnel needed — and this announce is what makes this GUI
+        // the driving client for its own terminals' git. CROSS-PLATFORM on purpose
+        // (NOT `cfg(unix)`): the whole point is that a Windows local GUI announces
+        // its agent too. Sent only when a local agent actually resolved; best-effort
+        // (a failed write never re-enters recovery).
+        if let Some(socket) = ssh_agent_bridge::local_agent_socket() {
+            self.send_control_to_local_daemon(&ControlMessage::ClientLocal {
+                ssh_auth_sock: socket.to_string_lossy().into_owned(),
+            });
+        }
         Ok(())
+    }
+
+    /// Best-effort write of one control message to the LOCAL daemon's persistent
+    /// writer (the local analog of `ssh_pool::write_remote_control`). Locks the
+    /// writer, `write_all` + `flush`, and silently drops any error — a dead or
+    /// swapped writer must never re-enter connection recovery from here (it would
+    /// deadlock the reader/heartbeat that may already hold paths into recovery).
+    /// Mirrors the persistent-writer half of `request_daemon_shutdown`.
+    fn send_control_to_local_daemon(&self, message: &ControlMessage) {
+        let Ok(bytes) = encode_control_message(message) else {
+            return;
+        };
+        if let Ok(mut guard) = self.0.writer.lock() {
+            if let Some(writer) = guard.as_mut() {
+                let _ = writer.write_all(&bytes).and_then(|()| writer.flush());
+            }
+        }
     }
 
     /// Spawn the `Ping`/`Pong` heartbeat for this connection (ADR 0009). It makes
@@ -1905,7 +1941,43 @@ fn reader_loop(
             ControlMessage::Request { .. } => {
                 // The daemon should never send requests to the desktop client.
             }
+            ControlMessage::ConnEnv { .. } => {
+                // A proxy→daemon prelude (forwarded SSH_AUTH_SOCK, silly-ridge-27),
+                // carried only on the proxy's local socket. The desktop client sits
+                // upstream of the daemon and never receives it. Ignore.
+            }
+            // ssh-agent relay frames (proto v29, slices 4+6). The relay only ever
+            // runs over a REMOTE connection (the GUI never declares
+            // `SshAgentRelay` to the LOCAL daemon, so the local daemon never opens
+            // a relay channel). These arms are DEFENSIVE: log-and-ignore so the
+            // exhaustive match compiles and a misbehaving local daemon can't crash
+            // or stall the reader. The real driver is `ssh_pool::remote_reader_loop`.
+            //
+            // `ClientActive` (proto v30) is a GUI → daemon focus-gain ping, and
+            // `ClientLocal` (proto v31, ADR 0014 amendment) is a GUI → local-daemon
+            // announce of this GUI's own resolved ssh-agent socket: the GUI only ever
+            // SENDS both (see `attach_with_reader` for `ClientLocal`) and never expects
+            // either back, so an inbound one is likewise an unexpected frame —
+            // log-and-ignore.
+            ControlMessage::SshAgentRelay
+            | ControlMessage::SshAgentOpen { .. }
+            | ControlMessage::SshAgentData { .. }
+            | ControlMessage::SshAgentClose { .. }
+            | ControlMessage::ClientActive
+            | ControlMessage::ClientLocal { .. } => {
+                debug_log_local(format_args!(
+                    "local daemon sent an unexpected ssh-agent relay frame; ignoring"
+                ));
+            }
         }
+    }
+}
+
+/// Opt-in `HITCH_DEBUG` stderr log for the local reader loop (mirrors the git
+/// crate's `HITCH_DEBUG` convention). Byte payloads are never logged.
+fn debug_log_local(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("HITCH_DEBUG").is_some_and(|v| !v.is_empty()) {
+        eprintln!("[hitch local reader] {args}");
     }
 }
 
@@ -2658,8 +2730,14 @@ fn open_path_with_default_viewer(path: &Path) -> Result<(), String> {
 /// is the CLIENT side of the remote attach; issue #27 reuses `ssh::run_test`'s
 /// handshake helper for the real persistent connection.
 #[tauri::command]
-async fn test_ssh_host(target: String) -> Result<ssh::SshTestResult, String> {
-    tauri::async_runtime::spawn_blocking(move || ssh::run_test(&target))
+async fn test_ssh_host(
+    target: String,
+    forward_agent: Option<bool>,
+) -> Result<ssh::SshTestResult, String> {
+    // Default agent forwarding on when the caller omits the flag (silly-ridge-27),
+    // matching the per-host `forwardAgent` default.
+    let forward_agent = forward_agent.unwrap_or(true);
+    tauri::async_runtime::spawn_blocking(move || ssh::run_test(&target, forward_agent))
         .await
         .map_err(|err| format!("ssh test task failed: {err}"))
 }
@@ -3076,8 +3154,12 @@ async fn hitch_request(
 /// (with backoff), removed hosts disconnect their proxy and drop their state. The
 /// remote Daemon keeps running across a removal (ADR 0014).
 #[tauri::command]
-fn set_ssh_hosts(app: AppHandle, ssh: State<'_, ssh_pool::SshConnections>, targets: Vec<String>) {
-    ssh.inner().set_hosts(&app, targets);
+fn set_ssh_hosts(
+    app: AppHandle,
+    ssh: State<'_, ssh_pool::SshConnections>,
+    hosts: Vec<ssh_pool::SshHostConfig>,
+) {
+    ssh.inner().set_hosts(&app, hosts);
 }
 
 /// Retry a host now: reset its backoff and reconnect immediately (the Retry Now
@@ -4681,6 +4763,26 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
                 api.prevent_close();
+            }
+            // OS focus-gain: this GUI is now the foreground app, so it should become
+            // the "driving client" for ssh-agent relay routing. Two pings, both
+            // `ControlMessage::ClientActive` (proto v30, ADR 0014 amendment):
+            //   1. every connected relay-capable REMOTE daemon, so each refreshes its
+            //      `driving_client` to this machine; and
+            //   2. our co-located LOCAL daemon, so terminal/Agent-run git on this same
+            //      machine relays its ssh-agent through this (now foreground) GUI.
+            // Event-driven (only on focus-gain) and best-effort; focus LOSS is
+            // intentionally a no-op. No visible UI change.
+            if let WindowEvent::Focused(true) = event {
+                window.state::<ssh_pool::SshConnections>().notify_focused();
+                // Also tell the LOCAL daemon this GUI is now foreground, so it refreshes
+                // its driving_client to this co-located GUI for ssh-agent relay routing.
+                // Cross-platform (NOT cfg(unix)): the co-located local GUI may itself be
+                // the signer (Windows). Best-effort, non-blocking, never re-enters
+                // recovery; focus LOSS stays a no-op.
+                window
+                    .state::<HitchClient>()
+                    .send_control_to_local_daemon(&ControlMessage::ClientActive);
             }
         })
         .invoke_handler(tauri::generate_handler![

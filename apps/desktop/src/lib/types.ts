@@ -87,6 +87,13 @@ export type DaemonScope = {
 export type SshHost = {
   id: DaemonScopeId;
   target: string;
+  // Let the persistent remote daemon sign git push/pull/fetch over YOUR local
+  // ssh-agent (e.g. 1Password), with no prompt landing on the remote host
+  // (silly-ridge-27). The Rust pool decides the mechanism: when reachable it
+  // relays the local agent over the control channel (proto v29), and it also
+  // keeps the OS ssh-agent forward as a fallback for older remote daemons.
+  // Defaults on; legacy hosts lacking the field are read as on.
+  forwardAgent?: boolean;
 };
 
 // The actionable failure categories the backend classifier returns for a failed

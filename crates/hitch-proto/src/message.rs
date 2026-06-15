@@ -88,7 +88,39 @@ use serde::{Deserialize, Serialize};
 /// non-interactive `ssh host cmd` PATH. An old daemon at v26 omits it, so the
 /// field decodes to `None` and the client falls back to its candidate-path
 /// probe (the known Unix self-install location, then bare `hitch`).
-pub const PROTOCOL_VERSION: u16 = 27;
+/// v28 adds the `ConnEnv` control message the SSH proxy emits to declare its
+/// forwarded `SSH_AUTH_SOCK` (ADR 0014, agent forwarding). Because the proxy
+/// sends it as a connection prelude — ahead of the GUI's Hello, and a frame an
+/// older daemon can't parse — a persistent remote daemon MUST be restarted onto
+/// a v28 binary after upgrading; an unrestarted v27 daemon chokes on the unknown
+/// frame before it answers the Hello. Bumping the version makes the GUI reject
+/// any still-reachable older daemon as a clean protocol mismatch.
+/// v29 adds the **ssh-agent relay** (ADR 0014 amendment): the GUI declares
+/// [`ControlMessage::SshAgentRelay`] on a remote connection it can sign for, and
+/// the daemon then tunnels the ssh-agent wire protocol over
+/// [`ControlMessage::SshAgentOpen`]/[`SshAgentData`]/[`SshAgentClose`] so a
+/// detached remote daemon signs `push/pull/fetch/clone` with the user's *local*
+/// agent — reaching where OS `ForwardAgent` (the v28 `ConnEnv` path) cannot. The
+/// same restart lesson applies: a persistent remote daemon MUST be restarted onto
+/// a v29 binary or it chokes on the unknown frames before answering Hello.
+/// v30 adds [`ControlMessage::ClientActive`] (ADR 0014 amendment): a GUI →
+/// daemon focus-gain ping the GUI sends when it becomes the foreground app, so
+/// the daemon can refresh its "driving client" — the most-recently-active
+/// relay-capable connection it routes ssh-agent signing to (presence routing for
+/// terminal & Agent-run git). Parameterless; the client_id is known from the
+/// connection. An old daemon at v29 has no such message, so a still-reachable
+/// older daemon is rejected as a clean protocol mismatch.
+/// v31 adds [`ControlMessage::ClientLocal`] (ADR 0014 amendment): a GUI → local
+/// daemon prelude carrying the local GUI's own resolved local-agent socket path.
+/// Its presence ⇔ "a local GUI with a signable agent is connected" — sent only
+/// when an agent resolved — so the co-located daemon stores it, bridges git
+/// directly to that agent (no relay tunnel needed; the daemon is co-located with
+/// the agent), and it widens driving-client eligibility. GUI → daemon only; the
+/// GUI never receives one. The same restart lesson applies: a persistent remote
+/// daemon MUST be restarted onto a v31 binary or it chokes on the unknown frame
+/// before answering Hello; the GUI rejects a still-reachable older daemon as a
+/// clean protocol mismatch.
+pub const PROTOCOL_VERSION: u16 = 31;
 
 /// Maximum bytes carried by one [`Request::UploadChunk`] frame (256 KiB). The
 /// upload stream is shared with interactive PTY traffic, so chunks are bounded
@@ -96,6 +128,15 @@ pub const PROTOCOL_VERSION: u16 = 27;
 /// request/response turn, giving PTY frames a natural slot between chunks instead
 /// of letting one giant frame starve a live session.
 pub const UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Defensive upper bound on the *decoded* byte length of a single
+/// [`ControlMessage::SshAgentData`] relay frame (256 KiB), matching OpenSSH's own
+/// ssh-agent message bound. ssh-agent sign requests/replies are sub-KiB, so this
+/// is pure abuse-resistance: a peer that base64-encodes a larger frame is
+/// rejected by [`decode_ssh_agent_data`] before the bytes are ever forwarded to a
+/// socket. Like [`UPLOAD_CHUNK_BYTES`] it keeps one relay frame from starving the
+/// PTY traffic that shares the same control channel.
+pub const SSH_AGENT_RELAY_MAX_FRAME: usize = 256 * 1024;
 
 /// Identifies one in-flight file upload, minted by the daemon in
 /// [`Response::UploadStarted`] and echoed by the client on every
@@ -141,6 +182,51 @@ pub enum ControlMessage {
     Response { id: RequestId, response: Response },
     /// Server-push notification delivered to subscribed clients.
     Event { event: Event },
+    /// Connection-environment prelude emitted by the SSH **proxy** (ADR 0014)
+    /// before it begins its verbatim GUI↔daemon bridge. It carries the proxy
+    /// process's forwarded `SSH_AUTH_SOCK` path so the long-lived remote daemon
+    /// can sign git pushes via the *local* user's forwarded ssh-agent instead of
+    /// prompting on the remote. Serialized as `{"kind":"conn-env",...}`. Backward
+    /// compatible: the GUI never emits it, and an older/local (non-proxy) peer
+    /// never sees it — a local daemon's git keeps inheriting env exactly as before.
+    ConnEnv { ssh_auth_sock: String },
+    /// GUI → daemon **ssh-agent relay** capability declaration (v29, ADR 0014
+    /// amendment). Sent as a connection prelude on a *remote* connection the GUI
+    /// can sign for (local agent reachable + per-host toggle on), it tells the
+    /// daemon "you may host a per-connection ssh-agent socket for my git ops and
+    /// relay its bytes back to me." The GUI never sends it on a local connection
+    /// (a local daemon inherits the real agent env). Serialized as
+    /// `{"kind":"ssh-agent-relay"}`.
+    SshAgentRelay,
+    /// Daemon → GUI: a git child connected to the daemon-hosted ssh-agent socket;
+    /// `channel` identifies this connection so concurrent signings (a push and a
+    /// fetch at once) stay distinct. The GUI opens a matching bridge to its local
+    /// agent. Serialized as `{"kind":"ssh-agent-open",...}`.
+    SshAgentOpen { channel: u64 },
+    /// Both ways: one chunk of raw ssh-agent wire bytes for `channel`, base64 in
+    /// `data` because the bytes are binary and the control channel is
+    /// newline-framed JSON the proxy bridges verbatim. Decode/size-check with
+    /// [`decode_ssh_agent_data`] (cap [`SSH_AGENT_RELAY_MAX_FRAME`]); build with
+    /// [`ControlMessage::ssh_agent_data`]. Serialized as `{"kind":"ssh-agent-data",...}`.
+    SshAgentData { channel: u64, data: String },
+    /// Both ways: `channel` reached EOF or was torn down — the git-side socket
+    /// closed (daemon → GUI) or the local agent connection closed (GUI → daemon).
+    /// Serialized as `{"kind":"ssh-agent-close",...}`.
+    SshAgentClose { channel: u64 },
+    /// GUI → daemon focus-gain ping: this GUI is now the foreground app and should
+    /// become the driving client for ssh-agent relay routing. Parameterless — the
+    /// client_id is known from the connection. (v30, ADR 0014 amendment)
+    ClientActive,
+    /// GUI → local daemon prelude (v31, ADR 0014 amendment): the *local* GUI
+    /// announces its OWN resolved local ssh-agent socket path so the co-located
+    /// daemon can bridge git directly to that agent. Its presence ⇔ "a local GUI
+    /// with a signable agent is connected" — the GUI sends it only when an agent
+    /// resolved — so it widens driving-client eligibility. The daemon stores the
+    /// path and signs git ops against it directly: no relay tunnel is needed
+    /// because the daemon is co-located with the agent (contrast the remote
+    /// [`ControlMessage::SshAgentRelay`] path). GUI → daemon only; the GUI never
+    /// receives one. Serialized as `{"kind":"client-local",...}`.
+    ClientLocal { ssh_auth_sock: String },
 }
 
 impl ControlMessage {
@@ -158,7 +244,74 @@ impl ControlMessage {
     pub fn event(event: Event) -> Self {
         Self::Event { event }
     }
+
+    /// Build an [`SshAgentData`](ControlMessage::SshAgentData) frame, base64
+    /// encoding the raw ssh-agent wire `bytes` so they survive the newline-framed
+    /// JSON control channel. The decode side is [`decode_ssh_agent_data`].
+    pub fn ssh_agent_data(channel: u64, bytes: &[u8]) -> Self {
+        Self::SshAgentData {
+            channel,
+            data: encode_ssh_agent_data(bytes),
+        }
+    }
 }
+
+/// Base64-encode raw ssh-agent wire bytes for a
+/// [`ControlMessage::SshAgentData`] frame. Standard alphabet with padding so any
+/// base64 decoder (incl. the matching [`decode_ssh_agent_data`]) accepts it.
+pub fn encode_ssh_agent_data(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Decode the `data` field of a [`ControlMessage::SshAgentData`] frame back to
+/// raw bytes, rejecting anything whose decoded length exceeds
+/// [`SSH_AGENT_RELAY_MAX_FRAME`] *before* allocating the full buffer would be
+/// unbounded — the cap is enforced on the decoded length. Returns the raw bytes
+/// ready to write to an ssh-agent socket.
+pub fn decode_ssh_agent_data(data: &str) -> Result<Vec<u8>, SshAgentDataError> {
+    use base64::Engine as _;
+    // Reject obviously-oversized payloads from the encoded length first (base64
+    // inflates ~4/3, so an encoded string longer than ceil(cap*4/3) cannot decode
+    // to <= cap), then enforce the exact cap on the decoded bytes.
+    let max_encoded = SSH_AGENT_RELAY_MAX_FRAME
+        .saturating_mul(4)
+        .saturating_div(3)
+        .saturating_add(4);
+    if data.len() > max_encoded {
+        return Err(SshAgentDataError::TooLarge);
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|_| SshAgentDataError::InvalidBase64)?;
+    if bytes.len() > SSH_AGENT_RELAY_MAX_FRAME {
+        return Err(SshAgentDataError::TooLarge);
+    }
+    Ok(bytes)
+}
+
+/// Why a [`ControlMessage::SshAgentData`] payload could not be decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshAgentDataError {
+    /// The `data` field was not valid base64.
+    InvalidBase64,
+    /// The decoded payload exceeded [`SSH_AGENT_RELAY_MAX_FRAME`].
+    TooLarge,
+}
+
+impl std::fmt::Display for SshAgentDataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SshAgentDataError::InvalidBase64 => f.write_str("ssh-agent relay frame is not valid base64"),
+            SshAgentDataError::TooLarge => write!(
+                f,
+                "ssh-agent relay frame exceeds {SSH_AGENT_RELAY_MAX_FRAME} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SshAgentDataError {}
 
 /// Long-running daemon operations that may run as an async **Job** (ADR 0008).
 /// This is the exact allowlist accepted by [`Request::StartJob`].
@@ -1906,7 +2059,7 @@ mod tests {
         let back: Request = serde_json::from_value(value).unwrap();
         assert_eq!(request, back);
 
-        assert_eq!(PROTOCOL_VERSION, 27);
+        assert_eq!(PROTOCOL_VERSION, 31);
     }
 
     #[test]
@@ -2754,6 +2907,74 @@ mod tests {
             ControlMessage::request(1, sample_requests().remove(0)),
             ControlMessage::response(1, sample_responses().remove(0)),
             ControlMessage::event(sample_events().remove(0)),
+            ControlMessage::ConnEnv {
+                ssh_auth_sock: "/tmp/agent.sock".into(),
+            },
+            ControlMessage::SshAgentRelay,
+            ControlMessage::SshAgentOpen { channel: 7 },
+            ControlMessage::ssh_agent_data(7, b"\x00\x01\x02ssh-agent bytes\xff"),
+            ControlMessage::SshAgentClose { channel: 7 },
+            ControlMessage::ClientActive,
+            ControlMessage::ClientLocal {
+                ssh_auth_sock: "/tmp/agent.sock".into(),
+            },
         ]
+    }
+
+    #[test]
+    fn ssh_agent_data_round_trips_through_base64() {
+        let raw: Vec<u8> = (0u16..=511).map(|b| b as u8).collect();
+        let message = ControlMessage::ssh_agent_data(3, &raw);
+        let ControlMessage::SshAgentData { channel, data } = &message else {
+            panic!("expected SshAgentData");
+        };
+        assert_eq!(*channel, 3);
+        assert_eq!(decode_ssh_agent_data(data).unwrap(), raw);
+        // Survives the JSON control-line encode the proxy bridges verbatim.
+        let json = serde_json::to_string(&message).unwrap();
+        let back: ControlMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(message, back);
+    }
+
+    #[test]
+    fn ssh_agent_relay_serializes_as_unit_kind() {
+        let json = serde_json::to_string(&ControlMessage::SshAgentRelay).unwrap();
+        assert_eq!(json, r#"{"kind":"ssh-agent-relay"}"#);
+        let back: ControlMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ControlMessage::SshAgentRelay);
+    }
+
+    #[test]
+    fn client_local_round_trips_carrying_the_local_agent_path() {
+        let message = ControlMessage::ClientLocal {
+            ssh_auth_sock: "/tmp/agent.sock".into(),
+        };
+        let value: serde_json::Value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value["kind"], "client-local");
+        assert_eq!(value["ssh_auth_sock"], "/tmp/agent.sock");
+        let back: ControlMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(message, back);
+    }
+
+    #[test]
+    fn decode_ssh_agent_data_enforces_size_cap() {
+        // At the cap: accepted.
+        let at_cap = vec![0u8; SSH_AGENT_RELAY_MAX_FRAME];
+        let encoded = encode_ssh_agent_data(&at_cap);
+        assert_eq!(decode_ssh_agent_data(&encoded).unwrap().len(), at_cap.len());
+
+        // One byte over the cap: rejected as TooLarge, not silently truncated.
+        let over_cap = vec![0u8; SSH_AGENT_RELAY_MAX_FRAME + 1];
+        let encoded = encode_ssh_agent_data(&over_cap);
+        assert_eq!(
+            decode_ssh_agent_data(&encoded),
+            Err(SshAgentDataError::TooLarge)
+        );
+
+        // Garbage base64 is rejected, never panics.
+        assert_eq!(
+            decode_ssh_agent_data("not valid base64 !!!"),
+            Err(SshAgentDataError::InvalidBase64)
+        );
     }
 }

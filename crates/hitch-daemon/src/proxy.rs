@@ -56,8 +56,45 @@ pub fn run() -> i32 {
 
 fn run_inner() -> Result<(), String> {
     let socket_path = resolve_socket_path();
-    let stream = connect_existing(&socket_path)?;
+    let mut stream = connect_existing(&socket_path)?;
+    send_conn_env_prelude(&mut stream);
     bridge_stdio(stream)
+}
+
+/// Emit a single `ConnEnv` control line carrying this proxy process's forwarded
+/// `SSH_AUTH_SOCK` to the daemon, then return so the verbatim bridge can begin
+/// (ADR 0014, SSH agent forwarding). sshd sets `SSH_AUTH_SOCK` per SSH
+/// connection in the proxy's own env, pointing at a forwarded agent socket on
+/// the remote; the long-lived daemon — started from an earlier, unrelated launch
+/// — has only a stale/empty one. This prelude is the only thing the proxy adds
+/// to the stream: it still NEVER parses or rewrites a single GUI↔daemon frame.
+///
+/// The line is the same newline-JSON control framing the daemon already reads on
+/// its control loop, written before the bridge threads spawn so it lands ahead
+/// of any GUI byte. Best-effort: if `SSH_AUTH_SOCK` is unset (no agent
+/// forwarding) we send nothing and the daemon keeps inheriting env as today; a
+/// write failure is reported to stderr only (never stdout) and the bridge still
+/// proceeds — the daemon then falls back to non-interactive git that fails fast
+/// rather than prompting on the remote.
+fn send_conn_env_prelude(stream: &mut hitch_proto::transport::DaemonStream) {
+    let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") else {
+        return;
+    };
+    if sock.is_empty() {
+        return;
+    }
+    let ssh_auth_sock = sock.to_string_lossy().into_owned();
+    let message = hitch_proto::message::ControlMessage::ConnEnv { ssh_auth_sock };
+    let encoded = match hitch_proto::framing::encode_control_message(&message) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("hitch daemon proxy: failed to encode ConnEnv prelude: {err}");
+            return;
+        }
+    };
+    if let Err(err) = stream.write_all(&encoded).and_then(|()| stream.flush()) {
+        eprintln!("hitch daemon proxy: failed to send ConnEnv prelude: {err}");
+    }
 }
 
 /// Resolve the host-local daemon endpoint the proxy attaches to. Honors the

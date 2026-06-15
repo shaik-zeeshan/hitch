@@ -25,3 +25,7 @@ serde_json.workspace = true
 uuid.workspace = true
 # Unix pidfile advisory locking.
 libc = "0.2"
+# Filesystem watcher backing the worktree dirty/status detector (replaces the
+# old per-second git-status poll — see `spawn_dirty_watcher`). RecommendedWatcher
+# maps to FSEvents on macOS, ReadDirectoryChangesW on Windows, inotify on Linux.
+notify = "6"

@@ -71,6 +71,12 @@ pub struct PtySpawnConfig {
     pub command: Option<Vec<String>>,
     pub size: TerminalSize,
     pub scrollback_capacity: usize,
+    /// Extra environment variables injected into the spawned child, applied
+    /// after the built-in vars (`TERM`, `HITCH_SESSION_ID`) so a caller can
+    /// override them. General-purpose: the daemon uses this to inject the
+    /// stable ssh-agent relay socket (`SSH_AUTH_SOCK`), and a future
+    /// local-agent resolver will reuse the same hook.
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl PtySpawnConfig {
@@ -81,6 +87,7 @@ impl PtySpawnConfig {
             command: None,
             size: TerminalSize::default(),
             scrollback_capacity: DEFAULT_SCROLLBACK_CAPACITY,
+            extra_env: Vec::new(),
         }
     }
 
@@ -96,6 +103,14 @@ impl PtySpawnConfig {
 
     pub fn scrollback_capacity(mut self, capacity: usize) -> Self {
         self.scrollback_capacity = capacity;
+        self
+    }
+
+    /// Inject extra environment variables into the spawned child. Applied after
+    /// the built-in vars (`TERM`, `HITCH_SESSION_ID`) so a caller can override
+    /// them.
+    pub fn extra_env(mut self, extra_env: Vec<(String, String)>) -> Self {
+        self.extra_env = extra_env;
         self
     }
 }
@@ -150,6 +165,7 @@ impl ManagedPty {
             &config.session_id,
             &config.command,
             &config.cwd,
+            &config.extra_env,
         ))?;
         #[cfg(windows)]
         let (child, job) = {
@@ -391,6 +407,7 @@ fn build_command(
     session_id: &SessionId,
     command: &Option<Vec<String>>,
     cwd: &Path,
+    extra_env: &[(String, String)],
 ) -> CommandBuilder {
     let uses_powershell_cwd = command
         .as_ref()
@@ -407,6 +424,10 @@ fn build_command(
     };
     builder.env("TERM", "xterm-256color");
     builder.env(SESSION_ID_ENV, session_id.to_string());
+    // Applied last so a caller can override the built-in vars above.
+    for (key, value) in extra_env {
+        builder.env(key, value);
+    }
     set_command_cwd(&mut builder, cwd);
     configure_powershell_display_cwd(&mut builder, cwd, uses_powershell_cwd);
     builder
@@ -709,7 +730,7 @@ fn command_name_for_pid(pid: libc::pid_t) -> Option<String> {
     }
     let path = std::str::from_utf8(&buf[..ret as usize]).ok()?;
     let executable = std::path::Path::new(path).file_name()?.to_string_lossy();
-    normalize_command_name(&executable, command_line_args_for_pid(pid).as_deref())
+    normalize_command_name(&executable, || command_line_args_for_pid(pid))
 }
 
 #[cfg(target_os = "linux")]
@@ -719,28 +740,40 @@ fn command_name_for_pid(pid: libc::pid_t) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    let args = command_line_args_for_pid(pid);
-    normalize_command_name(name, args.as_deref())
+    normalize_command_name(name, || command_line_args_for_pid(pid))
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
-fn normalize_command_name(executable: &str, args: Option<&[String]>) -> Option<String> {
+fn normalize_command_name(
+    executable: &str,
+    args: impl FnOnce() -> Option<Vec<String>>,
+) -> Option<String> {
     runtime_agent_command(executable, args)
         .map(str::to_string)
         .or_else(|| Some(executable.to_string()))
 }
 
+/// Resolve an agent CLI name only when the foreground process is a `node`
+/// runtime hosting one (claude/codex run as `node <cli.js>`). `args` is a
+/// closure, not a value, because fetching a process's argv is expensive (a
+/// double `KERN_PROCARGS2` sysctl on macOS, a `/proc` read on Linux) and the
+/// per-second poller would otherwise pay it for EVERY foreground process — vim,
+/// the shell, cargo — only to discard it here. Deferring the fetch behind the
+/// `node` check means the syscall runs only on the rare `node` tick.
 #[cfg_attr(not(unix), allow(dead_code))]
-fn runtime_agent_command(executable: &str, args: Option<&[String]>) -> Option<&'static str> {
+fn runtime_agent_command(
+    executable: &str,
+    args: impl FnOnce() -> Option<Vec<String>>,
+) -> Option<&'static str> {
     if !executable.eq_ignore_ascii_case("node") {
         return None;
     }
 
-    for arg in args? {
-        if path_basename_or_stem_eq(arg, "codex") {
+    for arg in args()? {
+        if path_basename_or_stem_eq(&arg, "codex") {
             return Some("codex");
         }
-        if path_basename_or_stem_eq(arg, "claude") || path_has_component(arg, "claude-code") {
+        if path_basename_or_stem_eq(&arg, "claude") || path_has_component(&arg, "claude-code") {
             return Some("claude");
         }
     }
@@ -1004,23 +1037,17 @@ mod tests {
     #[test]
     fn node_runtime_commands_report_agent_cli_names() {
         assert_eq!(
-            normalize_command_name(
-                "node",
-                Some(&[
-                    "node".into(),
-                    "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js".into(),
-                ]),
-            ),
+            normalize_command_name("node", || Some(vec![
+                "node".into(),
+                "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js".into(),
+            ])),
             Some("codex".into()),
         );
         assert_eq!(
-            normalize_command_name(
-                "node",
-                Some(&[
-                    "node".into(),
-                    "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js".into(),
-                ]),
-            ),
+            normalize_command_name("node", || Some(vec![
+                "node".into(),
+                "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js".into(),
+            ])),
             Some("claude".into()),
         );
     }
@@ -1028,7 +1055,7 @@ mod tests {
     #[test]
     fn ordinary_node_commands_still_report_node() {
         assert_eq!(
-            normalize_command_name("node", Some(&["node".into(), "server.js".into()])),
+            normalize_command_name("node", || Some(vec!["node".into(), "server.js".into()])),
             Some("node".into()),
         );
     }
@@ -1038,10 +1065,10 @@ mod tests {
         // A script whose name merely contains "claude-code" as a substring must
         // not be misreported as the Claude CLI.
         assert_eq!(
-            normalize_command_name(
-                "node",
-                Some(&["node".into(), "./scripts/claude-codegen.js".into()]),
-            ),
+            normalize_command_name("node", || Some(vec![
+                "node".into(),
+                "./scripts/claude-codegen.js".into(),
+            ])),
             Some("node".into()),
         );
     }
@@ -1069,7 +1096,7 @@ mod tests {
     fn powershell_command_builder_preserves_verbatim_extended_cwd() {
         let cwd = Path::new(r"\\?\C:\Code\hitch");
         let command = Some(vec!["powershell.exe".into(), "-NoProfile".into()]);
-        let builder = build_command(&SessionId::new(), &command, cwd);
+        let builder = build_command(&SessionId::new(), &command, cwd, &[]);
 
         assert_eq!(
             builder.get_cwd().map(|cwd| cwd.as_os_str()),
@@ -1140,7 +1167,7 @@ mod tests {
             "-EncodedCommand".into(),
             "ZQBjAGgAbwAgAGgAaQA=".into(),
         ]);
-        let builder = build_command(&SessionId::new(), &command, cwd);
+        let builder = build_command(&SessionId::new(), &command, cwd, &[]);
 
         let argv: Vec<String> = builder
             .get_argv()
@@ -1171,7 +1198,7 @@ mod tests {
             "-ec".into(),
             "ZQBjAGgAbwAgAGgAaQA=".into(),
         ]);
-        let builder = build_command(&SessionId::new(), &command, cwd);
+        let builder = build_command(&SessionId::new(), &command, cwd, &[]);
 
         assert!(
             !builder.get_argv().iter().any(|arg| arg
@@ -1255,6 +1282,34 @@ mod tests {
         let output = collect_output(&rx, Duration::from_secs(3));
         assert!(String::from_utf8_lossy(&output).contains(&session_id.to_string()));
         assert!(String::from_utf8_lossy(&pty.scrollback()).contains(&session_id.to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawned_pty_injects_extra_env() {
+        // The daemon injects the stable ssh-agent relay socket via `extra_env`;
+        // prove a configured extra var reaches the spawned child's environment.
+        let (tx, rx) = mpsc::channel();
+        let session_id = SessionId::new();
+        let pty = ManagedPty::spawn(
+            PtySpawnConfig::new(session_id, std::env::current_dir().unwrap())
+                .command(Some(vec![
+                    "/bin/sh".into(),
+                    "-lc".into(),
+                    "printf %s \"$HITCH_PTY_EXTRA_ENV_TEST\"".into(),
+                ]))
+                .extra_env(vec![(
+                    "HITCH_PTY_EXTRA_ENV_TEST".into(),
+                    "relay-sock-value".into(),
+                )])
+                .scrollback_capacity(1024),
+            tx,
+        )
+        .unwrap();
+
+        let output = collect_output(&rx, Duration::from_secs(3));
+        assert!(String::from_utf8_lossy(&output).contains("relay-sock-value"));
+        assert!(String::from_utf8_lossy(&pty.scrollback()).contains("relay-sock-value"));
     }
 
     #[cfg(unix)]

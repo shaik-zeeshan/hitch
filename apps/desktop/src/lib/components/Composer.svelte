@@ -33,7 +33,7 @@
     startCreatePr,
   } from "../daemon";
   import type { BranchSummary, CompositeStep } from "../types";
-  import { autoToastContent, autoErrorMessage } from "../composerToast";
+  import { autoToastContent, autoErrorMessage, logAutoError } from "../composerToast";
   import { worktreeToast } from "../appToast";
   import { commitOpen, createPrOpen } from "../overlays";
   import { currentDesktopPlatform, isShortcutModifier, shortcutKeys } from "../desktopPlatform";
@@ -91,6 +91,13 @@
 
   function close() {
     if (mode === "pr") {
+      // A parked PR failure is a daemon-owned chain (prChain/prFailed stay
+      // truthy until cleared). Closing the overlay alone leaves the card up, so
+      // mirror auto mode's dismiss and clear the composite chain too.
+      if (prFailed) {
+        const w = $gitWorktreeId;
+        if (w) clearCompositeChain(w);
+      }
       createPrOpen.set(false);
     } else {
       commitOpen.set(false);
@@ -447,6 +454,7 @@
       const result = await startCommitAndPush(worktreeId);
       t.success(autoToastContent(result), { id });
     } catch (err) {
+      logAutoError("commit & push", err);
       t.error(autoErrorMessage(err), { id });
     }
   }
@@ -568,7 +576,13 @@
   >
     <div class="cmp-head" class:is-error={Boolean(prFailed)}>
       {#if prFailed}
-        <span class="label"><span class="err-mk">✗</span> {prFailed.step} failed — retry</span>
+        <button
+          class="label"
+          type="button"
+          title="Retry create pull request"
+          aria-label="Retry create pull request"
+          onclick={() => void confirmPr()}
+        ><span class="err-mk">✗</span> {prFailed.step} failed — retry</button>
       {:else if prInProgress}
         <span class="label on-iris">
           <ArrowUp class="btnic icon" />
@@ -584,17 +598,13 @@
       <button
         class="close"
         type="button"
-        title={prFailed ? "Retry" : prInProgress ? "Hands-off" : "Close"}
-        aria-label={prFailed ? "Retry create pull request" : "Close composer"}
+        title={prInProgress && !prFailed ? "Hands-off" : "Close"}
+        aria-label="Close composer"
         disabled={prInProgress && !prFailed}
         onclick={() => {
-          if (prFailed) {
-            void confirmPr();
-          } else if (!prInProgress) {
-            close();
-          }
+          if (!(prInProgress && !prFailed)) close();
         }}
-      >{prFailed ? "▾" : "×"}</button>
+      >×</button>
       {#if prInProgress && !prFailed}
         <div class="hairline"></div>
       {/if}
@@ -670,8 +680,23 @@
   <div class="composer auto">
     <div class="cmp-head" class:is-error={Boolean(autoFailed)}>
       {#if autoFailed}
-        <span class="label"><span class="err-mk">✗</span> {autoFailed.step} failed — retry</span>
-        <button class="close" type="button" title="Retry" aria-label="Retry commit and push" onclick={() => void retryAuto()}>▾</button>
+        <button
+          class="label"
+          type="button"
+          title="Retry commit and push"
+          aria-label="Retry commit and push"
+          onclick={() => void retryAuto()}
+        ><span class="err-mk">✗</span> {autoFailed.step} failed — retry</button>
+        <button
+          class="close"
+          type="button"
+          title="Dismiss"
+          aria-label="Dismiss failed chain"
+          onclick={() => {
+            const w = $gitWorktreeId;
+            if (w) clearCompositeChain(w);
+          }}
+        >×</button>
       {:else}
         <span class="label on-iris"><span class="iris-dot"></span> {autoStepLabel}</span>
         <button

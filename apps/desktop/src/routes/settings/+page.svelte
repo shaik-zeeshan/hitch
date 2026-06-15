@@ -15,7 +15,7 @@
     retrySshHost,
     scopeStatusById,
   } from "$lib/daemon";
-  import { sshHosts, testSshHost } from "$lib/sshHosts";
+  import { sshHosts, testSshHost, updateSshHost } from "$lib/sshHosts";
   import { addSshHostOpen, removeSshHostTarget } from "$lib/overlays";
   import type { CliInstallStatus, DaemonStatus, SshHost, SshTestResult } from "$lib/types";
   import { currentDesktopPlatform } from "$lib/desktopPlatform";
@@ -256,7 +256,10 @@
     hostTesting = { ...hostTesting, [host.id]: true };
     hostTestResult = { ...hostTestResult, [host.id]: null };
     try {
-      const result = await testSshHost(host.target);
+      // Thread the host's saved forwardAgent so Test probes the same transport the
+      // real attach uses — an opted-OUT host is probed without agent forwarding,
+      // not as if it were forwarding (silly-ridge-27).
+      const result = await testSshHost(host.target, host.forwardAgent);
       hostTestResult = { ...hostTestResult, [host.id]: result };
     } catch (err) {
       hostTestResult = {
@@ -879,6 +882,21 @@
                   </span>
                   {#if host}
                     <div class="host-actions">
+                      <label class="host-fwd" title="Forward your local ssh-agent so the remote daemon can sign git push/pull/fetch">
+                        <span class="host-fwd-label">Forward agent</span>
+                        <Toggle.Root
+                          pressed={host.forwardAgent !== false}
+                          onPressedChange={(v) => updateSshHost(host.id, { forwardAgent: v })}
+                          class="toggle-btn"
+                          aria-label="Forward SSH agent for {host.target}"
+                        >
+                          {#snippet children({ pressed })}
+                            <span class="track" class:on={pressed}>
+                              <span class="thumb"></span>
+                            </span>
+                          {/snippet}
+                        </Toggle.Root>
+                      </label>
                       <button
                         class="btn"
                         disabled={hostTesting[scope.id]}
@@ -1533,6 +1551,18 @@
     align-items: center;
     gap: 6px;
     flex: none;
+  }
+  /* Per-host Forward-agent toggle: a quiet label + the shared track/thumb switch,
+     so a saved host can be flipped in/out of ssh-agent forwarding inline. */
+  .host-fwd {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+  }
+  .host-fwd-label {
+    font-size: var(--r0);
+    color: var(--ink-2);
   }
 
   /* The same liveness-dot recipe the tree's scope rows use (ProjectTree): running

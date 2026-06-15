@@ -72,7 +72,11 @@ function readStored(): SshHost[] {
       const valid = validateTarget(target);
       if (!valid.ok || seen.has(valid.target)) continue;
       seen.add(valid.target);
-      hosts.push({ id: sshHostId(valid.target), target: valid.target });
+      // forwardAgent defaults ON: legacy entries (and explicit `true`) forward the
+      // agent so the remote daemon's git ops just work (silly-ridge-27). Only an
+      // explicit `false` opts out.
+      const forwardAgent = (entry as { forwardAgent?: unknown }).forwardAgent !== false;
+      hosts.push({ id: sshHostId(valid.target), target: valid.target, forwardAgent });
     }
     return hosts;
   } catch {
@@ -104,17 +108,35 @@ export function isDuplicateTarget(target: string): boolean {
 // target. Returns the saved host, or an error message (empty/invalid/duplicate)
 // the dialog surfaces inline. Save does NOT require a passing test — the user may
 // be offline — but invalid/duplicate targets are always rejected.
-export function addSshHost(raw: string): { ok: true; host: SshHost } | { ok: false; error: string } {
+export function addSshHost(
+  raw: string,
+  forwardAgent = true,
+): { ok: true; host: SshHost } | { ok: false; error: string } {
   const valid = validateTarget(raw);
   if (!valid.ok) return valid;
   if (isDuplicateTarget(valid.target)) {
     return { ok: false, error: `“${valid.target}” is already saved.` };
   }
-  const host: SshHost = { id: sshHostId(valid.target), target: valid.target };
+  const host: SshHost = { id: sshHostId(valid.target), target: valid.target, forwardAgent };
   sshHosts.update((hosts) =>
     [...hosts, host].sort((a, b) => a.target.localeCompare(b.target)),
   );
   return { ok: true, host };
+}
+
+// Update a saved SSH Host's mutable fields by id. The target (and the id derived
+// from it) are immutable — only `forwardAgent` may be flipped on a saved host, so
+// the user can opt a host in/out of ssh-agent forwarding without delete+re-add
+// (silly-ridge-27). The write goes through `sshHosts.update`, so the existing
+// `sshHosts.subscribe → syncSshHostsToPool` reconcile re-pushes the host list (with
+// the new flag) via `set_ssh_hosts`. Because forwardAgent is fixed at connect time
+// (it picks the proxy ssh transport), the Rust pool tears the host's existing proxy
+// down and respawns it so the new setting takes effect on the next connection — an
+// already-attached host is reconnected, not silently left on the old transport.
+export function updateSshHost(id: DaemonScopeId, patch: { forwardAgent: boolean }): void {
+  sshHosts.update((hosts) =>
+    hosts.map((h) => (h.id === id ? { ...h, forwardAgent: patch.forwardAgent } : h)),
+  );
 }
 
 // Forget a saved SSH Host by id. Removing forgets ONLY the GUI-local entry; it
@@ -147,10 +169,12 @@ export function sshHostScopes(hosts: SshHost[]): DaemonScope[] {
 // `ssh -o BatchMode=yes <target> hitch daemon proxy`, attempts the Hitch Hello
 // handshake on its stdio, and returns a classified result. Validation errors are
 // caught client-side first so an obviously-invalid target never reaches ssh.
-export async function testSshHost(raw: string): Promise<SshTestResult> {
+export async function testSshHost(raw: string, forwardAgent = true): Promise<SshTestResult> {
   const valid = validateTarget(raw);
   if (!valid.ok) {
     return { ok: false, category: "network", message: valid.error };
   }
-  return invoke<SshTestResult>("test_ssh_host", { target: valid.target });
+  // Pass forwardAgent so the probe mirrors the real attach's transport
+  // (silly-ridge-27); the backend defaults it on when omitted.
+  return invoke<SshTestResult>("test_ssh_host", { target: valid.target, forwardAgent });
 }

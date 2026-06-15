@@ -10,7 +10,7 @@
   import { removeWorktreeTarget } from "../overlays";
   import { removeWorktreeTitle, remotePathAttribution } from "../scopeCopy";
   import { worktreeToast } from "../appToast";
-  import { autoErrorMessage } from "../composerToast";
+  import { autoErrorMessage, logAutoError } from "../composerToast";
 
   const target = $derived($removeWorktreeTarget);
   const dirty = $derived(target ? !!$dirtyWorktrees[target.id] : false);
@@ -56,7 +56,10 @@
     removeWorktreeTarget.set(null);
     void removeWorktree(w.id, false, true)
       .then(() => t.success("Worktree removed", { id }))
-      .catch((err) => t.error(autoErrorMessage(err), { id }));
+      .catch((err) => {
+        logAutoError("remove worktree", err);
+        t.error(autoErrorMessage(err), { id });
+      });
   }
 </script>
 

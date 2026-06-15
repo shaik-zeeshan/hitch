@@ -41,8 +41,39 @@ export function autoToastContent(result: CommitAndPushResult): {
 // for the rail's error-toast wording — RightRail (commit/push/pull/fetch) and
 // ProjectTree (open-in-editor) call this directly. The full reason also sits under
 // the oxide button via the chain store, so the toast only needs the gist.
+//
+// This is a PURE formatter — no logging side-effect. The toast can only show the
+// first line capped at 80 chars; call sites that want the full multi-line reason
+// in the devtools console use `logAutoError(op, err)` below with an op-specific
+// label, so a non-git caller never logs a misleading "operation failed".
 export function autoErrorMessage(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
   const first = msg.split("\n")[0].trim();
-  return first.length > 80 ? first.slice(0, 77) + "…" : first;
+  return truncateGraphemes(first, 80);
+}
+
+// Truncate to at most `limit` visible characters, counting and cutting on grapheme
+// boundaries so a multi-code-unit emoji / surrogate pair is never split mid-glyph.
+// Keeps the prior semantics: at or under the limit passes through untouched; over
+// it, the first `limit - 3` graphemes plus the ellipsis stand in for the rest.
+function truncateGraphemes(str: string, limit: number): string {
+  // Intl.Segmenter (grapheme mode) groups surrogate pairs and combining marks into
+  // single units; the Tauri webview is modern Chromium/WebKit, so it's available.
+  // Array.from (code points) is the surrogate-pair-safe fallback for any runtime
+  // without it.
+  const units =
+    typeof Intl !== "undefined" && "Segmenter" in Intl
+      ? Array.from(new Intl.Segmenter().segment(str), (s) => s.segment)
+      : Array.from(str);
+  return units.length > limit ? units.slice(0, limit - 3).join("") + "…" : str;
+}
+
+// Log a failed operation in full to the devtools console with an op-specific
+// label, so the user can read the whole reason a capped toast can't fit. Pair it
+// with `autoErrorMessage(err)` at each call site (the toast gets the gist, the
+// console gets the detail). `op` is a short human label, e.g. "push" or
+// "remove worktree".
+export function logAutoError(op: string, err: unknown): void {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(`hitch: ${op} failed —`, msg, err);
 }

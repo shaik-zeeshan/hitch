@@ -56,11 +56,12 @@ use hitch_proto::{
     encode_control_message, encode_pty_frame, ControlMessage, Event, OsFamily, Request, RequestId,
     Response, PROTOCOL_VERSION, UPLOAD_CHUNK_BYTES,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter};
 
 use crate::ssh::{self, HandshakeOutcome};
+use crate::ssh_agent_bridge;
 use crate::{read_control_message, read_pty_payload, OutputRouter};
 
 /// Scope-tagged event payload emitted to the webview (`hitch-scope-event`).
@@ -269,6 +270,20 @@ pub fn should_rediscover_cached_path(category: Option<ssh::FailureCategory>) -> 
     matches!(category, Some(ssh::FailureCategory::MissingHitch))
 }
 
+/// Decide whether a host already in the pool must be torn down and respawned
+/// because its `forwardAgent` toggle changed (H2, silly-ridge-27).
+///
+/// `RemoteConnection.forward_agent` is captured once in `new()` and read at every
+/// relay-declare / serve gate, and the live ssh-agent relay channels are bound to
+/// that value. So flipping the toggle on a LIVE host is a no-op until the
+/// connection is rebuilt — the security bug this guards: opting a host OUT of agent
+/// forwarding would otherwise keep the active signing path to the local agent open
+/// until the next disconnect/restart, the opposite of what the UI shows. Pure so
+/// the rule is unit-testable without spawning ssh.
+pub fn forward_agent_changed(live: bool, wanted: bool) -> bool {
+    live != wanted
+}
+
 /// The writer half of a remote connection: the SSH child's stdin. Frames are
 /// written to it exactly as they would be to a `DaemonStream`.
 type RemoteWriter = ChildStdin;
@@ -278,6 +293,10 @@ type RemoteWriter = ChildStdin;
 struct RemoteConnection {
     target: String,
     scope_id: String,
+    /// When set, the proxy ssh is launched with `-o ForwardAgent=yes` so the
+    /// persistent remote daemon can sign git operations through the local user's
+    /// forwarded ssh-agent (silly-ridge-27). Per-host, defaults on.
+    forward_agent: bool,
     next_request_id: AtomicU64,
     connected: AtomicBool,
     /// Bumped on each (re)connect so a stale reader/heartbeat from a superseded
@@ -309,13 +328,31 @@ struct RemoteConnection {
     shutting_down: AtomicBool,
     /// Set while a reconnect loop is in flight, so concurrent triggers collapse.
     reconnecting: AtomicBool,
+    /// Set true the instant the GUI actually sends `SshAgentRelay` to this remote
+    /// daemon (so a local agent WAS resolved and forwarding is on); cleared on
+    /// every reconnect/teardown. The inbound `SshAgentOpen` serve path gates on
+    /// BOTH this and `forward_agent`, so a compromised/curious remote daemon can
+    /// never make the GUI bridge to the local agent for a host the user never
+    /// declared a relay for. Cross-platform (the relay bridges via a named pipe on
+    /// Windows, a Unix socket on Unix — silly-ridge-27).
+    relay_declared: AtomicBool,
+    /// Live ssh-agent relay channels for THIS connection (proto v31, ADR 0014
+    /// amendment). When the per-host toggle is on AND a local agent is reachable,
+    /// the GUI declares the relay after the Hello; the remote daemon then opens a
+    /// channel per git child wanting to sign, and this registry bridges each to the
+    /// local agent. Invalidated (all channels closed) on disconnect/reconnect so a
+    /// stale frame from a superseded link finds nothing. Cross-platform: the bridge
+    /// connects to the local agent over a Unix socket (Unix) or a named pipe
+    /// (Windows) via `hitch_proto::transport::connect_external`.
+    relay: ssh_agent_bridge::SshAgentRelay,
 }
 
 impl RemoteConnection {
-    fn new(target: String, scope_id: String) -> Self {
+    fn new(target: String, scope_id: String, forward_agent: bool) -> Self {
         Self {
             target,
             scope_id,
+            forward_agent,
             next_request_id: AtomicU64::new(1),
             connected: AtomicBool::new(false),
             generation: AtomicU64::new(0),
@@ -328,6 +365,8 @@ impl RemoteConnection {
             exe_path: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             reconnecting: AtomicBool::new(false),
+            relay_declared: AtomicBool::new(false),
+            relay: ssh_agent_bridge::SshAgentRelay::new(),
         }
     }
 
@@ -339,6 +378,21 @@ impl RemoteConnection {
                 .map(|w| w.is_some())
                 .unwrap_or(false)
     }
+}
+
+/// One saved SSH Host as it crosses from the frontend into the pool reconcile
+/// (`set_ssh_hosts`). Mirrors the frontend `SshHost` (camelCase over Tauri IPC):
+/// `forwardAgent` toggles `-o ForwardAgent=yes` on the proxy ssh per-host
+/// (silly-ridge-27). It defaults on when omitted so existing hosts just work.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SshHostConfig {
+    pub target: String,
+    #[serde(rename = "forwardAgent", default = "default_forward_agent")]
+    pub forward_agent: bool,
+}
+
+fn default_forward_agent() -> bool {
+    true
 }
 
 /// The remote connection pool: a managed Tauri state mapping each SSH Host scope
@@ -478,13 +532,16 @@ impl SshConnections {
     /// connection (and an initial connect attempt); removed hosts are
     /// disconnected and dropped. Idempotent: an unchanged host keeps its live
     /// connection. Called on app launch and on every host add/remove.
-    pub fn set_hosts(&self, app: &AppHandle, targets: Vec<String>) {
-        let wanted: HashMap<String, String> = targets
+    pub fn set_hosts(&self, app: &AppHandle, hosts: Vec<SshHostConfig>) {
+        // scope_id -> (normalized target, forward_agent). The forward-agent flag is
+        // per-host so a user can opt out of agent forwarding for a given host
+        // (silly-ridge-27).
+        let wanted: HashMap<String, (String, bool)> = hosts
             .into_iter()
-            .filter_map(|target| {
-                ssh::normalize_target(&target)
+            .filter_map(|host| {
+                ssh::normalize_target(&host.target)
                     .ok()
-                    .map(|t| (format!("ssh:{t}"), t))
+                    .map(|t| (format!("ssh:{t}"), (t, host.forward_agent)))
             })
             .collect();
 
@@ -492,7 +549,8 @@ impl SshConnections {
         // a stale hint behind (and the file can't grow without bound). Persist only
         // if something was actually pruned.
         {
-            let kept: std::collections::HashSet<&String> = wanted.values().collect();
+            let kept: std::collections::HashSet<&String> =
+                wanted.values().map(|(target, _)| target).collect();
             if let Ok(mut hints) = self.0.os_hints.lock() {
                 let before = hints.len();
                 hints.retain(|target, _| kept.contains(target));
@@ -519,18 +577,28 @@ impl SshConnections {
             self.disconnect_scope(&scope_id);
         }
 
-        // Add + connect any newly-wanted scope.
-        for (scope_id, target) in wanted {
-            let already = self
-                .0
-                .connections
-                .lock()
-                .map(|map| map.contains_key(&scope_id))
-                .unwrap_or(false);
-            if already {
-                continue;
+        // Add + connect any newly-wanted scope. For a scope that ALREADY exists,
+        // honor a flipped `forwardAgent` toggle: `RemoteConnection.forward_agent`
+        // is captured once in `new()` and read at every relay/serve gate, and the
+        // live ssh-agent relay channels are bound to the value the connection was
+        // created with. So if the user opts a LIVE host OUT of (or back INTO) agent
+        // forwarding, the only correct fix is to tear the connection down and
+        // respawn it with the new value — otherwise flipping it OFF would leave the
+        // active signing path to the local agent open until disconnect/restart, the
+        // opposite of what the UI shows (security-relevant, silly-ridge-27).
+        for (scope_id, (target, forward_agent)) in wanted {
+            let existing = self.connection(&scope_id);
+            if let Some(connection) = existing {
+                if !forward_agent_changed(connection.forward_agent, forward_agent) {
+                    // Unchanged host: keep its live connection (idempotent reconcile).
+                    continue;
+                }
+                // The toggle changed for a live host: disconnect (which closes any
+                // relay channels and de-authorizes the serve path) and respawn with
+                // the new value, mirroring the not-yet-existing branch below.
+                self.disconnect_scope(&scope_id);
             }
-            let connection = Arc::new(RemoteConnection::new(target, scope_id.clone()));
+            let connection = Arc::new(RemoteConnection::new(target, scope_id.clone(), forward_agent));
             if let Ok(mut map) = self.0.connections.lock() {
                 map.insert(scope_id.clone(), connection.clone());
             }
@@ -566,10 +634,46 @@ impl SshConnections {
             if let Ok(mut writer) = connection.writer.lock() {
                 *writer = None;
             }
+            // Tear down any live ssh-agent relay channels so their dedicated
+            // reader threads (possibly blocked on a sign) unblock and exit, and
+            // de-authorize the serve path until a fresh connect re-declares it.
+            connection.relay_declared.store(false, Ordering::SeqCst);
+            connection.relay.close_all();
             kill_child(&connection);
         }
         if let Ok(mut map) = self.0.connections.lock() {
             map.remove(scope_id);
+        }
+    }
+
+    /// OS focus-gain ping: this GUI just became the foreground app, so tell every
+    /// connected relay-capable remote daemon it is now the driving client for
+    /// ssh-agent relay routing (proto v30 `ControlMessage::ClientActive`, ADR 0014
+    /// amendment). Event-driven — called only from the window focus handler, never
+    /// polled. Best-effort: a ping that can't be delivered (writer gone, link torn
+    /// down) is silently dropped by `write_remote_control`.
+    ///
+    /// Gating mirrors the relay serve path (`remote_reader_loop`'s `SshAgentOpen`):
+    /// only connections where forwarding is on AND the GUI actually declared the
+    /// relay (`relay_declared`) are pinged, so a host the user never relays for is
+    /// never told this GUI is driving. Cross-platform — the relay (and thus the
+    /// driving-client refresh) now serves both Unix and Windows GUIs.
+    pub fn notify_focused(&self) {
+        let connections: Vec<Arc<RemoteConnection>> = match self.0.connections.lock() {
+            Ok(map) => map.values().cloned().collect(),
+            Err(_) => return,
+        };
+        for connection in &connections {
+            if connection.forward_agent
+                && connection.relay_declared.load(Ordering::SeqCst)
+                && connection.is_connected()
+            {
+                debug_log_pool(format_args!(
+                    "focus-gain: pinging ClientActive to {}",
+                    connection.target
+                ));
+                write_remote_control(connection, &ControlMessage::ClientActive);
+            }
         }
     }
 
@@ -887,9 +991,14 @@ impl SshConnections {
             .arg("-o")
             .arg("ServerAliveInterval=15")
             .arg("-o")
-            .arg("ServerAliveCountMax=3")
-            .arg("--")
-            .arg(&connection.target);
+            .arg("ServerAliveCountMax=3");
+        // Forward the local ssh-agent so the persistent remote daemon can sign
+        // git push/pull/fetch through it, with no prompt landing on the remote
+        // (silly-ridge-27). Gated per-host so a user can opt out.
+        if connection.forward_agent {
+            command.arg("-o").arg("ForwardAgent=yes");
+        }
+        command.arg("--").arg(&connection.target);
         // The candidate's remote argv (program + `daemon proxy`). The known-location
         // candidate passes `~/.local/bin/hitch` as a LITERAL arg — the remote login
         // shell expands `~`, not the local process.
@@ -1003,6 +1112,42 @@ impl SshConnections {
                 self.record_os_hint(&connection.target, learned);
                 self.start_reader(app, connection.clone(), reader, generation);
                 self.start_heartbeat(app, connection.clone(), generation);
+                // Declare the ssh-agent relay (proto v31, ADR 0014 amendment) once
+                // the writer is live: if the per-host toggle is on AND a local
+                // ssh-agent is actually reachable, send the `SshAgentRelay`
+                // prelude so the remote daemon will open a relay channel per git
+                // child instead of (only) leaning on the OS ForwardAgent fallback.
+                // The `ForwardAgent=yes` flag above is KEPT regardless (plan
+                // decision #9: toggle ON => BOTH paths, for rolling upgrade).
+                // Cross-platform: the local agent is a Unix socket or a Windows
+                // named pipe, resolved + bridged by `ssh_agent_bridge`.
+                if connection.forward_agent {
+                    if let Some(socket) = ssh_agent_bridge::local_agent_socket() {
+                        write_remote_control(connection, &ControlMessage::SshAgentRelay);
+                        // We actually declared the relay (forwarding on AND a local
+                        // agent resolved): authorize the serve path to honor inbound
+                        // `SshAgentOpen` from this daemon.
+                        connection.relay_declared.store(true, Ordering::SeqCst);
+                        debug_log_pool(format_args!(
+                            "declared ssh-agent relay to {} (local agent {} reachable, toggle on)",
+                            connection.target,
+                            socket.display()
+                        ));
+                        // Self-diagnosis: a reachable agent with ZERO identities is
+                        // the #1 cause of an opaque remote "Permission denied
+                        // (publickey)" three machines away (agent locked, or the
+                        // wrong/empty SSH_AUTH_SOCK). Surface it once, here, instead.
+                        if ssh_agent_bridge::agent_identity_count(&socket) == Some(0) {
+                            eprintln!(
+                                "hitch: ssh-agent relay to {} resolved agent {} but it has 0 keys; \
+                                 remote git auth will fail. Unlock the agent, or check \
+                                 IdentityAgent/SSH_AUTH_SOCK points at the right one.",
+                                connection.target,
+                                socket.display()
+                            );
+                        }
+                    }
+                }
                 Ok(())
             }
             other => {
@@ -1076,6 +1221,12 @@ impl SshConnections {
         if let Ok(mut writer) = connection.writer.lock() {
             *writer = None;
         }
+        // Invalidate every live ssh-agent relay channel: shut their local-agent
+        // sockets so any thread blocked on a sign unblocks, and clear the registry
+        // so a stale frame from the superseded link finds nothing. A reconnect
+        // re-declares the relay and the daemon re-opens fresh channels.
+        connection.relay_declared.store(false, Ordering::SeqCst);
+        connection.relay.close_all();
         // Fail any in-flight requests so callers don't hang on a dead link.
         if let Ok(mut pending) = connection.pending.lock() {
             for (_, tx) in pending.drain() {
@@ -1314,6 +1465,90 @@ fn remote_reader_loop(
             ControlMessage::Request { .. } => {
                 // The daemon never sends requests to the client.
             }
+            ControlMessage::ConnEnv { .. } => {
+                // A proxy→daemon prelude (forwarded SSH_AUTH_SOCK, silly-ridge-27).
+                // It travels only on the proxy's local socket toward the daemon; the
+                // GUI is upstream of the daemon and never receives it. Ignore.
+            }
+            // ssh-agent relay frames (proto v31, ADR 0014 amendment). The remote
+            // daemon drives these once the GUI declared the relay
+            // (`connect_attempt`). Cross-platform: the bridge connects to the local
+            // agent over a Unix socket (Unix) or a named pipe (Windows).
+            ControlMessage::SshAgentOpen { channel } => {
+                // A git child on the remote connected to its proxied SSH_AUTH_SOCK.
+                // The serve side is authoritative about the per-host toggle: only
+                // bridge to the local agent when forwarding is on for this host AND
+                // the GUI actually declared the relay (a local agent was resolved).
+                // Otherwise a compromised/curious daemon could unilaterally drive
+                // the local agent as a signing oracle for a host the user opted out
+                // of — refuse and let the daemon tear its side down.
+                if connection.forward_agent
+                    && connection.relay_declared.load(Ordering::SeqCst)
+                {
+                    // Open a bridge to the LOCAL agent on a DEDICATED thread so a
+                    // multi-second Touch ID sign never stalls this reader loop.
+                    connection.relay.open(channel, relay_write_up(connection));
+                } else {
+                    debug_log_pool(format_args!(
+                        "ssh-agent relay: refusing SshAgentOpen on channel {channel} from {} \
+                         (forward_agent={}, relay_declared={}); closing",
+                        connection.target,
+                        connection.forward_agent,
+                        connection.relay_declared.load(Ordering::SeqCst),
+                    ));
+                    write_remote_control(connection, &ControlMessage::SshAgentClose { channel });
+                }
+            }
+            ControlMessage::SshAgentData { channel, data } => {
+                // Inbound request bytes for the local agent. Decode defensively
+                // (the helper enforces the 256 KiB cap + base64 validity and never
+                // panics); on a bad frame, log + close the channel rather than
+                // forwarding garbage to the agent. The write itself returns
+                // immediately — the SIGN/response is read async on the channel's
+                // dedicated thread, so this never blocks on Touch ID.
+                match hitch_proto::decode_ssh_agent_data(&data) {
+                    Ok(bytes) => {
+                        // `write` returns true when it had to drop the channel (a
+                        // dead local-agent socket, or the connect-window buffer
+                        // overflowed) with no reader thread to emit the close — so
+                        // tell the daemon to tear its side down.
+                        if connection.relay.write(channel, &bytes) {
+                            write_remote_control(
+                                connection,
+                                &ControlMessage::SshAgentClose { channel },
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        debug_log_pool(format_args!(
+                            "ssh-agent relay: bad SshAgentData on channel {channel} from {}: {err}; closing",
+                            connection.target
+                        ));
+                        connection.relay.close(channel);
+                        write_remote_control(connection, &ControlMessage::SshAgentClose { channel });
+                    }
+                }
+            }
+            ControlMessage::SshAgentClose { channel } => {
+                connection.relay.close(channel);
+            }
+            // The GUI declares the relay; the daemon never sends `SshAgentRelay`
+            // up. Ignore defensively (keeps the match exhaustive).
+            ControlMessage::SshAgentRelay => {}
+            // `ClientActive` (proto v30) is a GUI → daemon focus-gain ping: the GUI
+            // only ever SENDS it (see `notify_focused`), never receives it. Ignore
+            // an unexpected inbound one defensively so the match stays exhaustive.
+            ControlMessage::ClientActive => {
+                debug_log_pool(format_args!(
+                    "ignoring unexpected inbound ClientActive from {}",
+                    connection.target
+                ));
+            }
+            // `ClientLocal` (proto v31, ADR 0014 amendment) is a GUI → LOCAL-daemon
+            // announce: the GUI sends it only to its co-located daemon, never to a
+            // remote one, so a remote daemon never sends it up this proxy stream.
+            // Ignore defensively to keep the match exhaustive.
+            ControlMessage::ClientLocal { .. } => {}
         }
     }
 }
@@ -1591,6 +1826,51 @@ fn write_remote_input(connection: &Arc<RemoteConnection>, session_id: SessionId,
         return;
     }
     let _ = writer.flush();
+}
+
+/// Write one control line (no PTY payload frame) to a remote connection,
+/// best-effort. Mirrors [`write_remote_input`] but for control-only messages
+/// (the ssh-agent relay prelude + relay data/close frames, proto v31). The
+/// writer `Mutex` is HELD across the whole write+flush so concurrent writers
+/// (the input drain, the relay reader threads) never interleave bytes on the
+/// shared child stdin. Re-locks per call, so a reconnect that swaps the writer is
+/// picked up naturally; a missing/dead writer just drops the frame. NEVER calls
+/// `handle_remote_lost` from here (deadlock note, `lib.rs::write_input_frame`):
+/// the reader/heartbeat own recovery.
+fn write_remote_control(connection: &Arc<RemoteConnection>, message: &ControlMessage) {
+    let Ok(control) = encode_control_message(message) else {
+        return;
+    };
+    let Ok(mut writer_guard) = connection.writer.lock() else {
+        return;
+    };
+    let Some(writer) = writer_guard.as_mut() else {
+        return;
+    };
+    if writer.write_all(&control).is_err() {
+        return;
+    }
+    let _ = writer.flush();
+}
+
+/// Build the cheaply-cloneable write-up sink the ssh-agent relay hands to each
+/// per-channel reader thread: it locks THIS connection's writer and writes one
+/// control line via [`write_remote_control`]. Holds only an `Arc` to the
+/// connection, so a reader thread that outlives a reconnect re-locks the
+/// (swapped) writer per write — the existing re-lock-per-write idiom.
+fn relay_write_up(connection: &Arc<RemoteConnection>) -> ssh_agent_bridge::WriteUp {
+    let connection = connection.clone();
+    Arc::new(move |message: ControlMessage| {
+        write_remote_control(&connection, &message);
+    })
+}
+
+/// Opt-in `HITCH_DEBUG` stderr log for the remote pool (mirrors the git crate's
+/// convention). Byte payloads are never logged — only relay lifecycle + failures.
+fn debug_log_pool(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("HITCH_DEBUG").is_some_and(|v| !v.is_empty()) {
+        eprintln!("[hitch ssh pool] {args}");
+    }
 }
 
 /// Kill a remote connection's SSH child if one is held.
@@ -1898,6 +2178,37 @@ mod tests {
         assert_eq!(outcome, Ok(1));
     }
 
+    // ----- H2: flipping forwardAgent on a live host must reconnect -----
+
+    #[test]
+    fn forward_agent_unchanged_is_a_noop() {
+        // Same value on both sides: `set_hosts` keeps the live connection (the
+        // idempotent-reconcile path), so the decision helper reports "no change".
+        assert!(!forward_agent_changed(true, true));
+        assert!(!forward_agent_changed(false, false));
+    }
+
+    #[test]
+    fn flipping_forward_agent_triggers_reconnect() {
+        // The security-relevant case: a live host whose `forwardAgent` toggle the
+        // user flips (either direction) must be torn down and respawned with the new
+        // value, because `RemoteConnection.forward_agent` is captured once at
+        // construction and the relay channels are bound to it. The helper drives the
+        // `set_hosts` disconnect+respawn branch.
+        assert!(forward_agent_changed(true, false)); // opt OUT — close the signing path
+        assert!(forward_agent_changed(false, true)); // opt IN — declare the relay
+    }
+
+    #[test]
+    fn new_connection_captures_forward_agent_value() {
+        // The value flows from the config into the connection unchanged, so the
+        // reconnect installs a connection the relay/serve gates will read correctly.
+        let on = RemoteConnection::new("t".into(), "ssh:t".into(), true);
+        assert!(on.forward_agent);
+        let off = RemoteConnection::new("t".into(), "ssh:t".into(), false);
+        assert!(!off.forward_agent);
+    }
+
     #[test]
     fn cached_path_transient_failure_keeps_cache() {
         // A network blip on the cached path does NOT re-discover; backoff retries
@@ -1927,7 +2238,7 @@ mod tests {
     fn read_remote_hello_skips_banner_noise_then_reads_hello() {
         // A chatty login shell prints a MOTD/banner and blank lines before the proxy
         // starts; the Hello must still be found rather than failing as Malformed.
-        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into()));
+        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into(), true));
         let mut buf = Vec::new();
         buf.extend_from_slice(b"Welcome to Ubuntu 22.04 LTS\n");
         buf.extend_from_slice(b"\n");
@@ -1945,7 +2256,7 @@ mod tests {
     #[test]
     fn read_remote_hello_records_os_family_and_exe_path() {
         // The Hello's os_family + exe_path feed the OS hint and the reconnect cache.
-        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into()));
+        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into(), true));
         let mut reader =
             std::io::Cursor::new(hello_frame(OsFamily::Windows, Some("C:/Tools/hitch.exe")));
         let _ = read_remote_hello(&mut reader, 3, &conn);
@@ -1960,7 +2271,7 @@ mod tests {
     fn read_remote_hello_gives_up_after_noise_budget() {
         // Pure non-JSON garbage past the budget fails fast as Malformed instead of
         // reading forever.
-        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into()));
+        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into(), true));
         let mut buf = Vec::new();
         for _ in 0..(MAX_HANDSHAKE_NOISE_LINES + 5) {
             buf.extend_from_slice(b"this is not protocol json\n");
@@ -1974,7 +2285,7 @@ mod tests {
 
     #[test]
     fn read_remote_hello_eof_is_no_response() {
-        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into()));
+        let conn = Arc::new(RemoteConnection::new("t".into(), "ssh:t".into(), true));
         let mut reader = std::io::Cursor::new(Vec::new());
         assert_eq!(
             read_remote_hello(&mut reader, 1, &conn),

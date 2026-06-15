@@ -16,12 +16,14 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use interprocess::{
     local_socket::{
-        prelude::*, GenericNamespaced, ListenerNonblockingMode, ListenerOptions,
-        Name as LocalSocketName,
+        prelude::*, GenericFilePath, GenericNamespaced, ListenerNonblockingMode, ListenerOptions,
+        Name as LocalSocketName, RecvHalf, SendHalf,
     },
     os::windows::{local_socket::ListenerOptionsExt, security_descriptor::SecurityDescriptor},
     TryClone as _,
 };
+#[cfg(windows)]
+use std::os::windows::io::{AsHandle, AsRawHandle};
 
 use crate::framing::{
     encode_control_message, encode_pty_frame, ControlLineDecoder, FrameError, PtyFrameDecoder,
@@ -188,7 +190,15 @@ impl DaemonListener {
         #[cfg(unix)]
         let listener = {
             remove_stale_socket(&path)?;
-            UnixListener::bind(&path)?
+            let listener = UnixListener::bind(&path)?;
+            // Defense-in-depth (L3): the socket lives in $TMPDIR and so far relied
+            // on TMPDIR + umask defaults for access control. Pin the socket file to
+            // 0600 (owner read/write only) in-code so a permissive umask can't
+            // leave it group/world-accessible — the Unix analog of the Windows
+            // owner-only pipe DACL above. Best-effort: a metadata/permission error
+            // must not fail the bind, but is unexpected enough to surface.
+            harden_socket_permissions(&path)?;
+            listener
         };
         #[cfg(windows)]
         let listener = ListenerOptions::new()
@@ -230,6 +240,39 @@ impl DaemonListener {
     pub fn local_path(&self) -> &Path {
         &self.path
     }
+
+    /// The real OS address another process must use to reach this listener,
+    /// suitable to hand a child as `SSH_AUTH_SOCK`. Unlike [`local_path`], which
+    /// returns the stored *logical* path, this is always a connectable endpoint
+    /// string: the socket file path on Unix, or `\\.\pipe\hitch-<hash>` on
+    /// Windows (where the bound endpoint is a named pipe, not the logical path).
+    pub fn os_address(&self) -> String {
+        endpoint_os_address(&self.path)
+    }
+}
+
+/// Real OS address string for an endpoint bound at `path`, suitable to hand a
+/// child process as `SSH_AUTH_SOCK` (the ssh-agent relay's per-connection
+/// socket, ADR 0014 amendment).
+///
+/// On Unix the bound endpoint *is* a filesystem socket at `path` (that is what
+/// [`UnixListener::bind`] binds), so the address is the path string itself.
+#[cfg(unix)]
+pub fn endpoint_os_address(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Real OS address string for an endpoint bound at `path` (see the Unix variant).
+///
+/// On Windows the bound endpoint is a named pipe whose name is derived from the
+/// *logical* path by [`logical_socket_name`]; interprocess's `GenericNamespaced`
+/// namespace prefixes that name with `\\.\pipe\` at bind/connect time, so the
+/// connectable address is `\\.\pipe\hitch-<hash>`. Returning the logical path (as
+/// [`local_path`] does) would not be connectable. The hash stays in one place
+/// ([`logical_socket_name`]) so this is byte-for-byte what `bind` created.
+#[cfg(windows)]
+pub fn endpoint_os_address(path: &Path) -> String {
+    format!(r"\\.\pipe\{}", logical_socket_name(path))
 }
 
 impl Drop for DaemonListener {
@@ -386,6 +429,115 @@ impl DaemonStream {
     pub fn into_inner(self) -> UnixStream {
         self.stream
     }
+
+    /// Split this connected stream into a relay reader + writer pair (ADR 0014
+    /// amendment, ssh-agent relay). Both halves address the SAME underlying
+    /// connection: on Unix they are clones of one `UnixStream`; on Windows they are
+    /// the receive/send halves of one named-pipe stream, which share a single duplex
+    /// pipe handle (interprocess's `split` ref-clones it). Either half's
+    /// `force_close` therefore unblocks a read pending on the other. The control/PTY
+    /// decoders are discarded — a relay channel is a raw byte bridge.
+    pub fn into_relay_channel(self) -> io::Result<(RelayReader, RelayWriter)> {
+        #[cfg(unix)]
+        {
+            let writer = self.stream.try_clone()?;
+            // Bound the inbound GUI->git write (the control-reader thread does a
+            // blocking `write_all` to this half): a wedged git child that stops
+            // draining its socket could otherwise stall that thread — and thus the
+            // whole connection's control plane — forever. A timeout turns that into
+            // a recoverable `WouldBlock`/`TimedOut` the daemon treats as "close this
+            // channel". Best-effort: if the platform rejects the option, fall back to
+            // the prior unbounded behavior rather than failing the channel.
+            let _ = writer.set_write_timeout(Some(RELAY_WRITE_TIMEOUT));
+            Ok((RelayReader { stream: self.stream }, RelayWriter { stream: writer }))
+        }
+        #[cfg(windows)]
+        {
+            // Windows named pipes have no `set_write_timeout`; the inbound
+            // GUI->git write is instead bounded by `RelayWriter::write_with_deadline`
+            // (a CancelIoEx watchdog). The daemon's writer must call that method
+            // rather than a plain `write_all` for the no-stall guarantee to hold.
+            // TODO(win-e2e): exercise the watchdog deadline against a non-draining
+            // pipe peer on host `pc` (the deadline path has no CI coverage here).
+            let (recv, send) = self.stream.split();
+            Ok((RelayReader { half: recv }, RelayWriter { half: send }))
+        }
+    }
+}
+
+/// Connect to an **external** byte endpoint at the **literal** `path` and return
+/// the same splittable [`RelayReader`]/[`RelayWriter`] halves that
+/// [`DaemonStream::into_relay_channel`] yields (ADR 0014 live-origin amendment).
+///
+/// "External" means an endpoint Hitch does **not** own — specifically the local
+/// ssh-agent socket (1Password, OpenSSH, gpg-agent, …) on the machine the daemon
+/// runs on. This is the co-located direct-bridge path: when the driving GUI is
+/// *local* (it shares a host with the daemon and advertised a resolved
+/// `SSH_AUTH_SOCK` via `ClientLocal`), the daemon connects straight to the agent
+/// itself rather than tunneling agent traffic over a `SshAgentOpen` channel to a
+/// relay-capable GUI. The bytes are forwarded raw, so the agent never learns it
+/// is talking to anything but a normal client.
+///
+/// ## Literal-path / no-hash contract (hazard H2)
+///
+/// The `path` here is an **agent address owned by another program**, e.g.
+/// `\\.\pipe\openssh-ssh-agent` on Windows or `/private/tmp/com.apple…/Listeners`
+/// on macOS. It is **NOT** a Hitch endpoint, so it must be connected to
+/// **verbatim**. This function therefore deliberately does **not** route through
+/// [`logical_socket_name`] / [`endpoint_os_address`] / `windows_socket_name`,
+/// every one of which FNV-hashes the spelling into Hitch's *own* `hitch-<hash>`
+/// namespace — pointing those at an agent pipe would dial a non-existent
+/// Hitch-namespaced pipe and never reach the agent. On Windows we convert the
+/// full `\\.\pipe\…` path with interprocess's filesystem-path name type
+/// (`to_fs_name::<GenericFilePath>()`), the literal-path counterpart of the
+/// namespaced `to_ns_name::<GenericNamespaced>()` used for Hitch's own endpoints.
+///
+/// ## Windows validation
+///
+/// The Windows arm cannot be compiled or unit-tested in this repo's CI (no
+/// Windows target here). It is written to mirror the existing `#[cfg(windows)]`
+/// relay code in this file and the named-pipe spike at
+/// `spikes/win-ssh-agent-pipe/`, and is validated **live on host `pc`**, not in
+/// CI (see the `win-relay-implementation-facts` notes).
+pub fn connect_external(path: &Path) -> io::Result<(RelayReader, RelayWriter)> {
+    #[cfg(unix)]
+    {
+        // Mirror the Unix arm of `DaemonStream::into_relay_channel` exactly: the
+        // git→agent pump and the agent→git pump address the SAME underlying
+        // connection through two clones, so either half's `force_close`
+        // (shutdown(Both)) unblocks a read pending on the other.
+        let stream = UnixStream::connect(path)?;
+        let writer = stream.try_clone()?;
+        // Bound the agent→? write the same way the inbound relay write is bounded
+        // (see `into_relay_channel`): a wedged peer that stops draining cannot
+        // stall the pump thread forever — it degrades to a recoverable timeout the
+        // bridge treats as "tear this bridge down". Best-effort; fall back to the
+        // unbounded default if the platform rejects the option.
+        let _ = writer.set_write_timeout(Some(RELAY_WRITE_TIMEOUT));
+        Ok((RelayReader { stream }, RelayWriter { stream: writer }))
+    }
+    #[cfg(windows)]
+    {
+        // Connect to the LITERAL agent pipe path (hazard H2): use interprocess's
+        // filesystem-path name conversion (`to_fs_name::<GenericFilePath>()`) so a
+        // full `\\.\pipe\openssh-ssh-agent` address is used byte-for-byte. Do NOT
+        // use `windows_socket_name`/`logical_socket_name`/`endpoint_os_address`:
+        // those FNV-hash the path into Hitch's `hitch-<hash>` namespace and would
+        // never reach the agent. `.split()` ref-clones the single duplex pipe
+        // handle into recv/send halves (same as `into_relay_channel`), so either
+        // half's `force_close` (CancelIoEx + DisconnectNamedPipe) unblocks the
+        // other.
+        // As in `into_relay_channel`, Windows pipes have no write timeout; the
+        // agent->? write is bounded by `RelayWriter::write_with_deadline`
+        // (CancelIoEx watchdog), which the bridge must use in place of a plain
+        // `write_all`.
+        // TODO(win-e2e): exercise the watchdog deadline against a non-draining
+        // pipe peer on host `pc` (no CI coverage for the deadline path here).
+        let name = path.to_fs_name::<GenericFilePath>()?;
+        let stream = LocalSocketStream::connect(name)?;
+        let (recv, send) = stream.split();
+        Ok((RelayReader { half: recv }, RelayWriter { half: send }))
+    }
 }
 
 impl Read for DaemonStream {
@@ -402,6 +554,237 @@ impl Write for DaemonStream {
     fn flush(&mut self) -> io::Result<()> {
         self.stream.flush()
     }
+}
+
+/// Read half of an ssh-agent relay channel (ADR 0014 amendment). The daemon's
+/// pump thread reads the git child's request bytes (git → daemon → GUI) from it.
+#[derive(Debug)]
+pub struct RelayReader {
+    #[cfg(unix)]
+    stream: UnixStream,
+    #[cfg(windows)]
+    half: RecvHalf,
+}
+
+impl RelayReader {
+    /// Unblock a thread blocked in [`Read::read`] on this reader. Unix:
+    /// `shutdown(Both)`. Windows: `CancelIoEx` + `DisconnectNamedPipe` on the pipe
+    /// handle the pending `ReadFile` is using. Idempotent / best-effort.
+    pub fn force_close(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        { shutdown_both(&self.stream) }
+        #[cfg(windows)]
+        { force_close_recv_half(&self.half) }
+    }
+}
+
+impl Read for RelayReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        { self.stream.read(buf) }
+        #[cfg(windows)]
+        { let mut r = &self.half; r.read(buf) }
+    }
+}
+
+/// How long the inbound GUI→git write half may block before the daemon gives up
+/// on a wedged git child and closes the channel (ADR 0014 amendment). Generous
+/// enough to never trip on a healthy child (an ssh-agent reply is a few hundred
+/// bytes), short enough that one stuck child cannot stall the control plane
+/// indefinitely.
+///
+/// On Unix this is applied with `set_write_timeout`. On Windows named pipes have
+/// no native write timeout, so the bound is enforced with a `CancelIoEx`
+/// watchdog (see [`RelayWriter::write_with_deadline`]) — the constant is shared
+/// across both platforms so the no-stall guarantee holds everywhere.
+const RELAY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Write half of an ssh-agent relay channel (ADR 0014 amendment). Inbound GUI
+/// reply bytes (GUI → daemon → git) are written to it. Held behind an `Arc` by the
+/// daemon and written through a shared `&RelayWriter`, so it impls `Write` for both
+/// `RelayWriter` and `&RelayWriter`.
+#[derive(Debug)]
+pub struct RelayWriter {
+    #[cfg(unix)]
+    stream: UnixStream,
+    #[cfg(windows)]
+    half: SendHalf,
+}
+
+impl RelayWriter {
+    /// Unblock a read pending on the paired [`RelayReader`] and signal teardown to
+    /// the git child. Unix: `shutdown(Both)` (peer reads EOF). Windows: `CancelIoEx`
+    /// + `DisconnectNamedPipe` on the shared pipe handle (same handle the reader's
+    /// `ReadFile` uses); the disconnect breaks the pipe so the git child sees the
+    /// connection end immediately, not only once both halves drop. Idempotent /
+    /// best-effort.
+    pub fn force_close(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        { shutdown_both(&self.stream) }
+        #[cfg(windows)]
+        { force_close_send_half(&self.half) }
+    }
+
+    /// Write `buf` in full under a [`RELAY_WRITE_TIMEOUT`] deadline, so a peer
+    /// that stops draining the pipe cannot stall the writing thread — and thus
+    /// the connection's control plane — forever (ADR 0014 amendment, the
+    /// cross-platform half of the no-stall guarantee).
+    ///
+    /// On Unix the deadline is the `set_write_timeout` configured when the
+    /// channel was split (see [`DaemonStream::into_relay_channel`] /
+    /// [`connect_external`]), so this is a plain `write_all`: a wedged peer
+    /// surfaces as `WouldBlock`/`TimedOut`, which the daemon treats as "close
+    /// this channel".
+    ///
+    /// On Windows named pipes have no native write timeout, so the bound is
+    /// enforced with a `CancelIoEx` watchdog: a timer thread cancels any pending
+    /// `WriteFile` on the shared pipe handle once the deadline elapses, turning a
+    /// wedged write into a promptly-returning cancelled error. The watchdog is
+    /// disarmed the instant the write returns (success or error) so a healthy
+    /// write is never disturbed. The handle is borrowed from the half we still
+    /// hold, so it stays live for the duration of the call.
+    pub fn write_with_deadline(&self, buf: &[u8]) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let mut s = &self.stream;
+            s.write_all(buf)
+        }
+        #[cfg(windows)]
+        {
+            let raw = send_half_raw_handle(&self.half);
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // SAFETY: `raw` is borrowed from `self.half`, which outlives this
+            // call (we join the watchdog before returning), so the handle stays
+            // valid for any `CancelIoEx` the watchdog may issue.
+            let handle = PipeHandle(raw);
+            let watchdog = {
+                let done = std::sync::Arc::clone(&done);
+                std::thread::spawn(move || {
+                    let handle = handle; // move the wrapper across the boundary
+                    let deadline = std::time::Instant::now() + RELAY_WRITE_TIMEOUT;
+                    // Poll the done flag so a completed write disarms the watchdog
+                    // immediately instead of always waiting the full timeout.
+                    while std::time::Instant::now() < deadline {
+                        if done.load(std::sync::atomic::Ordering::Acquire) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    if !done.load(std::sync::atomic::Ordering::Acquire) {
+                        // Deadline blew: cancel the pending WriteFile. A null
+                        // OVERLAPPED cancels every pending op on the handle;
+                        // ERROR_NOT_FOUND (nothing pending) is benign.
+                        unsafe {
+                            let _ = windows_sys::Win32::System::IO::CancelIoEx(
+                                handle.0 as _,
+                                std::ptr::null(),
+                            );
+                        }
+                    }
+                })
+            };
+            let mut w = &self.half;
+            let result = w.write_all(buf);
+            done.store(true, std::sync::atomic::Ordering::Release);
+            let _ = watchdog.join();
+            result
+        }
+    }
+}
+
+/// A raw named-pipe handle made `Send` so it can be moved into the `CancelIoEx`
+/// watchdog thread. Safe because the watchdog only ever calls `CancelIoEx` on it
+/// and is joined before [`RelayWriter::write_with_deadline`] returns, so the
+/// handle the borrow came from is still alive for the whole lifetime of the copy.
+#[cfg(windows)]
+struct PipeHandle(std::os::windows::io::RawHandle);
+
+#[cfg(windows)]
+unsafe impl Send for PipeHandle {}
+
+#[cfg(windows)]
+fn send_half_raw_handle(half: &SendHalf) -> std::os::windows::io::RawHandle {
+    match half {
+        SendHalf::NamedPipe(np) => np.as_handle().as_raw_handle(),
+    }
+}
+
+impl Write for RelayWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        { self.stream.write(buf) }
+        #[cfg(windows)]
+        { let mut w = &self.half; w.write(buf) }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        { self.stream.flush() }
+        #[cfg(windows)]
+        { Ok(()) }
+    }
+}
+
+/// Write through a shared reference so the daemon can store the writer in an `Arc`
+/// and relay inbound chunks without cloning or holding the channel-map lock across
+/// the write.
+impl Write for &RelayWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        { let mut s = &self.stream; s.write(buf) }
+        #[cfg(windows)]
+        { let mut w = &self.half; w.write(buf) }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        { let mut s = &self.stream; s.flush() }
+        #[cfg(windows)]
+        { Ok(()) }
+    }
+}
+
+#[cfg(unix)]
+fn shutdown_both(stream: &UnixStream) -> io::Result<()> {
+    match stream.shutdown(std::net::Shutdown::Both) {
+        Ok(()) => Ok(()),
+        // Already shut down / peer gone — idempotent teardown is not an error.
+        Err(err) if err.kind() == io::ErrorKind::NotConnected => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(windows)]
+fn force_close_recv_half(half: &RecvHalf) -> io::Result<()> {
+    match half {
+        RecvHalf::NamedPipe(np) => force_close_pipe_handle(np.as_handle().as_raw_handle()),
+    }
+}
+
+#[cfg(windows)]
+fn force_close_send_half(half: &SendHalf) -> io::Result<()> {
+    match half {
+        SendHalf::NamedPipe(np) => force_close_pipe_handle(np.as_handle().as_raw_handle()),
+    }
+}
+
+/// Make a relay channel's named-pipe handle behave like a Unix `shutdown(Both)`:
+/// unblock any thread parked in `ReadFile` right now AND break the connection so
+/// the NEXT read also fails and the peer (git) sees the pipe end immediately —
+/// not only once both shared-handle halves finally drop. `CancelIoEx` only
+/// cancels I/O already pending in the kernel (not sticky), so on its own it misses
+/// the window where the relay pump is between reads; `DisconnectNamedPipe` is the
+/// sticky half and the true `shutdown(Both)` analog. Both are best-effort:
+/// `ERROR_NOT_FOUND` (nothing pending) and a disconnect on an already-broken or
+/// non-server handle are benign, so neither is treated as an error.
+#[cfg(windows)]
+fn force_close_pipe_handle(handle: std::os::windows::io::RawHandle) -> io::Result<()> {
+    // SAFETY: `handle` is borrowed from a half we still hold, so it is a live pipe
+    // handle for the duration of these calls, which only act on it. A null
+    // OVERLAPPED cancels every pending operation on the handle.
+    unsafe {
+        let _ = windows_sys::Win32::System::IO::CancelIoEx(handle as _, std::ptr::null());
+        let _ = windows_sys::Win32::System::Pipes::DisconnectNamedPipe(handle as _);
+    }
+    Ok(())
 }
 
 /// Transport-level error, wrapping I/O and framing failures.
@@ -505,6 +888,22 @@ fn normalize_socket_spelling(path: &Path) -> String {
         .to_lowercase()
 }
 
+/// Restrict the daemon control socket to its owning user (mode 0600) after bind
+/// (L3 defense-in-depth). The socket sits in `$TMPDIR`, which the daemon does not
+/// create here, so only the socket file's mode is tightened — not the directory.
+///
+/// L3: a peer-credential check at accept time (SO_PEERCRED on Linux,
+/// `getpeereid` on the BSDs/macOS) would harden this further by rejecting any
+/// connection not from the same uid even if the file mode were somehow loosened.
+/// It is left as future hardening: it needs a per-platform syscall (no std API)
+/// and 0600 already denies other users `connect(2)` on the socket inode.
+#[cfg(unix)]
+fn harden_socket_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = fs::Permissions::from_mode(0o600);
+    fs::set_permissions(path, perms)
+}
+
 #[cfg(unix)]
 fn remove_stale_socket(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
@@ -532,7 +931,7 @@ mod tests {
     use super::*;
     use crate::message::{ControlMessage, Request, Response, PROTOCOL_VERSION};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn client_and_listener_exchange_control_message() {
@@ -660,6 +1059,144 @@ mod tests {
             logical_socket_name(Path::new(r"C:\Users\pc\AppData\Local\Hitch\daemon.sock")),
             logical_socket_name(Path::new(r"C:\Users\pc\AppData\Local\Hitch\other.sock")),
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_os_address_is_the_socket_path_on_unix() {
+        // On Unix the bound endpoint IS the socket file, so the address handed to
+        // a child as SSH_AUTH_SOCK is the path string verbatim.
+        let path = Path::new("/tmp/hitch/agent/7.sock");
+        assert_eq!(endpoint_os_address(path), "/tmp/hitch/agent/7.sock");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn endpoint_os_address_is_the_named_pipe_on_windows() {
+        // On Windows the bound endpoint is a named pipe; the address must be the
+        // connectable `\\.\pipe\hitch-<hash>`, matching what `bind` created via
+        // `logical_socket_name`, and stable across equivalent path spellings.
+        let canonical = endpoint_os_address(Path::new(
+            r"C:\Users\pc\AppData\Local\Hitch\agent\7.sock",
+        ));
+        assert!(
+            canonical.starts_with(r"\\.\pipe\hitch-"),
+            "address {canonical:?} should be a hitch named pipe",
+        );
+        assert_eq!(
+            canonical,
+            format!(
+                r"\\.\pipe\{}",
+                logical_socket_name(Path::new(r"C:\Users\pc\AppData\Local\Hitch\agent\7.sock"))
+            ),
+            "address must reuse the same hash logical_socket_name/bind use",
+        );
+        for variant in [
+            r"c:\users\pc\appdata\local\hitch\agent\7.sock",
+            r"C:/Users/pc/AppData/Local/Hitch/agent/7.sock",
+        ] {
+            assert_eq!(
+                endpoint_os_address(Path::new(variant)),
+                canonical,
+                "spelling {variant:?} should resolve to the same pipe address",
+            );
+        }
+        // A genuinely different endpoint must produce a different address.
+        assert_ne!(
+            endpoint_os_address(Path::new(r"C:\Users\pc\AppData\Local\Hitch\agent\8.sock")),
+            canonical,
+        );
+    }
+
+    #[test]
+    fn relay_channel_round_trips_and_force_close_unblocks_reader() {
+        let path = test_socket_path();
+        let listener = DaemonListener::bind(&path).unwrap();
+        let accept = thread::spawn(move || {
+            let stream = listener.accept().unwrap();
+            stream.into_relay_channel().unwrap()
+            // `listener` drops here; the accepted connection persists via the halves.
+        });
+
+        let mut client = connect_daemon(&path).unwrap();
+        let (mut reader, writer) = accept.join().unwrap();
+
+        // git -> daemon: bytes arrive at the reader verbatim.
+        client.write_all(&[1, 2, 3, 4, 5]).unwrap();
+        client.flush().unwrap();
+        let mut got = [0u8; 5];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(got, [1, 2, 3, 4, 5]);
+
+        // daemon -> git: writer bytes reach the client verbatim (write through &writer,
+        // the path the daemon uses).
+        {
+            let mut w = &writer;
+            w.write_all(&[9, 8, 7]).unwrap();
+            w.flush().unwrap();
+        }
+        let mut back = [0u8; 3];
+        client.read_exact(&mut back).unwrap();
+        assert_eq!(back, [9, 8, 7]);
+
+        // A reader blocked on a pending read unblocks promptly after force_close.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let blocked = thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            let r = reader.read(&mut buf); // blocks: no more bytes are coming
+            let _ = tx.send(());
+            r
+        });
+        thread::sleep(Duration::from_millis(150));
+        writer.force_close().unwrap();
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("reader must unblock shortly after force_close");
+        match blocked.join().unwrap() {
+            // Unix shutdown -> clean EOF.
+            Ok(0) => {}
+            Ok(n) => panic!("unexpected {n} bytes after force_close"),
+            // Windows cancel / broken pipe is an acceptable "EOF" too.
+            Err(_) => {}
+        }
+
+        drop(client);
+        #[cfg(unix)]
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_control_socket_is_owner_only_0600() {
+        // L3: the daemon control socket must be mode 0600 after bind, regardless
+        // of the ambient umask, so no other local user can connect(2) to it.
+        use std::os::unix::fs::PermissionsExt;
+        let path = test_socket_path();
+        let listener = DaemonListener::bind(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "control socket should be 0600, got {mode:o}");
+        drop(listener);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_with_deadline_delivers_bytes_on_a_draining_peer() {
+        // On a healthy (draining) peer, the bounded write must behave like a
+        // normal `write_all`: the bytes arrive intact and the call returns Ok.
+        let path = test_socket_path();
+        let listener = DaemonListener::bind(&path).unwrap();
+        let accept = thread::spawn(move || listener.accept().unwrap().into_relay_channel().unwrap());
+
+        let mut client = connect_daemon(&path).unwrap();
+        let (_reader, writer) = accept.join().unwrap();
+
+        writer.write_with_deadline(&[4, 5, 6, 7]).unwrap();
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).unwrap();
+        assert_eq!(back, [4, 5, 6, 7]);
+
+        drop(client);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
