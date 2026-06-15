@@ -451,6 +451,23 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     #[cfg(windows)]
     let pid_lock = None;
 
+    // L10: establish the cleanup guard BEFORE binding the socket, holding only the
+    // pidfile lock at first (`_listener: None`). `acquire_pidfile` already CREATED the
+    // pidfile on disk and took its OS lock; if `DaemonListener::bind` below then failed
+    // via `?`, a guard constructed only AFTER the bind would never run, leaking the
+    // pidfile file (the `pid_lock` `File` drop releases the OS lock but does not
+    // `remove_file` it) — lock & socket left inconsistent. Owning the pidfile cleanup
+    // from the instant the lock exists makes every early-return path between here and
+    // the bind (and the bind itself) clean up atomically: on any unwind the guard's
+    // Drop removes the pidfile, then `_pid_lock` releases the lock. The listener is
+    // slotted in immediately after a successful bind below.
+    let mut daemon_files = DaemonFileGuard {
+        #[cfg(unix)]
+        socket_path: config.socket_path.clone(),
+        _listener: None,
+        _pid_lock: pid_lock,
+    };
+
     // `Arc`, not a plain owner moved into the accept thread: the socket file is
     // unlinked by `DaemonListener::drop`, so whoever holds the last reference
     // decides *when* the rendezvous socket disappears. The accept thread exits at
@@ -467,33 +484,26 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     // endpoint, classifies it as a live-but-slow daemon (connect succeeds, Hello
     // times out), and waits instead of double-spawning.
     let listener = Arc::new(DaemonListener::bind(&config.socket_path)?);
+    // L10: bind succeeded — record the listener on the guard so the socket file now
+    // has exactly ONE unlinking owner (`DaemonListener::drop`). Field order is
+    // load-bearing: `_listener` is declared BEFORE `_pid_lock`, so on the guard's drop
+    // the listener `Arc` reference drops first — and if it is the last reference (the
+    // accept thread's clone already gone at shutdown), its `DaemonListener::drop`
+    // unlinks the socket — and only THEN does `_pid_lock` drop, releasing the singleton
+    // lock. Socket and lock disappear together with a single unlink, closing the prior
+    // double-unlink window where the listener's late drop could `remove_file` a
+    // relaunch's fresh socket after the lock was already released.
+    daemon_files._listener = Some(Arc::clone(&listener));
+    let _daemon_files = daemon_files;
     // The listener stays in blocking mode: a dedicated accept thread parks in
     // `accept()` so no poll gap exists in which a connect-write-close client is
     // dropped (see the accept thread below and ADR 0012). The old nonblocking
     // poll loop is gone, not cfg-switched.
     // The setup that follows (`Store::open`, `restore_layout`, the accept loop)
-    // can early-return via `?`. Own Unix pidfile + socket cleanup with a guard so
-    // every exit path clears filesystem rendezvous state. Windows local sockets
-    // are named-pipe endpoints owned by the listener; there is no socket path or
-    // pidfile to unlink.
-    //
-    // The guard OWNS a clone of the listener `Arc` so the socket file has exactly
-    // ONE unlinking owner. `DaemonListener::drop` is the sole place that
-    // `remove_file`s the socket; the guard does not unlink it separately. Field
-    // order is load-bearing: `_listener` is declared BEFORE `_pid_lock`, so on the
-    // guard's drop the listener `Arc` reference drops first — and if it is the last
-    // reference (the accept thread's clone already gone at shutdown), its
-    // `DaemonListener::drop` unlinks the socket — and only THEN does `_pid_lock`
-    // drop, releasing the singleton lock. Socket and lock disappear together with
-    // a single unlink, closing the prior double-unlink window where the listener's
-    // late drop could `remove_file` a relaunch's fresh socket after the lock was
-    // already released.
-    let _daemon_files = DaemonFileGuard {
-        #[cfg(unix)]
-        socket_path: config.socket_path.clone(),
-        _listener: Arc::clone(&listener),
-        _pid_lock: pid_lock,
-    };
+    // can early-return via `?`; the guard above owns pidfile + socket cleanup so
+    // every exit path clears filesystem rendezvous state. Windows local sockets are
+    // named-pipe endpoints owned by the listener; there is no socket path or pidfile
+    // to unlink.
 
     let shutdown = Arc::new(AtomicBool::new(false));
     // The dispatcher drains a single ordered channel of `DispatchMsg`. PTY reader
@@ -628,6 +638,24 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     cancel_active_jobs(&state);
     wait_for_jobs_to_finish(&state);
     kill_all_sessions(&state);
+    // L5: tear the ssh-agent relay down on graceful shutdown. The relay lives for the
+    // Daemon's whole lifetime (bound lazily on the first relay-capable connect) and is
+    // deliberately NOT torn down by `unregister_client`, so without an explicit
+    // shutdown teardown its accept thread, per-channel pump threads, and (Unix) socket
+    // file would leak past Daemon exit. `teardown` stops accepting, wakes the blocked
+    // `accept()`, force-closes every live channel (git children get EOF), and (Unix)
+    // unlinks the socket. It is idempotent and a no-op if the relay was never bound
+    // (a purely local Daemon, or one no relay-capable GUI ever reached): we clone the
+    // `Option<Arc<SshAgentRelay>>` out of state under the lock and only tear down when
+    // it is `Some`. Per H1 only the owner relay may remove the socket, and the stored
+    // relay IS the owner, so this teardown is the correct unlinking owner.
+    let relay = state
+        .lock()
+        .ok()
+        .and_then(|guard| guard.relay.lock().ok().and_then(|slot| slot.clone()));
+    if let Some(relay) = relay {
+        relay.teardown();
+    }
     // The accept thread (joined above) has dropped its listener `Arc` clone, so the
     // ONLY remaining reference is the one inside `_daemon_files` (`_listener`). It
     // has kept the socket file present through the drain above so the socket and the
@@ -681,7 +709,13 @@ struct DaemonFileGuard {
     // this (last) `Arc` reference drops, while the pidfile lock below is still held.
     // Declared BEFORE `_pid_lock` so it drops first (see the construction comment in
     // `run_daemon`). Never read — only its lifetime matters.
-    _listener: Arc<DaemonListener>,
+    //
+    // L10: `Option` so the guard can be constructed BEFORE the socket bind (holding
+    // only the pidfile lock) and have the listener slotted in once the bind succeeds.
+    // `None` covers the window between `acquire_pidfile` and a successful bind: if the
+    // bind fails, the guard still drops and removes the pidfile, while `DaemonListener`
+    // (never bound) needs no unlink.
+    _listener: Option<Arc<DaemonListener>>,
     // Held open for the daemon's whole lifetime so the advisory pidfile lock stays
     // taken; dropping it (clean exit or unwind) releases the lock, and the OS
     // releases it on an unclean kill too. Never read — only its lifetime matters.
@@ -1158,8 +1192,18 @@ fn restore_layout(
         // top stacked two banners (old + new), which read as duplicated output.
         // The in-memory broadcast log still drives same-daemon reattach; only
         // cross-restart history is dropped.
+        //
+        // H3: inject `SSH_AUTH_SOCK` = the STABLE relay socket path so `git push` in a
+        // restored terminal signs on the driving machine after a daemon restart, just
+        // like a freshly opened session (`open_session`). This MUST use the
+        // bind-timing-independent stable path (`restore_pty_env`), not `relay_pty_env`:
+        // `restore_layout` runs at startup before any client connects and before the
+        // relay binds lazily, so a bound-relay check would inject nothing. git connects
+        // to the socket only on a network op, by which point a GUI has bound the relay.
         let pty = ManagedPty::spawn(
-            PtySpawnConfig::new(session.id, session.cwd.clone()).command(None),
+            PtySpawnConfig::new(session.id, session.cwd.clone())
+                .command(None)
+                .extra_env(restore_pty_env()),
             pty_tx.clone(),
         )
         .map_err(|err| ProtocolError::new(ErrorCode::PtyFailed, err.to_string()))?;
@@ -1278,12 +1322,28 @@ fn unregister_client(state: &Arc<Mutex<DaemonState>>, client_id: u64) {
 /// there is no poller or timer (that would re-introduce the idle-wakeup floor).
 fn refresh_driving_client(state: &mut DaemonState, client_id: u64) {
     let eligible = state.clients.get(&client_id).is_some_and(|sink| {
-        sink.relay_capable.load(Ordering::SeqCst)
-            || sink
-                .local_agent_sock
-                .lock()
-                .map(|s| s.is_some())
-                .unwrap_or(false)
+        // L9: a focus ping (`ClientActive`) can arrive for a GUI that has gone
+        // unusable since it last spoke — its connection is tearing down, or it
+        // never declared a relay / has no local agent. Re-pointing to it would only
+        // be discovered when a later git op fails (the channel routes to a dead or
+        // signer-less driver). Do a cheap, NON-blocking liveness/eligibility check
+        // here (no agent probe — that would block the control path):
+        //   * the sink must NOT be `disconnected` (mid-teardown), and
+        //   * it must have declared a usable signer — `relay_capable` (a remote
+        //     relay GUI) OR a `local_agent_sock` path (a co-located local GUI).
+        // A GUI that has declared NEITHER (a v28 `ConnEnv`-only proxy, a local GUI
+        // with no signable agent) is last-known-NOT-good and is never made the
+        // driver. The agent could still be empty/locked behind a declared
+        // `local_agent_sock`; detecting that needs an actual probe, which we
+        // deliberately skip to keep this off the blocking path — the relay's
+        // per-accept routing already falls through to fail-fast for a stale driver.
+        !sink.disconnected.load(Ordering::SeqCst)
+            && (sink.relay_capable.load(Ordering::SeqCst)
+                || sink
+                    .local_agent_sock
+                    .lock()
+                    .map(|s| s.is_some())
+                    .unwrap_or(false))
     });
     if eligible {
         state.driving_client = Some(client_id);
@@ -1387,6 +1447,45 @@ fn handle_client(
         // accept-loop bridges a git child's signing directly to this path rather
         // than relaying over the control channel. Not a Request — never dispatch it.
         if let ControlMessage::ClientLocal { ssh_auth_sock } = &message {
+            // L2: a `ClientLocal` path is connected to verbatim by the co-located
+            // direct bridge (`connect_external`), so an unvalidated path is a same-uid
+            // SSRF: a same-user client could point the Daemon at an ARBITRARY unix
+            // socket. Validate before trusting:
+            //   (a) Mutually exclusive trust modes — a connection that ALSO announced
+            //       `SshAgentRelay` (a relay-capable REMOTE link) must not also claim
+            //       to be a co-located LOCAL GUI; reject rather than letting one
+            //       connection mix both. The remote relay tunnel and the local direct
+            //       bridge are different trust models and must not coexist on one link.
+            //   (b) Path sanity — it must be an absolute path that EXISTS and is a
+            //       SOCKET owned by the SAME uid as this Daemon. (`local_agent_socket`
+            //       resolution on the GUI side produces exactly such a path; anything
+            //       else is bogus or hostile.)
+            let already_relay_capable = state
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    state
+                        .clients
+                        .get(&client_id)
+                        .map(|sink| sink.relay_capable.load(Ordering::SeqCst))
+                })
+                .unwrap_or(false);
+            if already_relay_capable {
+                if ssh_agent_debug_enabled() {
+                    eprintln!(
+                        "hitch-daemon: rejecting ClientLocal from client {client_id}: connection already announced SshAgentRelay (mutually exclusive trust modes)"
+                    );
+                }
+                continue;
+            }
+            if let Err(reason) = validate_local_agent_path(ssh_auth_sock) {
+                if ssh_agent_debug_enabled() {
+                    eprintln!(
+                        "hitch-daemon: rejecting ClientLocal {ssh_auth_sock:?} from client {client_id}: {reason}"
+                    );
+                }
+                continue;
+            }
             if let Ok(mut state) = state.lock() {
                 if let Some(sink) = state.clients.get(&client_id) {
                     if let Ok(mut slot) = sink.local_agent_sock.lock() {
@@ -1430,14 +1529,18 @@ fn handle_client(
                 .and_then(|state| state.relay.lock().ok().and_then(|g| g.clone()));
             if let Some(relay) = relay {
                 match hitch_proto::decode_ssh_agent_data(data) {
-                    Ok(bytes) => relay.write_to_channel(*channel, &bytes),
+                    // L1: route ONLY if this connection owns the channel. A channel is
+                    // bound at accept time to the GUI that was driving; a different
+                    // same-user client must not inject signing bytes into another
+                    // session's in-flight git child by guessing/replaying a channel id.
+                    Ok(bytes) => relay.write_to_channel_for(client_id, *channel, &bytes),
                     Err(err) => {
                         if ssh_agent_debug_enabled() {
                             eprintln!(
                                 "hitch-daemon: ssh-agent relay channel {channel} bad inbound frame: {err}; closing channel"
                             );
                         }
-                        relay.close_channel(*channel);
+                        relay.close_channel_for(client_id, *channel);
                     }
                 }
             }
@@ -1450,7 +1553,9 @@ fn handle_client(
                 .ok()
                 .and_then(|state| state.relay.lock().ok().and_then(|g| g.clone()));
             if let Some(relay) = relay {
-                relay.close_channel(*channel);
+                // L1: a non-owner client must not be able to close another session's
+                // channel — verify ownership before tearing it down.
+                relay.close_channel_for(client_id, *channel);
             }
             continue;
         }
@@ -3989,6 +4094,18 @@ fn resolve_ssh_auth_sock(state: &Arc<Mutex<DaemonState>>, client_id: u64) -> Opt
     forwarded
 }
 
+/// Single-flight gate for the relay bind (H1). The relay binds at ONE fixed path
+/// (`data_dir()/agent/relay.sock`); two callers racing their preludes (the multi-GUI
+/// / live-origin scenario) must NOT both `bind` it, because `bind_at` does
+/// `remove_file` + bind, so the second binder would UNLINK the first's live socket
+/// and the store-race loser's `teardown()` would then delete the winner's. Holding
+/// this `Mutex` across the WHOLE check→bind→store critical section makes the bind a
+/// true single-flight: exactly one caller binds + stores, every other caller observes
+/// the stored relay and never binds (so there is no orphan to tear down, and no
+/// teardown ever unlinks the shared path). Process-global because the path is
+/// process-global. Poison-tolerant: a panicking binder must not wedge the rest.
+static RELAY_BIND_LOCK: Mutex<()> = Mutex::new(());
+
 /// Ensure the ONE Daemon-stable [`SshAgentRelay`] socket exists and return its
 /// connectable OS address (ADR 0014 amendment, 2026-06-15 stable-socket amendment).
 /// Idempotent: if the relay is already bound (on [`DaemonState::relay`]) return its
@@ -4000,10 +4117,25 @@ fn resolve_ssh_auth_sock(state: &Arc<Mutex<DaemonState>>, client_id: u64) -> Opt
 /// rung 1 of [`resolve_ssh_auth_sock`] and the `SshAgentRelay` prelude's lazy bind.
 /// Returns `None` only if the bind itself fails. The accept loop is live before this
 /// returns, satisfying git's synchronous connect.
+///
+/// H1: the check→bind→store sequence runs under [`RELAY_BIND_LOCK`], so concurrent
+/// callers single-flight the bind — only the first binds the shared fixed path; the
+/// others wait, then observe the stored relay on the fast path and return its address
+/// WITHOUT binding. No duplicate `bind_at` can unlink a live socket, and there is no
+/// store-race loser whose `teardown()` could delete the winner's socket.
 fn ensure_relay_socket(state: &Arc<Mutex<DaemonState>>) -> Option<String> {
-    // Fast path: already bound. Take the `relay` lock (NOT held across the bind
-    // below) so two concurrent callers can't double-bind. The address is owned, so
-    // capture it and let both guards drop before returning.
+    // H1: hold the single-flight bind lock across the ENTIRE check→bind→store. The
+    // state/relay locks are still taken and dropped briefly inside (never held across
+    // the bind, which spawns the accept thread that re-locks state per-accept); this
+    // outer lock is what serializes the *decision* so two racing callers can't both
+    // bind the one fixed path. Poison-tolerant so a panicked prior binder can't wedge
+    // every later relay-capable connect.
+    let _bind_guard = RELAY_BIND_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // Fast path: already bound (by us on a prior call, or by the caller we just
+    // waited behind on the bind lock). Capture the owned address and drop the guards.
     let existing_address = {
         let guard = state.lock().ok()?;
         let slot = guard.relay.lock().ok();
@@ -4018,7 +4150,8 @@ fn ensure_relay_socket(state: &Arc<Mutex<DaemonState>>) -> Option<String> {
 
     // Bind with the state lock dropped. `SshAgentRelay::bind` spawns the accept
     // thread, which itself locks state per-accept — so it must NOT be called while
-    // we hold the state lock.
+    // we hold the state lock. We DO still hold `RELAY_BIND_LOCK`, so no other caller
+    // is binding the same path concurrently.
     let relay = match SshAgentRelay::bind(Arc::clone(state)) {
         Ok(relay) => relay,
         Err(err) => {
@@ -4030,40 +4163,27 @@ fn ensure_relay_socket(state: &Arc<Mutex<DaemonState>>) -> Option<String> {
     };
     let path = hitch_proto::transport::endpoint_os_address(&relay.socket_path);
 
-    // Re-take the lock to store. If another caller raced us and already stored a
-    // relay, keep theirs and tear ours down so we don't leak the duplicate listener
-    // (its accept thread + socket file).
-    let outcome: Option<String> = {
-        match state.lock() {
-            Ok(guard) => match guard.relay.lock() {
-                Ok(mut slot) => match slot.as_ref() {
-                    Some(existing) => Some(hitch_proto::transport::endpoint_os_address(
-                        &existing.socket_path,
-                    )),
-                    None => {
-                        *slot = Some(Arc::clone(&relay));
-                        // Sentinel: we stored ours; signal "keep relay, return path".
-                        None
-                    }
-                },
-                // `relay` lock poisoned: fall through to teardown.
-                Err(_) => Some(String::new()),
-            },
-            // State lock poisoned after a successful bind: fall through to teardown.
-            Err(_) => Some(String::new()),
-        }
-    };
-    match outcome {
-        // We stored our relay (the `None` sentinel above).
-        None => Some(path),
-        // Another caller won the race (or a lock was poisoned): tear our orphan down.
-        Some(existing_address) => {
-            relay.teardown();
-            if existing_address.is_empty() {
-                None
-            } else {
-                Some(existing_address)
+    // Store it. Because we are under the single-flight `RELAY_BIND_LOCK` and observed
+    // an empty slot above (under that same lock), the slot is still empty here — no
+    // store-race loser exists, so there is nothing to tear down. The only `Err` paths
+    // are lock poisoning AFTER a successful bind; tear the freshly-bound relay down so
+    // we don't leak the listener thread + socket file.
+    match state.lock() {
+        Ok(guard) => match guard.relay.lock() {
+            Ok(mut slot) => {
+                *slot = Some(Arc::clone(&relay));
+                Some(path)
             }
+            // `relay` lock poisoned: tear our orphan down rather than leak it.
+            Err(_) => {
+                relay.teardown();
+                None
+            }
+        },
+        // State lock poisoned after a successful bind: tear our orphan down.
+        Err(_) => {
+            relay.teardown();
+            None
         }
     }
 }
@@ -4089,16 +4209,109 @@ fn ensure_relay_socket(state: &Arc<Mutex<DaemonState>>) -> Option<String> {
 /// state lock across the PTY spawn. Deliberately does NOT set `BatchMode` /
 /// `GIT_TERMINAL_PROMPT=0` — terminal PTYs stay interactive so a human can answer a
 /// host-key or passphrase prompt at the terminal.
+///
+/// H3 (PT1): two cases yield a usable agent socket. (1) **Relay-serving** — the stable
+/// relay is bound on [`DaemonState::relay`] → inject its connectable address. (2)
+/// **Co-located local** — no relay is bound, but a connected `ClientLocal` GUI
+/// announced its OWN local ssh-agent (`local_agent_sock`) → inject that path directly
+/// so a purely-local Daemon's terminals can still sign (the live-origin local path).
+/// Neither → `[]` (terminals inherit env exactly as today).
 fn relay_pty_env(state: &Arc<Mutex<DaemonState>>) -> Vec<(String, String)> {
     let sock = state.lock().ok().and_then(|guard| {
-        guard.relay.lock().ok().and_then(|slot| {
+        // Relay case: the stable relay socket's connectable OS address.
+        let relay_sock = guard.relay.lock().ok().and_then(|slot| {
             slot.as_ref()
                 .map(|relay| hitch_proto::transport::endpoint_os_address(&relay.socket_path))
-        })
+        });
+        if relay_sock.is_some() {
+            return relay_sock;
+        }
+        // Co-located-local case (H3 PT1): no relay bound, but a connected local GUI
+        // announced an agent path — inject it so the local Daemon's terminals sign
+        // through the local live-origin agent.
+        guard
+            .clients
+            .values()
+            .find_map(|sink| sink.local_agent_sock.lock().ok().and_then(|slot| slot.clone()))
     });
     match sock {
         Some(path) => vec![("SSH_AUTH_SOCK".to_string(), path)],
         None => Vec::new(),
+    }
+}
+
+/// The well-known connectable OS address of the Daemon-stable relay socket, computed
+/// from its FIXED path (`data_dir()/agent/relay.sock`) WITHOUT requiring the relay to
+/// be bound yet (H3). `endpoint_os_address` is pure over the path, so this is the same
+/// string a later bind produces. Used to inject `SSH_AUTH_SOCK` into restored
+/// terminals at startup, before any client connects and before the relay binds lazily:
+/// git connects to the agent socket only when it actually runs a network op, by which
+/// point a relay-capable (or co-located-local) GUI has bound the relay at this path.
+fn stable_relay_socket_address() -> String {
+    hitch_proto::transport::endpoint_os_address(&ssh_agent_relay_root().join("relay.sock"))
+}
+
+/// The `extra_env` for a **restored** terminal at daemon startup (H3). Unlike
+/// [`relay_pty_env`], this does NOT depend on the relay being bound — `restore_layout`
+/// runs before any client connects, so the relay's lazy bind has not happened and a
+/// bound-relay check would inject nothing. Restored terminals must still find the agent
+/// socket so `git push` works after a daemon restart in a previously-open terminal, so
+/// inject the STABLE fixed path unconditionally: git connects to it lazily (only on a
+/// network op), by which point a GUI has bound the relay at exactly this address. The
+/// env is opener-agnostic and the routing is decided live at the relay's accept time,
+/// exactly as for a freshly-opened session.
+fn restore_pty_env() -> Vec<(String, String)> {
+    vec![("SSH_AUTH_SOCK".to_string(), stable_relay_socket_address())]
+}
+
+/// L2: sanity-check a `ClientLocal`-announced local ssh-agent path before the
+/// co-located direct bridge will `connect_external` to it verbatim. A bad path is a
+/// same-uid SSRF lever — a same-user client could otherwise point the Daemon at an
+/// arbitrary unix socket. Returns `Err(reason)` describing the first failing check.
+///
+/// On Unix the path must be ABSOLUTE, must EXIST, must be a SOCKET, and (best-effort)
+/// must be owned by the SAME uid as this Daemon — the shape `local_agent_socket()`
+/// resolution on the GUI side actually produces. On Windows a local ssh-agent is a
+/// named pipe (`\\.\pipe\...`) with no filesystem object to stat, so only the
+/// non-empty/absolute-prefix shape is checked; the owner-only DACL on the agent's own
+/// pipe and same-user execution are the gate there, matching `DaemonListener`.
+fn validate_local_agent_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("empty path".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+        let p = Path::new(path);
+        if !p.is_absolute() {
+            return Err(format!("not an absolute path: {path}"));
+        }
+        let meta = std::fs::symlink_metadata(p)
+            .map_err(|err| format!("cannot stat {path}: {err}"))?;
+        if !meta.file_type().is_socket() {
+            return Err(format!("not a unix socket: {path}"));
+        }
+        // Same-uid ownership: the agent socket must belong to the user the Daemon
+        // runs as. A socket owned by a different uid is never the user's own agent.
+        let our_uid = unsafe { libc::getuid() };
+        if meta.uid() != our_uid {
+            return Err(format!(
+                "socket {path} owned by uid {} != daemon uid {our_uid}",
+                meta.uid()
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        // A Windows ssh-agent path is a named pipe; require the `\\.\pipe\` prefix
+        // (the only shape `connect_external` dials on Windows) and nothing more — the
+        // pipe's own owner-only DACL is the gate.
+        let looks_like_pipe = path.starts_with(r"\\.\pipe\") || path.starts_with(r"\\?\pipe\");
+        if !looks_like_pipe {
+            return Err(format!("not a named-pipe path: {path}"));
+        }
+        Ok(())
     }
 }
 
@@ -4329,24 +4542,56 @@ fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>
 
                 match rx.recv_timeout(timeout) {
                     Ok(Ok(event)) => {
-                        // Map each changed path back to the worktree(s) whose tree
-                        // contains it and arm a debounced rescan for each. A linked
-                        // worktree's external git dir
-                        // (`mainrepo/.git/worktrees/<name>`) also sits under the main
-                        // worktree's recursive workdir watch, so a commit there
-                        // matches BOTH the main and the linked worktree. `find`
-                        // (first-match in randomized HashMap order) could pick the
-                        // main worktree, whose `status()` is unchanged → no
-                        // broadcast, leaving the linked worktree's History/Changes
-                        // stale. Arm EVERY match instead; over-arming the main
-                        // worktree is harmless — an unchanged `status()` produces no
-                        // broadcast.
-                        for path in &event.paths {
-                            for (id, w) in watched.iter() {
-                                if w.contains(path) {
-                                    pending
-                                        .entry(*id)
-                                        .or_insert_with(|| Instant::now() + DIRTY_DEBOUNCE);
+                        // DW2: an inotify overflow (or any backend "events were
+                        // dropped" notice) surfaces as a `Rescan` flag, not a path
+                        // event. When it fires the events received so far can no
+                        // longer be trusted to represent the tree AND the kernel may
+                        // have torn the watch descriptor down, so reacting to the
+                        // (empty) path list would silently leave every worktree stale
+                        // with a dead watch. Force a full re-arm of every watch and an
+                        // immediate rescan of every watched worktree so state
+                        // re-syncs from the filesystem rather than staying dead.
+                        if event.need_rescan() {
+                            eprintln!(
+                                "hitch-daemon: fs watch overflow/rescan signaled; re-arming watches and rescanning all worktrees"
+                            );
+                            reconcile_dirty_watches(&state, &mut watcher, &mut watched, &mut last);
+                            pending.retain(|id, _| watched.contains_key(id));
+                            last_scan.retain(|id, _| watched.contains_key(id));
+                            next_reconcile = Instant::now() + DIRTY_RECONCILE;
+                            // Schedule an immediate rescan of every (re-armed) worktree
+                            // so a change the overflow swallowed is still detected.
+                            let due_now = Instant::now();
+                            for id in watched.keys() {
+                                pending.insert(*id, due_now);
+                            }
+                        } else {
+                            // Map each changed path back to the worktree(s) whose tree
+                            // contains it and arm a debounced rescan for each. A linked
+                            // worktree's external git dir
+                            // (`mainrepo/.git/worktrees/<name>`) also sits under the main
+                            // worktree's recursive workdir watch, so a commit there
+                            // matches BOTH the main and the linked worktree. `find`
+                            // (first-match in randomized HashMap order) could pick the
+                            // main worktree, whose `status()` is unchanged → no
+                            // broadcast, leaving the linked worktree's History/Changes
+                            // stale. Arm EVERY match instead; over-arming the main
+                            // worktree is harmless — an unchanged `status()` produces no
+                            // broadcast.
+                            //
+                            // DW3: the debounce is SLIDING — reset the timer to
+                            // `now + DIRTY_DEBOUNCE` on every event (plain `insert`, not
+                            // `or_insert`), so a worktree is rescanned only after the
+                            // tree goes quiet for the full window. The old `or_insert`
+                            // pinned the deadline to the FIRST event of a burst, firing
+                            // mid-save (write temp → rename → chmod) and missing the
+                            // settled state the doc promises ("fires after the LAST
+                            // event").
+                            for path in &event.paths {
+                                for (id, w) in watched.iter() {
+                                    if w.contains(path) {
+                                        pending.insert(*id, Instant::now() + DIRTY_DEBOUNCE);
+                                    }
                                 }
                             }
                         }
@@ -4423,6 +4668,16 @@ fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>
 struct DirtyWatch {
     workdir: PathBuf,
     git_dir: Option<PathBuf>,
+    /// DW4: the workdir/git_dir canonicalized ONCE at arm time (when the roots
+    /// still exist). `contains` matches an event path against these instead of
+    /// canonicalizing the roots on every event — a deletion event carries a path
+    /// that has already vanished, so canonicalizing the *event* path fails and the
+    /// raw path may be under a symlinked root (e.g. a `managed_root` reached via a
+    /// symlink, or macOS `/var → /private/var`); pre-resolving the stable roots
+    /// here lets the raw, un-canonicalizable event path still match. `None` if the
+    /// root could not be canonicalized at arm time (it falls back to the raw root).
+    workdir_canonical: Option<PathBuf>,
+    git_dir_canonical: Option<PathBuf>,
 }
 
 impl DirtyWatch {
@@ -4434,24 +4689,48 @@ impl DirtyWatch {
     /// on macOS a watch root reported as `/private/var/...` and an event path of
     /// `/var/...` (or vice versa via the `/var → /private/var` symlink, also
     /// `/tmp → /private/tmp` and `/var/folders`) name the same file but fail a raw
-    /// prefix test. Canonicalizing both sides makes the test symlink-stable —
-    /// reusing the same boundary handling as `hitch-git`'s pathspec relativizer.
+    /// prefix test.
+    ///
+    /// DW4: the roots are canonicalized ONCE at arm time (`*_canonical`), NOT here
+    /// per event. A deletion event's path no longer exists, so `canonicalize(path)`
+    /// fails for it — the old code then `return false`d and missed the deletion when
+    /// `managed_root` was reached via a symlink. Now the (possibly un-canonicalizable)
+    /// raw event path is tested against BOTH the raw roots and the pre-resolved
+    /// canonical roots, and only the still-existing event path is additionally
+    /// canonicalized as a last resort. A vanished path under a symlinked root still
+    /// matches via the raw-path-vs-canonical-root test.
     fn contains(&self, path: &Path) -> bool {
+        // Raw path against raw roots (common case) and against the pre-resolved
+        // canonical roots (catches a raw event path under a symlinked root, even
+        // when the path has since vanished and cannot be canonicalized itself).
         if path.starts_with(&self.workdir)
             || self.git_dir.as_ref().is_some_and(|g| path.starts_with(g))
+            || self
+                .workdir_canonical
+                .as_ref()
+                .is_some_and(|root| path.starts_with(root))
+            || self
+                .git_dir_canonical
+                .as_ref()
+                .is_some_and(|root| path.starts_with(root))
         {
             return true;
         }
+        // Last resort: the event path still exists but is itself symlinked the
+        // other way (event `/var/...`, root `/private/var/...`). Canonicalize the
+        // event path and test against the pre-resolved canonical roots. A vanished
+        // path that reaches here was already handled above, so a canonicalize
+        // failure now is a genuine miss, not the DW4 deletion bug.
         let Ok(real_path) = fs::canonicalize(path) else {
             return false;
         };
-        if fs::canonicalize(&self.workdir).is_ok_and(|root| real_path.starts_with(root)) {
-            return true;
-        }
-        self.git_dir
+        self.workdir_canonical
             .as_ref()
-            .and_then(|g| fs::canonicalize(g).ok())
             .is_some_and(|root| real_path.starts_with(root))
+            || self
+                .git_dir_canonical
+                .as_ref()
+                .is_some_and(|root| real_path.starts_with(root))
     }
 }
 
@@ -4503,7 +4782,42 @@ fn reconcile_dirty_watches(
     // Arm new or moved worktrees.
     for (id, path) in &desired {
         if watched.get(id).map(|w| &w.workdir) == Some(path) {
-            continue;
+            // DW1: the watch is already armed at the desired path. The OS can
+            // silently drop a watch descriptor (an inotify watch on a dir that was
+            // removed-then-recreated, or a moved subtree) without a `Rescan`
+            // signal, after which events for this worktree stop arriving forever —
+            // exactly the case this reconcile tick is documented to recover. notify
+            // exposes no "is this watch still live?" query, so re-issue the watch:
+            // re-watching an already-live path is a cheap no-op in every backend,
+            // while re-watching after an OS drop RE-ESTABLISHES the descriptor.
+            // Re-arm both roots; on failure fall through to a full re-arm by clearing
+            // the entry so the new-or-moved path below re-runs the seed/rescan.
+            let needs_full_rearm = {
+                let w = watched.get(id).expect("checked present above");
+                let workdir_ok = watcher.watch(&w.workdir, RecursiveMode::Recursive).is_ok();
+                let git_ok = w
+                    .git_dir
+                    .as_ref()
+                    .map(|g| watcher.watch(g, RecursiveMode::Recursive).is_ok())
+                    .unwrap_or(true);
+                !(workdir_ok && git_ok)
+            };
+            if needs_full_rearm {
+                eprintln!(
+                    "hitch-daemon: re-arming dropped fs watch for {}",
+                    path.display()
+                );
+                if let Some(old) = watched.remove(id) {
+                    let _ = watcher.unwatch(&old.workdir);
+                    if let Some(git_dir) = &old.git_dir {
+                        let _ = watcher.unwatch(git_dir);
+                    }
+                }
+                last.remove(id);
+                // fall through to the arm path below.
+            } else {
+                continue;
+            }
         }
         if let Some(old) = watched.get(id) {
             let _ = watcher.unwatch(&old.workdir);
@@ -4511,6 +4825,13 @@ fn reconcile_dirty_watches(
                 let _ = watcher.unwatch(git_dir);
             }
         }
+        // DW5: capture the PRE-arm baseline the GUI last knew (if any) BEFORE the
+        // watch arms, so an immediate post-arm rescan below can tell whether the
+        // tree changed during the up-to-`DIRTY_RECONCILE` (2s) gap between the
+        // worktree being created and this tick arming its watch. Without it the
+        // baseline was seeded from the post-gap status and any change that landed
+        // in the gap was silently folded into the starting state (never broadcast).
+        let prior_baseline = last.get(id).cloned();
         match watcher.watch(path, RecursiveMode::Recursive) {
             Ok(()) => {
                 // A linked worktree's commits land only in its external git dir,
@@ -4533,11 +4854,20 @@ fn reconcile_dirty_watches(
                         continue;
                     }
                 }
+                // DW4: canonicalize the roots ONCE here, while they still exist, so
+                // `contains` can match a later (possibly vanished) deletion event's
+                // raw path against a pre-resolved root instead of canonicalizing the
+                // event path itself.
+                let workdir_canonical = fs::canonicalize(path).ok();
+                let git_dir_canonical =
+                    git_dir.as_ref().and_then(|g| fs::canonicalize(g).ok());
                 watched.insert(
                     *id,
                     DirtyWatch {
                         workdir: path.clone(),
                         git_dir,
+                        workdir_canonical,
+                        git_dir_canonical,
                     },
                 );
                 // Seed the baseline so the first event compares against the
@@ -4545,6 +4875,24 @@ fn reconcile_dirty_watches(
                 if let Ok(summary) =
                     GitRepository::discover(path).and_then(|repo| repo.status())
                 {
+                    // DW5: close the arming-gap hole. The watch is now live, but any
+                    // change between worktree creation and this arm produced no event
+                    // (nothing was watching yet) and would be swallowed by seeding the
+                    // baseline silently. Compare the freshly-scanned status against the
+                    // baseline the GUI last knew (`prior_baseline`): if it differs (a
+                    // change landed during the gap, or this is a brand-new worktree
+                    // that is already dirty), broadcast once so the GUI re-syncs, THEN
+                    // record it as the new baseline.
+                    if prior_baseline.as_ref() != Some(&summary) {
+                        let dirty = summary.dirty;
+                        let _ = broadcast_event(
+                            state,
+                            Event::WorktreeDirty {
+                                worktree_id: *id,
+                                dirty,
+                            },
+                        );
+                    }
                     last.insert(*id, summary);
                 }
             }
@@ -4824,13 +5172,31 @@ fn collect_output_quiet_edges(
 }
 
 fn read_control_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
+    // M1: bound the line read. `read_until` is otherwise unbounded — a peer that sends
+    // a huge run of bytes with no `\n` would make this buffer grow without limit and
+    // OOM the daemon. Wrap the reader in `.take(MAX_CONTROL_LINE_LEN + 1)` so it reads
+    // at most one byte past the cap, then reject a line that hit the cap. The proto
+    // `ControlLineDecoder::push` enforces the SAME cap on the decoded path; this is the
+    // matching guard for the daemon's raw `read_until` control-line path.
+    const MAX: usize = hitch_proto::framing::MAX_CONTROL_LINE_LEN;
     let mut line = Vec::new();
-    let len = reader.read_until(b'\n', &mut line)?;
+    // `+1` so a maximal valid line (MAX content bytes + the `\n` terminator) still
+    // fits, while anything larger stops at the bound WITHOUT a trailing `\n` and is
+    // rejected below instead of being silently truncated and parsed.
+    let len = reader.take(MAX as u64 + 1).read_until(b'\n', &mut line)?;
     if len == 0 {
         return Ok(None);
     }
     if line.last() == Some(&b'\n') {
         line.pop();
+    } else if line.len() >= MAX + 1 {
+        // Hit the bound with no terminating newline: the content is at least MAX+1
+        // bytes (or unterminated past the cap). Reject rather than process truncated.
+        // Matches `ControlLineDecoder::push`'s cap on an oversized partial line.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("control line exceeds max {MAX} bytes"),
+        ));
     }
     if line.is_empty() {
         return Ok(None);
@@ -6493,6 +6859,62 @@ fn write_control_to_sink(sink: &ClientSink, message: &ControlMessage) -> io::Res
     writer.flush()
 }
 
+/// Bounded write of one control message to a sink (M3). The relay's single accept
+/// thread sends `SshAgentOpen` to the driving GUI before spawning the channel pump;
+/// the control [`ClientSink`] writer has no write timeout (only the relay's git-side
+/// split-halves do), so a slow/hung GUI that stops draining its socket would block the
+/// accept thread inside `write_all` forever → NO new git child can be accepted
+/// anywhere, and the wedged write contends the shared `writer` mutex against PTY
+/// broadcast.
+///
+/// `DaemonStream` (the sink's writer) exposes no portable per-write timeout, so bound
+/// the write off-thread: run [`write_control_to_sink`] on a short-lived worker and wait
+/// at most `deadline` for it. On timeout the GUI is treated as wedged — mark its sink
+/// `disconnected` (mirroring how broadcast drops a sink on a write ERROR; a blocking
+/// write never errors, so the deadline is the only signal) and return an error so the
+/// caller drops this channel and KEEPS ACCEPTING. The detached worker may still be
+/// parked in `write_all`; that is acceptable — it holds only this dead sink's writer
+/// mutex and unblocks when the GUI's connection is eventually reaped, while the accept
+/// thread is freed immediately. A poisoned/zero-length send still returns promptly.
+fn write_control_to_sink_with_deadline(
+    sink: &Arc<ClientSink>,
+    message: &ControlMessage,
+    deadline: Duration,
+) -> io::Result<()> {
+    let (tx, rx) = mpsc::channel();
+    let worker_sink = Arc::clone(sink);
+    let worker_message = message.clone();
+    // Best-effort spawn: if the OS can't give us a thread, fall back to a direct
+    // (unbounded) write rather than dropping the channel — the original behavior.
+    if thread::Builder::new()
+        .name("ssh-agent-relay-open-write".to_string())
+        .spawn(move || {
+            let _ = tx.send(write_control_to_sink(&worker_sink, &worker_message));
+        })
+        .is_err()
+    {
+        return write_control_to_sink(sink, message);
+    }
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The GUI did not drain within the deadline: treat it as gone. Mark it
+            // disconnected so per-accept routing stops resolving git children to it;
+            // `unregister_client` will fully reap it when its control reader notices
+            // the dead connection. Return an error → the caller closes this channel.
+            sink.disconnected.store(true, Ordering::SeqCst);
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control-sink write to driving GUI exceeded deadline (slow/hung GUI)",
+            ))
+        }
+        // The worker's sender dropped without sending (panic): treat as a failed write.
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+            "control-sink write worker ended without a result",
+        )),
+    }
+}
+
 fn write_output_to_sink(sink: &ClientSink, session_id: SessionId, bytes: &[u8]) -> io::Result<()> {
     let event = ControlMessage::event(Event::SessionOutput {
         session_id,
@@ -6633,6 +7055,12 @@ fn ssh_agent_relay_root() -> PathBuf {
 /// live channel.
 static SSH_AGENT_RELAY_CHANNEL_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// M3: bound on the accept thread's `SshAgentOpen` write to the driving GUI's control
+/// sink. Mirrors the relay's git-side `RELAY_WRITE_TIMEOUT` (30s) so a slow GUI gets
+/// the same grace a slow git child does; past it the GUI is treated as wedged and the
+/// channel is dropped so the accept thread stays free to accept the next git child.
+const SSH_AGENT_OPEN_WRITE_DEADLINE: Duration = Duration::from_secs(30);
+
 /// One live git-child connection on the Daemon-stable relay socket. Bound to the
 /// GUI (`owner`) that was driving when this channel was accepted; the binding is
 /// frozen for the channel's lifetime so an in-flight signing stays routed to the
@@ -6692,6 +7120,14 @@ impl SshAgentRelay {
             .recursive(true)
             .mode(0o700)
             .create(&dir)?;
+        // L3: `DirBuilder(0o700)` only applies its mode when it CREATES the dir — a
+        // pre-existing looser `agent/` (e.g. an old 0o755 left by a prior version, or
+        // a dir created by `default_data_dir` machinery without a tight mode) keeps its
+        // wider permissions, which would defeat the 0o700 gate the relay socket relies
+        // on. Explicitly tighten it after ensuring it exists so a pre-existing dir is
+        // brought down to owner-only too.
+        #[cfg(unix)]
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         let socket_path = dir.join("relay.sock");
         let relay = Self::bind_at(socket_path, state)?;
         // Tighten the freshly-bound socket to owner-only. There is a tiny window
@@ -6897,10 +7333,22 @@ impl SshAgentRelay {
             // never get force_closed. If shutdown raced in, drop this writer
             // (force_close so the git child unblocks) and stop accepting.
             {
-                let mut channels = match self.channels.lock() {
-                    Ok(channels) => channels,
-                    Err(_) => break,
-                };
+                // L6: recover from a poisoned `channels` mutex instead of breaking.
+                // Breaking here killed the accept loop while `SSH_AUTH_SOCK` stayed
+                // injected into every terminal -> silent total relay failure (a git
+                // child connects, nothing accepts it, it hangs/fails with no signer).
+                // A poisoned lock just means some other channel-holder panicked; the
+                // map is still usable, so step over the poison and keep accepting.
+                let mut channels = self.channels.lock().unwrap_or_else(|poisoned| {
+                    // Warn once: a recurring poison would otherwise flood the log.
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        eprintln!(
+                            "hitch-daemon: ssh-agent relay channels mutex poisoned; recovering and continuing to accept"
+                        );
+                    });
+                    poisoned.into_inner()
+                });
                 if self.shutdown.load(Ordering::SeqCst) {
                     drop(channels);
                     let _ = writer.force_close();
@@ -6913,16 +7361,49 @@ impl SshAgentRelay {
                         owner,
                     },
                 );
+                // L8: close the accept-vs-disconnect TOCTOU. The owner's liveness was
+                // checked (`!disconnected`) when `routed` was resolved, but the owner
+                // GUI can disconnect in the gap before this insert. `unregister_client`
+                // sets `sink.disconnected = true` and THEN calls
+                // `close_channels_for_client`, which sweeps the owner's channels — but
+                // if that sweep ran BEFORE this insert it never saw this channel, which
+                // would then be orphaned (the git child / pump thread waiting forever
+                // for a reply from a GUI that is gone). Re-check `disconnected` AFTER
+                // the insert, still under the `channels` lock so it serializes against
+                // any concurrent sweep: if it is now set, the sweep either already ran
+                // (and missed us) or will run; either way we remove+force_close this
+                // channel ourselves so the git child gets EOF and the pump never
+                // spawns. If `disconnected` is still clear here, a sweep that fires
+                // later is guaranteed to observe this inserted channel and reap it.
+                if sink.disconnected.load(Ordering::SeqCst) {
+                    if let Some(chan) = channels.remove(&channel) {
+                        let _ = chan.writer.force_close();
+                    }
+                    drop(channels);
+                    if ssh_agent_debug_enabled() {
+                        eprintln!(
+                            "hitch-daemon: ssh-agent relay channel {channel} owner={owner} disconnected during accept; reaped (git EOF)"
+                        );
+                    }
+                    continue;
+                }
             }
 
             if ssh_agent_debug_enabled() {
                 eprintln!("hitch-daemon: ssh-agent relay channel {channel} opened (owner={owner})");
             }
-            if let Err(err) =
-                write_control_to_sink(&sink, &ControlMessage::SshAgentOpen { channel })
-            {
-                // The owner GUI connection is gone; tear this channel down and keep
-                // serving (the relay survives, only this channel dies).
+            // M3: bound the `SshAgentOpen` send so a slow/hung driving GUI cannot block
+            // the single accept thread (which would stall accepting EVERY later git
+            // child). On timeout the helper marks the GUI disconnected and errors; we
+            // tear this channel down and keep accepting — same handling as a hard write
+            // error, just now reachable for a wedged (never-erroring) GUI too.
+            if let Err(err) = write_control_to_sink_with_deadline(
+                &sink,
+                &ControlMessage::SshAgentOpen { channel },
+                SSH_AGENT_OPEN_WRITE_DEADLINE,
+            ) {
+                // The owner GUI connection is gone (or too slow); tear this channel
+                // down and keep serving (the relay survives, only this channel dies).
                 if ssh_agent_debug_enabled() {
                     eprintln!(
                         "hitch-daemon: ssh-agent relay channel {channel} open send failed: {err}"
@@ -6932,9 +7413,15 @@ impl SshAgentRelay {
                 continue;
             }
 
-            // The pump captures the owner sink resolved at accept time, so the
-            // channel stays bound to the GUI it started on even if `driving_client`
-            // later changes.
+            // L7: the channel is PINNED to the driver resolved at accept time, not
+            // re-read from the global `driving_client` per frame. The pin has two
+            // halves and both are frozen here: outbound (git -> GUI) frames go to the
+            // `sink` captured below; inbound (GUI -> git) frames are accepted only
+            // from `owner` (stored on the `RelayChannel`, enforced by
+            // `write_to_channel_for`/`close_channel_for`). So with 2+ relay GUIs and
+            // focus flapping `driving_client` between them, an in-flight signing stays
+            // routed to the machine it started on — a later focus flip cannot re-bind
+            // this channel to a different GUI.
             let pump_relay = Arc::clone(&self);
             let pump_sink = Arc::clone(&sink);
             if let Err(err) = thread::Builder::new()
@@ -7136,17 +7623,82 @@ impl SshAgentRelay {
         }
     }
 
+    /// L1: owner-checked entry point for an inbound `SshAgentData` frame. Routes the
+    /// GUI reply chunk to the channel's git-side stream ONLY if `client_id` is the
+    /// channel's bound owner. A frame from a non-owner client (a same-user connection
+    /// guessing/replaying a channel id) is dropped and logged (debug), never written —
+    /// so one session cannot inject signing bytes into another's in-flight git child.
+    fn write_to_channel_for(&self, client_id: u64, channel: u64, bytes: &[u8]) {
+        let writer = self.channels.lock().ok().and_then(|channels| {
+            channels.get(&channel).and_then(|chan| {
+                if chan.owner == client_id {
+                    Some(Arc::clone(&chan.writer))
+                } else {
+                    if ssh_agent_debug_enabled() {
+                        eprintln!(
+                            "hitch-daemon: ssh-agent relay dropping SshAgentData for channel {channel} from non-owner client {client_id} (owner={})",
+                            chan.owner
+                        );
+                    }
+                    None
+                }
+            })
+        });
+        self.write_writer(channel, writer, bytes);
+    }
+
+    /// L1: owner-checked entry point for an inbound `SshAgentClose` frame. Tears the
+    /// channel down ONLY if `client_id` is its bound owner; a close from any other
+    /// same-user client is dropped (debug-logged) so it cannot kill another session's
+    /// signing.
+    fn close_channel_for(&self, client_id: u64, channel: u64) {
+        let owned = matches!(
+            self.channels
+                .lock()
+                .ok()
+                .and_then(|channels| channels.get(&channel).map(|chan| chan.owner)),
+            Some(owner) if owner == client_id
+        );
+        if owned {
+            self.close_channel(channel);
+        } else if ssh_agent_debug_enabled() {
+            eprintln!(
+                "hitch-daemon: ssh-agent relay dropping SshAgentClose for channel {channel} from non-owner client {client_id}"
+            );
+        }
+    }
+
     /// Write a GUI reply chunk (`GUI -> daemon -> git`) to the channel's git-side
     /// stream. A frame for an unknown/closed channel is a harmless no-op.
+    ///
+    /// NOTE: this entry point performs NO owner check — it is for internal callers
+    /// (none currently; inbound GUI frames go through the owner-checked
+    /// [`Self::write_to_channel_for`]). Kept for completeness / tests.
+    #[cfg(test)]
     fn write_to_channel(&self, channel: u64, bytes: &[u8]) {
         let writer = self
             .channels
             .lock()
             .ok()
             .and_then(|channels| channels.get(&channel).map(|chan| Arc::clone(&chan.writer)));
+        self.write_writer(channel, writer, bytes);
+    }
+
+    /// Shared body of the channel write: given the resolved write half (if any),
+    /// perform the bounded GUI->git write and close the channel on error.
+    fn write_writer(&self, channel: u64, writer: Option<Arc<RelayWriter>>, bytes: &[u8]) {
         if let Some(writer) = writer {
-            let mut sink_writer = &*writer;
-            if let Err(err) = sink_writer.write_all(bytes).and_then(|()| sink_writer.flush()) {
+            // M2: this write runs inline on the per-connection CONTROL-READER thread
+            // (the loop in `handle_client` that also services PTY input, Pings, and
+            // Requests). Use the bounded `write_with_deadline` rather than a plain
+            // `write_all`/`flush`: on Unix it surfaces the channel's `set_write_timeout`
+            // (a non-draining git child becomes `WouldBlock`/`TimedOut`), and on Windows
+            // — where named pipes have NO native write timeout — it arms a `CancelIoEx`
+            // watchdog. Without it a stuck/non-draining git child could block this
+            // thread indefinitely on Windows, freezing the GUI's whole control plane
+            // (now that the relay is cross-platform). On either platform a timeout is
+            // treated as "close this channel", exactly like a hard write error.
+            if let Err(err) = writer.write_with_deadline(bytes) {
                 if ssh_agent_debug_enabled() {
                     eprintln!(
                         "hitch-daemon: ssh-agent relay channel {channel} write to git failed: {err}"
@@ -7155,10 +7707,11 @@ impl SshAgentRelay {
                 // The git child is gone OR wedged: any write error — including a
                 // `WouldBlock`/`TimedOut` from the relay write half's write timeout
                 // (a git child that stopped draining its socket; see
-                // `into_relay_channel`) — closes the channel. `close_channel`
-                // force_closes the write half so the pump's read half also unblocks
-                // and this connection's control plane is never stalled by one stuck
-                // child.
+                // `into_relay_channel`) or a Windows `CancelIoEx` cancellation —
+                // closes the channel. `close_channel` force_closes the write half so
+                // the pump's read half also unblocks and this connection's control
+                // plane is bounded — never stalled indefinitely by one stuck child on
+                // either platform.
                 self.close_channel(channel);
             } else if ssh_agent_debug_enabled() {
                 eprintln!(
@@ -7368,6 +7921,38 @@ mod tests {
             state: state.to_string(),
             draft: false,
         }
+    }
+
+    /// M1: `read_control_line` must reject an oversized newline-less line rather than
+    /// growing its buffer without bound (an OOM vector). A line within the cap (and a
+    /// maximal cap-length line terminated by `\n`) still parses; one past the cap with
+    /// no terminator errors. Mirrors `ControlLineDecoder::push`'s `ControlLineTooLarge`.
+    #[test]
+    fn read_control_line_rejects_oversized_line() {
+        use super::read_control_line;
+        use std::io::BufReader;
+
+        const MAX: usize = hitch_proto::framing::MAX_CONTROL_LINE_LEN;
+
+        // A normal line parses (newline stripped).
+        let mut ok = BufReader::new(&b"hello\n"[..]);
+        assert_eq!(read_control_line(&mut ok).unwrap(), Some(b"hello".to_vec()));
+
+        // A maximal valid line: exactly MAX content bytes + the `\n` terminator.
+        let mut maximal_buf = vec![b'x'; MAX];
+        maximal_buf.push(b'\n');
+        let mut maximal = BufReader::new(&maximal_buf[..]);
+        let line = read_control_line(&mut maximal)
+            .expect("a cap-length line with a terminator is accepted")
+            .expect("non-empty");
+        assert_eq!(line.len(), MAX, "the maximal line keeps all MAX content bytes");
+
+        // One byte past the cap with NO terminating newline: rejected, not truncated.
+        let flood = vec![b'x'; MAX + 1];
+        let mut oversized = BufReader::new(&flood[..]);
+        let err = read_control_line(&mut oversized)
+            .expect_err("an oversized newline-less line is rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -10205,6 +10790,8 @@ mod tests {
         let watch = super::DirtyWatch {
             workdir: linked.clone(),
             git_dir: Some(git_dir.clone()),
+            workdir_canonical: std::fs::canonicalize(&linked).ok(),
+            git_dir_canonical: std::fs::canonicalize(&git_dir).ok(),
         };
 
         let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
@@ -10295,13 +10882,20 @@ mod tests {
         let mut watched: HashMap<WorktreeId, DirtyWatch> = HashMap::new();
         watched.insert(
             main_id,
-            DirtyWatch { workdir: main_workdir.clone(), git_dir: None },
+            DirtyWatch {
+                workdir: main_workdir.clone(),
+                git_dir: None,
+                workdir_canonical: None,
+                git_dir_canonical: None,
+            },
         );
         watched.insert(
             linked_id,
             DirtyWatch {
                 workdir: linked_workdir,
                 git_dir: Some(linked_git_dir.clone()),
+                workdir_canonical: None,
+                git_dir_canonical: None,
             },
         );
 
@@ -10329,6 +10923,114 @@ mod tests {
         assert!(
             pending.contains_key(&main_id),
             "the main worktree also matches and is armed too (harmless over-arm)"
+        );
+    }
+
+    /// DW4 (deletion under a symlinked root): when a worktree's `managed_root` is
+    /// reached via a symlink, a deletion event carries a path under the SYMLINK
+    /// that no longer exists. The old `contains` canonicalized the EVENT path
+    /// (which fails for a vanished file) and `return false`d, so the deletion was
+    /// missed. The pre-resolved `*_canonical` roots, captured at arm time, let the
+    /// raw (un-canonicalizable) event path still map to the worktree.
+    #[cfg(unix)]
+    #[test]
+    fn deletion_under_symlinked_root_still_maps() {
+        use super::DirtyWatch;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("hitch-dw4-{nonce}"));
+        let real = base.join("real-root");
+        std::fs::create_dir_all(&real).unwrap();
+        // A symlink that points at the real worktree dir — the watch is armed via
+        // the symlink path, exactly as a `managed_root` reached through a symlink.
+        let link = base.join("link-root");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Arm time: canonicalize the (symlink) root once, while it exists.
+        let watch = DirtyWatch {
+            workdir: link.clone(),
+            git_dir: None,
+            workdir_canonical: std::fs::canonicalize(&link).ok(),
+            git_dir_canonical: None,
+        };
+
+        // A file existed and was deleted: the deletion event names it via the
+        // symlink path, and the file no longer exists so it cannot be canonicalized.
+        let deleted = link.join("gone.txt");
+        assert!(
+            !deleted.exists(),
+            "the deleted path must not exist (modeling a deletion event)"
+        );
+        assert!(
+            watch.contains(&deleted),
+            "a deletion event under a symlinked root must still map to the worktree \
+             (DW4: matched against the pre-resolved canonical root, not by \
+             canonicalizing the vanished event path)"
+        );
+
+        // A path under a DIFFERENT root must still NOT match (no false positives).
+        let other = base.join("elsewhere/file.txt");
+        assert!(
+            !watch.contains(&other),
+            "an unrelated path must not map to this worktree"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// DW3 (sliding debounce): the production mapping loop now resets the rescan
+    /// deadline to `now + DIRTY_DEBOUNCE` on EVERY matching event (`insert`, not
+    /// `or_insert`), so the rescan fires after the tree goes quiet — not a fixed
+    /// window from the FIRST event. This drives the exact reset and asserts the
+    /// second (later) event PUSHED the deadline out rather than leaving the first
+    /// one pinned.
+    #[cfg(unix)]
+    #[test]
+    fn debounce_window_slides_with_each_event() {
+        use super::{DirtyWatch, DIRTY_DEBOUNCE};
+        use hitch_core::WorktreeId;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::time::Instant;
+
+        let id = WorktreeId::new();
+        let workdir = PathBuf::from("/repo/wt");
+        let mut watched: HashMap<WorktreeId, DirtyWatch> = HashMap::new();
+        watched.insert(
+            id,
+            DirtyWatch {
+                workdir: workdir.clone(),
+                git_dir: None,
+                workdir_canonical: None,
+                git_dir_canonical: None,
+            },
+        );
+        let event_path = workdir.join("a.txt");
+
+        // The production sliding-debounce body: `insert` (reset), not `or_insert`.
+        let mut pending: HashMap<WorktreeId, Instant> = HashMap::new();
+        let arm = |pending: &mut HashMap<WorktreeId, Instant>| {
+            for (wid, w) in watched.iter() {
+                if w.contains(&event_path) {
+                    pending.insert(*wid, Instant::now() + DIRTY_DEBOUNCE);
+                }
+            }
+        };
+
+        arm(&mut pending);
+        let first = *pending.get(&id).unwrap();
+        // A later event must RESET the deadline strictly forward (the slide).
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        arm(&mut pending);
+        let second = *pending.get(&id).unwrap();
+        assert!(
+            second > first,
+            "a later event must slide the debounce deadline forward, not keep the \
+             first event's fixed window"
         );
     }
 
@@ -10669,6 +11371,109 @@ mod tests {
             relay_after.teardown();
             drop((relay_before, state));
             let _ = std::fs::remove_dir_all(&dir_root);
+        }
+
+        /// H1 (duplicate-bind race): N callers racing `ensure_relay_socket` on the one
+        /// fixed path must single-flight the bind. Afterward EXACTLY ONE relay socket
+        /// exists on disk, `DaemonState.relay` is `Some`, all callers resolved the same
+        /// address, and that address is a LIVE, EXISTING socket the stored relay still
+        /// points at — i.e. no store-race loser unlinked the winner's socket. Before the
+        /// fix, two callers both `bind`-ed the fixed path (the second unlinking the
+        /// first) and the loser's `teardown` deleted the survivor's socket, leaving
+        /// `DaemonState.relay` pointing at a non-existent path.
+        #[test]
+        fn concurrent_ensure_relay_socket_binds_exactly_once() {
+            use super::super::{ensure_relay_socket, ssh_agent_relay_root};
+
+            let _real_path = lock_real_relay_path();
+            let (state, dir_root) = test_state();
+            let gui = fake_gui();
+            insert_gui(&state, 1, &gui);
+            set_driving(&state, Some(1));
+
+            const N: usize = 8;
+            let barrier = Arc::new(std::sync::Barrier::new(N));
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    let state = Arc::clone(&state);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        // Release all threads at once to maximize the bind race.
+                        barrier.wait();
+                        ensure_relay_socket(&state)
+                    })
+                })
+                .collect();
+            let addresses: Vec<Option<String>> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+            // Every caller resolved the SAME non-None address.
+            let first = addresses[0].clone().expect("at least one caller binds");
+            for addr in &addresses {
+                assert_eq!(
+                    addr.as_ref(),
+                    Some(&first),
+                    "every concurrent caller resolves the one stable address"
+                );
+            }
+
+            // Exactly one relay is stored, and its socket address matches.
+            let stored = state.lock().unwrap().relay.lock().unwrap().clone();
+            let relay = stored.expect("DaemonState.relay is Some after the race");
+            assert_eq!(
+                hitch_proto::transport::endpoint_os_address(&relay.socket_path),
+                first,
+                "DaemonState.relay points at the resolved stable address"
+            );
+
+            // Exactly ONE socket file exists in the agent dir (Unix: the file is real;
+            // the stored relay still owns a LIVE, connectable endpoint).
+            #[cfg(unix)]
+            {
+                let entries: Vec<_> = std::fs::read_dir(ssh_agent_relay_root())
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().map(|x| x == "sock").unwrap_or(false))
+                    .collect();
+                assert_eq!(entries.len(), 1, "exactly one relay socket exists on disk");
+                assert!(
+                    relay.socket_path.exists(),
+                    "the stored relay's socket file still exists (no loser unlinked it)"
+                );
+            }
+            // The stored endpoint is live: a git child can connect to it.
+            let _git = connect_daemon(&relay.socket_path)
+                .expect("the stored relay address is a live, connectable socket");
+            #[cfg(not(unix))]
+            let _ = ssh_agent_relay_root();
+
+            relay.teardown();
+            drop(state);
+            let _ = std::fs::remove_dir_all(&dir_root);
+        }
+
+        /// H3 (restored terminals get the stable agent path): the env injected into a
+        /// restored terminal at startup carries `SSH_AUTH_SOCK` = the STABLE relay
+        /// socket path, computed from the fixed path and INDEPENDENT of whether the
+        /// relay is currently bound (restore runs before any client connects). git
+        /// connects to it lazily, by which point a GUI has bound the relay there.
+        #[test]
+        fn restore_pty_env_injects_the_stable_relay_path_without_a_bind() {
+            use super::super::{restore_pty_env, ssh_agent_relay_root};
+
+            let _real_path = lock_real_relay_path();
+
+            // No relay bound, no client connected — exactly the restore-at-startup
+            // situation. The env must STILL carry the stable path.
+            let env = restore_pty_env();
+            let expected = hitch_proto::transport::endpoint_os_address(
+                &ssh_agent_relay_root().join("relay.sock"),
+            );
+            assert_eq!(
+                env,
+                vec![("SSH_AUTH_SOCK".to_string(), expected)],
+                "a restored terminal gets SSH_AUTH_SOCK = the stable relay.sock path"
+            );
         }
 
         /// (a) ROUND-TRIP: a git child connects, the relay opens a channel routed to
@@ -11274,6 +12079,85 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir_root);
         }
 
+        /// L8 (accept-vs-disconnect TOCTOU): a git child connects while its owner GUI
+        /// is the driving client, and the owner is `unregister_client`ed concurrently
+        /// — the exact window where the accept loop has resolved+checked the owner but
+        /// not yet inserted (or has just inserted) the channel. The post-insert
+        /// `disconnected` re-check plus the disconnect-path sweep must, together,
+        /// guarantee NO orphan: after the dust settles the relay holds no channel
+        /// owned by the departed client, and the git child reads EOF (its pump/thread
+        /// never hangs). Run many iterations to land in the race window; each one
+        /// asserts the invariant regardless of which side won.
+        #[test]
+        fn accept_during_owner_disconnect_leaves_no_orphan_channel() {
+            use super::super::unregister_client;
+
+            for _ in 0..40 {
+                let (state, dir_root) = test_state();
+                let gui = fake_gui();
+                insert_gui(&state, 10, &gui);
+                set_driving(&state, Some(10));
+
+                let path = temp_sock("l8");
+                let relay = SshAgentRelay::bind_at(path.clone(), Arc::clone(&state)).unwrap();
+                *state.lock().unwrap().relay.lock().unwrap() = Some(Arc::clone(&relay));
+
+                // Race a git connect against the owner's disconnect. The connect drives
+                // the accept loop's resolve→insert→re-check; the unregister sets
+                // `disconnected` then sweeps. Either ordering must leave no orphan.
+                let connect_path = path.clone();
+                let connector =
+                    std::thread::spawn(move || connect_daemon(&connect_path).ok());
+                unregister_client(&state, 10);
+                let git = connector.join().unwrap();
+
+                // The owner is gone, so it must not be the driving client anymore
+                // (it was the only eligible GUI → None).
+                assert_eq!(
+                    state.lock().unwrap().driving_client,
+                    None,
+                    "the sole driver disconnecting clears driving_client"
+                );
+
+                // Give the accept loop a beat to run its post-insert re-check / the
+                // sweep to complete, then assert no channel survives for the gone
+                // owner.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    let orphan = relay
+                        .channels
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .any(|chan| chan.owner == 10);
+                    if !orphan || Instant::now() >= deadline {
+                        assert!(
+                            !orphan,
+                            "no channel owned by the disconnected client may survive"
+                        );
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+
+                // If git did connect, it must read EOF rather than hang forever waiting
+                // on a reply from the departed GUI.
+                if let Some(git) = git {
+                    let result = read_within(git, Duration::from_secs(5));
+                    assert!(
+                        is_git_eof(&result),
+                        "git child for the disconnected owner must read EOF, got {result:?}"
+                    );
+                }
+
+                relay.teardown();
+                #[cfg(unix)]
+                let _ = std::fs::remove_file(&path);
+                drop(state);
+                let _ = std::fs::remove_dir_all(&dir_root);
+            }
+        }
+
         /// (d) FAIL-FAST RESOLVE: `resolve_ssh_auth_sock` with NO relay-capable
         /// client (driving_client None) and no forwarded socket returns `None` (env
         /// inherited) and binds no relay.
@@ -11465,6 +12349,46 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir_root);
         }
 
+        /// L9 (don't re-point to a dying driver): a focus ping (`ClientActive` →
+        /// `refresh_driving_client`) for a relay-capable client whose sink is already
+        /// marked `disconnected` (mid-teardown) must NOT make it the driving client —
+        /// otherwise the relay would route the next git op to a connection that is
+        /// going away and only discover it when the op fails. The cheap, non-blocking
+        /// liveness re-check skips a disconnected sink even though it is relay-capable.
+        #[test]
+        fn refresh_driving_client_skips_disconnected_sink() {
+            use super::super::refresh_driving_client;
+
+            let (state, dir_root) = test_state();
+            let live = fake_gui_with(true);
+            let dying = fake_gui_with(true);
+            insert_gui(&state, 1, &live);
+            insert_gui(&state, 2, &dying);
+
+            // Establish a good driver first.
+            {
+                let mut guard = state.lock().unwrap();
+                refresh_driving_client(&mut guard, 1);
+            }
+            assert_eq!(state.lock().unwrap().driving_client, Some(1));
+
+            // The other relay-capable GUI is mid-teardown: its sink is flagged
+            // disconnected. A focus ping from it must NOT steal the drive.
+            dying.sink.disconnected.store(true, Ordering::SeqCst);
+            {
+                let mut guard = state.lock().unwrap();
+                refresh_driving_client(&mut guard, 2);
+            }
+            assert_eq!(
+                state.lock().unwrap().driving_client,
+                Some(1),
+                "a focus ping from a disconnected (mid-teardown) relay GUI must not re-point driving"
+            );
+
+            drop(state);
+            let _ = std::fs::remove_dir_all(&dir_root);
+        }
+
         /// A focus-gain ping (`ClientActive`) and a PTY-input (`SendSessionInput`)
         /// from a relay-capable client refresh `driving_client` to it; from a
         /// non-relay-capable client they do not. The `handle_client` `ClientActive`
@@ -11590,6 +12514,33 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir_root);
         }
 
+        /// H3 (PT1, co-located-local): on a purely-local Daemon (no relay bound) whose
+        /// connected local GUI announced its OWN ssh-agent via `ClientLocal`,
+        /// `relay_pty_env` must inject that local agent path so the Daemon's terminals
+        /// can still sign via the live-origin local agent — not return `[]`.
+        #[test]
+        fn relay_pty_env_injects_local_agent_when_no_relay_is_bound() {
+            use super::super::relay_pty_env;
+
+            let _real_path = lock_real_relay_path();
+            let (state, dir_root) = test_state();
+
+            // A local (non-relay-capable) GUI that announced a local agent path.
+            let local = fake_gui_with(false);
+            *local.sink.local_agent_sock.lock().unwrap() =
+                Some("/tmp/local-agent.sock".to_string());
+            insert_gui(&state, 1, &local);
+
+            assert_eq!(
+                relay_pty_env(&state),
+                vec![("SSH_AUTH_SOCK".to_string(), "/tmp/local-agent.sock".to_string())],
+                "a co-located-local Daemon injects the local agent path when no relay is bound"
+            );
+
+            drop(state);
+            let _ = std::fs::remove_dir_all(&dir_root);
+        }
+
         /// LIVE-ORIGIN RESOLVE (the button/job path, §5 oracle, proto v31): the resolve
         /// ladder follows the clicker. A remote relay clicker (relay-capable, driving)
         /// resolves to the stable relay socket; a local clicker (a `ClientLocal`
@@ -11652,6 +12603,226 @@ mod tests {
             if let Some(relay) = state.lock().unwrap().relay.lock().unwrap().take() {
                 relay.teardown();
             }
+            drop(state);
+            let _ = std::fs::remove_dir_all(&dir_root);
+        }
+
+        /// L1 (relay integrity): an inbound `SshAgentData`/`SshAgentClose` frame from a
+        /// client that does NOT own the channel must be dropped — never written to the
+        /// git child and never able to close it. Open a channel owned by client A, then:
+        ///   - a NON-owner `write_to_channel_for` must NOT reach git, while an OWNER
+        ///     `write_to_channel_for` does;
+        ///   - a NON-owner `close_channel_for` must NOT close the channel, while an
+        ///     OWNER `close_channel_for` does.
+        /// This stops a same-user client from injecting into / closing another session's
+        /// signing by guessing a channel id.
+        #[test]
+        fn inbound_frame_from_non_owner_is_rejected() {
+            let (state, dir_root) = test_state();
+            let owner = fake_gui(); // client 10 owns the channel
+            insert_gui(&state, 10, &owner);
+            set_driving(&state, Some(10));
+
+            let path = temp_sock("own");
+            let relay = SshAgentRelay::bind_at(path.clone(), Arc::clone(&state)).unwrap();
+
+            let mut git = connect_daemon(&path).unwrap();
+            let mut owner_reader = GuiReader::new(owner.gui_reader);
+            let channel = owner_reader.next_matching(|m| match m {
+                ControlMessage::SshAgentOpen { channel } => Some(*channel),
+                _ => None,
+            });
+
+            const NON_OWNER: u64 = 999;
+            const OWNER: u64 = 10;
+
+            // A non-owner write must be dropped: git sees NOTHING from it.
+            let attacker_bytes = [0xAAu8, 0xBB, 0xCC, 0xDD];
+            relay.write_to_channel_for(NON_OWNER, channel, &attacker_bytes);
+
+            // An owner write goes through; git reads exactly the owner's bytes (proving
+            // the non-owner bytes were never written ahead of them).
+            let owner_bytes = [1u8, 2, 3, 4, 5];
+            relay.write_to_channel_for(OWNER, channel, &owner_bytes);
+            let mut got = [0u8; 5];
+            git.read_exact(&mut got)
+                .expect("owner write reaches git");
+            assert_eq!(
+                got, owner_bytes,
+                "git must read the OWNER's bytes, never the dropped non-owner frame"
+            );
+
+            // A non-owner close must NOT close the channel.
+            relay.close_channel_for(NON_OWNER, channel);
+            assert!(
+                relay.channels.lock().unwrap().contains_key(&channel),
+                "a non-owner SshAgentClose must not close another session's channel"
+            );
+
+            // The owner close DOES close it (git reads EOF).
+            relay.close_channel_for(OWNER, channel);
+            let result = read_within(git, Duration::from_secs(5));
+            assert!(
+                is_git_eof(&result),
+                "the owner's SshAgentClose must close the channel (git EOF), got {result:?}"
+            );
+            assert!(
+                !relay.channels.lock().unwrap().contains_key(&channel),
+                "the owner close removed the channel"
+            );
+
+            relay.teardown();
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&path);
+            drop(state);
+            let _ = std::fs::remove_dir_all(&dir_root);
+        }
+
+        /// L2 (relay integrity): `validate_local_agent_path` rejects paths that the
+        /// co-located direct bridge must not `connect_external` to verbatim. Only a
+        /// real, absolute, same-uid SOCKET is accepted; a relative path, a missing
+        /// path, and a regular file are all rejected (same-uid SSRF guard).
+        #[cfg(unix)]
+        #[test]
+        fn validate_local_agent_path_rejects_bad_paths_and_accepts_a_real_socket() {
+            use super::super::validate_local_agent_path;
+
+            // Empty / relative / missing are rejected before any stat.
+            assert!(validate_local_agent_path("").is_err(), "empty rejected");
+            assert!(
+                validate_local_agent_path("relative/agent.sock").is_err(),
+                "relative path rejected"
+            );
+            assert!(
+                validate_local_agent_path("/no/such/hitch/agent-XYZ.sock").is_err(),
+                "missing path rejected"
+            );
+
+            // A regular FILE at an absolute path is rejected (exists but not a socket).
+            let dir = std::env::temp_dir().join(format!(
+                "hitch-l2-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let regular = dir.join("not-a-socket");
+            std::fs::write(&regular, b"x").unwrap();
+            assert!(
+                validate_local_agent_path(regular.to_str().unwrap()).is_err(),
+                "a regular file is not a socket -> rejected"
+            );
+
+            // A real bound socket owned by us IS accepted.
+            let sock = temp_sock("ok");
+            let _listener = DaemonListener::bind(&sock).unwrap();
+            assert!(
+                validate_local_agent_path(sock.to_str().unwrap()).is_ok(),
+                "a real, absolute, same-uid socket is accepted"
+            );
+
+            drop(_listener);
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&sock);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// L2 (relay integrity): a connection that ALSO announced `SshAgentRelay`
+        /// (relay-capable, a REMOTE link) must not be allowed to claim co-located
+        /// `ClientLocal` — the two are mutually exclusive trust modes. This asserts the
+        /// guard condition the `ClientLocal` handler uses: a relay-capable sink is
+        /// detected and would short-circuit the handler before recording any local
+        /// agent path.
+        #[test]
+        fn client_local_rejected_when_connection_is_already_relay_capable() {
+            let (state, _dir_root) = test_state();
+            // A relay-capable sink (it sent SshAgentRelay earlier on this connection).
+            let relay_gui = fake_gui_with(true);
+            insert_gui(&state, 1, &relay_gui);
+
+            // The exact predicate the handler evaluates before trusting a ClientLocal.
+            let already_relay_capable = state
+                .lock()
+                .unwrap()
+                .clients
+                .get(&1)
+                .unwrap()
+                .relay_capable
+                .load(Ordering::SeqCst);
+            assert!(
+                already_relay_capable,
+                "a relay-capable connection must be detected so ClientLocal is rejected (mutually exclusive)"
+            );
+            // The handler would `continue` here without ever setting local_agent_sock,
+            // so the sink must still have none.
+            assert!(
+                relay_gui.sink.local_agent_sock.lock().unwrap().is_none(),
+                "a rejected ClientLocal records no local_agent_sock"
+            );
+        }
+
+        /// L5 (lifecycle): `teardown` is idempotent and safe when the relay was never
+        /// effectively used — a second teardown is a no-op and does not panic, matching
+        /// the shutdown path which clones an `Option<Arc<SshAgentRelay>>` and tears down
+        /// only when bound. (The never-bound case is covered by the shutdown code
+        /// guarding on `Option::Some`; here we prove the teardown itself is repeatable.)
+        #[test]
+        fn teardown_is_idempotent() {
+            let (state, dir_root) = test_state();
+            let path = temp_sock("td");
+            let relay = SshAgentRelay::bind_at(path.clone(), Arc::clone(&state)).unwrap();
+
+            relay.teardown();
+            // A second teardown must not panic or double-unlink.
+            relay.teardown();
+
+            drop(state);
+            let _ = std::fs::remove_dir_all(&dir_root);
+        }
+
+        /// L6 (lifecycle): a poisoned `channels` mutex must NOT kill the accept loop.
+        /// Poison the mutex (a panic while holding it), then connect a git child: the
+        /// accept loop must recover from the poison, still register the channel, and
+        /// the GUI must still see the `SshAgentOpen`. Before the fix the loop did
+        /// `Err(_) => break`, silently dying while `SSH_AUTH_SOCK` stayed injected.
+        #[test]
+        fn accept_loop_recovers_from_poisoned_channels_mutex() {
+            let (state, dir_root) = test_state();
+            let gui = fake_gui();
+            insert_gui(&state, 1, &gui);
+            set_driving(&state, Some(1));
+
+            let path = temp_sock("psn");
+            let relay = SshAgentRelay::bind_at(path.clone(), Arc::clone(&state)).unwrap();
+
+            // Poison the channels mutex: panic while holding its lock.
+            let poison_relay = Arc::clone(&relay);
+            let _ = std::thread::spawn(move || {
+                let _guard = poison_relay.channels.lock().unwrap();
+                panic!("intentional poison");
+            })
+            .join();
+            assert!(
+                relay.channels.lock().is_err(),
+                "the channels mutex is now poisoned"
+            );
+
+            // The accept loop must still serve a new git child despite the poison.
+            let _git = connect_daemon(&path).unwrap();
+            let mut gui_reader = GuiReader::new(gui.gui_reader);
+            let channel = gui_reader.next_matching(|m| match m {
+                ControlMessage::SshAgentOpen { channel } => Some(*channel),
+                _ => None,
+            });
+            assert!(
+                channel >= 1,
+                "the accept loop recovered from the poison and opened a channel"
+            );
+
+            relay.teardown();
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&path);
             drop(state);
             let _ = std::fs::remove_dir_all(&dir_root);
         }

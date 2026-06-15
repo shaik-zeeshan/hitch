@@ -967,6 +967,109 @@ fn simulated_reboot_restores_persisted_session_layout_as_fresh_session() {
     let _ = std::fs::remove_dir_all(project_root);
 }
 
+/// L11 — regression for the split-brain restart window fixed by commit ce542a6
+/// (later refactored into the `DaemonFileGuard`/`_listener` form, finding L10).
+///
+/// ce542a6 summary: the accept thread used to OWN the `DaemonListener`, so the
+/// rendezvous socket file was unlinked by `DaemonListener::drop` the instant that
+/// thread exited — the FIRST step of shutdown — while the pidfile singleton lock
+/// stayed held through the job/session drain (the LAST step, seconds for a slow
+/// cancelled Job). A relaunch landing in that gap saw "socket absent", spawned a
+/// replacement, and the replacement hit the still-held lock ("another daemon
+/// already owns ...; refusing to start"). The fix holds the listener via an `Arc`
+/// in `run_daemon` so the socket file outlives the accept thread and disappears
+/// together with the lock at function return — the socket and the singleton gate
+/// are now released as one.
+///
+/// What this test pins: the SINGLETON GATE the fix protects. While daemon A is
+/// alive (serving on its socket), a second daemon B spawned at the SAME socket
+/// path must refuse to start (exit non-zero) and must NOT disturb A — A's socket
+/// stays present and connectable and keeps answering `Hello`. The lock is the sole
+/// authority; B can never circumvent it. Once A exits cleanly its socket vanishes
+/// (together with the lock, per the fix), and a fresh daemon C then starts on the
+/// same path. Without the gate (or with the pre-ce542a6 socket-vanishes-early
+/// behavior) B would either steal A's socket or be told to spawn against an absent
+/// socket and then collide with the held lock.
+///
+/// GAP: the timed shutdown-DRAIN window itself (relaunch arriving DURING A's
+/// job/session drain, observing socket-present + lock-held → "live but slow,
+/// wait") needs a deliberately slow cancelled Job to widen the window enough to
+/// race a subprocess into deterministically; reproducing that black-box without
+/// flakiness is impractical here. This covers the gate invariant the fix exists to
+/// keep — a second instance never wins the path from a live owner — which is the
+/// failure ce542a6's split-brain race ultimately produced.
+#[cfg(unix)]
+#[test]
+fn second_daemon_cannot_steal_socket_from_a_live_owner() {
+    let socket = test_socket_path("split-brain-gate");
+    let store = test_file_path("split-brain-store", "sqlite");
+    let managed_root = test_dir_path("split-brain-managed");
+
+    // Daemon A: the live owner.
+    let mut a = spawn_daemon(&socket, &store, &managed_root);
+    let mut client_a = TestClient::connect(&socket);
+    client_a.hello(1);
+
+    // Daemon B: a relaunch landing while A is alive. It must NOT take over — the
+    // pidfile singleton lock A holds is the gate. B exits promptly (non-zero) with
+    // its stderr captured so we can confirm it was the gate (not some other error)
+    // that stopped it.
+    let mut b = daemon_command(&socket, &store, &managed_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn second hitch-daemon");
+    let b_status = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = b.try_wait().expect("try_wait B") {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "second daemon must refuse and exit while the owner is alive, not block"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    };
+    assert!(
+        !b_status.success(),
+        "a second daemon at a live owner's socket path must exit non-zero (refused)"
+    );
+    let mut b_stderr = String::new();
+    if let Some(mut err) = b.stderr.take() {
+        let _ = err.read_to_string(&mut b_stderr);
+    }
+    assert!(
+        b_stderr.contains("already owns"),
+        "B must refuse via the singleton gate (\"already owns\"), got stderr: {b_stderr:?}"
+    );
+
+    // A is undisturbed: its socket is still present and still serves a fresh client.
+    assert!(socket.exists(), "the live owner's socket must survive B's attempt");
+    let mut client_a2 = TestClient::connect(&socket);
+    client_a2.hello(2);
+
+    // Shut A down: per the fix, the socket and the lock disappear together at exit.
+    client_a.shutdown(3);
+    wait_for_socket_gone(&socket, Duration::from_secs(5));
+    let _ = a.wait();
+
+    // Now the path is free: a fresh daemon C starts cleanly on it (the gate
+    // released, the socket gone).
+    let mut c = spawn_daemon(&socket, &store, &managed_root);
+    let mut client_c = TestClient::connect(&socket);
+    client_c.hello(4);
+    client_c.shutdown(5);
+    wait_for_socket_gone(&socket, Duration::from_secs(5));
+    let _ = c.wait();
+
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(store);
+    let _ = std::fs::remove_dir_all(managed_root);
+}
+
 #[cfg(unix)]
 #[test]
 fn graceful_quit_preserves_layout_for_next_launch() {
