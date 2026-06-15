@@ -2313,31 +2313,70 @@ impl CommandEnv<'_> {
                     self.ssh_auth_sock.map(|sock| sock.as_os_str()),
                     resolved.as_deref(),
                 );
+                // A repo-LOCAL `core.sshCommand` is run by git via `/bin/sh -c`
+                // on the daemon host: opening a repo means trusting its committed
+                // git config (ADR 0014's trust model). Surface it under debug so
+                // an operator can spot a repo-supplied command driving a remote
+                // op. Only probed when debug is on — no extra spawn otherwise.
+                if let Some(local) = local_core_ssh_command(git_program, cwd) {
+                    eprintln!(
+                        "hitch-git[debug]: repo-LOCAL core.sshCommand in effect for network op in {}: {local:?}",
+                        cwd.display(),
+                    );
+                }
             }
         }
     }
 }
 
 /// Resolve `GIT_SSH_COMMAND` for a network op so it stays non-interactive
-/// (BatchMode) WITHOUT overriding the user's chosen ssh. Honors, in order: an
-/// explicit `GIT_SSH_COMMAND` already in the env, `GIT_SSH` (left to git), the
-/// repo's `core.sshCommand`, then a platform default. `None` means "leave it
-/// unset" so git uses `GIT_SSH`/its own resolution. On Windows the default
-/// prefers the System32 OpenSSH because the bundled MSYS ssh can't talk to
-/// named-pipe agents (1Password's `\\.\pipe\…`).
+/// (BatchMode) WITHOUT overriding the user's chosen ssh. Honors git's real
+/// precedence — `GIT_SSH_COMMAND` > `core.sshCommand` > `GIT_SSH` — appending
+/// `-o BatchMode=yes` to whichever wins, then falling back to a platform
+/// default. `None` means "leave it unset" so git uses its own resolution. On
+/// Windows the default prefers the System32 OpenSSH because the bundled MSYS ssh
+/// can't talk to named-pipe agents (1Password's `\\.\pipe\…`).
 fn resolve_network_ssh_command(git_program: &Path, cwd: &Path) -> Option<OsString> {
     if let Some(existing) = non_empty_env("GIT_SSH_COMMAND") {
         return Some(with_batchmode(existing));
     }
-    // `GIT_SSH` names a bare helper binary, not a command line — appending ssh
-    // flags to it is invalid, so defer entirely to git's own handling.
-    if non_empty_env("GIT_SSH").is_some() {
-        return None;
-    }
+    // `core.sshCommand` BEFORE `GIT_SSH` — that is git's real precedence. The
+    // earlier ordering returned `None` whenever `GIT_SSH` was set, which dropped
+    // BatchMode even though git would have used `core.sshCommand` (which wins),
+    // letting a remote op hang on an ssh prompt no one can answer.
     if let Some(configured) = core_ssh_command(git_program, cwd) {
         return Some(with_batchmode(OsString::from(configured)));
     }
+    if let Some(git_ssh) = non_empty_env("GIT_SSH") {
+        // `GIT_SSH` names a bare helper binary, not a command line, and git
+        // doesn't let us pass it flags — so to keep the op non-interactive we
+        // promote it to a `GIT_SSH_COMMAND` (which wins over `GIT_SSH`) with
+        // BatchMode appended. That only works when it's a single binary token;
+        // if it already carries arguments (whitespace) it isn't a valid bare
+        // helper, so defer to git's own handling rather than mangle it.
+        if let Some(command) = git_ssh_as_command(&git_ssh) {
+            return Some(with_batchmode(command));
+        }
+        return None;
+    }
     Some(default_network_ssh_command())
+}
+
+/// Promote a bare `GIT_SSH` helper binary to a `GIT_SSH_COMMAND`-style command
+/// line so we can append `-o BatchMode=yes` (`GIT_SSH_COMMAND` wins over
+/// `GIT_SSH`). Only a single, whitespace-free token is a valid bare helper; a
+/// value carrying its own arguments isn't, so it returns `None` and the caller
+/// defers to git. The path is shell-quoted because `GIT_SSH_COMMAND` is run via
+/// `/bin/sh -c` and the binary path can contain spaces.
+fn git_ssh_as_command(git_ssh: &OsStr) -> Option<OsString> {
+    let text = git_ssh.to_str()?;
+    if text.split_whitespace().count() != 1 {
+        return None;
+    }
+    let mut command = OsString::from("\"");
+    command.push(git_ssh);
+    command.push("\"");
+    Some(command)
 }
 
 /// `std::env::var_os` filtered to a present, non-empty value.
@@ -2345,12 +2384,14 @@ fn non_empty_env(key: &str) -> Option<OsString> {
     std::env::var_os(key).filter(|value| !value.is_empty())
 }
 
-/// Append `-o BatchMode=yes` to an ssh command unless it already pins BatchMode,
-/// keeping the user's binary and flags intact.
+/// Append `-o BatchMode=yes` to an ssh command, keeping the user's binary and
+/// flags intact. We always append rather than try to detect an existing setting:
+/// OpenSSH honors the *first* occurrence of an option, so a user's own
+/// `BatchMode=…` earlier on the line still wins, and a trailing duplicate is
+/// harmless. (The previous substring test for `"batchmode"` produced a
+/// false-negative for unrelated paths like `~/.ssh/batchmode/config`, silently
+/// dropping the fail-fast flag.)
 fn with_batchmode(command: OsString) -> OsString {
-    if command.to_string_lossy().to_ascii_lowercase().contains("batchmode") {
-        return command;
-    }
     let mut augmented = command;
     augmented.push(" -o BatchMode=yes");
     augmented
@@ -2359,11 +2400,33 @@ fn with_batchmode(command: OsString) -> OsString {
 /// The repo/global `core.sshCommand`, if set. Read with a plain `git config`
 /// (not [`run_command`], to avoid recursion); failures/empties yield `None`.
 fn core_ssh_command(git_program: &Path, cwd: &Path) -> Option<String> {
-    let output = Command::new(git_program)
+    let mut command = Command::new(git_program);
+    command
         .current_dir(cwd)
-        .args(["config", "--get", "core.sshCommand"])
-        .output()
-        .ok()?;
+        .args(["config", "--get", "core.sshCommand"]);
+    // Runs per network op on the daemon; without this each one flashes a console
+    // window on Windows (matching every other git spawn in this file).
+    hitch_process::configure_windowless(&mut command);
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+/// The **repo-local** (`.git/config`) `core.sshCommand`, if set — used only for a
+/// HITCH_DEBUG warning that a repo-supplied ssh command is driving a remote op
+/// (it is run via `/bin/sh -c` on the daemon host; opening a repo trusts its
+/// config — ADR 0014). `--local` scopes the lookup to the repository so a benign
+/// `--global` value never trips the warning. `None` on any error/empty.
+fn local_core_ssh_command(git_program: &Path, cwd: &Path) -> Option<String> {
+    let mut command = Command::new(git_program);
+    command
+        .current_dir(cwd)
+        .args(["config", "--local", "--get", "core.sshCommand"]);
+    hitch_process::configure_windowless(&mut command);
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -2538,6 +2601,31 @@ fn drain_pipe_reader_bounded(reader: PipeReader, grace: Duration) -> std::io::Re
     reader.drain_bounded(grace).map(DrainOutcome::into_inner)
 }
 
+/// Redact `user:password@` credentials from a URL-shaped argument before it is
+/// echoed to the (on-disk) HITCH_DEBUG log. A clone/push URL like
+/// `https://user:token@host/repo` would otherwise persist the token in
+/// `daemon.log`. Non-URL args (and URLs without userinfo) pass through unchanged.
+/// Only the password half is masked, so `https://user@host` (no secret) is kept
+/// readable for diagnosis.
+fn redact_arg(arg: &str) -> Cow<'_, str> {
+    let Some((scheme, rest)) = arg.split_once("://") else {
+        return Cow::Borrowed(arg);
+    };
+    // Userinfo, if present, ends at the first `@` and must come before the path.
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let Some(at) = rest[..authority_end].find('@') else {
+        return Cow::Borrowed(arg);
+    };
+    let (userinfo, host) = rest.split_at(at);
+    match userinfo.split_once(':') {
+        Some((user, _password)) => {
+            Cow::Owned(format!("{scheme}://{user}:***REDACTED***{host}"))
+        }
+        // `user@host` with no password — nothing secret to mask.
+        None => Cow::Borrowed(arg),
+    }
+}
+
 fn command_failed(
     program: &Path,
     cwd: &Path,
@@ -2557,7 +2645,7 @@ fn command_failed(
             cwd.display(),
             program.to_string_lossy(),
             args.iter()
-                .map(|arg| arg.to_string_lossy())
+                .map(|arg| redact_arg(&arg.to_string_lossy()).into_owned())
                 .collect::<Vec<_>>()
                 .join(" "),
             code,
@@ -4801,5 +4889,110 @@ mod tests {
             .unwrap()
             .as_nanos();
         format!("{prefix}-{nanos}")
+    }
+
+    // Serializes the env-mutating ssh-resolver tests: they set/clear process-wide
+    // `GIT_SSH*` vars, which would race other tests in this module that resolve a
+    // network ssh command.
+    static SSH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn resolve_network_ssh_command_prefers_core_ssh_command_over_git_ssh() {
+        // Regression for the inverted precedence bug: git's real order is
+        // GIT_SSH_COMMAND > core.sshCommand > GIT_SSH. With BOTH core.sshCommand
+        // and GIT_SSH set, the resolver must honor core.sshCommand and append
+        // BatchMode — not return None and silently drop the fail-fast flag.
+        let _guard = SSH_ENV_LOCK.lock().unwrap();
+        let fixture = RepoFixture::new();
+        fixture.git(["config", "core.sshCommand", "ssh -o X"]);
+
+        std::env::remove_var("GIT_SSH_COMMAND");
+        std::env::set_var("GIT_SSH", "/path/to/helper");
+
+        let resolved = resolve_network_ssh_command(Path::new("git"), fixture.path());
+
+        std::env::remove_var("GIT_SSH");
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some(OsStr::new("ssh -o X -o BatchMode=yes")),
+            "core.sshCommand must win over GIT_SSH and still get BatchMode"
+        );
+    }
+
+    #[test]
+    fn resolve_network_ssh_command_promotes_bare_git_ssh_to_batchmode() {
+        // With no core.sshCommand, a single-binary GIT_SSH is promoted to a
+        // GIT_SSH_COMMAND (which wins over GIT_SSH) carrying BatchMode, instead of
+        // deferring and hanging on a prompt.
+        let _guard = SSH_ENV_LOCK.lock().unwrap();
+        let fixture = RepoFixture::new();
+
+        std::env::remove_var("GIT_SSH_COMMAND");
+        std::env::set_var("GIT_SSH", "/usr/bin/ssh");
+
+        let resolved = resolve_network_ssh_command(Path::new("git"), fixture.path());
+
+        std::env::remove_var("GIT_SSH");
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some(OsStr::new("\"/usr/bin/ssh\" -o BatchMode=yes")),
+            "a bare GIT_SSH binary should be promoted with BatchMode"
+        );
+    }
+
+    #[test]
+    fn resolve_network_ssh_command_defers_when_git_ssh_carries_args() {
+        // A GIT_SSH value with arguments isn't a valid bare helper, so we can't
+        // safely promote it — defer to git's own handling.
+        let _guard = SSH_ENV_LOCK.lock().unwrap();
+        let fixture = RepoFixture::new();
+
+        std::env::remove_var("GIT_SSH_COMMAND");
+        std::env::set_var("GIT_SSH", "ssh -p 2222");
+
+        let resolved = resolve_network_ssh_command(Path::new("git"), fixture.path());
+
+        std::env::remove_var("GIT_SSH");
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn with_batchmode_always_appends_even_for_batchmode_in_a_path() {
+        // The old substring check false-negatived on unrelated paths containing
+        // "batchmode"; we now always append (OpenSSH honors the first occurrence).
+        let augmented = with_batchmode(OsString::from("ssh -F ~/.ssh/batchmode/config"));
+        assert_eq!(
+            augmented,
+            OsString::from("ssh -F ~/.ssh/batchmode/config -o BatchMode=yes")
+        );
+    }
+
+    #[test]
+    fn redact_arg_masks_url_credentials() {
+        // A clone/push URL with userinfo must not leak its password into the log.
+        assert_eq!(
+            redact_arg("https://alice:ghp_secret@github.com/acme/repo.git"),
+            "https://alice:***REDACTED***@github.com/acme/repo.git"
+        );
+        // No password half — nothing secret, keep it readable.
+        assert_eq!(
+            redact_arg("https://alice@github.com/acme/repo.git"),
+            "https://alice@github.com/acme/repo.git"
+        );
+        // Plain URL without userinfo is unchanged.
+        assert_eq!(
+            redact_arg("https://github.com/acme/repo.git"),
+            "https://github.com/acme/repo.git"
+        );
+        // An `@` in the path (not the authority) must not be treated as userinfo.
+        assert_eq!(
+            redact_arg("https://github.com/acme/repo@v1.git"),
+            "https://github.com/acme/repo@v1.git"
+        );
+        // Non-URL args pass through untouched.
+        assert_eq!(redact_arg("push"), "push");
     }
 }
