@@ -1920,10 +1920,15 @@ fn reader_loop(
             // a relay channel). These arms are DEFENSIVE: log-and-ignore so the
             // exhaustive match compiles and a misbehaving local daemon can't crash
             // or stall the reader. The real driver is `ssh_pool::remote_reader_loop`.
+            //
+            // `ClientActive` (proto v30) is a GUI → daemon focus-gain ping: the GUI
+            // only ever SENDS it (on OS focus-gain) and never expects it back, so an
+            // inbound one is likewise an unexpected frame — log-and-ignore.
             ControlMessage::SshAgentRelay
             | ControlMessage::SshAgentOpen { .. }
             | ControlMessage::SshAgentData { .. }
-            | ControlMessage::SshAgentClose { .. } => {
+            | ControlMessage::SshAgentClose { .. }
+            | ControlMessage::ClientActive => {
                 debug_log_local(format_args!(
                     "local daemon sent an unexpected ssh-agent relay frame; ignoring"
                 ));
@@ -4722,6 +4727,15 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
                 api.prevent_close();
+            }
+            // OS focus-gain: this GUI is now the foreground app, so it should become
+            // the "driving client" for ssh-agent relay routing. Ping every connected
+            // relay-capable remote daemon with `ControlMessage::ClientActive` (proto
+            // v30, ADR 0014 amendment) so each refreshes its `driving_client` to this
+            // machine. Event-driven (only on focus-gain) and best-effort; focus LOSS
+            // is intentionally a no-op. No visible UI change.
+            if let WindowEvent::Focused(true) = event {
+                window.state::<ssh_pool::SshConnections>().notify_focused();
             }
         })
         .invoke_handler(tauri::generate_handler![
