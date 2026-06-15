@@ -16,7 +16,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": "app",
     "externalBin": ["binaries/hitch-daemon", "binaries/hitch-hook"],
     "publisher": "Hitch",
     "category": "DeveloperTool",
