@@ -22,7 +22,7 @@
   import Copy from "~icons/lucide/copy";
   import Trash2 from "~icons/lucide/trash-2";
   import toast from "svelte-french-toast";
-  import { autoErrorMessage } from "../composerToast";
+  import { autoErrorMessage, logAutoError } from "../composerToast";
   import { editorApp } from "../settings";
   import {
     agentActRollupByProject,
@@ -152,7 +152,7 @@
     try {
       await invoke("open_in_editor", { path, editor: get(editorApp).trim() });
     } catch (err) {
-      console.error("Open in editor failed:", err);
+      logAutoError("open in editor", err);
       toast.error(autoErrorMessage(err));
     }
   }

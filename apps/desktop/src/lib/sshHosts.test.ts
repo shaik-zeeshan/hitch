@@ -140,6 +140,36 @@ describe("removeSshHost", () => {
   });
 });
 
+describe("updateSshHost", () => {
+  it("flips forwardAgent on a saved host and persists it", async () => {
+    const { addSshHost, updateSshHost, sshHosts } = await freshModule();
+    addSshHost("prod"); // defaults forwardAgent: true
+    updateSshHost("ssh:prod", { forwardAgent: false });
+    expect(get(sshHosts)).toEqual([{ id: "ssh:prod", target: "prod", forwardAgent: false }]);
+    expect(JSON.parse(store.get(SSH_HOSTS_KEY)!)).toEqual([
+      { id: "ssh:prod", target: "prod", forwardAgent: false },
+    ]);
+  });
+
+  it("touches only the targeted host", async () => {
+    const { addSshHost, updateSshHost, sshHosts } = await freshModule();
+    addSshHost("alpha");
+    addSshHost("bravo");
+    updateSshHost("ssh:alpha", { forwardAgent: false });
+    expect(get(sshHosts)).toEqual([
+      { id: "ssh:alpha", target: "alpha", forwardAgent: false },
+      { id: "ssh:bravo", target: "bravo", forwardAgent: true },
+    ]);
+  });
+
+  it("is a no-op for an unknown id", async () => {
+    const { addSshHost, updateSshHost, sshHosts } = await freshModule();
+    addSshHost("prod");
+    updateSshHost("ssh:nope", { forwardAgent: false });
+    expect(get(sshHosts)).toEqual([{ id: "ssh:prod", target: "prod", forwardAgent: true }]);
+  });
+});
+
 describe("scope seeding", () => {
   it("mints an ssh-host scope per host with a neutral unreachable placeholder", async () => {
     const { sshHostScope, sshHostScopes } = await freshModule();

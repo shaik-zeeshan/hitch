@@ -41,13 +41,23 @@ export function autoToastContent(result: CommitAndPushResult): {
 // for the rail's error-toast wording — RightRail (commit/push/pull/fetch) and
 // ProjectTree (open-in-editor) call this directly. The full reason also sits under
 // the oxide button via the chain store, so the toast only needs the gist.
+//
+// This is a PURE formatter — no logging side-effect. The toast can only show the
+// first line capped at 80 chars; call sites that want the full multi-line reason
+// in the devtools console use `logAutoError(op, err)` below with an op-specific
+// label, so a non-git caller never logs a misleading "operation failed".
 export function autoErrorMessage(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
-  // The toast can only show the first line capped at 80 chars, but a failed
-  // git op carries the full reason (e.g. the complete push/pull stderr) in the
-  // message. Log it in full to the devtools console so the user can read the
-  // whole thing a toast can't fit.
-  console.error("hitch: operation failed —", msg, err);
   const first = msg.split("\n")[0].trim();
   return first.length > 80 ? first.slice(0, 77) + "…" : first;
+}
+
+// Log a failed operation in full to the devtools console with an op-specific
+// label, so the user can read the whole reason a capped toast can't fit. Pair it
+// with `autoErrorMessage(err)` at each call site (the toast gets the gist, the
+// console gets the detail). `op` is a short human label, e.g. "push" or
+// "remove worktree".
+export function logAutoError(op: string, err: unknown): void {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(`hitch: ${op} failed —`, msg, err);
 }

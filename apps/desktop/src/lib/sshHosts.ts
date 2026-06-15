@@ -124,6 +124,18 @@ export function addSshHost(
   return { ok: true, host };
 }
 
+// Update a saved SSH Host's mutable fields by id. The target (and the id derived
+// from it) are immutable — only `forwardAgent` may be flipped on a saved host, so
+// the user can opt a host in/out of ssh-agent forwarding without delete+re-add
+// (silly-ridge-27). The write goes through `sshHosts.update`, so the existing
+// `sshHosts.subscribe → syncSshHostsToPool` reconcile re-pushes the new toggle to
+// the Rust pool automatically.
+export function updateSshHost(id: DaemonScopeId, patch: { forwardAgent: boolean }): void {
+  sshHosts.update((hosts) =>
+    hosts.map((h) => (h.id === id ? { ...h, forwardAgent: patch.forwardAgent } : h)),
+  );
+}
+
 // Forget a saved SSH Host by id. Removing forgets ONLY the GUI-local entry; it
 // does not (and in this slice cannot) touch any remote Daemon or its Sessions
 // (ADR 0014). Issue #27's proxy disconnect hooks in here.

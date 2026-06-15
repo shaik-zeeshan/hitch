@@ -50,7 +50,7 @@
     viewDiff,
   } from "../daemon";
   import { discardAllConfirm, discardFileConfirm } from "../scopeCopy";
-  import { autoErrorMessage, autoToastContent } from "../composerToast";
+  import { autoErrorMessage, autoToastContent, logAutoError } from "../composerToast";
   import { worktreeToast } from "../appToast";
   import { currentDesktopPlatform, shortcutKeys, shortcutLabel } from "../desktopPlatform";
   import { cssEscape } from "../cssEscape";
@@ -533,6 +533,7 @@
       const result = await startCommitAndPush(worktreeId);
       t.success(autoToastContent(result), { id });
     } catch (err) {
+      logAutoError("commit & push", err);
       t.error(autoErrorMessage(err), { id });
     }
   }
@@ -549,6 +550,7 @@
       void loadPrStatus(worktreeId);
       t.success(`Pushed ↑${count}`, { id });
     } catch (err) {
+      logAutoError("push", err);
       t.error(autoErrorMessage(err), { id });
     }
   }
@@ -564,6 +566,7 @@
       void loadGitStatus(worktreeId).catch(() => {});
       t.success(`Pulled ↓${count}`, { id });
     } catch (err) {
+      logAutoError("pull", err);
       t.error(autoErrorMessage(err), { id });
     }
   }
@@ -579,6 +582,7 @@
       void loadPrStatus(worktreeId);
       t.success("Fetched", { id });
     } catch (err) {
+      logAutoError("fetch", err);
       t.error(autoErrorMessage(err), { id });
     }
   }

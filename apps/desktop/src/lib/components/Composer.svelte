@@ -33,7 +33,7 @@
     startCreatePr,
   } from "../daemon";
   import type { BranchSummary, CompositeStep } from "../types";
-  import { autoToastContent, autoErrorMessage } from "../composerToast";
+  import { autoToastContent, autoErrorMessage, logAutoError } from "../composerToast";
   import { worktreeToast } from "../appToast";
   import { commitOpen, createPrOpen } from "../overlays";
   import { currentDesktopPlatform, isShortcutModifier, shortcutKeys } from "../desktopPlatform";
@@ -91,6 +91,13 @@
 
   function close() {
     if (mode === "pr") {
+      // A parked PR failure is a daemon-owned chain (prChain/prFailed stay
+      // truthy until cleared). Closing the overlay alone leaves the card up, so
+      // mirror auto mode's dismiss and clear the composite chain too.
+      if (prFailed) {
+        const w = $gitWorktreeId;
+        if (w) clearCompositeChain(w);
+      }
       createPrOpen.set(false);
     } else {
       commitOpen.set(false);
@@ -447,6 +454,7 @@
       const result = await startCommitAndPush(worktreeId);
       t.success(autoToastContent(result), { id });
     } catch (err) {
+      logAutoError("commit & push", err);
       t.error(autoErrorMessage(err), { id });
     }
   }
