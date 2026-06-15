@@ -12,6 +12,8 @@ use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -474,9 +476,22 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     // every exit path clears filesystem rendezvous state. Windows local sockets
     // are named-pipe endpoints owned by the listener; there is no socket path or
     // pidfile to unlink.
+    //
+    // The guard OWNS a clone of the listener `Arc` so the socket file has exactly
+    // ONE unlinking owner. `DaemonListener::drop` is the sole place that
+    // `remove_file`s the socket; the guard does not unlink it separately. Field
+    // order is load-bearing: `_listener` is declared BEFORE `_pid_lock`, so on the
+    // guard's drop the listener `Arc` reference drops first — and if it is the last
+    // reference (the accept thread's clone already gone at shutdown), its
+    // `DaemonListener::drop` unlinks the socket — and only THEN does `_pid_lock`
+    // drop, releasing the singleton lock. Socket and lock disappear together with
+    // a single unlink, closing the prior double-unlink window where the listener's
+    // late drop could `remove_file` a relaunch's fresh socket after the lock was
+    // already released.
     let _daemon_files = DaemonFileGuard {
         #[cfg(unix)]
         socket_path: config.socket_path.clone(),
+        _listener: Arc::clone(&listener),
         _pid_lock: pid_lock,
     };
 
@@ -520,10 +535,15 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     // still poll (ADR 0012).
     let (accept_tx, accept_rx) = mpsc::channel::<DaemonStream>();
     let accept_shutdown = Arc::clone(&shutdown);
-    // Clone the listener into the accept thread; `run_daemon` keeps the original
-    // reference alive through the shutdown drain so the socket file outlives this
-    // thread (see the `Arc::new(DaemonListener::bind(...))` rationale above).
+    // Clone the listener into the accept thread; the `DaemonFileGuard` (`_listener`
+    // field) keeps the canonical reference alive through the shutdown drain so the
+    // socket file outlives this thread, and is the single owner that unlinks it
+    // (see the `DaemonFileGuard` construction comment above). Drop the local
+    // `listener` once both the guard and the accept thread hold their clones, so the
+    // guard's reference is the LAST one at shutdown — making the guard's drop the
+    // sole `DaemonListener::drop` that unlinks, while the pidfile lock is held.
     let accept_listener = Arc::clone(&listener);
+    drop(listener);
     let accept_thread = thread::Builder::new()
         .name("hitch-accept".to_string())
         .spawn(move || {
@@ -608,15 +628,14 @@ fn run_daemon(config: DaemonConfig) -> io::Result<()> {
     cancel_active_jobs(&state);
     wait_for_jobs_to_finish(&state);
     kill_all_sessions(&state);
-    // `listener` (the `Arc<DaemonListener>` original) is intentionally still alive
-    // here: it has kept the socket file present through the drain above so the
-    // socket and the pidfile lock disappear together, not seconds apart. Let it
-    // drop by scope exit, NOT an explicit `drop()` — `_daemon_files` is declared
-    // after `listener`, so on return the guard drops first (releasing the lock and
-    // unlinking the pidfile + socket) and this `listener` reference drops second,
-    // its `DaemonListener::drop` re-unlinking the already-gone socket as a no-op.
-    // An explicit `drop(listener)` here would instead remove the socket just before
-    // the guard releases the lock, reopening the very window this fix closes.
+    // The accept thread (joined above) has dropped its listener `Arc` clone, so the
+    // ONLY remaining reference is the one inside `_daemon_files` (`_listener`). It
+    // has kept the socket file present through the drain above so the socket and the
+    // pidfile lock disappear together, not seconds apart. On return `_daemon_files`
+    // drops: its `_listener` field (declared before `_pid_lock`) drops first, and
+    // being the last reference its `DaemonListener::drop` unlinks the socket exactly
+    // once — then `_pid_lock` releases the singleton lock. One owner, one unlink,
+    // while the lock is held: the double-unlink window is closed.
     Ok(())
 }
 
@@ -657,6 +676,12 @@ fn wake_accept_thread(socket_path: &Path) {
 struct DaemonFileGuard {
     #[cfg(unix)]
     socket_path: PathBuf,
+    // The listener `Arc`. This guard is the single owner responsible for unlinking
+    // the socket file: it is unlinked exactly once, by `DaemonListener::drop` when
+    // this (last) `Arc` reference drops, while the pidfile lock below is still held.
+    // Declared BEFORE `_pid_lock` so it drops first (see the construction comment in
+    // `run_daemon`). Never read — only its lifetime matters.
+    _listener: Arc<DaemonListener>,
     // Held open for the daemon's whole lifetime so the advisory pidfile lock stays
     // taken; dropping it (clean exit or unwind) releases the lock, and the OS
     // releases it on an unclean kill too. Never read — only its lifetime matters.
@@ -665,11 +690,13 @@ struct DaemonFileGuard {
 
 impl Drop for DaemonFileGuard {
     fn drop(&mut self) {
+        // Only the pidfile is removed here; the socket is unlinked by
+        // `DaemonListener::drop` as this guard's `_listener` field drops (a single
+        // owner), so it is never double-unlinked. This Drop body runs before the
+        // fields drop, so the pidfile is removed while the listener (and thus the
+        // socket) is still present — fine, the pidfile and socket are independent.
         #[cfg(unix)]
-        {
-            let _ = fs::remove_file(hitch_proto::transport::pidfile_path(&self.socket_path));
-            let _ = fs::remove_file(&self.socket_path);
-        }
+        let _ = fs::remove_file(hitch_proto::transport::pidfile_path(&self.socket_path));
     }
 }
 
@@ -1060,6 +1087,17 @@ struct ClientSink {
     /// the `Arc<ClientSink>`. The relay is an AF_UNIX socket on Unix and an
     /// owner-only named pipe on Windows.
     ssh_agent: Mutex<Option<Arc<SshAgentRelay>>>,
+    /// Set true (under the state lock) by [`unregister_client`] the instant this
+    /// sink is removed from `clients`. Closes the relay-leak TOCTOU (ADR 0014):
+    /// [`ensure_relay_socket`] binds with the state lock dropped, so a rung-3
+    /// background op can bind a relay for a connection that disconnected in the
+    /// window. After binding, `ensure_relay_socket` checks this flag and tears the
+    /// orphaned relay down instead of storing it on a sink no longer in `clients`
+    /// (which nothing would ever teardown). An `AtomicBool` rather than re-taking
+    /// the state lock — `unregister_client` locks state→ssh_agent, so re-taking
+    /// state while holding ssh_agent here would invert that order and risk
+    /// deadlock.
+    disconnected: AtomicBool,
 }
 
 fn restore_layout(
@@ -1149,6 +1187,7 @@ fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &DaemonStream) -> io
             ssh_auth_sock: Mutex::new(None),
             relay_capable: AtomicBool::new(false),
             ssh_agent: Mutex::new(None),
+            disconnected: AtomicBool::new(false),
         }),
     );
     Ok(client_id)
@@ -1170,6 +1209,13 @@ fn unregister_client(state: &Arc<Mutex<DaemonState>>, client_id: u64) {
     // teardown — a throwaway self-connect that must not deadlock the accept thread
     // — runs AFTER the lock is released.
     let relay = if let Ok(mut state) = state.lock() {
+        // Mark the sink disconnected under the state lock BEFORE removing it, so a
+        // rung-3 `ensure_relay_socket(other)` that bound a relay for this departing
+        // connection (with the lock dropped) observes it and tears its orphan down
+        // instead of storing it on a sink that is no longer in `clients` (TOCTOU).
+        if let Some(sink) = state.clients.get(&client_id) {
+            sink.disconnected.store(true, Ordering::SeqCst);
+        }
         let relay = state
             .clients
             .get(&client_id)
@@ -3834,6 +3880,15 @@ fn ensure_relay_socket(state: &Arc<Mutex<DaemonState>>, client_id: u64) -> Optio
     }
     match SshAgentRelay::bind(client_id, Arc::clone(&sink)) {
         Ok(relay) => {
+            // TOCTOU guard (ADR 0014): the sink may have been removed from
+            // `clients` by a concurrent `unregister_client` while we bound with the
+            // state lock dropped. If so, nothing tracks this sink anymore, so the
+            // relay (accept thread + socket file) would leak forever. Tear it down
+            // and report no socket rather than store it on the orphan.
+            if sink.disconnected.load(Ordering::SeqCst) {
+                relay.teardown();
+                return None;
+            }
             let path = hitch_proto::transport::endpoint_os_address(&relay.socket_path);
             *slot = Some(relay);
             Some(path)
@@ -3982,6 +4037,45 @@ const DIRTY_RECONCILE: Duration = Duration::from_secs(2);
 /// and more files change — the case the old boolean-only poll missed and the
 /// frontend's own per-second `git-status` poll existed to cover. The frontend
 /// drops that poll and re-fetches on this event instead.
+/// How often the degraded fallback poller rescans every worktree when the fs
+/// watcher backend could not be constructed (see [`dirty_poll_fallback`]). Slower
+/// than the watcher path's debounce on purpose — this is the safety net, not the
+/// hot path — but still keeps the GUI's Changes/dirty view eventually consistent.
+const DIRTY_FALLBACK_POLL: Duration = Duration::from_secs(2);
+
+/// Degraded dirty detection when the fs watcher backend cannot be created. Polls
+/// every live worktree's `status()` on a fixed cadence and broadcasts
+/// `WorktreeDirty` on a content change, mirroring the watcher path's
+/// change-detection (full [`StatusSummary`] compare) and broadcast. Loops until
+/// `shutdown`. This is the inotify-limit / unsupported-backend safety net so a
+/// failed watcher no longer silently kills all dirty detection.
+fn dirty_poll_fallback(state: &Arc<Mutex<DaemonState>>, shutdown: &Arc<AtomicBool>) {
+    let mut last: HashMap<WorktreeId, StatusSummary> = HashMap::new();
+    while !shutdown.load(Ordering::SeqCst) {
+        let worktrees: Vec<(WorktreeId, PathBuf)> = match state.lock() {
+            Ok(state) => state
+                .worktrees
+                .iter()
+                .map(|(id, worktree)| (*id, worktree.path.clone()))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let live: HashSet<WorktreeId> = worktrees.iter().map(|(id, _)| *id).collect();
+        last.retain(|id, _| live.contains(id));
+        for (id, path) in worktrees {
+            let Ok(summary) = GitRepository::discover(&path).and_then(|repo| repo.status()) else {
+                continue;
+            };
+            if last.get(&id) != Some(&summary) {
+                let dirty = summary.dirty;
+                last.insert(id, summary);
+                let _ = broadcast_event(state, Event::WorktreeDirty { worktree_id: id, dirty });
+            }
+        }
+        thread::sleep(DIRTY_FALLBACK_POLL);
+    }
+}
+
 fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>) {
     thread::Builder::new()
         .name("hitch-dirty-watch".into())
@@ -3994,7 +4088,17 @@ fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>
             }) {
                 Ok(watcher) => watcher,
                 Err(err) => {
-                    eprintln!("hitch-daemon: failed to create fs watcher: {err}");
+                    // The fs watcher backend could not be constructed (e.g. inotify
+                    // instance/watch limits exhausted on a remote Linux daemon host).
+                    // Do NOT silently `return` — that kills ALL dirty detection (the
+                    // 1s frontend poll that used to mask this was removed). Fall back
+                    // to a periodic status poll so the GUI still refreshes, just less
+                    // promptly.
+                    eprintln!(
+                        "hitch-daemon: failed to create fs watcher: {err}; \
+                         falling back to periodic dirty polling"
+                    );
+                    dirty_poll_fallback(&state, &shutdown);
                     return;
                 }
             };
@@ -4027,15 +4131,25 @@ fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>
 
                 match rx.recv_timeout(timeout) {
                     Ok(Ok(event)) => {
-                        // Map each changed path back to the worktree whose tree
-                        // contains it and arm a debounced rescan for it.
+                        // Map each changed path back to the worktree(s) whose tree
+                        // contains it and arm a debounced rescan for each. A linked
+                        // worktree's external git dir
+                        // (`mainrepo/.git/worktrees/<name>`) also sits under the main
+                        // worktree's recursive workdir watch, so a commit there
+                        // matches BOTH the main and the linked worktree. `find`
+                        // (first-match in randomized HashMap order) could pick the
+                        // main worktree, whose `status()` is unchanged → no
+                        // broadcast, leaving the linked worktree's History/Changes
+                        // stale. Arm EVERY match instead; over-arming the main
+                        // worktree is harmless — an unchanged `status()` produces no
+                        // broadcast.
                         for path in &event.paths {
-                            if let Some((id, _)) =
-                                watched.iter().find(|(_, w)| w.contains(path))
-                            {
-                                pending
-                                    .entry(*id)
-                                    .or_insert_with(|| Instant::now() + DIRTY_DEBOUNCE);
+                            for (id, w) in watched.iter() {
+                                if w.contains(path) {
+                                    pending
+                                        .entry(*id)
+                                        .or_insert_with(|| Instant::now() + DIRTY_DEBOUNCE);
+                                }
                             }
                         }
                     }
@@ -4116,9 +4230,30 @@ struct DirtyWatch {
 impl DirtyWatch {
     /// True when `path` falls under either watched root, mapping a filesystem
     /// event back to this worktree.
+    ///
+    /// Tries a direct `starts_with` first (the common case — prod paths arrive
+    /// canonical from libgit2). When that misses it retries on *physical* paths:
+    /// on macOS a watch root reported as `/private/var/...` and an event path of
+    /// `/var/...` (or vice versa via the `/var → /private/var` symlink, also
+    /// `/tmp → /private/tmp` and `/var/folders`) name the same file but fail a raw
+    /// prefix test. Canonicalizing both sides makes the test symlink-stable —
+    /// reusing the same boundary handling as `hitch-git`'s pathspec relativizer.
     fn contains(&self, path: &Path) -> bool {
-        path.starts_with(&self.workdir)
+        if path.starts_with(&self.workdir)
             || self.git_dir.as_ref().is_some_and(|g| path.starts_with(g))
+        {
+            return true;
+        }
+        let Ok(real_path) = fs::canonicalize(path) else {
+            return false;
+        };
+        if fs::canonicalize(&self.workdir).is_ok_and(|root| real_path.starts_with(root)) {
+            return true;
+        }
+        self.git_dir
+            .as_ref()
+            .and_then(|g| fs::canonicalize(g).ok())
+            .is_some_and(|root| real_path.starts_with(root))
     }
 }
 
@@ -6304,10 +6439,30 @@ impl SshAgentRelay {
         let dir = ssh_agent_relay_root();
         // On Unix the endpoint is a filesystem socket and needs its parent dir; on
         // Windows it is a named pipe with no on-disk file, so no directory is made.
+        //
+        // SECURITY (ADR 0014, P0): the relay socket is handed to git as
+        // `SSH_AUTH_SOCK` on a possibly multi-user remote host, and its path is
+        // predictable (`<counter>.sock`). The 0700 dir is the load-bearing
+        // protection on macOS/BSD, where the socket's own mode is NOT checked on
+        // `connect()` — only directory traversal is — so without it any local user
+        // on the remote could connect to the path and drive the user's LOCAL
+        // ssh-agent as a signing oracle. The 0600 socket below additionally covers
+        // Linux (where umask-default would otherwise leave it group-connectable).
+        // This mirrors sshd's `ssh -A` hardening and the Windows owner-only DACL
+        // already set in `DaemonListener::bind`.
         #[cfg(unix)]
-        fs::create_dir_all(&dir)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)?;
         let socket_path = dir.join(format!("{client_id}.sock"));
-        Self::bind_at(client_id, socket_path, sink)
+        let relay = Self::bind_at(client_id, socket_path, sink)?;
+        // Tighten the freshly-bound socket to owner-only. There is a tiny window
+        // between bind and this chmod; the 0700 dir above is what actually denies
+        // other users on macOS, so this is belt-and-suspenders for Linux.
+        #[cfg(unix)]
+        std::fs::set_permissions(&relay.socket_path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(relay)
     }
 
     /// Bind the relay at an explicit `socket_path` (the production [`bind`] derives
@@ -6354,16 +6509,33 @@ impl SshAgentRelay {
     /// inbound GUI replies. `teardown` wakes a blocked `accept()` with a throwaway
     /// self-connect, after which the `shutdown` check breaks the loop.
     fn accept_loop(self: Arc<Self>, listener: DaemonListener, sink: Arc<ClientSink>) {
+        // Exponential backoff for the error path, mirroring the main daemon accept
+        // loop: a persistent `accept()` failure (e.g. fd/handle exhaustion —
+        // EMFILE/ENFILE, which the relay itself contributes to via per-child threads
+        // + stream halves) leaves the listener valid and `shutdown` unset, so a bare
+        // `continue` would peg a CPU core and flood the log. Start small, grow to a
+        // 1s ceiling, reset on the next successful accept.
+        const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(25);
+        const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+        let mut backoff = ACCEPT_BACKOFF_MIN;
         loop {
             let stream = match listener.accept() {
-                Ok(stream) => stream,
+                Ok(stream) => {
+                    backoff = ACCEPT_BACKOFF_MIN;
+                    stream
+                }
                 Err(err) => {
                     if ssh_agent_debug_enabled() {
                         eprintln!("hitch-daemon: ssh-agent relay accept error: {err}");
                     }
+                    // Sleep before re-arming so a persistent failure cannot spin a
+                    // busy loop. Re-check `shutdown` AFTER the sleep so a teardown
+                    // self-connect is honored within one backoff interval.
+                    thread::sleep(backoff);
                     if self.shutdown.load(Ordering::SeqCst) {
                         break;
                     }
+                    backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
                     continue;
                 }
             };
@@ -6387,7 +6559,22 @@ impl SshAgentRelay {
             let channel = SSH_AGENT_RELAY_CHANNEL_SEQ.fetch_add(1, Ordering::SeqCst);
             // Store the write half BEFORE telling the GUI the channel is open, so a
             // GUI reply can never race ahead of the write half being present.
-            if let Ok(mut channels) = self.channels.lock() {
+            // Re-check `shutdown` while holding the channel-map lock: `teardown`
+            // takes that lock to drain+force_close every channel, so checking it
+            // here closes the window where a channel accepted between teardown's
+            // drain and this insert would be stored after teardown ran and never get
+            // force_closed. If shutdown raced in, drop this writer (force_close so
+            // the git child unblocks) and stop accepting.
+            {
+                let mut channels = match self.channels.lock() {
+                    Ok(channels) => channels,
+                    Err(_) => break,
+                };
+                if self.shutdown.load(Ordering::SeqCst) {
+                    drop(channels);
+                    let _ = writer.force_close();
+                    break;
+                }
                 channels.insert(channel, Arc::new(writer));
             }
 
@@ -6493,8 +6680,13 @@ impl SshAgentRelay {
                         "hitch-daemon: ssh-agent relay channel {channel} write to git failed: {err}"
                     );
                 }
-                // The git child is gone; force_close so the pump's read half also
-                // unblocks.
+                // The git child is gone OR wedged: any write error — including a
+                // `WouldBlock`/`TimedOut` from the relay write half's write timeout
+                // (a git child that stopped draining its socket; see
+                // `into_relay_channel`) — closes the channel. `close_channel`
+                // force_closes the write half so the pump's read half also unblocks
+                // and this connection's control plane is never stalled by one stuck
+                // child.
                 self.close_channel(channel);
             } else if ssh_agent_debug_enabled() {
                 eprintln!(
@@ -6538,10 +6730,15 @@ impl SshAgentRelay {
     fn teardown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
         // Wake the accept thread blocked in `accept()`: the standard self-connect
-        // idiom, cross-platform via `connect_daemon`. The accept loop sees
-        // `shutdown` set and breaks. Best-effort — if the connect fails the listener
-        // is likely already gone.
-        let _ = connect_daemon(&self.socket_path);
+        // idiom. Use the shared `wake_accept_thread` helper rather than a single
+        // best-effort `connect_daemon`: on Windows a connect can return
+        // `ERROR_PIPE_BUSY` (231) in the narrow window while the relay's accept loop
+        // re-arms a fresh pipe instance after the previous accept. A single un-
+        // retried connect that hits that loses the wake → the accept thread blocks
+        // forever holding the listener → an OS thread + named-pipe instance leak per
+        // reconnect. The helper retries-on-busy (bounded, 10×) exactly like the main
+        // daemon's accept-thread wake.
+        wake_accept_thread(&self.socket_path);
         if let Ok(mut channels) = self.channels.lock() {
             for (_channel, writer) in channels.drain() {
                 let _ = writer.force_close();
@@ -6940,6 +7137,7 @@ mod tests {
         ssh_auth_sock: Mutex::new(None),
         relay_capable: AtomicBool::new(false),
         ssh_agent: Mutex::new(None),
+        disconnected: AtomicBool::new(false),
         });
         {
             let mut guard = state.lock().unwrap();
@@ -7038,6 +7236,7 @@ mod tests {
         ssh_auth_sock: Mutex::new(None),
         relay_capable: AtomicBool::new(false),
         ssh_agent: Mutex::new(None),
+        disconnected: AtomicBool::new(false),
         });
         {
             let mut guard = state.lock().unwrap();
@@ -7654,6 +7853,7 @@ mod tests {
         ssh_auth_sock: Mutex::new(None),
         relay_capable: AtomicBool::new(false),
         ssh_agent: Mutex::new(None),
+        disconnected: AtomicBool::new(false),
         });
         let blocked = Arc::new(super::ClientSink {
             writer: Mutex::new(super::DaemonStream::new(peer_writer)),
@@ -7666,6 +7866,7 @@ mod tests {
         ssh_auth_sock: Mutex::new(None),
         relay_capable: AtomicBool::new(false),
         ssh_agent: Mutex::new(None),
+        disconnected: AtomicBool::new(false),
         });
         {
             let mut guard = state.lock().unwrap();
@@ -7993,6 +8194,7 @@ mod tests {
         ssh_auth_sock: Mutex::new(None),
         relay_capable: AtomicBool::new(false),
         ssh_agent: Mutex::new(None),
+        disconnected: AtomicBool::new(false),
         });
         {
             let mut guard = state.lock().unwrap();
@@ -8974,6 +9176,7 @@ mod tests {
         ssh_auth_sock: Mutex::new(None),
         relay_capable: AtomicBool::new(false),
         ssh_agent: Mutex::new(None),
+        disconnected: AtomicBool::new(false),
         });
         {
             let mut guard = state.lock().unwrap();
@@ -9553,6 +9756,75 @@ mod tests {
         );
     }
 
+    /// Regression for finding #7: a linked worktree's external git dir
+    /// (`mainrepo/.git/worktrees/<name>`) also falls under the MAIN worktree's
+    /// recursive workdir watch, so a commit there matches BOTH `DirtyWatch`es. The
+    /// old `watched.iter().find(...)` returned only the first match in randomized
+    /// HashMap order and could pick the main worktree (whose `status()` is
+    /// unchanged → no broadcast), leaving the linked worktree's History/Changes
+    /// stale. The fix arms EVERY matching worktree. This exercises the mapping loop
+    /// directly: with both watches registered, a path under the linked worktree's
+    /// git dir must arm the linked worktree's id in `pending`.
+    #[cfg(unix)]
+    #[test]
+    fn fs_event_arms_every_matching_worktree_not_just_first() {
+        use super::{DirtyWatch, DIRTY_DEBOUNCE};
+        use hitch_core::WorktreeId;
+        use std::collections::HashMap;
+        use std::path::{Path, PathBuf};
+        use std::time::Instant;
+
+        let main_id = WorktreeId::new();
+        let linked_id = WorktreeId::new();
+
+        // The main worktree's recursive workdir watch covers `mainrepo`; its
+        // `.git/worktrees/linked` is the linked worktree's EXTERNAL git dir, which
+        // therefore sits under BOTH the main workdir watch and the linked
+        // worktree's own git-dir watch.
+        let main_workdir = PathBuf::from("/repo/main");
+        let linked_workdir = PathBuf::from("/repo/linked");
+        let linked_git_dir = main_workdir.join(".git/worktrees/linked");
+
+        let mut watched: HashMap<WorktreeId, DirtyWatch> = HashMap::new();
+        watched.insert(
+            main_id,
+            DirtyWatch { workdir: main_workdir.clone(), git_dir: None },
+        );
+        watched.insert(
+            linked_id,
+            DirtyWatch {
+                workdir: linked_workdir,
+                git_dir: Some(linked_git_dir.clone()),
+            },
+        );
+
+        // A commit in the linked worktree writes here — under both watch roots.
+        let event_path = linked_git_dir.join("HEAD");
+
+        // The exact mapping loop from `spawn_dirty_watcher`.
+        let mut pending: HashMap<WorktreeId, Instant> = HashMap::new();
+        let paths: Vec<&Path> = vec![event_path.as_path()];
+        for path in &paths {
+            for (id, w) in watched.iter() {
+                if w.contains(path) {
+                    pending
+                        .entry(*id)
+                        .or_insert_with(|| Instant::now() + DIRTY_DEBOUNCE);
+                }
+            }
+        }
+
+        assert!(
+            pending.contains_key(&linked_id),
+            "the linked worktree must be armed for a rescan even when the main \
+             worktree also matches the path"
+        );
+        assert!(
+            pending.contains_key(&main_id),
+            "the main worktree also matches and is armed too (harmless over-arm)"
+        );
+    }
+
     /// Unit tests for the ssh-agent relay (ADR 0014 amendment). The relay is a
     /// transparent byte bridge, so every assertion is about BYTES — never
     /// ssh-agent semantics. The "git child" is a real connection (Unix socket /
@@ -9604,6 +9876,7 @@ mod tests {
                 ssh_auth_sock: Mutex::new(None),
                 relay_capable: AtomicBool::new(true),
                 ssh_agent: Mutex::new(None),
+                disconnected: AtomicBool::new(false),
             });
             FakeGui { sink, gui_reader }
         }
@@ -9699,6 +9972,39 @@ mod tests {
                     }
                 }
             }
+        }
+
+        /// SECURITY (finding #1): the production `bind` must create the agent dir
+        /// 0o700 and chmod the bound socket 0o600, so a multi-user remote host
+        /// cannot connect to the predictable relay path and drive the user's local
+        /// ssh-agent. `bind` uses the real `ssh_agent_relay_root()`; we remove a
+        /// stale agent dir first so the `DirBuilder(0o700)` actually runs (it does
+        /// not relax an existing dir's mode), and tear the relay down after.
+        #[cfg(unix)]
+        #[test]
+        fn bind_hardens_agent_dir_0700_and_socket_0600() {
+            use super::super::ssh_agent_relay_root;
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let FakeGui { sink, .. } = fake_gui();
+            let dir = ssh_agent_relay_root();
+            // Start from a clean slate so the 0o700 DirBuilder runs on a fresh dir.
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let relay = SshAgentRelay::bind(4242, Arc::clone(&sink))
+                .expect("production bind succeeds");
+
+            let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700, "agent dir must be owner-only (0o700)");
+
+            let sock_mode = std::fs::metadata(&relay.socket_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(sock_mode, 0o600, "relay socket must be owner-only (0o600)");
+
+            relay.teardown();
         }
 
         /// (a) ROUND-TRIP: a git child connects, the relay opens a channel, git's
@@ -9936,6 +10242,7 @@ mod tests {
                 ssh_auth_sock: Mutex::new(None),
                 relay_capable: AtomicBool::new(false),
                 ssh_agent: Mutex::new(None),
+                disconnected: AtomicBool::new(false),
             });
             {
                 let mut guard = state.lock().unwrap();
@@ -9990,6 +10297,7 @@ mod tests {
                 ssh_auth_sock: Mutex::new(None),
                 relay_capable: AtomicBool::new(true),
                 ssh_agent: Mutex::new(None),
+                disconnected: AtomicBool::new(false),
             });
             {
                 let mut guard = state.lock().unwrap();

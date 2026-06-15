@@ -433,6 +433,14 @@ impl DaemonStream {
         #[cfg(unix)]
         {
             let writer = self.stream.try_clone()?;
+            // Bound the inbound GUI->git write (the control-reader thread does a
+            // blocking `write_all` to this half): a wedged git child that stops
+            // draining its socket could otherwise stall that thread — and thus the
+            // whole connection's control plane — forever. A timeout turns that into
+            // a recoverable `WouldBlock`/`TimedOut` the daemon treats as "close this
+            // channel". Best-effort: if the platform rejects the option, fall back to
+            // the prior unbounded behavior rather than failing the channel.
+            let _ = writer.set_write_timeout(Some(RELAY_WRITE_TIMEOUT));
             Ok((RelayReader { stream: self.stream }, RelayWriter { stream: writer }))
         }
         #[cfg(windows)]
@@ -489,6 +497,14 @@ impl Read for RelayReader {
         { let mut r = &self.half; r.read(buf) }
     }
 }
+
+/// How long the inbound GUI→git write half may block before the daemon gives up
+/// on a wedged git child and closes the channel (ADR 0014 amendment). Generous
+/// enough to never trip on a healthy child (an ssh-agent reply is a few hundred
+/// bytes), short enough that one stuck child cannot stall the control plane
+/// indefinitely. Unix only — Windows named pipes do not support write timeouts.
+#[cfg(unix)]
+const RELAY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Write half of an ssh-agent relay channel (ADR 0014 amendment). Inbound GUI
 /// reply bytes (GUI → daemon → git) are written to it. Held behind an `Arc` by the
