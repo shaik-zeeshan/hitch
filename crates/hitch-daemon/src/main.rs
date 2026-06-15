@@ -1604,7 +1604,8 @@ fn handle_request<R: Read>(
             cols,
             rows,
         } => {
-            let session = open_session(state, parent, name, command, cols, rows, &channels.pty_tx)?;
+            let session =
+                open_session(state, client_id, parent, name, command, cols, rows, &channels.pty_tx)?;
             let replay = session_opened_replay(state, session.id)?;
             send_response(
                 state,
@@ -2804,6 +2805,7 @@ fn remove_worktree(
 
 fn open_session(
     state: &Arc<Mutex<DaemonState>>,
+    client_id: u64,
     parent: SessionParent,
     name: String,
     command: Option<Vec<String>>,
@@ -2831,13 +2833,15 @@ fn open_session(
     } else {
         TerminalSize::new(cols, rows)
     };
-    // On a relay-serving Daemon, inject `SSH_AUTH_SOCK` = the stable relay socket so
-    // git run in THIS terminal (or by an Agent inside it) signs on the driving
-    // machine (ADR 0014 amendment, 2026-06-15 stable-socket amendment, Slice 6). The
-    // helper reads the bound socket under a brief lock and DROPS it before we build
-    // the config, so the state lock is not held across the spawn. Empty on a local /
-    // non-relay-serving Daemon → terminals inherit env exactly as today.
-    let extra_env = relay_pty_env(state);
+    // Inject `SSH_AUTH_SOCK` = the stable relay socket so git run in THIS terminal (or
+    // by an Agent inside it) signs on the driving machine (ADR 0014 amendment,
+    // 2026-06-15 stable-socket amendment, Slice 6) — but ONLY when the opening client
+    // is relay-capable (per-origin amendment): a terminal opened by a local GUI on the
+    // Daemon's own machine inherits the env so its git signs with the local agent. The
+    // helper reads the flag + bound socket under a brief lock and DROPS it before we
+    // build the config, so the state lock is not held across the spawn. Empty on a
+    // local / non-relay-serving Daemon → terminals inherit env exactly as today.
+    let extra_env = relay_pty_env(state, client_id);
     let pty = ManagedPty::spawn(
         PtySpawnConfig::new(session.id, cwd)
             .command(command)
@@ -3833,12 +3837,16 @@ fn git_context(
 /// Resolve the `SSH_AUTH_SOCK` to use for a git op originated by `client_id`
 /// (ADR 0014, SSH agent forwarding + the relay amendment; 2026-06-15 stable-socket
 /// amendment). The ladder, highest rung first:
-///   1. **Stable relay** — *any* relay-capable GUI is connected
-///      ([`DaemonState::driving_client`] is `Some`): ensure the ONE Daemon-stable
-///      relay socket exists and return its path. This is **client-agnostic** — who
-///      actually signs is decided later, at accept time, by the relay's per-accept
-///      presence routing — so owned and ownerless ops resolve identically. The
-///      accept loop is live before we return, so git can connect synchronously.
+///   1. **Stable relay** — the op's **originating** client (`client_id`) is itself
+///      relay-capable AND a driving GUI is present ([`DaemonState::driving_client`]
+///      is `Some`): ensure the ONE Daemon-stable relay socket exists and return its
+///      path. Per-origin (2026-06-15 per-origin amendment): a git op started by a
+///      non-relay client — a local GUI on the Daemon's own machine — must NOT be
+///      forced onto a remote GUI's agent just because that remote GUI is driving;
+///      it falls through to its own local env. *Which* relay GUI actually signs is
+///      still decided later, at accept time, by the relay's per-accept presence
+///      routing. The accept loop is live before we return, so git can connect
+///      synchronously.
 ///   2. **ConnEnv** — this connection forwarded a `SSH_AUTH_SOCK` (the v28 proxy
 ///      rolling-upgrade rung): return it unchanged.
 ///   3. **Background ConnEnv fallback** — the daemon-wide latest forwarded socket
@@ -3849,23 +3857,29 @@ fn git_context(
 /// The resolved `String` is captured into the Job closure by the caller so a
 /// mid-op disconnect doesn't lose it.
 fn resolve_ssh_auth_sock(state: &Arc<Mutex<DaemonState>>, client_id: u64) -> Option<String> {
-    // Rung 1: is any relay-capable GUI connected? If so, the one Daemon-stable
-    // socket is the answer regardless of which connection originated this op —
-    // routing to the driving GUI is resolved at accept time, not here. Read
-    // `driving_client` (and rung-2/3 sources) under one brief lock, then ensure the
-    // socket with the state lock dropped.
-    let (driving, conn_env_sock, forwarded) = {
+    // Rung 1: is THIS op's originating client a relay-capable (remote) GUI, and is a
+    // driving GUI present? Then the one Daemon-stable socket is the answer; routing to
+    // the driving GUI is resolved at accept time, not here. The per-origin gate keeps
+    // a non-relay client's op (a local GUI on the Daemon's own machine) off the remote
+    // GUI's agent — it falls through to its own local env. Read the gate inputs (and
+    // rung-2/3 sources) under one brief lock, then ensure the socket with the lock
+    // dropped.
+    let (relay_origin, conn_env_sock, forwarded) = {
         let guard = state.lock().ok()?;
-        let driving = guard.driving_client.is_some();
+        let relay_origin = guard.driving_client.is_some()
+            && guard
+                .clients
+                .get(&client_id)
+                .is_some_and(|sink| sink.relay_capable.load(Ordering::SeqCst));
         let conn_env_sock = guard
             .clients
             .get(&client_id)
             .and_then(|sink| sink.ssh_auth_sock.lock().ok().and_then(|slot| slot.clone()));
         let forwarded = guard.forwarded_ssh_auth_sock.clone();
-        (driving, conn_env_sock, forwarded)
+        (relay_origin, conn_env_sock, forwarded)
     };
 
-    if driving {
+    if relay_origin {
         if let Some(path) = ensure_relay_socket(state) {
             if ssh_agent_debug_enabled() {
                 eprintln!(
@@ -3981,20 +3995,41 @@ fn ensure_relay_socket(state: &Arc<Mutex<DaemonState>>) -> Option<String> {
 }
 
 /// Compute the relay `extra_env` to inject into a PTY at spawn (ADR 0014 amendment,
-/// 2026-06-15 stable-socket amendment, Slice 6). When the Daemon is **relay-serving**
-/// — the one stable relay socket is bound on [`DaemonState::relay`] — return
-/// `[("SSH_AUTH_SOCK", <stable socket's connectable OS address>)]` so any git the
+/// 2026-06-15 stable-socket amendment, Slice 6; per-origin amendment 2026-06-15).
+/// Return `[("SSH_AUTH_SOCK", <stable socket's connectable OS address>)]` — so git the
 /// user runs in the terminal (or an Agent runs for them) signs through the relay and
-/// Touch ID pops on the driving machine. On a non-relay-serving Daemon (local, or the
-/// relay was never bound) return `[]` — terminals inherit env exactly as today.
+/// Touch ID pops on the driving machine — **only when both** (a) the stable relay
+/// socket is bound on [`DaemonState::relay`] AND (b) the GUI that opened this terminal
+/// (`client_id`) is itself **relay-capable**. Otherwise return `[]` so the terminal
+/// inherits the env exactly as today.
 ///
-/// This is the pure, testable injection *decision*: it only reads the bound socket's
-/// path under a brief lock and returns owned strings, so the caller does NOT hold the
-/// state lock across the PTY spawn. Deliberately does NOT set `BatchMode` /
-/// `GIT_TERMINAL_PROMPT=0` — terminal PTYs stay interactive so a human can answer a
-/// host-key or passphrase prompt at the terminal.
-fn relay_pty_env(state: &Arc<Mutex<DaemonState>>) -> Vec<(String, String)> {
+/// The per-origin gate is the fix for the co-located GUI case: a Daemon can serve a
+/// remote relay-capable GUI (e.g. a Mac driving this box over SSH) *and* a local GUI
+/// on the Daemon's own machine (e.g. a Windows GUI, which is never relay-capable —
+/// the relay-serve path is `cfg(unix)`). Without the gate, the relay socket was
+/// injected daemon-wide, so a terminal opened by the *local* user was hijacked onto
+/// the remote GUI's agent (Touch ID popped on the wrong machine). Gating on the
+/// opening client means the local user's terminals use the local machine's own agent
+/// while the remote GUI's terminals still relay.
+///
+/// This is the pure, testable injection *decision*: it only reads the opening client's
+/// relay-capable flag and the bound socket's path under a brief lock and returns owned
+/// strings, so the caller does NOT hold the state lock across the PTY spawn.
+/// Deliberately does NOT set `BatchMode` / `GIT_TERMINAL_PROMPT=0` — terminal PTYs
+/// stay interactive so a human can answer a host-key or passphrase prompt.
+fn relay_pty_env(state: &Arc<Mutex<DaemonState>>, client_id: u64) -> Vec<(String, String)> {
     let sock = state.lock().ok().and_then(|guard| {
+        // Per-origin gate: only a terminal opened by a relay-capable (remote) GUI
+        // rides the relay. A terminal opened by a non-relay client — a local GUI on
+        // the Daemon's own machine — inherits the env so its git signs with the local
+        // machine's agent.
+        let relay_capable = guard
+            .clients
+            .get(&client_id)
+            .is_some_and(|sink| sink.relay_capable.load(Ordering::SeqCst));
+        if !relay_capable {
+            return None;
+        }
         guard.relay.lock().ok().and_then(|slot| {
             slot.as_ref()
                 .map(|relay| hitch_proto::transport::endpoint_os_address(&relay.socket_path))
@@ -8594,8 +8629,11 @@ mod tests {
         // Keep the receiver alive so the PTY reader thread's sends don't error;
         // the tests never need to consume it.
         let (pty_tx, pty_rx) = std::sync::mpsc::channel();
+        // client_id 0: no registered client → not relay-capable → no relay env, which
+        // is correct for this agent-state test (it isn't exercising the relay).
         let session = super::open_session(
             &state,
+            0,
             SessionParent::Project(project_id),
             "shell".into(),
             None,
@@ -10994,29 +11032,98 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir_root);
         }
 
-        /// `relay_pty_env` (the PTY injection decision, Slice 6): returns
-        /// `[("SSH_AUTH_SOCK", <stable socket path>)]` when the Daemon is
-        /// relay-serving (the stable relay is bound), and `[]` when it is not.
+        /// `relay_pty_env` (the PTY injection decision, Slice 6 + per-origin
+        /// amendment): injects `[("SSH_AUTH_SOCK", <stable socket path>)]` ONLY when
+        /// the relay is bound AND the opening client is relay-capable. A terminal
+        /// opened by a non-relay client (a local GUI on the Daemon's own machine) gets
+        /// `[]` so its git signs with the local machine's agent — even while a remote
+        /// relay GUI is serving the same Daemon.
         #[test]
-        fn relay_pty_env_injects_only_when_relay_bound() {
+        fn relay_pty_env_injects_only_for_relay_capable_origin() {
             use super::super::{ensure_relay_socket, relay_pty_env};
 
             let _real_path = lock_real_relay_path();
             let (state, dir_root) = test_state();
+            let remote = fake_gui_with(true); // a relay-capable (remote) GUI
+            let local = fake_gui_with(false); // a local GUI: never relay-capable
+            insert_gui(&state, 1, &remote);
+            insert_gui(&state, 2, &local);
 
-            // Not relay-serving yet: no injection.
+            // Not relay-serving yet: no injection, even for the relay-capable client.
             assert!(
-                relay_pty_env(&state).is_empty(),
+                relay_pty_env(&state, 1).is_empty(),
                 "a non-relay-serving Daemon injects nothing"
             );
 
-            // Bind the stable relay, then the injection carries its connectable path.
+            // Bind the stable relay. Now a terminal opened by the relay-capable client
+            // rides the relay…
             let stable = ensure_relay_socket(&state).expect("the stable relay binds");
-            let env = relay_pty_env(&state);
             assert_eq!(
-                env,
+                relay_pty_env(&state, 1),
                 vec![("SSH_AUTH_SOCK".to_string(), stable.clone())],
-                "a relay-serving Daemon injects SSH_AUTH_SOCK = the stable socket"
+                "a terminal opened by a relay-capable client injects the stable socket"
+            );
+
+            // …but a terminal opened by the LOCAL (non-relay) client does NOT — it
+            // inherits the env so its git uses the local machine's own agent. This is
+            // the co-located-GUI fix.
+            assert!(
+                relay_pty_env(&state, 2).is_empty(),
+                "a terminal opened by a non-relay client must not ride the relay"
+            );
+            // An unknown client id is treated as non-relay (no injection).
+            assert!(
+                relay_pty_env(&state, 999).is_empty(),
+                "an unknown opening client injects nothing"
+            );
+
+            if let Some(relay) = state.lock().unwrap().relay.lock().unwrap().take() {
+                relay.teardown();
+            }
+            drop(state);
+            let _ = std::fs::remove_dir_all(&dir_root);
+        }
+
+        /// PER-ORIGIN RESOLVE (the button/job path, 2026-06-15 per-origin amendment):
+        /// even when a relay-capable GUI is driving, a git op ORIGINATED by a
+        /// non-relay client (a local GUI on the Daemon's own machine) must NOT resolve
+        /// to the relay — it falls through to its own local env. The relay-capable
+        /// originator still gets the relay. Without the per-origin gate the local op
+        /// was hijacked onto the remote GUI's agent (Touch ID on the wrong machine).
+        #[test]
+        fn resolve_skips_relay_for_non_relay_origin_even_when_a_gui_drives() {
+            use super::super::resolve_ssh_auth_sock;
+
+            let _real_path = lock_real_relay_path();
+            let (state, dir_root) = test_state();
+            let remote = fake_gui_with(true); // relay-capable remote GUI (the driver)
+            let local = fake_gui_with(false); // local GUI on the Daemon's own machine
+            insert_gui(&state, 1, &remote);
+            insert_gui(&state, 2, &local);
+            // The remote GUI is driving (the only relay-capable connection).
+            set_driving(&state, Some(1));
+
+            // The driver's own op resolves to the relay socket.
+            let remote_op = resolve_ssh_auth_sock(&state, 1)
+                .expect("a relay-capable originator resolves to the relay");
+            let stable = state
+                .lock()
+                .unwrap()
+                .relay
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|relay| hitch_proto::transport::endpoint_os_address(&relay.socket_path))
+                .expect("the driver's resolve bound the stable relay");
+            assert_eq!(remote_op, stable, "the relay-capable originator gets the relay");
+
+            // The LOCAL client's op, with NO ConnEnv and NO forwarded fallback, must
+            // resolve to None (env inherited → local agent) despite the remote GUI
+            // driving. This is the assertion that fails without the per-origin gate.
+            let local_op = resolve_ssh_auth_sock(&state, 2);
+            assert_eq!(
+                local_op, None,
+                "a non-relay originator must not be routed to the driving GUI's relay"
             );
 
             if let Some(relay) = state.lock().unwrap().relay.lock().unwrap().take() {
