@@ -582,6 +582,134 @@ impl GitClient {
     }
 }
 
+/// A reusable, single-thread handle for cheaply deciding whether a filesystem event
+/// path is worth a `git status` rescan. The daemon's dirty watcher uses it to drop the
+/// gitignored build-output firehose (`target/`, `node_modules/`, …) before it churns
+/// the rescan debounce. It holds one open libgit2 repository so the ignore rules and
+/// index are parsed once and reused across the thousands of events a build emits —
+/// open it once per worktree, not once per event.
+///
+/// `git2::Repository` is `!Sync`; keep a filter on the thread that created it.
+pub struct StatusRelevanceFilter {
+    repo: Repository,
+    /// The workdir as the caller named it (the daemon's raw watch root). Event paths
+    /// arrive under this form OR its canonicalized form, mirroring how the dirty
+    /// watcher matches them — so both are kept and tried (the macOS
+    /// `/var → /private/var` symlink, a `managed_root` reached via a symlink).
+    workdir: PathBuf,
+    workdir_canonical: Option<PathBuf>,
+    git_dir: PathBuf,
+    git_dir_canonical: Option<PathBuf>,
+}
+
+impl StatusRelevanceFilter {
+    /// Open a filter for the worktree at `workdir`. Cheaper than a `status()` walk but
+    /// not free (it opens the repo and primes the ignore cache) — reuse the handle.
+    pub fn open(workdir: impl AsRef<Path>) -> Result<Self> {
+        let workdir = workdir.as_ref();
+        let repo = Repository::open(workdir)?;
+        if repo.workdir().is_none() {
+            return Err(GitError::BareRepository);
+        }
+        let git_dir = repo.path().to_path_buf();
+        Ok(Self {
+            repo,
+            workdir: workdir.to_path_buf(),
+            workdir_canonical: fs::canonicalize(workdir).ok(),
+            git_dir_canonical: fs::canonicalize(&git_dir).ok(),
+            git_dir,
+        })
+    }
+
+    /// True when a change at `path` could alter `git status` output, so the worktree
+    /// warrants a rescan. False ONLY when `path` is provably irrelevant: a
+    /// pattern-ignored, untracked path. Everything else fails open (returns `true`) —
+    /// git-metadata writes, paths outside the workdir, and any libgit2 error all
+    /// rescan rather than risk dropping a real change. The filter only ever
+    /// *suppresses* events it is certain don't matter.
+    pub fn is_relevant(&self, path: &Path) -> bool {
+        // Writes under the git dir (commits, ref updates, index/staging) drive History
+        // and staged state, and are never subject to ignore rules — always relevant.
+        if path.starts_with(&self.git_dir)
+            || self
+                .git_dir_canonical
+                .as_ref()
+                .is_some_and(|g| path.starts_with(g))
+        {
+            return true;
+        }
+        let Some(rel) = self.workdir_relative(path) else {
+            return true; // can't place it under the workdir — keep it (fail open)
+        };
+        if rel.as_os_str().is_empty() {
+            return true; // the workdir root itself
+        }
+        // The main worktree's `.git` sits under the workdir, so a commit/stage event
+        // arrives as a workdir-relative `.git/…` path. libgit2 reports `.git` ignored,
+        // but those writes drive History/staged state — keep them. (`.gitignore` is a
+        // single component, not under `.git`, so it is unaffected and falls through.)
+        if rel.starts_with(".git") {
+            return true;
+        }
+        // `is_path_ignored` is pattern-only (libgit2's `--no-index`): a force-added
+        // (`git add -f`) tracked file that matches a pattern still reports ignored, so
+        // guard with an index-membership check before suppressing — otherwise edits to
+        // it would silently vanish from the GUI.
+        // Ignored by pattern: relevant ONLY if it is tracked anyway (force-added) —
+        // an ignored, untracked path (the build firehose) is suppressed. Not ignored,
+        // or the check errored: relevant (fail open).
+        match self.repo.is_path_ignored(&rel) {
+            Ok(true) => self.is_tracked(&rel),
+            _ => true,
+        }
+    }
+
+    /// `path` made relative to the workdir, trying the raw and canonical roots and, as
+    /// a last resort, the canonicalized event path (handles a `/var` event under a
+    /// `/private/var` root). `None` when `path` is genuinely outside the workdir.
+    fn workdir_relative(&self, path: &Path) -> Option<PathBuf> {
+        if let Ok(rel) = path.strip_prefix(&self.workdir) {
+            return Some(rel.to_path_buf());
+        }
+        if let Some(rel) = self
+            .workdir_canonical
+            .as_ref()
+            .and_then(|root| path.strip_prefix(root).ok())
+        {
+            return Some(rel.to_path_buf());
+        }
+        let real = fs::canonicalize(path).ok()?;
+        if let Some(root) = &self.workdir_canonical {
+            if let Ok(rel) = real.strip_prefix(root) {
+                return Some(rel.to_path_buf());
+            }
+        }
+        real.strip_prefix(&self.workdir).ok().map(Path::to_path_buf)
+    }
+
+    /// Whether `rel` (workdir-relative) is in the index, i.e. tracked. Uses the index
+    /// libgit2 cached at open; a just-staged path arrives via a `.git/index` write,
+    /// which the daemon treats as filter-invalidating ([`Self::invalidated_by`]), so a
+    /// stale cache cannot mask a newly-tracked path for long.
+    fn is_tracked(&self, rel: &Path) -> bool {
+        match self.repo.index() {
+            Ok(index) => index.get_path(rel, 0).is_some(),
+            Err(_) => true, // can't read the index — fail open
+        }
+    }
+
+    /// True when a change at `path` can flip which paths are ignored or tracked, so a
+    /// cached filter must be dropped and re-opened: any `.gitignore`, `.git/info/exclude`,
+    /// or the `.git/index`. (`core.excludesFile` / global ignores are not covered;
+    /// editing those is rare and recovers on the next worktree reopen.)
+    pub fn invalidated_by(path: &Path) -> bool {
+        matches!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some(".gitignore") | Some("exclude") | Some("index")
+        )
+    }
+}
+
 fn pr_status_with_client(
     client: &GitClient,
     repo_path: &Path,
@@ -2998,6 +3126,93 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use tempfile::TempDir;
+
+    fn write_file(root: &Path, rel: &str, contents: &str) -> PathBuf {
+        let p = root.join(rel);
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&p, contents).unwrap();
+        p
+    }
+
+    /// DW6: the status-relevance filter suppresses gitignored, untracked build output
+    /// (`target/`, `*.log`) — the firehose that starves the dirty watcher — while
+    /// still treating tracked edits, new untracked source, and git-metadata writes as
+    /// changes worth a rescan.
+    #[test]
+    fn relevance_filter_suppresses_only_ignored_untracked() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo = git2::Repository::init(root).unwrap();
+        write_file(root, ".gitignore", "target/\n*.log\n");
+        let src = write_file(root, "src/main.rs", "fn main() {}\n");
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(".gitignore")).unwrap();
+        index.add_path(Path::new("src/main.rs")).unwrap();
+        index.write().unwrap();
+        drop(index);
+
+        let filter = StatusRelevanceFilter::open(root).unwrap();
+
+        // The ignored, untracked firehose is suppressed.
+        let target_file = write_file(root, "target/debug/app", "binary");
+        assert!(!filter.is_relevant(&target_file), "target/ output suppressed");
+        assert!(!filter.is_relevant(&root.join("target")), "ignored dir suppressed");
+        assert!(!filter.is_relevant(&root.join("run.log")), "*.log suppressed");
+
+        // Real changes still rescan.
+        assert!(filter.is_relevant(&src), "tracked source edit is relevant");
+        assert!(
+            filter.is_relevant(&write_file(root, "src/new.rs", "x")),
+            "new untracked, non-ignored source is relevant"
+        );
+        assert!(
+            filter.is_relevant(&root.join(".git/HEAD")),
+            "git-metadata write is relevant"
+        );
+        assert!(
+            filter.is_relevant(Path::new("/definitely/outside/the/repo")),
+            "path outside the workdir fails open"
+        );
+    }
+
+    /// DW6: a force-added (`git add -f`) file matches an ignore pattern yet is tracked,
+    /// so `is_path_ignored` (pattern-only) reports it ignored. It must NOT be
+    /// suppressed, or live edits to it would vanish.
+    #[test]
+    fn relevance_filter_keeps_force_added_ignored_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo = git2::Repository::init(root).unwrap();
+        write_file(root, ".gitignore", "*.log\n");
+        let forced = write_file(root, "keep.log", "v1\n");
+        let mut index = repo.index().unwrap();
+        // add_path bypasses ignore rules, exactly like `git add -f`.
+        index.add_path(Path::new("keep.log")).unwrap();
+        index.write().unwrap();
+        drop(index);
+
+        let filter = StatusRelevanceFilter::open(root).unwrap();
+        assert!(
+            filter.is_relevant(&forced),
+            "tracked-but-ignored (force-added) file must stay relevant"
+        );
+        assert!(
+            !filter.is_relevant(&root.join("other.log")),
+            "an untracked ignored file is still suppressed"
+        );
+    }
+
+    #[test]
+    fn relevance_filter_invalidation_targets_ignore_and_index_files() {
+        assert!(StatusRelevanceFilter::invalidated_by(Path::new("/repo/.gitignore")));
+        assert!(StatusRelevanceFilter::invalidated_by(Path::new("/repo/sub/.gitignore")));
+        assert!(StatusRelevanceFilter::invalidated_by(Path::new("/repo/.git/info/exclude")));
+        assert!(StatusRelevanceFilter::invalidated_by(Path::new("/repo/.git/index")));
+        assert!(!StatusRelevanceFilter::invalidated_by(Path::new("/repo/src/index.js")));
+        assert!(!StatusRelevanceFilter::invalidated_by(Path::new("/repo/src/main.rs")));
+    }
 
     #[test]
     fn pr_branch_search_groups_ored_heads_and_skips_blanks() {

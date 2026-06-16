@@ -5,6 +5,7 @@
 //! crates (ADR 0005). It wires store + git + PTY + agent-hook installation into
 //! the socket API consumed by the desktop client and `hitch-hook`.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 #[cfg(unix)]
@@ -53,7 +54,8 @@ use hitch_core::{
 };
 use hitch_git::{
     staged_diff, CommandControl, CreatePrRequest, CreateWorktreeRequest, DiffFileOptions,
-    DiffTarget, FileState, GitClient, GitRepository, StatusEntry, StatusSummary, WorktreeCheckout,
+    DiffTarget, FileState, GitClient, GitRepository, StatusEntry, StatusRelevanceFilter,
+    StatusSummary, WorktreeCheckout,
 };
 use hitch_process::{DrainOutcome, PipeReader, ProcessTree};
 use notify::{RecursiveMode, Watcher};
@@ -4427,6 +4429,26 @@ const DIRTY_DEBOUNCE: Duration = Duration::from_millis(300);
 /// the whole point of moving off the old per-second poll.
 const DIRTY_MIN_RESCAN: Duration = Duration::from_millis(750);
 
+/// Ceiling on the sliding debounce (DW6). `DIRTY_DEBOUNCE` slides forward on every
+/// event so an editor's save burst settles into one scan — but a worktree under
+/// *continuous* sub-`DIRTY_DEBOUNCE` churn (rust-analyzer's flycheck rewriting
+/// `target/`, a running build, a watch task touching `node_modules/`) would push
+/// that deadline forward forever and the rescan would NEVER run, freezing the GUI's
+/// Changes panel until a forced read (worktree switch / reload). Capping the deadline
+/// at `first_event + DIRTY_MAX_DEBOUNCE` guarantees the scan fires at least this often
+/// under unending churn, while still settling promptly when the tree goes quiet. The
+/// scan stays cheap — libgit2 ignores the gitignored churn — and `DIRTY_MIN_RESCAN`
+/// still bounds the worst-case rate.
+const DIRTY_MAX_DEBOUNCE: Duration = Duration::from_millis(1000);
+
+/// The debounced rescan deadline after an event landed at `now`, where `first_event`
+/// opened the current pending window. Slides to `now + DIRTY_DEBOUNCE` to coalesce a
+/// burst, but never past `first_event + DIRTY_MAX_DEBOUNCE` so continuous churn cannot
+/// starve the scan (DW6).
+fn debounce_deadline(now: Instant, first_event: Instant) -> Instant {
+    (now + DIRTY_DEBOUNCE).min(first_event + DIRTY_MAX_DEBOUNCE)
+}
+
 /// How often the watcher reconciles its watch set against the live worktree
 /// registry. Worktrees are added/removed by request handlers across many sites,
 /// so rather than thread a watch-registration call through each, the watcher
@@ -4523,6 +4545,10 @@ fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>
             let mut pending: HashMap<WorktreeId, Instant> = HashMap::new();
             // Last rescan time per worktree, for the min-interval rate cap.
             let mut last_scan: HashMap<WorktreeId, Instant> = HashMap::new();
+            // DW6: first event of each worktree's current pending window — the anchor
+            // the max-wait cap measures against so continuous churn cannot slide the
+            // debounce deadline forever. Cleared when the worktree is actually scanned.
+            let mut pending_since: HashMap<WorktreeId, Instant> = HashMap::new();
 
             reconcile_dirty_watches(&state, &mut watcher, &mut watched, &mut last);
             let mut next_reconcile = Instant::now() + DIRTY_RECONCILE;
@@ -4558,6 +4584,7 @@ fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>
                             reconcile_dirty_watches(&state, &mut watcher, &mut watched, &mut last);
                             pending.retain(|id, _| watched.contains_key(id));
                             last_scan.retain(|id, _| watched.contains_key(id));
+                            pending_since.retain(|id, _| watched.contains_key(id));
                             next_reconcile = Instant::now() + DIRTY_RECONCILE;
                             // Schedule an immediate rescan of every (re-armed) worktree
                             // so a change the overflow swallowed is still detected.
@@ -4588,10 +4615,43 @@ fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>
                             // settled state the doc promises ("fires after the LAST
                             // event").
                             for path in &event.paths {
+                                // DW6: a `.gitignore`/`exclude`/index write can flip
+                                // which paths are ignored or tracked — force matching
+                                // worktrees to re-read their rules on the next event.
+                                let invalidate =
+                                    StatusRelevanceFilter::invalidated_by(path);
                                 for (id, w) in watched.iter() {
-                                    if w.contains(path) {
-                                        pending.insert(*id, Instant::now() + DIRTY_DEBOUNCE);
+                                    if !w.contains(path) {
+                                        continue;
                                     }
+                                    // DW6: drop the gitignored build-output firehose
+                                    // (`target/`, `node_modules/`, …) before it touches
+                                    // the debounce. The filter is opened lazily and fails
+                                    // open — an unopenable repo suppresses nothing — and
+                                    // always lets git-metadata, `.gitignore`, and index
+                                    // writes through, so a real change is never dropped.
+                                    {
+                                        let mut slot = w.filter.borrow_mut();
+                                        if invalidate {
+                                            slot.take();
+                                        }
+                                        if slot.is_none() {
+                                            *slot =
+                                                StatusRelevanceFilter::open(&w.workdir).ok();
+                                        }
+                                        let relevant = slot
+                                            .as_ref()
+                                            .map_or(true, |f| f.is_relevant(path));
+                                        if !relevant {
+                                            continue;
+                                        }
+                                    }
+                                    let now = Instant::now();
+                                    // DW6: anchor the window's first event, then slide the
+                                    // deadline but cap it against that anchor so unending
+                                    // churn can't defer forever.
+                                    let first = *pending_since.entry(*id).or_insert(now);
+                                    pending.insert(*id, debounce_deadline(now, first));
                                 }
                             }
                         }
@@ -4620,6 +4680,9 @@ fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>
                         }
                     }
                     pending.remove(&id);
+                    // DW6: the window is being scanned now — drop its anchor so the
+                    // next event opens a fresh max-wait window.
+                    pending_since.remove(&id);
                     let Some(path) = watched.get(&id).map(|w| w.workdir.clone()) else {
                         continue;
                     };
@@ -4650,6 +4713,7 @@ fn spawn_dirty_watcher(state: Arc<Mutex<DaemonState>>, shutdown: Arc<AtomicBool>
                     reconcile_dirty_watches(&state, &mut watcher, &mut watched, &mut last);
                     pending.retain(|id, _| watched.contains_key(id));
                     last_scan.retain(|id, _| watched.contains_key(id));
+                    pending_since.retain(|id, _| watched.contains_key(id));
                     next_reconcile = Instant::now() + DIRTY_RECONCILE;
                 }
             }
@@ -4678,6 +4742,14 @@ struct DirtyWatch {
     /// root could not be canonicalized at arm time (it falls back to the raw root).
     workdir_canonical: Option<PathBuf>,
     git_dir_canonical: Option<PathBuf>,
+    /// DW6: lazily-opened ignore/tracked filter used to drop the gitignored
+    /// build-output firehose (`target/`, `node_modules/`, …) before it churns the
+    /// rescan debounce. `RefCell` because the event loop holds the watch set by shared
+    /// reference: the filter is interior-mutable — opened on first use, evicted when a
+    /// `.gitignore`/index write may have changed what's relevant. A path move rebuilds
+    /// the whole `DirtyWatch` in `reconcile_dirty_watches`, so the filter re-opens
+    /// against the new path for free.
+    filter: RefCell<Option<StatusRelevanceFilter>>,
 }
 
 impl DirtyWatch {
@@ -4782,42 +4854,21 @@ fn reconcile_dirty_watches(
     // Arm new or moved worktrees.
     for (id, path) in &desired {
         if watched.get(id).map(|w| &w.workdir) == Some(path) {
-            // DW1: the watch is already armed at the desired path. The OS can
-            // silently drop a watch descriptor (an inotify watch on a dir that was
-            // removed-then-recreated, or a moved subtree) without a `Rescan`
-            // signal, after which events for this worktree stop arriving forever —
-            // exactly the case this reconcile tick is documented to recover. notify
-            // exposes no "is this watch still live?" query, so re-issue the watch:
-            // re-watching an already-live path is a cheap no-op in every backend,
-            // while re-watching after an OS drop RE-ESTABLISHES the descriptor.
-            // Re-arm both roots; on failure fall through to a full re-arm by clearing
-            // the entry so the new-or-moved path below re-runs the seed/rescan.
-            let needs_full_rearm = {
-                let w = watched.get(id).expect("checked present above");
-                let workdir_ok = watcher.watch(&w.workdir, RecursiveMode::Recursive).is_ok();
-                let git_ok = w
-                    .git_dir
-                    .as_ref()
-                    .map(|g| watcher.watch(g, RecursiveMode::Recursive).is_ok())
-                    .unwrap_or(true);
-                !(workdir_ok && git_ok)
-            };
-            if needs_full_rearm {
-                eprintln!(
-                    "hitch-daemon: re-arming dropped fs watch for {}",
-                    path.display()
-                );
-                if let Some(old) = watched.remove(id) {
-                    let _ = watcher.unwatch(&old.workdir);
-                    if let Some(git_dir) = &old.git_dir {
-                        let _ = watcher.unwatch(git_dir);
-                    }
-                }
-                last.remove(id);
-                // fall through to the arm path below.
-            } else {
-                continue;
-            }
+            // DW7: the watch is already armed at the desired path — leave it ALONE.
+            //
+            // A previous revision (DW1) re-issued `watcher.watch()` here on every
+            // reconcile tick to "recover a silently-dropped watch", on the assumption
+            // that re-watching an already-live path is a cheap no-op. That assumption
+            // is FALSE on macOS: notify's `FsEventWatcher::watch()` calls
+            // `FSEventStreamCreate`, tearing down and rebuilding the entire FSEvents
+            // stream. Doing that for every worktree every 2s churned the stream
+            // continuously and, after some hours, FSEvents stopped delivering events
+            // altogether (the watch thread sat idle while no callbacks fired) — the GUI
+            // Changes view froze until a daemon restart. Re-arm ONLY on a structural
+            // change (new/moved/gone worktree, handled below); a genuinely dropped batch
+            // of events is recovered by the overflow/`need_rescan` path, which notify
+            // signals and which re-arms once rather than on a timer.
+            continue;
         }
         if let Some(old) = watched.get(id) {
             let _ = watcher.unwatch(&old.workdir);
@@ -4868,6 +4919,8 @@ fn reconcile_dirty_watches(
                         git_dir,
                         workdir_canonical,
                         git_dir_canonical,
+                        // Opened lazily on the worktree's first relevant event.
+                        filter: RefCell::new(None),
                     },
                 );
                 // Seed the baseline so the first event compares against the
@@ -7914,6 +7967,39 @@ mod tests {
     use hitch_core::SessionId;
     use hitch_git::{FileState, StatusEntry};
 
+    /// DW6 regression: the dirty-watch debounce slides forward on each event so a
+    /// save burst coalesces into one scan, but a worktree under continuous
+    /// sub-`DIRTY_DEBOUNCE` churn (rust-analyzer flycheck / a build rewriting
+    /// `target/`) must NOT be able to push the rescan deadline forward forever —
+    /// that froze the GUI Changes panel until a worktree switch forced a read.
+    /// The deadline is capped at `first_event + DIRTY_MAX_DEBOUNCE`.
+    #[test]
+    fn debounce_deadline_caps_under_continuous_churn() {
+        use super::{debounce_deadline, DIRTY_DEBOUNCE, DIRTY_MAX_DEBOUNCE};
+        use std::time::{Duration, Instant};
+
+        let first = Instant::now();
+
+        // Quiet tree: a single event settles after one debounce window (the cap is
+        // larger than one debounce, so it does not interfere).
+        assert_eq!(debounce_deadline(first, first), first + DIRTY_DEBOUNCE);
+
+        // Continuous churn: events keep landing far past the cap. The deadline must
+        // never exceed first_event + DIRTY_MAX_DEBOUNCE, however long the burst runs,
+        // so the rescan is guaranteed to come due.
+        for elapsed_ms in [100, 300, 1_000, 5_000, 60_000] {
+            let now = first + Duration::from_millis(elapsed_ms);
+            assert!(
+                debounce_deadline(now, first) <= first + DIRTY_MAX_DEBOUNCE,
+                "deadline must stay capped under churn at +{elapsed_ms}ms"
+            );
+        }
+
+        // Once the burst length passes the cap, the deadline pins exactly to the cap.
+        let well_past = first + DIRTY_MAX_DEBOUNCE;
+        assert_eq!(debounce_deadline(well_past, first), first + DIRTY_MAX_DEBOUNCE);
+    }
+
     fn git_pr(number: u64, state: &str) -> hitch_git::PrInfo {
         hitch_git::PrInfo {
             number,
@@ -10792,6 +10878,7 @@ mod tests {
             git_dir: Some(git_dir.clone()),
             workdir_canonical: std::fs::canonicalize(&linked).ok(),
             git_dir_canonical: std::fs::canonicalize(&git_dir).ok(),
+            filter: std::cell::RefCell::new(None),
         };
 
         let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
@@ -10887,6 +10974,7 @@ mod tests {
                 git_dir: None,
                 workdir_canonical: None,
                 git_dir_canonical: None,
+                filter: std::cell::RefCell::new(None),
             },
         );
         watched.insert(
@@ -10896,6 +10984,7 @@ mod tests {
                 git_dir: Some(linked_git_dir.clone()),
                 workdir_canonical: None,
                 git_dir_canonical: None,
+                filter: std::cell::RefCell::new(None),
             },
         );
 
@@ -10956,6 +11045,7 @@ mod tests {
             git_dir: None,
             workdir_canonical: std::fs::canonicalize(&link).ok(),
             git_dir_canonical: None,
+            filter: std::cell::RefCell::new(None),
         };
 
         // A file existed and was deleted: the deletion event names it via the
@@ -11007,6 +11097,7 @@ mod tests {
                 git_dir: None,
                 workdir_canonical: None,
                 git_dir_canonical: None,
+                filter: std::cell::RefCell::new(None),
             },
         );
         let event_path = workdir.join("a.txt");
