@@ -3325,3 +3325,78 @@ fn wait_for_socket_gone(socket: &Path, timeout: Duration) {
     }
     panic!("socket still exists after shutdown: {}", socket.display());
 }
+
+#[cfg(unix)]
+fn daemon_rss_kb(pid: u32) -> u64 {
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0)
+}
+
+/// Regression: a session that floods output while a client stops draining its
+/// socket must NOT grow daemon memory without bound.
+///
+/// Before the per-client bounded writer (this commit), the PTY reader thread
+/// `send()`d every 64 KiB chunk into an UNBOUNDED `pty_tx`/`dispatch_tx`, and the
+/// single dispatcher wrote to each client over a BLOCKING socket. A client that
+/// stopped reading (or merely rendered slower than the producer — a GUI showing a
+/// build firehose always does) blocked the dispatcher, so the channel queues
+/// accumulated `Vec<u8>` frames without limit: RSS climbed ~60 MB/s (this exact
+/// harness measured +363 MB in 6 s) until OOM, with rising latency. Scrollback
+/// stayed capped at 1 MB, so the leak was invisible there.
+///
+/// Now each client has a bounded outbound queue drained by its own writer thread;
+/// the dispatcher only enqueues and never blocks, and oldest terminal-output
+/// frames are shed once a client falls `CLIENT_OUTBOUND_CAP_BYTES` (8 MiB) behind
+/// (the client re-syncs from the daemon's authoritative scrollback — ADR 0007).
+/// So a stalled client now plateaus near baseline instead of growing unbounded.
+#[cfg(unix)]
+#[test]
+fn stalled_client_does_not_grow_daemon_rss_unbounded() {
+    // Keep the socket name short: the temp-dir prefix + nonce + name must fit the
+    // Unix-socket SUN_LEN (~104 chars). The descriptive test name is unaffected.
+    let socket = test_socket_path("stall-rss");
+    let daemon = DaemonGuard::start(&socket);
+    let pid = daemon.child.id();
+
+    let mut client = TestClient::connect(&socket);
+    client.hello(1);
+    let project_root = test_dir_path("stall-rss-project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let project = client.add_project(2, &project_root);
+
+    // Firehose: `yes <512-byte line>` floods stdout as fast as the reader drains.
+    let line = "X".repeat(512);
+    let _session = client.open_session(
+        3,
+        SessionParent::Project(project.id),
+        vec!["/usr/bin/yes".to_string(), line],
+    );
+
+    // From here the client NEVER reads its socket: its recv buffer fills and the
+    // daemon's per-client writer thread stalls. With the bounded queue, daemon RSS
+    // must plateau rather than climb. Run long enough (8 s) that the pre-fix leak
+    // (~60 MB/s ⇒ ~+480 MB) would blow past the bound by an order of magnitude.
+    let baseline = daemon_rss_kb(pid);
+    let mut peak = baseline;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+        peak = peak.max(daemon_rss_kb(pid));
+    }
+
+    let growth = peak.saturating_sub(baseline);
+    // Steady state is ~8 MiB queue + ~1 MiB scrollback + in-flight + allocator
+    // slack (observed ~11 MB). 96 MB gives wide margin over that while still
+    // catching a reintroduced unbounded leak (which reaches hundreds of MB here).
+    assert!(
+        growth < 96_000,
+        "daemon RSS must stay bounded for a stalled client; grew {growth}KB \
+         (baseline {baseline}KB, peak {peak}KB) — the per-client outbound queue is not capping"
+    );
+}

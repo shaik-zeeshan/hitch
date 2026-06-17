@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1087,8 +1087,157 @@ struct DispatchChannels {
     dispatch_tx: mpsc::Sender<DispatchMsg>,
 }
 
+/// Per-client outbound write budget. A client that falls more than this far
+/// behind on terminal output has its OLDEST buffered output frames dropped — the
+/// live byte stream is best-effort repaint (ADR 0007) and the daemon's bounded
+/// scrollback stays authoritative, so a lagging GUI re-syncs from that snapshot
+/// rather than the daemon buffering its backlog without limit. Control-plane
+/// frames are never dropped. This is the bound that stops a slow or stalled GUI
+/// from growing daemon memory unbounded while a session floods output (a build),
+/// the leak that the per-client writer thread replaces.
+const CLIENT_OUTBOUND_CAP_BYTES: usize = 8 * 1024 * 1024;
+
+/// One queued write to a client socket.
+struct OutboundFrame {
+    bytes: Vec<u8>,
+    /// Terminal-output frames may be shed under backpressure; control-plane
+    /// frames (events, responses, relay control) must always be delivered.
+    droppable: bool,
+    /// Fired with the eventual write result once this frame reaches the socket.
+    /// Only the relay's deadline-bounded `SshAgentOpen` write sets it, so a wedged
+    /// GUI is still detected within a deadline (see `write_control_to_sink_with_deadline`).
+    done: Option<mpsc::SyncSender<io::Result<()>>>,
+}
+
+#[derive(Default)]
+struct OutboundQueue {
+    frames: VecDeque<OutboundFrame>,
+    bytes: usize,
+    /// Set by `close` (client unregistered) or by the writer thread on a socket
+    /// write error, so the thread drains and exits and further enqueues fail.
+    closed: bool,
+}
+
+/// The write half of a client connection: a bounded queue drained by a dedicated
+/// writer thread that owns the socket. Enqueue NEVER blocks the caller — the PTY
+/// dispatcher, job broadcasts, and reconnect replay all hand frames here and move
+/// on — so a slow or stalled GUI can no longer wedge the single dispatcher on a
+/// blocking socket write and back up the unbounded `dispatch_rx`/`pty_rx` queues
+/// behind it (the memory leak this replaces). Backpressure is absorbed by
+/// shedding the oldest *droppable* (terminal-output) frames once the queue
+/// exceeds `CLIENT_OUTBOUND_CAP_BYTES`.
+struct ClientWriter {
+    queue: Mutex<OutboundQueue>,
+    ready: Condvar,
+    /// Set by the writer thread when a socket write errors (broken pipe) so the
+    /// broadcast path reaps the dead client, mirroring the old inline-write reap.
+    failed: AtomicBool,
+}
+
+impl ClientWriter {
+    /// Spawn the per-client writer thread that owns `stream`. There are only a
+    /// handful of clients (GUI windows plus an optional SSH proxy), so the thread
+    /// count is trivially bounded; the thread parks on the condvar when idle and
+    /// exits when the queue is closed.
+    fn spawn(stream: DaemonStream) -> Arc<Self> {
+        let writer = Arc::new(ClientWriter {
+            queue: Mutex::new(OutboundQueue::default()),
+            ready: Condvar::new(),
+            failed: AtomicBool::new(false),
+        });
+        let thread_writer = Arc::clone(&writer);
+        if thread::Builder::new()
+            .name("hitch-client-writer".into())
+            .spawn(move || thread_writer.run(stream))
+            .is_err()
+        {
+            // Could not get a thread: mark closed so enqueues fail fast and the
+            // client is reaped rather than silently swallowing its writes.
+            writer.close();
+        }
+        writer
+    }
+
+    /// Enqueue one frame, shedding oldest droppable frames if over budget. Returns
+    /// `false` if the client is already closed (the caller treats that like a write
+    /// error and reaps the client).
+    fn enqueue(&self, frame: OutboundFrame) -> bool {
+        let mut q = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+        if q.closed {
+            if let Some(done) = frame.done {
+                let _ = done.try_send(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "client connection closed",
+                )));
+            }
+            return false;
+        }
+        q.bytes += frame.bytes.len();
+        q.frames.push_back(frame);
+        while q.bytes > CLIENT_OUTBOUND_CAP_BYTES {
+            // Drop the oldest droppable (terminal-output) frame; keep control.
+            let Some(pos) = q.frames.iter().position(|f| f.droppable) else {
+                break; // only undelivered control remains — never drop that
+            };
+            if let Some(dropped) = q.frames.remove(pos) {
+                q.bytes -= dropped.bytes.len();
+            }
+        }
+        self.ready.notify_one();
+        true
+    }
+
+    /// Close the queue so the writer thread drains and exits. Idempotent.
+    fn close(&self) {
+        let mut q = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+        q.closed = true;
+        self.ready.notify_all();
+    }
+
+    fn run(self: Arc<Self>, mut stream: DaemonStream) {
+        loop {
+            let frame = {
+                let mut q = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+                loop {
+                    if let Some(frame) = q.frames.pop_front() {
+                        q.bytes -= frame.bytes.len();
+                        break frame;
+                    }
+                    if q.closed {
+                        return;
+                    }
+                    q = self.ready.wait(q).unwrap_or_else(|p| p.into_inner());
+                }
+            };
+            // Blocking writes are fine here: they stall only THIS client's writer
+            // thread, never the dispatcher or any other client.
+            let result = stream.write_all(&frame.bytes).and_then(|()| stream.flush());
+            if let Some(done) = frame.done {
+                let _ = done.try_send(result.as_ref().map(|_| ()).map_err(|e| {
+                    io::Error::new(e.kind(), e.to_string())
+                }));
+            }
+            if result.is_err() {
+                self.failed.store(true, Ordering::SeqCst);
+                let mut q = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+                q.closed = true;
+                for leftover in q.frames.drain(..) {
+                    if let Some(done) = leftover.done {
+                        let _ = done.try_send(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "client write failed",
+                        )));
+                    }
+                }
+                q.bytes = 0;
+                return;
+            }
+        }
+    }
+}
+
 struct ClientSink {
-    writer: Mutex<DaemonStream>,
+    writer: Arc<ClientWriter>,
     /// Output readiness gate. `false` until the replay thread has delivered the
     /// full scrollback snapshot and drained any output buffered in `pending`.
     /// and writes directly once it is open. Job events use their own gate below;
@@ -1230,14 +1379,14 @@ fn restore_layout(
 }
 
 fn register_client(state: &Arc<Mutex<DaemonState>>, stream: &DaemonStream) -> io::Result<u64> {
-    let writer = stream.try_clone()?;
+    let writer = ClientWriter::spawn(stream.try_clone()?);
     let mut state = state.lock().map_err(|_| poisoned("state"))?;
     let client_id = state.next_client_id;
     state.next_client_id += 1;
     state.clients.insert(
         client_id,
         Arc::new(ClientSink {
-            writer: Mutex::new(writer),
+            writer,
             live: AtomicBool::new(false),
             jobs_live: AtomicBool::new(false),
             pending: Mutex::new(Vec::new()),
@@ -1277,7 +1426,12 @@ fn unregister_client(state: &Arc<Mutex<DaemonState>>, client_id: u64) {
         if let Some(sink) = state.clients.get(&client_id) {
             sink.disconnected.store(true, Ordering::SeqCst);
         }
-        state.clients.remove(&client_id);
+        // Closing the sink's writer queue lets its dedicated writer thread drain
+        // any buffered frames and exit, rather than parking on the condvar forever
+        // once the sink Arc is dropped from `clients`.
+        if let Some(sink) = state.clients.remove(&client_id) {
+            sink.writer.close();
+        }
         state.broadcaster.forget_client(client_id);
         if state.driving_client == Some(client_id) {
             // Re-point to any other still-connected eligible client (relay-capable
@@ -6905,48 +7059,61 @@ where
     }
 }
 
+/// Treat a closed (writer-gone) sink as a broken-pipe write error so callers reap
+/// the client exactly as they did when writes were synchronous.
+fn enqueue_or_broken(sink: &ClientSink, frame: OutboundFrame) -> io::Result<()> {
+    if sink.writer.enqueue(frame) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "client connection closed",
+        ))
+    }
+}
+
 fn write_control_to_sink(sink: &ClientSink, message: &ControlMessage) -> io::Result<()> {
     let bytes = encode_control_message(message).map_err(io::Error::other)?;
-    let mut writer = sink.writer.lock().map_err(|_| poisoned("client writer"))?;
-    writer.write_all(&bytes)?;
-    writer.flush()
+    enqueue_or_broken(
+        sink,
+        OutboundFrame {
+            bytes,
+            droppable: false,
+            done: None,
+        },
+    )
 }
 
 /// Bounded write of one control message to a sink (M3). The relay's single accept
 /// thread sends `SshAgentOpen` to the driving GUI before spawning the channel pump;
-/// the control [`ClientSink`] writer has no write timeout (only the relay's git-side
-/// split-halves do), so a slow/hung GUI that stops draining its socket would block the
-/// accept thread inside `write_all` forever → NO new git child can be accepted
-/// anywhere, and the wedged write contends the shared `writer` mutex against PTY
-/// broadcast.
+/// a slow/hung GUI that stops draining its socket must not wedge the accept thread →
+/// NO new git child could be accepted anywhere.
 ///
-/// `DaemonStream` (the sink's writer) exposes no portable per-write timeout, so bound
-/// the write off-thread: run [`write_control_to_sink`] on a short-lived worker and wait
-/// at most `deadline` for it. On timeout the GUI is treated as wedged — mark its sink
-/// `disconnected` (mirroring how broadcast drops a sink on a write ERROR; a blocking
-/// write never errors, so the deadline is the only signal) and return an error so the
-/// caller drops this channel and KEEPS ACCEPTING. The detached worker may still be
-/// parked in `write_all`; that is acceptable — it holds only this dead sink's writer
-/// mutex and unblocks when the GUI's connection is eventually reaped, while the accept
-/// thread is freed immediately. A poisoned/zero-length send still returns promptly.
+/// Per-client writes are now enqueued to a dedicated writer thread, so enqueue never
+/// blocks the accept thread. We still want to know whether the GUI actually *received*
+/// the open within a deadline (so a wedged GUI's channel is dropped rather than left
+/// waiting on a reply that never comes): enqueue the frame with a one-shot completion
+/// signal the writer thread fires after the bytes reach the socket, and wait at most
+/// `deadline` for it. On timeout the GUI is treated as wedged — mark its sink
+/// `disconnected` and return an error so the caller drops this channel and KEEPS
+/// ACCEPTING; the frame stays queued and the writer thread unblocks when the GUI's
+/// connection is eventually reaped.
 fn write_control_to_sink_with_deadline(
     sink: &Arc<ClientSink>,
     message: &ControlMessage,
     deadline: Duration,
 ) -> io::Result<()> {
-    let (tx, rx) = mpsc::channel();
-    let worker_sink = Arc::clone(sink);
-    let worker_message = message.clone();
-    // Best-effort spawn: if the OS can't give us a thread, fall back to a direct
-    // (unbounded) write rather than dropping the channel — the original behavior.
-    if thread::Builder::new()
-        .name("ssh-agent-relay-open-write".to_string())
-        .spawn(move || {
-            let _ = tx.send(write_control_to_sink(&worker_sink, &worker_message));
-        })
-        .is_err()
-    {
-        return write_control_to_sink(sink, message);
+    let bytes = encode_control_message(message).map_err(io::Error::other)?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    if !sink.writer.enqueue(OutboundFrame {
+        bytes,
+        droppable: false,
+        done: Some(tx),
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "client connection closed",
+        ));
     }
     match rx.recv_timeout(deadline) {
         Ok(result) => result,
@@ -6961,7 +7128,8 @@ fn write_control_to_sink_with_deadline(
                 "control-sink write to driving GUI exceeded deadline (slow/hung GUI)",
             ))
         }
-        // The worker's sender dropped without sending (panic): treat as a failed write.
+        // The writer thread dropped the completion sender without firing it (queue
+        // closed mid-flight): treat as a failed write.
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
             "control-sink write worker ended without a result",
         )),
@@ -6976,10 +7144,20 @@ fn write_output_to_sink(sink: &ClientSink, session_id: SessionId, bytes: &[u8]) 
     let control = encode_control_message(&event).map_err(io::Error::other)?;
     let payload = encode_pty_frame(bytes).map_err(io::Error::other)?;
 
-    let mut writer = sink.writer.lock().map_err(|_| poisoned("client writer"))?;
-    writer.write_all(&control)?;
-    writer.write_all(&payload)?;
-    writer.flush()
+    // The control line and its binary frame are one indivisible unit on the wire,
+    // so concatenate them into a single queued frame: they are enqueued, dropped
+    // (under backpressure), and written together, never split.
+    let mut frame = Vec::with_capacity(control.len() + payload.len());
+    frame.extend_from_slice(&control);
+    frame.extend_from_slice(&payload);
+    enqueue_or_broken(
+        sink,
+        OutboundFrame {
+            bytes: frame,
+            droppable: true,
+            done: None,
+        },
+    )
 }
 
 /// Snapshot a worktree's in-flight composite Jobs (ADR 0013 amendment) so a
@@ -8305,7 +8483,7 @@ mod tests {
 
         let (mut reader, writer) = UnixStream::pair().unwrap();
         let sink = Arc::new(super::ClientSink {
-            writer: Mutex::new(super::DaemonStream::new(writer)),
+            writer: super::ClientWriter::spawn(super::DaemonStream::new(writer)),
             live: AtomicBool::new(true),
             jobs_live: AtomicBool::new(true),
             agent_state_live: AtomicBool::new(false),
@@ -8404,7 +8582,7 @@ mod tests {
 
         let (mut reader, writer) = UnixStream::pair().unwrap();
         let sink = Arc::new(super::ClientSink {
-            writer: Mutex::new(super::DaemonStream::new(writer)),
+            writer: super::ClientWriter::spawn(super::DaemonStream::new(writer)),
             live: AtomicBool::new(true),
             jobs_live: AtomicBool::new(true),
             agent_state_live: AtomicBool::new(false),
@@ -9021,7 +9199,7 @@ mod tests {
         let (request_writer, _request_reader) = UnixStream::pair().unwrap();
         let (peer_writer, _peer_reader) = UnixStream::pair().unwrap();
         let requester = Arc::new(super::ClientSink {
-            writer: Mutex::new(super::DaemonStream::new(request_writer)),
+            writer: super::ClientWriter::spawn(super::DaemonStream::new(request_writer)),
             live: AtomicBool::new(true),
             jobs_live: AtomicBool::new(true),
             agent_state_live: AtomicBool::new(true),
@@ -9034,7 +9212,7 @@ mod tests {
         disconnected: AtomicBool::new(false),
         });
         let blocked = Arc::new(super::ClientSink {
-            writer: Mutex::new(super::DaemonStream::new(peer_writer)),
+            writer: super::ClientWriter::spawn(super::DaemonStream::new(peer_writer)),
             live: AtomicBool::new(true),
             jobs_live: AtomicBool::new(true),
             agent_state_live: AtomicBool::new(true),
@@ -9052,7 +9230,9 @@ mod tests {
             guard.clients.insert(2, Arc::clone(&blocked));
         }
 
-        let blocked_writer = blocked.writer.lock().unwrap();
+        // `blocked`'s peer socket is never drained, so its writer thread stalls on
+        // the socket once its buffer fills. With per-client async writes that can
+        // no longer wedge the worker: enqueueing the running-event never blocks.
         let started = Arc::new(AtomicBool::new(false));
         let started_flag = Arc::clone(&started);
         let worker_state = Arc::clone(&state);
@@ -9081,7 +9261,6 @@ mod tests {
             "worker should start even while a peer client's running-event write is blocked"
         );
 
-        drop(blocked_writer);
         handle.join().unwrap();
 
         drop(state);
@@ -9362,7 +9541,7 @@ mod tests {
         // back off the wire.
         let (reader, writer) = UnixStream::pair().unwrap();
         let sink = Arc::new(super::ClientSink {
-            writer: Mutex::new(super::DaemonStream::new(writer)),
+            writer: super::ClientWriter::spawn(super::DaemonStream::new(writer)),
             live: AtomicBool::new(true),
             jobs_live: AtomicBool::new(true),
             agent_state_live: AtomicBool::new(true),
@@ -10344,7 +10523,7 @@ mod tests {
         let worktree_id = worktree.id;
         let (reader, writer) = UnixStream::pair().unwrap();
         let sink = Arc::new(super::ClientSink {
-            writer: Mutex::new(super::DaemonStream::new(writer)),
+            writer: super::ClientWriter::spawn(super::DaemonStream::new(writer)),
             live: AtomicBool::new(true),
             jobs_live: AtomicBool::new(true),
             agent_state_live: AtomicBool::new(true),
@@ -11175,7 +11354,7 @@ mod tests {
         fn fake_gui_with(relay_capable: bool) -> FakeGui {
             let (gui_reader, sink_writer) = connected_pair();
             let sink = Arc::new(ClientSink {
-                writer: Mutex::new(sink_writer),
+                writer: crate::ClientWriter::spawn(sink_writer),
                 live: AtomicBool::new(true),
                 jobs_live: AtomicBool::new(true),
                 pending: Mutex::new(Vec::new()),
